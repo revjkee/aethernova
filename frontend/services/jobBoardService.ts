@@ -1,0 +1,1 @@
+// jobBoardService.ts - автогенерировано
