@@ -1,0 +1,207 @@
+# cybersecurity-core/configs/attack_simulator.yaml
+# Промышленная конфигурация Attack Simulator / Adversary Emulation
+# Источники и соответствие:
+# - MITRE ATT&CK T1486 (Data Encrypted for Impact): https://attack.mitre.org/techniques/T1486/
+# - MITRE ATT&CK T1490 (Inhibit System Recovery):  https://attack.mitre.org/techniques/T1490/
+# - NIST SP 800-115 (Security Testing & Assessment): https://csrc.nist.gov/pubs/sp/800/115/final
+# - NIST SP 800-53 Rev.5 (CA-8 Penetration Testing): https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final
+# - OCSF (Open Cybersecurity Schema Framework): https://github.com/ocsf/ocsf-schema
+
+version: "1.0"
+
+metadata:
+  project: "Aethernova Cybersecurity Core"
+  component: "Adversary Emulation / Attack Simulator"
+  owner: "platform-security-core"
+  schema_version: 1
+  generated_utc: "2025-09-05T00:00:00Z"
+  references:
+    - name: "ATT&CK T1486"  # Data Encrypted for Impact
+      url: "https://attack.mitre.org/techniques/T1486/"
+    - name: "ATT&CK T1490"  # Inhibit System Recovery
+      url: "https://attack.mitre.org/techniques/T1490/"
+    - name: "NIST SP 800-115"
+      url: "https://csrc.nist.gov/pubs/sp/800/115/final"
+    - name: "NIST SP 800-53 Rev.5 CA-8"
+      url: "https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final"
+    - name: "OCSF schema"
+      url: "https://github.com/ocsf/ocsf-schema"
+
+runtime:
+  python_min: "3.10"
+  entrypoints:
+    # Полное имя класса сценария (module:Class)
+    ransomware: "cybersecurity.adversary_emulation.scenarios.library.scenario_ransomware:RansomwareScenario"
+
+safety:
+  # Строгий режим: любые нарушения правил безопасности -> штатная аварийная остановка шага
+  strict: true
+
+  # Полная блокировка сети для шагов симуляции
+  disable_network: true
+
+  # Базовая директория песочницы (используется guardrails.py)
+  base_dir: "${TMPDIR:-/tmp}/advemu_safe"
+
+  # Разрешенные подкаталоги для записи
+  allow_subdirs: ["artifacts", "tmp", "work", "."]
+
+  # Запрет симлинков (защита от выхода из песочницы)
+  follow_symlinks: false
+
+  # Политика команд (должна соответствовать guardrails.py)
+  command_policy:
+    allowed_binaries: ["echo", "cat"]   # пример минимального allowlist
+    denied_binaries:
+      - "rm"       # destructive
+      - "dd"
+      - "mkfs"
+      - "mount"
+      - "umount"
+      - "shutdown"
+      - "reboot"
+      - "iptables"
+      - "tc"
+      - "sysctl"
+      - "reg"
+      - "sc"
+      - "vssadmin"
+      - "bcdedit"
+      - "cipher"
+      - "wmic"
+    denied_args_patterns:
+      - "(?i)--?no[-_]?preserve[-_]?root"
+      - "(?i)--?force"
+      - "(?i)--?recursive"
+      - "(?i)--?delete"
+      - "(?i)--?format"
+
+  # Санитайз окружения
+  env:
+    allowlist: ["PATH", "LANG", "LC_ALL", "TZ"]
+    overrides:
+      LANG: "C"
+      LC_ALL: "C"
+    wipe_others: true
+
+  # Лимиты ресурсов (см. guardrails.py / resource limits)
+  resource_limits:
+    cpu_seconds: 5
+    wall_timeout_seconds: 20
+    rss_megabytes: 512
+    nofile: 256
+    fsize_megabytes: 128
+
+  # Аудит действий песочницы (NDJSON, с редакцией секретов)
+  audit:
+    enabled: true
+    path: "${TMPDIR:-/tmp}/advemu_audit.ndjson"
+    redact_patterns:
+      - "(?i)(api_?key|token|secret|password)\\s*=\\s*([^\\s,;]+)"
+      - "(?i)bearer\\s+[A-Za-z0-9\\-\\._~\\+\\/]+=*"
+      - "0x[a-fA-F0-9]{32,}"
+
+telemetry:
+  # Хранилище телеметрии шагов симуляции
+  format: "ndjson"
+  path: "${TMPDIR:-/tmp}/advemu_ransomware/artifacts/telemetry.ndjson"
+
+  # Маппинг на OCSF поля (для SIEM/даталейк)
+  # См. OCSF: https://github.com/ocsf/ocsf-schema
+  ocsf_mapping:
+    class: "application_activity"
+    category: "security_analytics"
+    type_uid: 300000
+    fields:
+      ts: "datetime"
+      scenario_id: "string"
+      step_id: "string"
+      status: "string"
+      message: "string"
+      technique_id: "string"         # ATT&CK ID: T1486/T1490
+      technique_tactic: "string"     # Impact
+      artifacts: "array"
+      metrics: "object"
+      host: "object"
+
+logging:
+  level: "INFO"
+  # Путь для логов самого оркестратора (не телеметрии шагов)
+  file: "${TMPDIR:-/tmp}/advemu_ransomware/simulator.log"
+  rotation:
+    max_megabytes: 32
+    max_backups: 5
+
+artifacts:
+  directory: "${TMPDIR:-/tmp}/advemu_ransomware/artifacts"
+  retention:
+    max_days: 7
+    max_total_mb: 256
+  package_evidence_zip: true
+
+execution:
+  # Глобальные параметры выполнения сценариев
+  max_concurrency: 1
+  step_timeout_sec: 15
+  retries:
+    max_attempts: 1
+    backoff: "exponential"
+    jitter: true
+  # Порядок шагов для сценариев, которые его используют
+  default_order: ["generate_canaries", "simulate_encryption", "simulate_inhibit_recovery", "collect_evidence_zip"]
+  stop_on_violation: true
+
+scenarios:
+  - id: "ransomware_safe"
+    enabled: true
+    entrypoint: "ransomware"
+    parameters:
+      file_count: 12
+      file_size_kb: 16
+      step_timeout_sec: 15
+      seed: null
+      create_zip: true
+    compliance:
+      mitre_attack:
+        - "T1486"  # Data Encrypted for Impact
+        - "T1490"  # Inhibit System Recovery
+      nist:
+        - "SP 800-115 Technical Guide to Information Security Testing and Assessment"
+        - "SP 800-53 Rev.5 CA-8 Penetration Testing"
+    telemetry_tags: ["simulation", "impact", "safe-mode"]
+
+schedules:
+  - name: "manual"
+    type: "manual"
+  - name: "nightly_safety_selftest"
+    type: "cron"
+    expr: "0 3 * * *"
+    enabled: false
+
+profiles:
+  # Базовый профиль по умолчанию
+  default:
+    logging:
+      level: "INFO"
+    artifacts:
+      retention:
+        max_days: 7
+        max_total_mb: 256
+  # Профиль для разработки
+  dev:
+    artifacts:
+      retention:
+        max_days: 3
+        max_total_mb: 128
+    execution:
+      retries:
+        max_attempts: 1
+  # Профиль для продакшн-учений
+  prod:
+    artifacts:
+      retention:
+        max_days: 30
+        max_total_mb: 1024
+    execution:
+      retries:
+        max_attempts: 2

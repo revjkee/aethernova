@@ -1,0 +1,321 @@
+# file: neuroforge-core/configs/security.yaml
+schema: neuroforge.security.v1
+version: "1.0.0"
+updated_at: "2025-08-26Z"
+description: "Единая политика безопасности для сервисов neuroforge-core. Значения секретов поставляются из Vault/ENV."
+
+profiles:
+  # Базовые параметры применяются всегда, затем переопределяются profile_overrides.{prod|staging|dev}
+  default:
+    http:
+      require_https: true
+      # HSTS включается только при наличии корректного TLS фронта
+      hsts:
+        enabled: true
+        max_age_seconds: 31536000
+        include_subdomains: true
+        preload: false
+      # Заголовки защиты (рекомендуемые безопасные значения)
+      security_headers:
+        x_content_type_options: "nosniff"
+        x_frame_options: "DENY"
+        referrer_policy: "no-referrer"
+        # Современные браузеры игнорируют X-XSS-Protection; оставлено для обратной совместимости
+        x_xss_protection: "0"
+        # Старайтесь избегать 'unsafe-inline' в проде; используйте nonce/sha256 и CSP_ROUTES/EXTRA при необходимости
+        content_security_policy: "default-src 'none'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"
+        # Ограничение API/браузерных возможностей
+        permissions_policy: "geolocation=(), microphone=(), camera=(), payment=()"
+      # Ограничение максимального размера запроса и времени ответа
+      request_limits:
+        body_bytes: 10485760         # 10 MiB
+        header_bytes: 65536
+        client_read_timeout_seconds: 30
+        client_write_timeout_seconds: 30
+
+    cors:
+      enabled: true
+      allowed_origins:
+        - "https://app.neuroforge.example.com"
+        - "https://staging.neuroforge.example.com"
+      allowed_methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+      allowed_headers: ["Authorization","Content-Type","X-Request-Id","X-Correlation-Id"]
+      exposed_headers: ["Content-Length","Content-Type","ETag","X-Request-Id"]
+      allow_credentials: true
+      max_age_seconds: 600
+
+    csrf:
+      enabled: true
+      header_name: "X-CSRF-Token"
+      cookie:
+        name: "nf_csrf"
+        secure: true
+        http_only: true
+        same_site: "Strict"
+
+    cookies:
+      session:
+        name: "nf_session"
+        secure: true
+        http_only: true
+        same_site: "Lax"
+        max_age_seconds: 2592000      # 30 дней
+
+    auth:
+      # Поддерживаем несколько механизмов. Приложение выбирает нужный.
+      mode_order: ["jwt","oauth2","api_key"]
+      jwt:
+        enabled: true
+        issuer: "https://auth.neuroforge.example.com/"
+        audiences: ["neuroforge-api"]
+        jwks_url: "${OAUTH_JWKS_URL}"          # из ENV/Secret
+        cache_jwks_ttl_seconds: 3600
+        leeway_seconds: 60
+        access_token_ttl_seconds: 900
+        refresh_token_ttl_seconds: 2592000
+        required_claims: ["sub","exp","iat"]
+        optional_claims: ["scope","roles","tenant"]
+        map_roles_from: ["realm_access.roles","roles"]
+        clock_skew_seconds: 30
+      oauth2:
+        enabled: true
+        providers:
+          - name: "okta"
+            introspection_url: "${OKTA_INTROSPECTION_URL}"
+            client_id: "${OKTA_CLIENT_ID}"
+            # client_secret в Vault, не хранить в файле
+            required_scopes: ["openid","profile","email"]
+            enforce_mfa: false
+      api_keys:
+        enabled: true
+        header: "X-API-Key"
+        hashing: "sha256"
+        # Источник ключей: vault.kv path -> поле "keys" (массив хэшей)
+        vault:
+          path: "kv/neuroforge/api-keys"
+          field: "keys"
+
+    rbac:
+      enabled: true
+      default_role: "viewer"
+      roles:
+        admin:
+          permissions: ["*"]
+        operator:
+          permissions: ["read:*","write:jobs","write:configs"]
+        viewer:
+          permissions: ["read:*"]
+      # Маппинг ролей из claims токена -> локальные роли
+      role_mapping:
+        "admin": ["admin"]
+        "ops": ["operator"]
+        "viewer": ["viewer"]
+
+    rate_limit:
+      enabled: true
+      # Наборы лимитов по категориям маршрутов
+      buckets:
+        - name: "global"
+          match:
+            routes: ["*"]
+          limit_per_minute: 600
+          burst: 100
+        - name: "login"
+          match:
+            routes: ["/auth/login","/auth/refresh"]
+          limit_per_minute: 20
+          burst: 5
+        - name: "graphql"
+          match:
+            routes: ["/graphql"]
+          limit_per_minute: 300
+          burst: 60
+      ip_allow_cidrs: ["10.0.0.0/8","192.168.0.0/16"]
+      ip_deny_cidrs: []
+      penalty_box_minutes: 15
+
+    ddos:
+      max_concurrent_requests: 1000
+      queue_burst: 200
+      slowloris_protection:
+        headers_timeout_seconds: 5
+        min_bytes_per_second: 100
+
+    uploads:
+      enabled: true
+      destination: "s3://nf-uploads"          # конечное хранилище
+      quarantine_destination: "s3://nf-quarantine"
+      max_size_bytes: 52428800                # 50 MiB
+      allowed_mime_types: ["image/png","image/jpeg","application/pdf","application/zip"]
+      content_disposition_policy: "attachment"
+      antivirus:
+        enabled: true
+        engine: "clamav"
+        clamav_tcp: "clamav.clamav:3310"
+        timeout_seconds: 15
+        on_fail: "quarantine"                 # block|quarantine|allow
+
+    crypto:
+      # Шифрование на хранении
+      at_rest:
+        kms_key_arn: "${KMS_KEY_ARN}"         # если пусто, используется AES-256 (управление платформой)
+        field_level:
+          enabled: true
+          algorithm: "aes-256-gcm"
+          # Не хранить ключи здесь: только ссылки на менеджер секретов
+          key_ref: "vault:kv/neuroforge/crypto#field_key"
+      # Шифрование в транзите
+      in_transit:
+        tls_min_version: "1.2"
+        prefer_server_ciphers: true
+        ciphers:
+          - "TLS_AES_256_GCM_SHA384"
+          - "TLS_AES_128_GCM_SHA256"
+          - "TLS_CHACHA20_POLY1305_SHA256"
+        http2_enabled: true
+        mtls:
+          enabled: false
+          ca_bundle_path: "/etc/neuroforge/mtls/ca.crt"
+          client_cert_header: "X-Client-Cert"
+
+    secrets:
+      provider: "vault"                       # vault|aws_sm|env
+      vault:
+        address: "${VAULT_ADDR}"
+        role: "neuroforge"
+        mount: "kv"
+        paths:
+          app: "kv/neuroforge/app"
+          db: "kv/neuroforge/db"
+          oauth: "kv/neuroforge/oauth"
+      # Для aws_sm укажите region и префикс, для env значения читаются из окружения процесса
+
+    databases:
+      default:
+        dsn: "${DATABASE_URL}"
+        pool_max: 50
+        require_tls: true
+        tls_min_version: "1.2"
+        # Опционально: client cert для mTLS к БД
+        mtls:
+          enabled: false
+          key_ref: "vault:kv/neuroforge/db#client_key"
+          cert_ref: "vault:kv/neuroforge/db#client_cert"
+
+    outbound:
+      # Жесткий SSRF/egress контроль: deny по умолчанию
+      deny_unknown_hosts: true
+      allowed_hosts:
+        - "api.stripe.com:443"
+        - "s3.amazonaws.com:443"
+      dns_resolver: "169.254.169.253"        # при наличии кастомного резолвера
+
+    pii:
+      redaction:
+        enabled: true
+        # Поля в логах/метриках маскируются значением "***"
+        fields: ["password","pass","secret","token","authorization","set-cookie","refresh_token","access_token","ssn","email","phone"]
+        patterns:
+          - name: "email"
+            regex: "(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}"
+          - name: "visa"
+            regex: "\\b4[0-9]{12}(?:[0-9]{3})?\\b"
+      exports:
+        allow_raw_pii_exports: false
+        approval_required_roles: ["admin","dpo"]
+
+    audit:
+      enabled: true
+      capture:
+        request_headers: ["x-request-id","x-correlation-id","user-agent","x-forwarded-for"]
+        response_headers: ["content-type","content-length"]
+        bodies: false                       # включайте точечно и с DLP
+      destinations:
+        - type: "stdout"
+        - type: "http"
+          url: "${AUDIT_COLLECTOR_URL}"
+          auth_header: "Bearer ${AUDIT_TOKEN}"
+      sampling:
+        default: 1.0
+        health: 0.0
+      retention_days: 365
+
+    compliance:
+      gdpr:
+        default_retention_days: 365
+        dsr_window_days: 30
+      hipaa:
+        enabled: false
+
+    observability:
+      request_id_header: "X-Request-Id"
+      correlation_id_header: "X-Correlation-Id"
+      log_level: "info"
+      log_format: "json"
+      # Сэмплирование событий безопасности для телеметрии
+      security_event_sample_rate: 1.0
+
+  # Переопределения по окружениям
+  profile_overrides:
+    prod:
+      http:
+        hsts:
+          preload: true
+      crypto:
+        in_transit:
+          tls_min_version: "1.3"
+      rate_limit:
+        buckets:
+          - name: "global"
+            match: { routes: ["*"] }
+            limit_per_minute: 1200
+            burst: 200
+      ddos:
+        max_concurrent_requests: 3000
+      uploads:
+        antivirus:
+          timeout_seconds: 20
+      csrf:
+        cookie:
+          same_site: "Lax"
+
+    staging:
+      rate_limit:
+        buckets:
+          - name: "global"
+            match: { routes: ["*"] }
+            limit_per_minute: 600
+            burst: 100
+
+    dev:
+      http:
+        require_https: false
+      cors:
+        allowed_origins: ["*"]
+      csrf:
+        enabled: false
+      rate_limit:
+        enabled: false
+      uploads:
+        antivirus:
+          enabled: false
+      audit:
+        sampling:
+          default: 0.2
+
+# Проверочные правила для запуска сервиса
+validation:
+  require_env:
+    - "OAUTH_JWKS_URL"
+    - "DATABASE_URL"
+  forbid_empty:
+    - "profiles.default.auth.jwt.issuer"
+    - "profiles.default.secrets.provider"
+  require_when:
+    - if: "profiles.default.crypto.at_rest.field_level.enabled"
+      then:
+        - "profiles.default.crypto.at_rest.field_level.key_ref"
+    - if: "profiles.default.secrets.provider == 'vault'"
+      then:
+        - "profiles.default.secrets.vault.address"
+        - "profiles.default.secrets.vault.role"

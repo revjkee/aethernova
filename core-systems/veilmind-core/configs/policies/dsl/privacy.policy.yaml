@@ -1,0 +1,428 @@
+schema: "veilmind-privacy-dsl"
+version: "1.3.0"
+
+meta:
+  owner: "VeilMind Privacy Office"
+  dpo_contact: "dpo@veilmind.example"
+  updated_at: "2025-08-21"
+  description: "Машинно-исполняемая политика приватности для сервисов VeilMind Core"
+  references:
+    - "GDPR Art.5(1)(b) purpose limitation"
+    - "GDPR Art.6 lawful basis"
+    - "GDPR Art.32 security of processing"
+    - "ISO/IEC 27701 controls"
+  notes:
+    - "Политика применяется в PDP, действия исполняются в PEP и конвейере redaction"
+    - "Все сроки и ограничения уточняются в overlays окружений"
+
+defaults:
+  decision_on_unknown: "deny"
+  decision_on_system_error: "deny_with_alert"
+  pii_definition_region: "EEA"
+  encryption_at_rest: "required"
+  encryption_in_transit: "required"
+  pseudonymization_preferred: true
+  telemetry_low_cardinality: true
+  residency_enforced: true
+
+taxonomy:
+  data_categories:
+    PII_BASIC:
+      examples: ["email", "phone", "ip", "name"]
+      risk: "medium"
+    PII_SENSITIVE:
+      examples: ["religion", "sexual_orientation", "political_opinion"]
+      risk: "high"
+    FINANCIAL:
+      examples: ["card_number", "iban"]
+      risk: "high"
+    HEALTH:
+      examples: ["diagnosis", "lab_results"]
+      risk: "high"
+    BIOMETRIC:
+      examples: ["face_embedding", "fingerprint"]
+      risk: "high"
+    AUTH_SECRETS:
+      examples: ["password", "token", "jwt", "api_key", "private_key"]
+      risk: "critical"
+    NETWORK_IDS:
+      examples: ["device_id", "cookie", "session_id"]
+      risk: "medium"
+    USER_CONTENT:
+      examples: ["free_text", "attachments"]
+      risk: "variable"
+    TELEMETRY:
+      examples: ["http_meta", "metrics", "traces"]
+      risk: "low"
+  subjects:
+    ADULT: { min_age: 18 }
+    TEEN: { min_age: 13, max_age: 17 }
+    CHILD: { max_age: 12 }
+  purposes:
+    SECURITY:
+      description: "Защита, обнаружение аномалий, журналирование безопасности"
+      allowed_categories: ["TELEMETRY","NETWORK_IDS","PII_BASIC","AUTH_SECRETS"]
+      default_retention_days: 365
+      legal_bases: ["legitimate_interest","legal_obligation"]
+    SUPPORT:
+      description: "Поддержка и расследования инцидентов пользователя"
+      allowed_categories: ["PII_BASIC","USER_CONTENT","TELEMETRY","NETWORK_IDS"]
+      default_retention_days: 180
+      legal_bases: ["contract","legitimate_interest"]
+    ANALYTICS:
+      description: "Аналитика продукта и производительности"
+      allowed_categories: ["TELEMETRY","PII_BASIC"]
+      default_retention_days: 90
+      legal_bases: ["consent","legitimate_interest"]
+    PERSONALIZATION:
+      description: "Персонализация интерфейса и рекомендаций"
+      allowed_categories: ["PII_BASIC","NETWORK_IDS","TELEMETRY"]
+      default_retention_days: 180
+      legal_bases: ["consent"]
+    MARKETING:
+      description: "Маркетинговые рассылки и ретаргетинг"
+      allowed_categories: ["PII_BASIC","NETWORK_IDS"]
+      default_retention_days: 365
+      legal_bases: ["consent"]
+
+legal:
+  bases:
+    consent:
+      proof_required: true
+      revocation_effect: "stop_and_delete_non_necessary"
+    contract:
+      applicability: ["core service operations"]
+    legal_obligation:
+      applicability: ["tax","law_enforcement_hold"]
+    legitimate_interest:
+      lria_required: true
+      opt_out_required: true
+    vital_interest: {}
+    public_task: {}
+  consent:
+    storage: "consent_db"
+    keys: ["purpose","subject_id","jurisdiction","timestamp","version"]
+    minor_consent_required_age: 16
+    parent_guardian_required_for_child: true
+
+jurisdictions:
+  EEA:
+    residency_required: true
+    cross_border_requirements: ["SCC","adequacy_decision","BCR"]
+    treat_ip_as_pii: true
+  US:
+    state_variants: ["CA","CO","VA","CT"]
+    sell_share_opt_out_required: true
+  SE:
+    residency_required: true
+    overrides_from: "EEA"
+
+systems:
+  - id: "api.edge"
+    region: "SE"
+    sinks: ["logs","metrics","traces"]
+    data_stores: ["postgres","redis"]
+  - id: "ops.telemetry"
+    region: "SE"
+    sinks: ["metrics","traces"]
+    data_stores: ["s3","clickhouse"]
+  - id: "ml.analytics"
+    region: "SE"
+    sinks: ["s3"]
+    data_stores: ["s3"]
+    notes: "Использует обезличенные данные максимально возможным образом"
+
+enforcement_profiles:
+  # Готовые наборы действий
+  block_all:
+    actions: [{ type: "deny_processing" }, { type: "alert_dpo", severity: "high" }]
+  minimize_hash:
+    actions:
+      - { type: "minimize_fields" }
+      - { type: "apply_redaction_profile", profile: "hash_only" }
+  anonymize_aggregate:
+    actions:
+      - { type: "drop_raw_payload" }
+      - { type: "aggregate_only" }
+      - { type: "apply_redaction_profile", profile: "hash_low_cardinality" }
+  consent_gate:
+    actions:
+      - { type: "require_consent" }
+      - { type: "purpose_bind" }
+      - { type: "defer_until_consent" }
+
+retention_policies:
+  defaults:
+    fallback_days: 365
+    legal_hold_overrides: true
+  by_purpose:
+    SECURITY: { days: 365 }
+    SUPPORT: { days: 180 }
+    ANALYTICS: { days: 90 }
+    PERSONALIZATION: { days: 180 }
+    MARKETING: { days: 365 }
+  by_category:
+    AUTH_SECRETS: { days: 0, action: "never_store" }
+    PII_SENSITIVE: { days: 30, action: "pseudonymize_after" }
+    BIOMETRIC: { days: 0, action: "never_store" }
+    HEALTH: { days: 0, action: "never_store" }
+  incident_override:
+    enabled: true
+    purpose: "SECURITY"
+    days: 365
+
+transfer_policies:
+  cross_border:
+    - id: "eea_outbound"
+      when:
+        subject_region: "EEA"
+        destination_region_not_in: ["EEA","SE"]
+      require: ["SCC_or_equivalent"]
+      actions:
+        - { type: "pseudonymize" }
+        - { type: "apply_redaction_profile", profile: "hash_only" }
+        - { type: "log_transfer_register" }
+    - id: "us_marketing"
+      when:
+        purpose: "MARKETING"
+        destination_region: "US"
+      require: ["consent_opt_in","do_not_sell_opt_out_available"]
+
+minimization:
+  # Декларативный whitelisting полей по системам и целям
+  allowlists:
+    - system: "api.edge"
+      purpose: "SECURITY"
+      fields: ["request_id","client_ip","user_agent","path","method","status","trace_id"]
+    - system: "ml.analytics"
+      purpose: "ANALYTICS"
+      fields: ["tenant_id","feature_flag","latency_bucket","country_code"]
+  drop_unlisted: true
+
+redaction_integration:
+  # Согласование с configs/redaction.yaml
+  default_profile: "hash_low_cardinality"
+  profiles:
+    hash_low_cardinality:
+      sinks: { logs: "mask", traces: "hash", metrics: "hash" }
+      pii: "hash"
+      sensitive: "mask"
+      denylist: "remove"
+    hash_only:
+      sinks: { logs: "hash", traces: "hash", metrics: "hash" }
+      pii: "hash"
+      sensitive: "hash"
+      denylist: "remove"
+
+access_controls:
+  roles:
+    support_agent:
+      allow_purposes: ["SUPPORT","SECURITY"]
+      deny_categories: ["PII_SENSITIVE","FINANCIAL","HEALTH","BIOMETRIC"]
+      session_mfa_required: true
+    analyst:
+      allow_purposes: ["ANALYTICS"]
+      only_anonymized: true
+      dataset_tags_required: ["anonymized","no_raw"]
+    marketing:
+      allow_purposes: ["MARKETING"]
+      require_consent_check: true
+      deny_categories: ["PII_SENSITIVE","FINANCIAL","HEALTH","BIOMETRIC","AUTH_SECRETS"]
+
+dsr:
+  # Data Subject Requests
+  types:
+    access: { sla_days: 30 }
+    rectification: { sla_days: 30 }
+    deletion: { sla_days: 30, legal_hold_check: true }
+    portability: { sla_days: 30 }
+  enforcement:
+    deletion:
+      actions:
+        - { type: "mark_for_erasure" }
+        - { type: "suppress_processing" }
+        - { type: "notify_processors" }
+    access:
+      actions:
+        - { type: "prepare_portable_export", pseudonymize: false }
+        - { type: "audit_disclosure" }
+
+rules:
+  # 1. Никогда не хранить секреты аутентификации
+  - id: "never-store-secrets"
+    description: "AUTH_SECRETS не должны сохраняться ни в каком виде"
+    when:
+      category_in: ["AUTH_SECRETS"]
+    then:
+      decision: "deny_store"
+      obligations:
+        - { type: "remove_value" }
+        - { type: "alert_security", severity: "high" }
+
+  # 2. Аналитика допускается только на обезличенных/агрегированных данных
+  - id: "analytics-minimize"
+    when:
+      purpose: "ANALYTICS"
+    require:
+      legal_basis_in: ["consent","legitimate_interest"]
+    then:
+      decision: "allow_with_obligations"
+      obligations:
+        - { type: "apply_profile", ref: "anonymize_aggregate" }
+        - { type: "minimize_to_allowlist", system: "ml.analytics" }
+
+  # 3. Маркетинг только по явному согласию; детям запрещено
+  - id: "marketing-consent"
+    when:
+      purpose: "MARKETING"
+    deny_if:
+      - { subject_class: "CHILD" }
+    require:
+      - "consent_valid_current"
+    then:
+      decision: "allow_with_obligations"
+      obligations:
+        - { type: "purpose_bind" }
+        - { type: "opt_out_link_required" }
+
+  # 4. Чувствительные категории запрещены вне SECURITY/SUPPORT
+  - id: "sensitive-restriction"
+    when:
+      category_in: ["PII_SENSITIVE","HEALTH","BIOMETRIC","FINANCIAL"]
+      purpose_not_in: ["SECURITY","SUPPORT"]
+    then:
+      decision: "deny"
+      obligations:
+        - { type: "alert_dpo", severity: "high" }
+
+  # 5. EEA IP считается PII и хранится ограниченно
+  - id: "eea-ip-pii"
+    when:
+      jurisdiction: "EEA"
+      category_in: ["PII_BASIC"]
+      attribute: "ip"
+    then:
+      decision: "allow_with_obligations"
+      obligations:
+        - { type: "hash_value" }
+        - { type: "set_retention_days", days: 30 }
+
+  # 6. Трансграничный трансфер из EEA требует защит
+  - id: "xborder-eea"
+    when:
+      jurisdiction: "EEA"
+      destination_region_not_in: ["EEA","SE"]
+    require:
+      - "SCC_or_equivalent"
+    then:
+      decision: "allow_with_obligations"
+      obligations:
+        - { type: "pseudonymize" }
+        - { type: "log_transfer_register" }
+
+  # 7. SUPPORT допускает пользовательский контент, но с редактированием
+  - id: "support-user-content"
+    when:
+      purpose: "SUPPORT"
+      category_in: ["USER_CONTENT"]
+    then:
+      decision: "allow_with_obligations"
+      obligations:
+        - { type: "apply_profile", ref: "minimize_hash" }
+        - { type: "set_retention_days", days: 180 }
+
+  # 8. Обязательная минимизация телеметрии
+  - id: "telemetry-low-cardinality"
+    when:
+      category_in: ["TELEMETRY","NETWORK_IDS"]
+    then:
+      decision: "allow_with_obligations"
+      obligations:
+        - { type: "low_cardinality_enforce" }
+        - { type: "drop_large_bodies", threshold_kb: 64 }
+
+  # 9. Подростки: персонализация только с согласием
+  - id: "teen-personalization"
+    when:
+      subject_class: "TEEN"
+      purpose: "PERSONALIZATION"
+    require:
+      - "consent_valid_current"
+    then:
+      decision: "allow_with_obligations"
+      obligations:
+        - { type: "pseudonymize" }
+
+  # 10. Инцидент безопасности — продление хранения SECURITY логов
+  - id: "incident-retention-override"
+    when:
+      purpose: "SECURITY"
+      context_flags_contains: ["incident_mode"]
+    then:
+      decision: "allow_with_obligations"
+      obligations:
+        - { type: "set_retention_days", days: 365 }
+
+violations:
+  actions:
+    - type: "block_request"
+    - type: "emit_audit_event"
+    - type: "notify_dpo"
+    - type: "notify_security"
+  escalation:
+    thresholds:
+      medium: { after_violations: 3, window_minutes: 60 }
+      high: { immediate: true }
+
+decision_contract:
+  # Формат ответа PDP для PEP
+  fields:
+    - action            # allow | allow_with_obligations | deny | deny_store
+    - reasons[]         # список кодов причин
+    - obligations[]     # детализированные действия
+    - retention_days    # финальный срок хранения
+    - redaction_profile # профиль редактирования
+    - audit_level       # none|basic|verbose
+
+tests:
+  # Проверочные сценарии для CI
+  - name: "deny secrets"
+    input:
+      purpose: "SECURITY"
+      jurisdiction: "EEA"
+      category: "AUTH_SECRETS"
+    expect:
+      action: "deny_store"
+  - name: "analytics needs anonymization"
+    input:
+      purpose: "ANALYTICS"
+      jurisdiction: "EEA"
+      category: "PII_BASIC"
+      legal_basis: "consent"
+    expect:
+      action: "allow_with_obligations"
+      obligations_contains: ["aggregate_only","drop_raw_payload"]
+  - name: "marketing child denied"
+    input:
+      purpose: "MARKETING"
+      subject_class: "CHILD"
+      legal_basis: "consent"
+    expect:
+      action: "deny"
+  - name: "eea ip hashed"
+    input:
+      jurisdiction: "EEA"
+      category: "PII_BASIC"
+      attribute: "ip"
+      purpose: "SECURITY"
+    expect:
+      action: "allow_with_obligations"
+      obligations_contains: ["hash_value"]
+  - name: "cross-border requires scc"
+    input:
+      jurisdiction: "EEA"
+      destination_region: "US"
+      purpose: "ANALYTICS"
+    expect:
+      action: "allow_with_obligations"
+      obligations_contains: ["pseudonymize","log_transfer_register"]

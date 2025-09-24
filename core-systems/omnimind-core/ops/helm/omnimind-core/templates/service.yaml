@@ -1,0 +1,194 @@
+# path: omnimind-core/ops/helm/templates/service.yaml
+{{- /*
+Industrial-grade Service template for omnimind-core.
+Assumes existence of helpers in _helpers.tpl:
+- "omnimind-core.fullname"
+- "omnimind-core.labels"
+- "omnimind-core.selectorLabels"
+Values structure (recommended):
+service:
+  enabled: true
+  type: ClusterIP            # ClusterIP | NodePort | LoadBalancer | ExternalName
+  externalName: ""           # only if type=ExternalName
+  headless: false            # if true -> clusterIP: None (overrides type to ClusterIP)
+  clusterIP: ""              # optional fixed clusterIP
+  allocateLoadBalancerNodePorts: true
+  loadBalancerClass: ""      # e.g. service.k8s.aws/nlb
+  loadBalancerIP: ""         # optional static LB IP
+  loadBalancerSourceRanges: []   # e.g. ["10.0.0.0/8"]
+  externalIPs: []            # optional
+  externalTrafficPolicy: Cluster # or Local (LB/NodePort only)
+  internalTrafficPolicy: Cluster # or Local
+  healthCheckNodePort: null  # integer, LB only + externalTrafficPolicy=Local
+  sessionAffinity: None      # None | ClientIP
+  sessionAffinityConfig: {}  # { clientIP: { timeoutSeconds: 10800 } }
+  ipFamilyPolicy: ""         # SingleStack | PreferDualStack | RequireDualStack
+  ipFamilies: []             # ["IPv4","IPv6"]
+  publishNotReadyAddresses: false
+  annotations: {}
+  labels: {}
+
+  # Ports definition; defaults below if empty
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+      nodePort: null
+    - name: grpc
+      port: 9091
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: grpc
+      nodePort: null
+
+metrics:
+  enabled: true
+  service:
+    name: metrics
+    port: 9090
+    targetPort: metrics
+    appProtocol: http
+*/ -}}
+{{- if .Values.service.enabled }}
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "omnimind-core.fullname" . }}
+  labels:
+    {{- include "omnimind-core.labels" . | nindent 4 }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* ExternalName short-circuit */ -}}
+  {{- if eq (default "ClusterIP" .Values.service.type) "ExternalName" }}
+  type: ExternalName
+  externalName: {{ required "service.externalName is required when type=ExternalName" .Values.service.externalName | quote }}
+  {{- else }}
+
+  {{- if .Values.service.headless }}
+  clusterIP: None
+  {{- else if .Values.service.clusterIP }}
+  clusterIP: {{ .Values.service.clusterIP | quote }}
+  {{- end }}
+
+  type: {{ default "ClusterIP" .Values.service.type }}
+  {{- with .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.externalIPs }}
+  externalIPs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  {{- if or (eq (default "ClusterIP" .Values.service.type) "LoadBalancer") (eq (default "ClusterIP" .Values.service.type) "NodePort") }}
+  externalTrafficPolicy: {{ default "Cluster" .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  {{- with .Values.service.internalTrafficPolicy }}
+  internalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- if and (eq (default "ClusterIP" .Values.service.type) "LoadBalancer") (eq (default "Cluster" .Values.service.externalTrafficPolicy) "Local") (.Values.service.healthCheckNodePort) }}
+  healthCheckNodePort: {{ .Values.service.healthCheckNodePort }}
+  {{- end }}
+  {{- with .Values.service.allocateLoadBalancerNodePorts }}
+  allocateLoadBalancerNodePorts: {{ . }}
+  {{- end }}
+
+  {{- with .Values.service.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with .Values.service.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  {{- if .Values.service.sessionAffinity }}
+  sessionAffinity: {{ .Values.service.sessionAffinity }}
+  {{- with .Values.service.sessionAffinityConfig }}
+  sessionAffinityConfig:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+
+  publishNotReadyAddresses: {{ toBool (default false .Values.service.publishNotReadyAddresses) }}
+
+  ports:
+    {{- $ports := .Values.service.ports }}
+    {{- if not $ports }}
+    # Defaults if service.ports not provided
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+      {{- if eq (default "ClusterIP" .Values.service.type) "NodePort" }}
+      nodePort: {{ default nil .Values.service.nodePortHttp | default "" }}
+      {{- end }}
+    - name: grpc
+      port: 9091
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: grpc
+      {{- if eq (default "ClusterIP" .Values.service.type) "NodePort" }}
+      nodePort: {{ default nil .Values.service.nodePortGrpc | default "" }}
+      {{- end }}
+    {{- else }}
+    {{- range $i, $p := $ports }}
+    - name: {{ required "service.ports[].name is required" $p.name | quote }}
+      port: {{ required (printf "service.ports[%d].port is required" $i) $p.port }}
+      targetPort: {{ default $p.port $p.targetPort }}
+      protocol: {{ default "TCP" $p.protocol }}
+      {{- with $p.appProtocol }}
+      appProtocol: {{ . }}
+      {{- end }}
+      {{- if and (eq (default "ClusterIP" $.Values.service.type) "NodePort") $p.nodePort }}
+      nodePort: {{ $p.nodePort }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
+  selector:
+    {{- /* Prefer explicit selectorLabels if defined in helpers */ -}}
+    {{- include "omnimind-core.selectorLabels" . | nindent 4 }}
+  {{- end }} # end ExternalName short-circuit
+---
+{{- if and .Values.metrics.enabled (ne (default "ExternalName" .Values.service.type) "ExternalName") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "omnimind-core.fullname" . }}-metrics
+  labels:
+    {{- include "omnimind-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Cluster
+  publishNotReadyAddresses: false
+  ports:
+    - name: {{ default "metrics" .Values.metrics.service.name | quote }}
+      port: {{ default 9090 .Values.metrics.service.port }}
+      targetPort: {{ default "metrics" .Values.metrics.service.targetPort }}
+      protocol: TCP
+      appProtocol: {{ default "http" .Values.metrics.service.appProtocol }}
+  selector:
+    {{- include "omnimind-core.selectorLabels" . | nindent 4 }}
+{{- end }}
+{{- end }}

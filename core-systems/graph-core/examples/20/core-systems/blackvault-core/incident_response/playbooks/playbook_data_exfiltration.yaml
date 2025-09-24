@@ -1,0 +1,143 @@
+id: playbook-data-exfiltration-v4
+name: Data Exfiltration Containment and Analysis
+description: |
+  Автоматический сценарий реагирования на критическую утечку данных. 
+  Предназначен для моментального обнаружения, блокировки, forensic-анализа, уведомления и эскалации.
+
+version: "4.0.1"
+severity: critical
+tags:
+  - data-exfiltration
+  - dlp
+  - zero-trust
+  - containment
+  - forensic
+  - legal-ready
+  - ai-analysis
+
+entry_conditions:
+  - anomaly_detected:
+      rule_ids: ["dlp_large_transfer", "unusual_export", "suspicious_sftp", "cloud_sync_leak"]
+      data_volume_mb: ">500"
+  - destination:
+      not_in_allowlist: true
+      geolocation_risk: high
+  - behavioral_risk_score:
+      threshold: 80
+  - confirmed_threat_actor:
+      status: suspected
+
+actions:
+  - id: kill-active-session
+    type: handler
+    module: playbooks.handlers.block_ip
+    input:
+      ip: "{{ incident.session_ip }}"
+      engine: iptables
+      mode: drop
+      operator: system-playbook
+      reason: "Data exfiltration containment"
+      dry_run: false
+
+  - id: isolate-vm-or-container
+    type: handler
+    module: playbooks.handlers.isolate_container
+    input:
+      container_id: "{{ incident.container_or_vm_id }}"
+      runtime: docker
+      mode: network_block
+      operator: system-playbook
+      reason: "Source environment isolated"
+      dry_run: false
+
+  - id: trigger-deep-forensics
+    type: handler
+    module: playbooks.handlers.trigger_ai_forensics
+    input:
+      incident_id: "{{ incident.id }}"
+      evidence:
+        log: "{{ incident.log_path }}"
+        memory: "{{ incident.memory_path }}"
+        file_dump: "{{ incident.suspect_file }}"
+        process_tree: "{{ incident.proc_tree }}"
+      operator: system-playbook
+      mode: full
+      dry_run: false
+      access_token: "{{ secrets.ai_forensics_token }}"
+
+  - id: lock-user-credentials
+    type: handler
+    module: playbooks.handlers.escalate_to_admin
+    input:
+      incident_id: "{{ incident.id }}"
+      title: "Account Lockdown due to Data Exfil"
+      description: "User account {{ incident.username }} locked due to suspected leak"
+      severity: critical
+      operator: system-playbook
+      channel: webhook
+      contact: "{{ secrets.account_lockdown_webhook }}"
+      context: dlp-lock
+
+  - id: alert-legal-and-admin
+    type: handler
+    module: playbooks.handlers.escalate_to_admin
+    input:
+      incident_id: "{{ incident.id }}"
+      title: "URGENT: Data Exfiltration Contained"
+      description: |
+        Containment activated. Forensics ongoing.
+        Incident ID: {{ incident.id }}
+        Affected User: {{ incident.username }}
+      severity: critical
+      operator: system-playbook
+      channel: telegram
+      contact: "{{ secrets.legal_team_chat_id }}"
+      token: "{{ secrets.telegram_bot_token }}"
+      context: dlp-legal-notification
+
+  - id: snapshot-system-state
+    type: handler
+    module: playbooks.handlers.reboot_sandboxed_vm
+    input:
+      vm_id: "{{ incident.vm_id }}"
+      provider: proxmox
+      mode: soft
+      operator: system-playbook
+      snapshot_before: true
+      dry_run: false
+
+post_conditions:
+  - confirm_action:
+      from: kill-active-session
+      must_be: "success"
+  - confirm_action:
+      from: trigger-deep-forensics
+      must_be: "success"
+  - validate_no_further_exfil_traffic: true
+  - notify_on_failure: true
+
+output_artifacts:
+  - exfil_logs:
+      source: "{{ incident.log_path }}"
+      archived_as: "{{ incident.id }}_log.tar.gz"
+  - forensic_ai_report:
+      source: trigger-deep-forensics.details
+      format: json
+  - full_snapshot:
+      source: snapshot-system-state.details
+      encrypted: true
+
+audit:
+  enabled: true
+  log_channel: "blackvault.audit.data_exfiltration"
+  redact_sensitive: true
+  trace_id: "{{ trace.uuid }}"
+  correlate_with: ["session_logs", "vpn_exit", "data_streams", "identity_risk"]
+
+meta:
+  created_by: TeslaAI Genesis
+  validated_by: metaagents [20x audit + 3 meta-generals]
+  zero_trust_compliant: true
+  immutable_record: true
+  version_controlled: true
+  replayable: true

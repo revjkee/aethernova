@@ -1,0 +1,207 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: zero-trust-core-prod
+nameSuffix: -prod
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/part-of: zero-trust-core
+  app.kubernetes.io/name: zero-trust-core
+  app.kubernetes.io/instance: zero-trust-core
+  app.kubernetes.io/managed-by: kustomize
+  env: prod
+
+commonAnnotations:
+  owner: platform-security
+  contact: security@neurocity.local
+  runbook: https://runbooks.neurocity.local/zero-trust-core
+  tier: backend
+
+labels:
+  - pairs:
+      env: prod
+    includeSelectors: true
+    includeTemplates: true
+
+images:
+  - name: ghcr.io/neurocity/zero-trust-core
+    newName: ghcr.io/neurocity/zero-trust-core
+    newTag: v1.0.0 # зафиксируйте версию релиза
+
+replicas:
+  - name: zero-trust-core
+    count: 4
+
+generatorOptions:
+  disableNameSuffixHash: false
+  annotations:
+    managed-by: kustomize
+  labels:
+    env: prod
+
+configMapGenerator:
+  - name: zero-trust-core-config
+    behavior: merge
+    literals:
+      - APP_ENV=production
+      - LOG_LEVEL=INFO
+      - CORS_ALLOW_ORIGINS=https://app.neurocity.io,https://admin.neurocity.io
+      - RATE_LIMIT_PER_MINUTE=240
+      - PROMETHEUS_PORT=9090
+      - FEATURE_STRICT_MTLS=false
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability.svc.cluster.local:4317
+
+secretGenerator:
+  - name: zero-trust-core-secrets
+    behavior: replace
+    literals:
+      - OIDC_CLIENT_SECRET=REPLACE_IN_CI
+      - SESSION_SECRET=REPLACE_IN_CI
+      - KAFKA_PASSWORD=REPLACE_IN_CI
+    type: Opaque
+
+patches:
+  # Усиление Deployment: ресурсы, probes, безопасный securityContext, spread/anti-affinity
+  - target:
+      kind: Deployment
+      name: zero-trust-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: zero-trust-core
+      spec:
+        minReadySeconds: 10
+        revisionHistoryLimit: 10
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 25%
+        template:
+          metadata:
+            labels:
+              env: prod
+          spec:
+            serviceAccountName: zero-trust-core
+            priorityClassName: high-priority
+            enableServiceLinks: false
+            dnsPolicy: ClusterFirst
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 10001
+              runAsGroup: 10001
+              fsGroup: 10001
+              seccompProfile:
+                type: RuntimeDefault
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: topology.kubernetes.io/zone
+                whenUnsatisfiable: DoNotSchedule
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: zero-trust-core
+                    app.kubernetes.io/component: api
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: zero-trust-core
+                        app.kubernetes.io/component: api
+                    topologyKey: kubernetes.io/hostname
+            containers:
+              - name: zero-trust-core
+                imagePullPolicy: IfNotPresent
+                envFrom:
+                  - configMapRef:
+                      name: zero-trust-core-config
+                  - secretRef:
+                      name: zero-trust-core-secrets
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                resources:
+                  requests:
+                    cpu: "500m"
+                    memory: "512Mi"
+                  limits:
+                    cpu: "2000m"
+                    memory: "2Gi"
+                ports:
+                  - name: http
+                    containerPort: 8080
+                    protocol: TCP
+                  - name: metrics
+                    containerPort: 9090
+                    protocol: TCP
+                readinessProbe:
+                  httpGet:
+                    path: /health/ready
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  failureThreshold: 6
+                livenessProbe:
+                  httpGet:
+                    path: /health/live
+                    port: 8080
+                  initialDelaySeconds: 20
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                startupProbe:
+                  httpGet:
+                    path: /health/startup
+                    port: 8080
+                  failureThreshold: 30
+                  periodSeconds: 2
+                volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+                  - name: var-run
+                    mountPath: /var/run
+            volumes:
+              - name: tmp
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 256Mi
+              - name: var-run
+                emptyDir: {}
+
+  # Актуализируем основной Service (балансировка/внутренняя политика)
+  - target:
+      kind: Service
+      name: zero-trust-core
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: zero-trust-core
+        annotations:
+          service.kubernetes.io/topology-aware-hints: "auto"
+      spec:
+        internalTrafficPolicy: Cluster
+        sessionAffinity: None
+
+  # Явная маркировка сервиса метрик для Prometheus
+  - target:
+      kind: Service
+      name: zero-trust-core-metrics
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: zero-trust-core-metrics
+        labels:
+          monitoring: "true"
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9090"
+          prometheus.io/path: "/metrics"

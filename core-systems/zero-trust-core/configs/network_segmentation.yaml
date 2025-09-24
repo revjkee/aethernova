@@ -1,0 +1,423 @@
+# zero-trust-core/configs/network_segmentation.yaml
+apiVersion: zerotrust.aethernova.io/v1
+kind: NetworkSegmentationPolicy
+metadata:
+  name: core-microsegmentation
+  description: >
+    Декларативная микросегментация по модели Zero Trust: default-deny, явные L4/L7 разрешения,
+    строгая mTLS, контекстные условия (идентичность/устройство/время/риск), контроль egress.
+  owners:
+    - secops@company.example
+    - platform@company.example
+  labels:
+    tenant: acme
+    system: security-core
+  revision: "2025-08-20T00:00:00Z"
+
+# Глобальные настройки и якори для переиспользования
+defaults:
+  policyMode: enforce            # enforce|monitor
+  defaultAction: deny            # глобальный default-deny
+  riskThresholds:
+    medium: 50
+    high: 70
+    critical: 90
+  logging:
+    level: info                  # off|error|warn|info|debug
+    redact:
+      pii: true
+      secrets: true
+    sampling:
+      decision_allow: 0.1        # 10% allow-событий
+      decision_deny: 1.0         # все deny-события
+  time:
+    timezone: UTC
+    maintenanceWindows: []       # например: "sat 01:00-03:00"
+  tlsProfiles:
+    mtls_strict: &mtls_strict
+      mode: require              # require|prefer
+      minVersion: TLS1.2
+      ciphers: "HIGH:!aNULL:!eNULL"
+      clientAuth: require
+      spiffeTrustBundle: spiffe://acme/.well-known/spiffe-bundle.json
+      caBundleRef: platform-ca-bundle
+    mtls_internal: &mtls_internal
+      mode: require
+      minVersion: TLS1.2
+      clientAuth: require
+      spiffeTrustBundle: spiffe://acme/.well-known/spiffe-bundle.json
+  egress:
+    default: deny
+    viaProxy:
+      enabled: true
+      proxyRef: corporate-egress-proxy
+      allowFQDN:
+        - api.payment.example
+        - storage.eu.example
+      allowSNI:
+        - "*.trusted-saas.example"
+    dns:
+      allowedResolvers:
+        - 10.0.0.10
+        - 10.0.0.11
+
+# Каталог селекторов: как найти ворклоады/хосты/идентичности
+selectors:
+  # Kubernetes
+  k8s:
+    frontend: &sel_k8s_frontend
+      kind: kubernetes
+      namespace: web
+      labels:
+        app: frontend
+    backend: &sel_k8s_backend
+      kind: kubernetes
+      namespace: web
+      labels:
+        app: backend
+    db: &sel_k8s_db
+      kind: kubernetes
+      namespace: data
+      labels:
+        role: postgres
+    observability: &sel_k8s_obs
+      kind: kubernetes
+      namespace: observability
+  # ВМ/Bare Metal
+  vm:
+    jump: &sel_vm_jump
+      kind: vm
+      tags:
+        role: jump
+        env: prod
+    bastion: &sel_vm_bastion
+      kind: vm
+      tags:
+        role: bastion
+  # SPIFFE/идеcнтичности сервисов
+  spiffe:
+    frontend: &idn_spiffe_frontend
+      spiffeID: spiffe://acme/prod/web/frontend
+    backend: &idn_spiffe_backend
+      spiffeID: spiffe://acme/prod/web/backend
+    db: &idn_spiffe_db
+      spiffeID: spiffe://acme/prod/db/postgres
+
+# Зоны безопасности и их покрытие
+zones:
+  - id: edge
+    description: Пограничный ingress слой (L7 gateway/ingress-controller)
+    selectors:
+      - *sel_k8s_frontend
+    trustLevel: low
+  - id: app-frontend
+    description: Веб-приложение (FE pod'ы)
+    selectors:
+      - *sel_k8s_frontend
+    trustLevel: medium
+  - id: app-backend
+    description: Бизнес-логика (BE pod'ы)
+    selectors:
+      - *sel_k8s_backend
+    trustLevel: medium
+  - id: data-store
+    description: Хранилище данных (PostgreSQL)
+    selectors:
+      - *sel_k8s_db
+    trustLevel: high
+  - id: mgmt
+    description: Админ-доступ (jump/bastion)
+    selectors:
+      - *sel_vm_jump
+      - *sel_vm_bastion
+    trustLevel: high
+  - id: observability
+    description: Мониторинг/логирование/трейсинг
+    selectors:
+      - *sel_k8s_obs
+    trustLevel: medium
+  - id: egress-proxy
+    description: Центральный egress-прокси
+    selectors:
+      - kind: vm
+        tags: { role: egress-proxy }
+
+# Сервисный каталог (L4/L7, TLS, идентичность)
+services:
+  - id: fe-http
+    zone: app-frontend
+    protocol: http
+    ports: [ 8080 ]
+    tls: *mtls_strict
+    identity: *idn_spiffe_frontend
+    http:
+      methods: [ GET, POST, PUT ]
+      paths:
+        - /api/v1/public/.*
+        - /healthz
+  - id: be-grpc
+    zone: app-backend
+    protocol: grpc
+    ports: [ 9090 ]
+    tls: *mtls_internal
+    identity: *idn_spiffe_backend
+    grpc:
+      services:
+        - web.BackendService/.*
+  - id: postgres
+    zone: data-store
+    protocol: tcp
+    ports: [ 5432 ]
+    tls: *mtls_internal
+    identity: *idn_spiffe_db
+  - id: obs-otlp
+    zone: observability
+    protocol: grpc
+    ports: [ 4317 ]
+    tls: *mtls_internal
+
+# Политики: default-deny, далее явные allow с условиями
+policies:
+  # Edge -> Frontend HTTP (только нужные пути/методы)
+  - id: allow-edge-to-frontend
+    action: allow
+    source:
+      zones: [ edge ]
+    destination:
+      service: fe-http
+    l4:
+      protocols: [ tcp ]
+    l7:
+      http:
+        methods: [ GET, POST ]
+        paths:
+          - ^/api/v1/public/.*
+          - ^/healthz$
+    tls:
+      enforce: true
+    conditions:
+      time:
+        notBefore: "2025-01-01T00:00:00Z"
+      device:
+        # Edge компоненты должны быть в compliant‑состоянии
+        posture: compliant
+      risk:
+        max: 69   # разрешаем трафик при риске < 70
+    observation:
+      log: true
+      sample: 0.5
+      metrics: true
+    enforcement:
+      targets:
+        - kind: istio.authorizationPolicy
+          namespace: web
+        - kind: cilium.networkPolicy
+          namespace: web
+
+  # Frontend -> Backend gRPC (только whitelisted методы)
+  - id: allow-frontend-to-backend
+    action: allow
+    source:
+      identities:
+        - *idn_spiffe_frontend
+      zones: [ app-frontend ]
+    destination:
+      service: be-grpc
+    l7:
+      grpc:
+        allow:
+          - web.BackendService/GetProfile
+          - web.BackendService/SubmitOrder
+    tls:
+      enforce: true
+    conditions:
+      user:
+        # Пример: только сервисные аккаунты приложения
+        principalRegex: "^svc:web-frontend:.*$"
+    observation: { log: true, metrics: true }
+    enforcement:
+      targets:
+        - kind: istio.authorizationPolicy
+          namespace: web
+
+  # Backend -> Postgres (только из BE зон, фиксированный порт)
+  - id: allow-backend-to-db
+    action: allow
+    source:
+      identities: [ *idn_spiffe_backend ]
+      zones: [ app-backend ]
+    destination:
+      service: postgres
+    l4:
+      ports: [ 5432 ]
+      protocols: [ tcp ]
+    tls:
+      enforce: true
+    conditions:
+      device:
+        posture: compliant
+    observation: { log: true }
+    enforcement:
+      targets:
+        - kind: cilium.networkPolicy
+          namespace: data
+
+  # Observability сбор метрик/трейсов из FE/BE
+  - id: allow-obs
+    action: allow
+    source:
+      zones: [ app-frontend, app-backend ]
+    destination:
+      service: obs-otlp
+    l4: { protocols: [ tcp ] }
+    tls: { enforce: true }
+    observation: { log: false, metrics: true }
+    enforcement:
+      targets:
+        - kind: istio.authorizationPolicy
+          namespace: observability
+
+  # Управляемый egress только через прокси и только к разрешенным FQDN/SNI
+  - id: allow-egress-via-proxy
+    action: allow
+    source:
+      zones: [ app-backend ]
+    destination:
+      zones: [ egress-proxy ]
+    l4:
+      protocols: [ tcp ]
+    tls: { enforce: true }
+    egress:
+      viaProxy: true
+      allowFQDN:
+        - api.payment.example
+      allowSNI:
+        - storage.eu.example
+    observation: { log: true }
+    enforcement:
+      targets:
+        - kind: cilium.networkPolicy
+          namespace: web
+
+  # Администрирование: jump/bastion -> DB (только по расписанию и при MFA)
+  - id: allow-mgmt-to-db-windowed
+    action: allow
+    source:
+      zones: [ mgmt ]
+    destination:
+      service: postgres
+    l4:
+      protocols: [ tcp ]
+      ports: [ 5432 ]
+    tls: { enforce: true }
+    conditions:
+      user:
+        mfa: required
+        rolesAnyOf: [ dba, sre ]
+      time:
+        schedule: "mon-fri 08:00-20:00"
+    observation: { log: true, metrics: true }
+    enforcement:
+      targets:
+        - kind: cloud.securityGroup
+          provider: aws
+          groupRef: sg-db-admin
+
+# Явные запреты (приоритетнее allow)
+deny:
+  - id: deny-db-from-frontend
+    source: { zones: [ app-frontend ] }
+    destination: { zones: [ data-store ] }
+    reason: "FE не должен обращаться к БД напрямую"
+    observation: { log: true }
+
+# Исключения (временные; обязательна причина и срок)
+exceptions:
+  - id: temp-fe-debug-to-be
+    scope:
+      source: { zones: [ app-frontend ] }
+      destination: { service: be-grpc }
+    action: allow
+    expiresAt: "2025-09-30T23:59:59Z"
+    justification: "Временная диагностика проблем в проде, инцидент INC-12345"
+    approvedBy: "head-of-secops"
+    observation: { log: true, metrics: true }
+
+# Аудит и телеметрия
+telemetry:
+  sinks:
+    - type: stdout
+    - type: otlp
+      endpoint: otel-collector.observability.svc.cluster.local:4317
+      tls: *mtls_internal
+  fields:
+    include:
+      - decision
+      - policy_id
+      - src.zone
+      - dst.service
+      - user.id
+    exclude:
+      - headers.authorization
+      - cookies
+
+# Валидация и правила компиляции
+validation:
+  failOn:
+    unusedSelectors: true
+    shadowedRules: true
+    unknownServices: true
+  compileTargets:
+    - istio.authorizationPolicy
+    - cilium.networkPolicy
+    - cloud.securityGroup
+
+# Профили окружений (overlays). Порядок применимости: base -> overlay
+overlays:
+  - name: dev
+    patch:
+      defaults:
+        policyMode: monitor
+        logging:
+          level: debug
+          sampling:
+            decision_allow: 1.0
+      egress:
+        default: allow
+      exceptions:
+        - id: dev-open-egress
+          scope: { source: { zones: [ app-frontend, app-backend ] }, destination: { zones: [ egress-proxy ] } }
+          action: allow
+          expiresAt: "2026-01-01T00:00:00Z"
+          justification: "Разработка/интеграции"
+          approvedBy: "platform-lead"
+  - name: stage
+    patch:
+      defaults:
+        policyMode: enforce
+      telemetry:
+        sinks:
+          - type: stdout
+  - name: prod
+    patch:
+      defaults:
+        policyMode: enforce
+      telemetry:
+        sinks:
+          - type: otlp
+            endpoint: otel-collector.observability.svc.cluster.local:4317
+            tls: *mtls_internal
+
+# Справочные объекты (CA bundles, прокси и т.д.)
+references:
+  caBundles:
+    - name: platform-ca-bundle
+      type: kubernetes.secret
+      namespace: platform-ca
+      key: ca.crt
+  proxies:
+    - name: corporate-egress-proxy
+      endpoints:
+        - 10.0.20.10:3128
+        - 10.0.20.11:3128
+      tls: *mtls_internal

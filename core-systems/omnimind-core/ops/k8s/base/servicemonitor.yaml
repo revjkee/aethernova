@@ -1,0 +1,87 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: omnimind-core
+  labels:
+    app.kubernetes.io/name: omnimind-core
+    app.kubernetes.io/part-of: omnimind
+    app.kubernetes.io/component: api
+    release: prometheus
+spec:
+  # Имя job берётся из label сервиса
+  jobLabel: app.kubernetes.io/name
+
+  # Пустой selector по namespace — выбирает сервисы из того же namespace, где установлен ServiceMonitor.
+  namespaceSelector: {}
+
+  # Выбираем только сервисы Omnimind API
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: omnimind-core
+      app.kubernetes.io/component: api
+
+  # Копируем метки Service в метрики (контролируемая кардинальность)
+  targetLabels:
+    - app.kubernetes.io/instance
+    - app.kubernetes.io/version
+
+  # Копируем некоторые Pod labels (если включено в Prometheus конфиге)
+  podTargetLabels:
+    - app.kubernetes.io/name
+    - app.kubernetes.io/instance
+
+  # Глобальные лимиты для защиты Prometheus от взрыва кардинальности
+  sampleLimit: 500000
+  targetLimit: 0                # 0 = без лимита целей, контролируйте через селекторы
+  labelLimit: 64
+  labelNameLengthLimit: 1024
+  labelValueLengthLimit: 2048
+
+  endpoints:
+    - port: http-metrics         # Имя порта в Service, например spec.ports[].name: http-metrics
+      path: /metrics
+      scheme: http               # при необходимости сменить на https и включить tlsConfig
+      interval: 15s
+      scrapeTimeout: 10s
+      honorLabels: true
+      honorTimestamps: true
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+      # Включите при использовании mTLS; секреты должны быть смонтированы в Prometheus
+      # tlsConfig:
+      #   insecureSkipVerify: false
+      #   caFile:   /etc/prometheus/secrets/omnimind-mtls/ca.crt
+      #   certFile: /etc/prometheus/secrets/omnimind-mtls/tls.crt
+      #   keyFile:  /etc/prometheus/secrets/omnimind-mtls/tls.key
+      #   serverName: omnimind-core.local
+
+      # Перенос и нормализация целевых меток
+      relabelings:
+        - action: replace
+          sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - action: replace
+          sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: service
+        - action: replace
+          targetLabel: job
+          replacement: omnimind-core
+
+      # Снижаем шум и защищаемся от чувствительных лейблов
+      metricRelabelings:
+        # Уберём служебные promhttp_* (handler метрик самого экспозера)
+        - action: drop
+          sourceLabels: [__name__]
+          regex: "promhttp_.*"
+
+        # Удалим потенциально чувствительные/взрывоопасные лейблы, если вдруг кто-то их добавил в метрики
+        - action: labeldrop
+          regex: "trace_id|span_id|session|token|password|secret|authorization"
+
+        # Переименуем label instance (если используется как хост:порт) в target_instance для ясности
+        - action: labelmap
+          regex: "^instance$"
+          replacement: "target_instance"

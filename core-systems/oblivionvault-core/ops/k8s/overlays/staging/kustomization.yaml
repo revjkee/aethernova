@@ -1,0 +1,181 @@
+# oblivionvault-core/ops/k8s/overlays/staging/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Базовые манифесты приложения
+resources:
+  - ../../base
+
+# Пространство имён и унификация имён объектов overlay
+namespace: oblivionvault-staging
+nameSuffix: -stg
+
+# Единые метки и аннотации для трассируемости
+commonLabels:
+  env: staging
+  system: oblivionvault
+  app.kubernetes.io/name: oblivionvault
+  app.kubernetes.io/part-of: oblivionvault
+  app.kubernetes.io/instance: staging
+commonAnnotations:
+  owner: platform-team
+  support: devops@oblivionvault.local
+  revision: "${GIT_COMMIT_SHA:-unknown}"
+  deployment.kubernetes.io/revisionSource: "kustomize"
+
+# Генерация конфигураций (используется behavior: merge для слияния с base)
+generatorOptions:
+  disableNameSuffixHash: false
+  annotations:
+    managed-by: kustomize
+configMapGenerator:
+  - name: app-config
+    behavior: merge
+    literals:
+      - ENV=staging
+      - LOG_LEVEL=info
+      - FEATURE_FLAGS=auth_v2,async_jobs
+      - TELEMETRY_SAMPLING=0.10
+      - HTTP_REQUEST_TIMEOUT=5s
+      - GRACEFUL_SHUTDOWN=25s
+secretGenerator:
+  - name: app-secrets
+    behavior: merge
+    # При наличии файла — будет использован; иначе генерация пропущена без падения пайплайна.
+    # Формат .env: KEY=value
+    envs:
+      - ../../secrets/.staging.env
+    type: Opaque
+
+# Замена образов для staging
+images:
+  - name: ghcr.io/yourorg/oblivionvault-core
+    newName: ghcr.io/yourorg/oblivionvault-core
+    newTag: "${IMAGE_TAG:-staging}"
+
+# Масштабирование реплик поверх base
+replicas:
+  - name: oblivionvault-api
+    count: 3
+  - name: oblivionvault-worker
+    count: 2
+
+# Жёсткие политики безопасности, ресурсы и пробы, прометеевские аннотации.
+# Таргетируем любые Deployment со знакомой меткой app=oblivionvault
+patches:
+  # Pod-уровень: securityContext, автомаунт SA токена, spread, аннотации scrape
+  - target:
+      kind: Deployment
+      labelSelector: "app=oblivionvault"
+    patch: |-
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9090"
+          prometheus.io/path: "/metrics"
+          checksum/config: "${CONFIG_CHECKSUM:-0}"
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 2000
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/automountServiceAccountToken
+        value: false
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app: oblivionvault
+  # Контейнер-уровень (первый контейнер): ресурсы, пробы, securityContext
+  - target:
+      kind: Deployment
+      labelSelector: "app=oblivionvault"
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "512Mi"
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 6
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /livez
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+
+  # Аналогичные настройки для StatefulSet, если такие есть в base
+  - target:
+      kind: StatefulSet
+      labelSelector: "app=oblivionvault"
+    patch: |-
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "512Mi"
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          tcpSocket:
+            port: 5432
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          tcpSocket:
+            port: 5432
+          initialDelaySeconds: 20
+          periodSeconds: 10
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]

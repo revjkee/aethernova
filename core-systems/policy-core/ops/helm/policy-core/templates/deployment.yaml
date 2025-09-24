@@ -1,0 +1,348 @@
+# policy-core/ops/helm/policy-core/templates/deployment.yaml
+{{- /*
+  Промышленный шаблон Deployment для policy-core.
+  Предполагаем структуру Values (ключи опциональны):
+  image:
+    registry: ""
+    repository: "ghcr.io/org/policy-core"
+    tag: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  nameOverride: ""
+  fullnameOverride: ""
+  replicaCount: 2
+  autoscaling:
+    enabled: false
+  serviceAccount:
+    create: true
+    name: ""
+    automount: false
+  podAnnotations: {}
+  podLabels: {}
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  dnsConfig: {}
+  dnsPolicy: "ClusterFirst"
+  hostNetwork: false
+  hostPID: false
+  terminationGracePeriodSeconds: 30
+
+  command: []
+  args: []
+  ports:
+    - name: http
+      containerPort: 8080
+      protocol: TCP
+
+  env: []                  # [{name: "KEY", value: "VAL"}]
+  envFrom:
+    configMaps: []         # ["policy-core-config"]
+    secrets: []            # ["policy-core-secret"]
+  volumes:
+    configMaps: []         # [{name: "cfg", cmName: "policy-core-config"}]
+    secrets: []            # [{name: "sec", secretName: "policy-core-secret"}]
+    extra: []              # произвольные volume-объявления
+  volumeMounts:
+    extra: []              # произвольные mounts
+
+  probes:
+    startup:
+      enabled: true
+      httpGet:
+        path: /healthz/startup
+        port: http
+      failureThreshold: 30
+      periodSeconds: 5
+    liveness:
+      enabled: true
+      httpGet:
+        path: /healthz/live
+        port: http
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 3
+    readiness:
+      enabled: true
+      httpGet:
+        path: /healthz/ready
+        port: http
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 6
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+
+  global:
+    imageRegistry: ""      # общий реестр на уровень кластера/организации
+
+  # Файлы в чарте (опционально): configs/**, secrets/**
+*/ -}}
+
+{{- /* ---------- helpers (внутри файла для самодостаточности) ---------- */ -}}
+{{- define "policy-core.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "policy-core.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := include "policy-core.name" . -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "policy-core.labels" -}}
+app.kubernetes.io/name: {{ include "policy-core.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/component: engine
+app.kubernetes.io/part-of: policy-core
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
+{{- end -}}
+
+{{- define "policy-core.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "policy-core.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: engine
+{{- end -}}
+
+{{- /* ---------- вычисления checksum для перекатывания ---------- */ -}}
+{{- $cfgConcat := "" -}}
+{{- range $path, $_ := .Files.Glob "configs/**" }}
+  {{- $cfgConcat = printf "%s\n# file:%s\n%s" $cfgConcat $path (.Files.Get $path) -}}
+{{- end -}}
+{{- $secConcat := "" -}}
+{{- range $path, $_ := .Files.Glob "secrets/**" }}
+  {{- $secConcat = printf "%s\n# file:%s\n%s" $secConcat $path (.Files.Get $path) -}}
+{{- end -}}
+{{- $valuesCfg := toYaml (default dict .Values.config) -}}
+{{- $valuesSec := toYaml (default dict .Values.secrets) -}}
+{{- $checksumConfig := sha256sum (printf "%s\n%s" $cfgConcat $valuesCfg) -}}
+{{- $checksumSecret := sha256sum (printf "%s\n%s" $secConcat $valuesSec) -}}
+
+{{- /* ---------- образ ---------- */ -}}
+{{- $registry := coalesce .Values.global.imageRegistry .Values.image.registry -}}
+{{- $repo := required "image.repository is required" .Values.image.repository -}}
+{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "policy-core.fullname" . }}
+  labels:
+    {{- include "policy-core.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ default 2 .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "policy-core.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "policy-core.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ $checksumConfig | quote }}
+        checksum/secret: {{ $checksumSecret | quote }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ default (include "policy-core.fullname" .) .Values.serviceAccount.name }}
+      automountServiceAccountToken: {{ default false .Values.serviceAccount.automount }}
+      {{- else if .Values.serviceAccount.name }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: {{ default false .Values.serviceAccount.automount }}
+      {{- end }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName | quote }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}hostNetwork: true{{- end }}
+      {{- if .Values.hostPID }}hostPID: true{{- end }}
+      {{- if .Values.dnsPolicy }}dnsPolicy: {{ .Values.dnsPolicy }}{{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- with .Values.securityContext.seccompProfile }}
+        seccompProfile:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        fsGroup: {{ default 10001 .Values.securityContext.fsGroup }}
+      terminationGracePeriodSeconds: {{ default 30 .Values.terminationGracePeriodSeconds }}
+      {{- if or .Values.topologySpreadConstraints .Values.affinity }}
+      {{- /* Если явно не заданы — ниже включим дефолтный anti-affinity */ -}}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "policy-core.selectorLabels" . | nindent 14 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "policy-core.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: {{ include "policy-core.name" . }}
+          image: {{- if $registry -}}{{ printf "%s/%s:%s" $registry $repo $tag | quote }}{{- else -}}{{ printf "%s:%s" $repo $tag | quote }}{{- end }}
+          imagePullPolicy: {{ default "IfNotPresent" .Values.image.pullPolicy }}
+          {{- with .Values.command }}
+          command: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args: {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          {{- if .Values.ports }}
+          ports:
+            {{- toYaml .Values.ports | nindent 12 }}
+          {{- end }}
+
+          {{- with .Values.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          {{- if or .Values.envFrom.configMaps .Values.envFrom.secrets }}
+          envFrom:
+            {{- range .Values.envFrom.configMaps }}
+            - configMapRef:
+                name: {{ . | quote }}
+            {{- end }}
+            {{- range .Values.envFrom.secrets }}
+            - secretRef:
+                name: {{ . | quote }}
+            {{- end }}
+          {{- end }}
+
+          {{- /* Пробы */ -}}
+          {{- with .Values.probes.startup }}
+          {{- if .enabled }}
+          startupProbe:
+            {{- toYaml (omit . "enabled") | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          {{- with .Values.probes.liveness }}
+          {{- if .enabled }}
+          livenessProbe:
+            {{- toYaml (omit . "enabled") | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          {{- with .Values.probes.readiness }}
+          {{- if .enabled }}
+          readinessProbe:
+            {{- toYaml (omit . "enabled") | nindent 12 }}
+          {{- end }}
+          {{- end }}
+
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- range .Values.volumes.configMaps }}
+            - name: {{ .name }}
+              mountPath: /etc/policy/{{ .name }}
+            {{- end }}
+            {{- range .Values.volumes.secrets }}
+            - name: {{ .name }}
+              mountPath: /etc/secret/{{ .name }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.volumeMounts.extra }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","sleep 3"]
+
+        {{- /* Доп. контейнеры при необходимости */ -}}
+        {{- with .Values.sidecars }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- range .Values.volumes.configMaps }}
+        - name: {{ .name }}
+          configMap:
+            name: {{ .cmName }}
+        {{- end }}
+        {{- range .Values.volumes.secrets }}
+        - name: {{ .name }}
+          secret:
+            secretName: {{ .secretName }}
+        {{- end }}
+        {{- with .Values.volumes.extra }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

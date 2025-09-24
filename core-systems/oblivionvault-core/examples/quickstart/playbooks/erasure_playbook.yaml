@@ -1,0 +1,218 @@
+# oblivionvault-core/examples/playbooks/erasure_playbook.yaml
+# Industrial erasure playbook for OblivionVault run_erasure.py
+# YAML 1.2
+
+version: 1
+kind: ov:erasure-playbook
+
+metadata:
+  id: "erasure-playbook-main"
+  owner: "SecOps"
+  created_at: "2025-08-26T00:00:00Z"
+  description: "Декларативные задачи безопасного стирания с профилями dev/stage/prod"
+  change_ref: "CHG-ERASE-001"
+
+defaults:
+  runtime: &runtime_default
+    parallelism: 2
+    dry_run: true                 # защита по умолчанию
+    yes: false
+    journal_path: "logs/erasure/%Y%m%d-%H%M%S.jsonl"
+  policy_balanced: &policy_balanced
+    passes: 2
+    pattern: ["random", "zero"]
+    chunk_size: 4194304           # 4 MiB
+    verify: true
+    verify_samples: 4
+    verify_sample_bytes: 131072   # 128 KiB
+    rename_before_unlink: true
+    follow_symlinks: false
+    throttle_mbps: 64
+  policy_strict: &policy_strict
+    passes: 3
+    pattern: ["random", "0xFF", "zero"]
+    chunk_size: 8388608           # 8 MiB
+    verify: true
+    verify_samples: 8
+    verify_sample_bytes: 262144   # 256 KiB
+    rename_before_unlink: true
+    follow_symlinks: false
+    throttle_mbps: 48
+  policy_fast: &policy_fast
+    passes: 1
+    pattern: ["zero"]
+    chunk_size: 2097152           # 2 MiB
+    verify: false
+    rename_before_unlink: true
+    follow_symlinks: false
+    throttle_mbps: null
+
+guardrails:
+  require_confirmation: true
+  confirmation_phrase: "ERASE"
+  safe_roots:
+    - "/var/tmp"
+    - "/tmp"
+    - "/opt/oblivionvault/cache"
+    - "C:/Temp"
+  forbid_paths:
+    - "/"               # корень
+    - "/proc"
+    - "/sys"
+    - "/dev"
+    - "/run"
+    - "/var/lib"
+    - "/etc"
+    - "C:/Windows"
+    - "C:/Program Files"
+  allow_only_under_safe_roots: true
+  min_free_space_gib: 1          # прерывать, если свободного места меньше (для журналов и атомарных операций)
+
+windows:
+  # Временные окна обслуживания (локальное время узла)
+  - id: "nightly"
+    days: ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    start: "22:00"
+    end: "06:00"
+  - id: "weekend"
+    days: ["Sat","Sun"]
+    start: "00:00"
+    end: "23:59"
+
+hooks:
+  pre:  # Выполняются перед любой задачей (пример: снимок списка открытых дескрипторов)
+    - name: "snapshot-open-files"
+      shell: "bash"
+      cmd: "ls -la /proc/$$/fd > ./logs/erasure/pre_open_fds_$(date +%s).log || true"
+  post: # Выполняются после всех задач
+    - name: "flush-journal"
+      shell: "bash"
+      cmd: "sync || true"
+
+targets:
+  # Группы целей; могут использоваться в задачах через ref
+  - id: "tmp-cache-linux"
+    type: "dir"
+    paths:
+      - "/var/tmp/obv/*"
+      - "/opt/oblivionvault/cache/**"
+    exclude:
+      - "/opt/oblivionvault/cache/keep/**"
+  - id: "tmp-cache-windows"
+    type: "dir"
+    paths:
+      - "C:/Temp/obv/*"
+  - id: "pii-drops"
+    type: "manifest"
+    manifest_path: "./manifests/pii_cleanup.jsonl"  # JSONL: {"type": "file","path": "..."}
+  - id: "adhoc-files"
+    type: "file"
+    paths:
+      - "./sandbox/*.tmp"
+      - "./sandbox/*.bak"
+
+profiles:
+  # Профили выбирают политику и рантайм-настройки
+  dev:
+    runtime: *runtime_default
+    policy: *policy_fast
+    windows: ["nightly"]
+  stage:
+    runtime:
+      <<: *runtime_default
+      parallelism: 3
+      dry_run: true
+    policy: *policy_balanced
+    windows: ["nightly"]
+  prod:
+    runtime:
+      <<: *runtime_default
+      parallelism: 4
+      dry_run: false
+      yes: true
+      journal_path: "logs/erasure/prod/%Y%m%d-%H%M%S.jsonl"
+    policy: *policy_strict
+    windows: ["nightly","weekend"]
+    approvals:
+      required: 2
+      approvers:
+        - "secops-lead"
+        - "privacy-officer"
+        - "sre-oncall"
+
+tasks:
+  # Матрица задач; executor мапит в вызовы run_erasure.py
+  - id: "clean-linux-caches"
+    description: "Перезапись и удаление временных кэшей Linux"
+    targets_ref: ["tmp-cache-linux"]
+    profile: "stage"
+    labels: ["cache","linux"]
+  - id: "clean-windows-caches"
+    description: "Перезапись и удаление временных кэшей Windows"
+    targets_ref: ["tmp-cache-windows"]
+    profile: "stage"
+    labels: ["cache","windows"]
+  - id: "erase-pii-drops"
+    description: "Стирание файлов с потенциальными персональными данными по манифесту"
+    targets_ref: ["pii-drops"]
+    profile: "prod"
+    labels: ["pii","high-risk"]
+  - id: "adhoc-sandbox"
+    description: "Быстрое удаление временных файлов sandBox"
+    targets_ref: ["adhoc-files"]
+    profile: "dev"
+    labels: ["adhoc"]
+
+mapping:
+  # Соответствие полей playbook → флагам cli/tools/run_erasure.py
+  cli:
+    program: "python3 cli/tools/run_erasure.py"
+    flags:
+      passes: "--passes {passes}"
+      pattern: "--pattern {pattern_csv}"
+      chunk_size: "--chunk-size {chunk_size}"
+      verify_bool: "--verify"                      # включается, если true
+      verify_samples: "--verify-samples {verify_samples}"
+      verify_sample_bytes: "--verify-sample-bytes {verify_sample_bytes}"
+      rename_true: "--rename"
+      rename_false: "--no-rename"
+      follow_symlinks: "--follow-symlinks"
+      throttle_mbps: "--throttle-mbps {throttle_mbps}"
+      parallelism: "--parallelism {parallelism}"
+      dry_run: "--dry-run"
+      yes: "--yes"
+      journal_path: "--journal {journal_path}"
+      dir_mode: "--dir"                            # для директорий
+      manifest: "--manifest {manifest_path}"       # для manifest целей
+
+execution_plan:
+  # Описание порядка: pre-hooks → задачи по порядку → post-hooks
+  order:
+    - "pre"
+    - "tasks"
+    - "post"
+  stop_on_first_error: false
+
+examples_cli:
+  # Непосредственные примеры вызовов, которые должен сформировать исполнитель playbook
+  - name: "Stage: очистка linux-кэшей (ночное окно)"
+    cmd: >
+      python3 cli/tools/run_erasure.py
+      --dir --passes 2 --pattern random,zero --chunk-size 4194304
+      --verify --verify-samples 4 --verify-sample-bytes 131072
+      --rename --parallelism 3 --dry-run
+      --journal logs/erasure/%Y%m%d-%H%M%S.jsonl
+      /var/tmp/obv /opt/oblivionvault/cache
+  - name: "Prod: стирание PII по манифесту (строгая политика)"
+    cmd: >
+      python3 cli/tools/run_erasure.py
+      --passes 3 --pattern random,0xFF,zero --chunk-size 8388608
+      --verify --verify-samples 8 --verify-sample-bytes 262144
+      --rename --parallelism 4 --yes
+      --journal logs/erasure/prod/%Y%m%d-%H%M%S.jsonl
+      --manifest ./manifests/pii_cleanup.jsonl
+
+notes:
+  - "Перед исполнением профиля prod требуется подтверждение и два аппрува согласно секции profiles.prod.approvals."
+  - "Для надежной проверки задавайте завершающий проход 'zero' или '0xFF'."
+  - "allow_only_under_safe_roots=true блокирует цели вне safe_roots."

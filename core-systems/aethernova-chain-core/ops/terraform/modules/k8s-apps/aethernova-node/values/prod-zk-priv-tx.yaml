@@ -1,0 +1,178 @@
+# Production values for Aethernova Node: ZK private transactions profile
+# Focus: HA, security hardening, observability.
+# Note: некоторые ключи зависят от конкретного чарта; структура подобрана как де-факто стандартная для app-чартов.
+
+replicaCount: 3  # HA: минимум 3 реплики для кворума/устойчивости
+
+image:
+  repository: ghcr.io/aethernova/aethernova-node
+  tag: "v1.0.0"
+  pullPolicy: IfNotPresent
+  # РЕКОМЕНДАЦИЯ: закрепляйте образ по digest (sha256) согласно supply-chain best practices.
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: "aethernova-node"
+
+serviceAccount:
+  create: true
+  name: ""
+  automountServiceAccountToken: false  # снижение поверхности атаки (SA токен не монтируется по умолчанию)
+  annotations: {}
+  labels: {}
+# ref: K8s service accounts & automountServiceAccountToken. 
+
+podAnnotations:
+  # Обновление при изменении конфигурации (rollout по checksum)
+  checksum/config: "{{ .Values.configChecksum | default \"\" }}"
+  # Если не используете ServiceMonitor, можно включить аннотации Prometheus ниже.
+  # prometheus.io/scrape: "true"
+  # prometheus.io/port: "9090"
+  # prometheus.io/path: "/metrics"
+
+podLabels:
+  app.kubernetes.io/part-of: "aethernova-chain-core"
+  aethernova.io/profile: "prod-zk-priv-tx"
+
+priorityClassName: "aethernova-critical"  # используйте заранее созданный PriorityClass
+
+podSecurityContext:
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "1"
+    memory: "2Gi"
+
+# Контейнерные порты приложения (наименования портов используются далее в probes/service)
+containerPorts:
+  - name: http
+    containerPort: 8080
+  - name: metrics
+    containerPort: 9090
+
+# Пробы: TCP для универсальности (если у приложения есть HTTP /healthz — можно заменить на httpGet)
+livenessProbe:
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+readinessProbe:
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+startupProbe:
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 18  # даёт до ~90с на холодный старт
+
+service:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+  annotations: {}
+  labels: {}
+
+ingress:
+  enabled: false
+
+# Профиль приватных ZK-транзакций: переменные окружения и секреты — без привязки к конкретным ключам приложения
+env:
+  - name: TZ
+    value: "Europe/Stockholm"
+  - name: AETHERNOVA_PRIVACY_PROFILE
+    value: "zk-priv-tx"    # название профиля
+  - name: AETHERNOVA_PRIVACY_ENABLED
+    value: "true"          # приложение должно самостоятельно интерпретировать
+
+envFrom:
+  - secretRef:
+      name: aethernova-node-prod-secrets   # секреты с ключами/endpoint’ами (например, proving keys, RPC, DB)
+
+volumes: []
+volumeMounts: []
+
+# Стратегия обновления
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+pdb:
+  enabled: true
+  minAvailable: 2
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: aethernova-node
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: aethernova-node
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+terminationGracePeriodSeconds: 60
+
+# Prometheus Operator: ServiceMonitor для метрик
+metrics:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+    additionalLabels: {}
+    namespace: ""   # по умолчанию — тот же namespace, где релиз
+    selector: {}
+    endpoints:
+      - port: metrics
+        path: /metrics
+        scheme: http
+        honorLabels: false
+        relabelings: []
+        metricRelabelings: []
+
+# Автомасштабирование (если чарт поддерживает HPA через values)
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 9
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80

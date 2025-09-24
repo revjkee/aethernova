@@ -1,0 +1,306 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish-to-pypi:
+        description: "Publish package to PyPI using Trusted Publishing (OIDC)"
+        required: true
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+  push:
+    tags:
+      - "v*.*.*"        # SemVer tags, e.g. v1.2.3
+
+permissions:
+  contents: write           # для GitHub Release и загрузки артефактов
+  id-token: write           # для OIDC (PyPI Trusted Publishing, provenance)
+  attestations: write       # для actions/attest-build-provenance
+  packages: read            # на случай внутренних зависимостей
+  actions: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION_MATRIX: "['3.11', '3.12']"
+  MIN_PYTHON: "3.11"
+  PACKAGE_DIR: "."
+  DIST_DIR: "dist"
+  SBOM_DIR: "sbom"
+  SBOM_FILE: "sbom/omnimind-core.cdx.json"
+  WHEELHOUSE: "dist"
+  PUBLISH_TO_PYPI: ${{ github.event_name == 'workflow_dispatch' && inputs.publish-to-pypi || 'false' }}
+
+jobs:
+  preflight:
+    name: Preflight checks (tag, semver, prerelease)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse-version.outputs.version }}
+      is_prerelease: ${{ steps.parse-version.outputs.is_prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure Git tag context
+        if: startsWith(github.ref, 'refs/tags/') != true
+        run: |
+          echo "This workflow must run on a git tag (refs/tags/vX.Y.Z) or manual dispatch."
+          exit 1
+
+      - name: Parse SemVer from tag
+        id: parse-version
+        shell: bash
+        run: |
+          REF="${GITHUB_REF#refs/tags/}"
+          if [[ ! "$REF" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)([-+].*)?$ ]]; then
+            echo "Tag $REF is not SemVer (vX.Y.Z)."
+            exit 1
+          fi
+          VER="${REF#v}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          # prerelease if contains '-' part, e.g. 1.2.3-rc.1
+          if [[ "$VER" == *"-"* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    name: Test matrix (Linux)
+    runs-on: ubuntu-latest
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.11", "3.12" ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          check-latest: true
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml', '**/poetry.lock', '**/requirements*.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ matrix.python-version }}-
+            pip-
+
+      - name: Install build deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          # Для poetry/uv/requirements — оставьте то, что используете в проекте
+          if [[ -f "pyproject.toml" ]]; then
+            python -m pip install "build" "pytest" "pytest-cov" "coverage[toml]" "cyclonedx-bom" "pip-audit"
+            # при необходимости: python -m pip install "poetry"
+          elif [[ -f "requirements.txt" ]]; then
+            python -m pip install -r requirements.txt
+            python -m pip install "pytest" "pytest-cov" "coverage[toml]" "cyclonedx-bom" "pip-audit" "build"
+          fi
+
+      - name: Security audit (pip-audit)
+        shell: bash
+        continue-on-error: true    # не «падаем» релиз; отчёт сохраняем
+        run: |
+          pip-audit -r requirements.txt -f json -o pip-audit-${{ matrix.python-version }}.json || true
+
+      - name: Run tests
+        shell: bash
+        run: |
+          pytest -q --maxfail=1 --disable-warnings --cov --cov-report=xml --cov-report=term
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            .coverage*
+            pip-audit-${{ matrix.python-version }}.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  build:
+    name: Build, SBOM, attest
+    runs-on: ubuntu-latest
+    needs: [preflight, test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python ${{ env.MIN_PYTHON }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.MIN_PYTHON }}
+          check-latest: true
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ env.MIN_PYTHON }}-${{ hashFiles('**/pyproject.toml', '**/poetry.lock', '**/requirements*.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ env.MIN_PYTHON }}-
+            pip-
+
+      - name: Install build toolchain
+        run: |
+          python -m pip install --upgrade pip wheel setuptools build cyclonedx-bom
+
+      - name: Build sdist & wheel
+        run: |
+          rm -rf $DIST_DIR && mkdir -p $DIST_DIR
+          python -m build $PACKAGE_DIR --outdir $DIST_DIR
+          ls -la $DIST_DIR
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          mkdir -p $SBOM_DIR
+          cyclonedx-bom -o $SBOM_FILE -e
+          # Привязываем SBOM к артефактам релиза
+          echo "SBOM generated at $SBOM_FILE"
+          jq --arg version "${{ needs.preflight.outputs.version }}" '.metadata |= (.component.version=$version)' $SBOM_FILE > $SBOM_FILE.tmp || true
+          mv $SBOM_FILE.tmp $SBOM_FILE || true
+
+      - name: Hash artifacts
+        shell: bash
+        run: |
+          cd $DIST_DIR
+          shopt -s nullglob
+          for f in *; do
+            sha256sum "$f" >> SHA256SUMS.txt
+          done
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ needs.preflight.outputs.version }}
+          path: |
+            ${{ env.DIST_DIR }}/**
+            ${{ env.SBOM_FILE }}
+          retention-days: 14
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            ${{ env.DIST_DIR }}/*.whl
+            ${{ env.DIST_DIR }}/*.tar.gz
+
+  github_release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [preflight, build]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ needs.preflight.outputs.version }}
+          path: artifacts
+
+      - name: Generate release notes
+        id: notes
+        uses: release-drafter/release-drafter@v6
+        with:
+          config-name: release-drafter.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.preflight.outputs.version }}
+          name: omnimind-core v${{ needs.preflight.outputs.version }}
+          prerelease: ${{ needs.preflight.outputs.is_prerelease }}
+          draft: false
+          body: ${{ steps.notes.outputs.body || 'Automated release' }}
+          files: |
+            artifacts/dist/*.whl
+            artifacts/dist/*.tar.gz
+            artifacts/dist/SHA256SUMS.txt
+            artifacts/sbom/omnimind-core.cdx.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish_pypi:
+    name: Publish to PyPI (Trusted Publishing)
+    if: ${{ needs.preflight.result == 'success' && (github.event_name == 'workflow_dispatch') && env.PUBLISH_TO_PYPI == 'true' }}
+    runs-on: ubuntu-latest
+    needs: [preflight, build, github_release]
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ needs.preflight.outputs.version }}
+          path: dist
+
+      - name: Verify artifacts SHA256
+        shell: bash
+        run: |
+          cd dist/dist
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Publish to PyPI (OIDC)
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          packages-dir: dist/dist
+          skip-existing: true
+          verbose: true
+        env:
+          # Без секретов: PyPI Trusted Publishing через OIDC
+          # Требуется предварительная настройка проекта в PyPI
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+  # Опционально: валидация релиза «после факта» (smoke test установки)
+  smoke_install:
+    name: Smoke install test from GitHub artifact
+    runs-on: ubuntu-latest
+    needs: [github_release]
+    steps:
+      - name: Setup Python ${{ env.MIN_PYTHON }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.MIN_PYTHON }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ needs.preflight.outputs.version }}
+          path: dist
+
+      - name: Install wheel locally
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install dist/dist/*.whl
+          python -c "import importlib; import sys; print('OK:', sys.version)"
+
+      - name: Import basic module
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib
+          try:
+              import omnimind_core
+              print("Imported omnimind_core:", getattr(omnimind_core, '__version__', 'unknown'))
+          except Exception as e:
+              raise SystemExit(f"Import failed: {e}")
+          PY

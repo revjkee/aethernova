@@ -1,0 +1,289 @@
+# Ledger Core — Unified Logging Configuration
+# Формат: YAML со ссылками/якорями, поддержка переменных окружения ${VAR:-default}
+# Назначение: конфиг для адаптеров логирования (Python/Go/Node/Java) и sidecar‑агентов.
+
+schema_version: 1
+
+service:
+  name: ledger-core
+  component: api
+  environment: ${APP_ENV:-staging}
+  version: ${APP_VERSION:-1.0.0}
+  instance: ${HOSTNAME:-local}
+
+# Базовые поля, которые должны присутствовать в каждом событии
+fields:
+  static:
+    project: ledger-core
+    managed_by: ops
+    team: core-ledger
+  correlation:
+    # Порядок разрешения ID: заголовки → контекст → генерация
+    request_id_header: X-Request-Id
+    trace_id_header: traceparent
+    fallback_generate: true
+
+# Маскирование чувствительных данных (редакция)
+redaction:
+  enabled: true
+  # Ключи в JSON/форм‑данных, которые нужно скрывать
+  keys:
+    - password
+    - pass
+    - secret
+    - token
+    - authorization
+    - set-cookie
+    - api_key
+    - x-api-key
+  # Регекспы для поиска в строках сообщений (маска заменяет на "***")
+  patterns:
+    - '(?i)(bearer\s+[a-z0-9\.\-_]+)'
+    - '(?i)(api[_-]?key\s*[:=]\s*[a-z0-9\-_]{8,})'
+    - '(?i)(secret\s*[:=]\s*[a-z0-9\-_]{8,})'
+    - '([0-9]{12,19})'   # PAN/номера карт — пример, дополнительно валидируйте по Luhn
+  replacement: '***'
+
+# Семплирование шумных событий
+sampling:
+  enabled: true
+  rules:
+    - match:
+        logger: http.access
+        status_code: [200, 201, 204]
+      rate: 0.1          # 10% успешных access‑логов
+    - match:
+        logger: http.access
+        path_regex: '^/(health|ready|metrics)$'
+      rate: 0.0          # не логируем health/metrics
+    - match:
+        level: DEBUG
+      rate: 0.2
+    - match:
+        level: INFO
+      rate: 1.0
+
+# Форматтеры
+formatters:
+  json: &json_formatter
+    type: json
+    utc: true
+    # Поля, которые обязательно включать
+    include:
+      - ts                # ISO8601 с миллисекундами
+      - level
+      - msg
+      - logger
+      - service
+      - component
+      - env
+      - version
+      - instance
+      - request_id
+      - trace_id
+      - span_id
+      - http.method
+      - http.path
+      - http.status_code
+      - http.remote_addr
+      - duration_ms
+      - extra
+    rename:
+      service: ${SERVICE_FIELD_NAME:-service}
+      env: environment
+    # Нормализация (обрезка больших payload’ов)
+    limits:
+      message_bytes: 8192
+      field_bytes: 16384
+      array_length: 1000
+    # Отбрасывать пустые null‑поля
+    drop_nulls: true
+  text:
+    type: console
+    pattern: '%(asctime)s | %(levelname)s | %(name)s | %(message)s'
+
+# Фильтры (последовательность: redact → sampling)
+filters:
+  redact:
+    enabled: ${LOG_REDACT_ENABLED:-true}
+  sample:
+    enabled: ${LOG_SAMPLING_ENABLED:-true}
+
+# Приёмники (sinks/handlers)
+sinks:
+  console_json:
+    type: stdout
+    level: ${LOG_LEVEL:-INFO}
+    formatter: *json_formatter
+  console_text:
+    type: stdout
+    level: ${LOG_LEVEL:-DEBUG}
+    formatter: text
+
+  file_json:
+    type: file_rotate
+    level: ${FILE_LOG_LEVEL:-INFO}
+    path: ${LOG_DIR:-/var/log/ledger-core}/app.log
+    formatter: *json_formatter
+    rotate:
+      size_mb: 100
+      backups: 7
+      max_age_days: 14
+      compress: true
+      permissions: "0640"
+
+  otlp:
+    enabled: ${OTLP_LOGS_ENABLED:-false}
+    type: otlp_http
+    level: ${OTLP_LOG_LEVEL:-INFO}
+    endpoint: ${OTLP_ENDPOINT:-http://otel-collector:4318}
+    resource_attributes:
+      service.name: ${OTEL_SERVICE_NAME:-ledger-core}
+      service.version: ${APP_VERSION:-1.0.0}
+      deployment.environment: ${APP_ENV:-staging}
+    timeout_ms: 2000
+    batch:
+      max_bytes: 1048576
+      max_wait_ms: 200
+
+  sentry:
+    enabled: ${SENTRY_ENABLED:-false}
+    type: sentry
+    dsn: ${SENTRY_DSN:-}
+    level: WARNING
+    environment: ${APP_ENV:-staging}
+    release: ${APP_VERSION:-1.0.0}
+    attach_stacktrace: true
+    send_default_pii: false
+    traces_sample_rate: 0.0    # трассинг отдельно настраивается в APM
+
+  gelf:
+    enabled: ${GELF_ENABLED:-false}
+    type: gelf_udp
+    level: ${GELF_LEVEL:-INFO}
+    host: ${GELF_HOST:-graylog}
+    port: ${GELF_PORT:-12201}
+    chunk_size: 8192
+
+  loki:
+    enabled: ${LOKI_ENABLED:-false}
+    type: loki_http
+    level: ${LOKI_LEVEL:-INFO}
+    url: ${LOKI_URL:-http://loki:3100/loki/api/v1/push}
+    labels:
+      job: ledger-core
+      env: ${APP_ENV:-staging}
+      component: api
+    timeout_ms: 2000
+    batch:
+      max_entries: 1024
+      max_wait_ms: 500
+
+# Маршрутизация (root + именованные логгеры)
+routes:
+  root:
+    level: ${LOG_LEVEL:-INFO}
+    sinks:
+      - console_json
+      - file_json
+      - ${OTLP_LOGS_ENABLED:-false} ? otlp
+      - ${SENTRY_ENABLED:-false} ? sentry
+      - ${GELF_ENABLED:-false} ? gelf
+      - ${LOKI_ENABLED:-false} ? loki
+
+  # Логгер доступа HTTP
+  "http.access":
+    level: ${ACCESS_LOG_LEVEL:-INFO}
+    sinks: [ console_json, file_json ]
+    propagate: false
+
+  # Логгер безопасности/аудита
+  "security.audit":
+    level: ${AUDIT_LOG_LEVEL:-INFO}
+    sinks: [ console_json, file_json, ${GELF_ENABLED:-false} ? gelf ]
+    propagate: false
+
+  # Шумные компоненты — понижаем уровень/семплируем
+  "http.client":
+    level: WARNING
+    sinks: [ console_json ]
+    propagate: false
+
+  # SQL/ORM — в проде только предупреждения
+  "db.sql":
+    level: ${DB_LOG_LEVEL:-WARNING}
+    sinks: [ file_json ]
+    propagate: false
+
+# Профили окружений (переопределения)
+profiles:
+  dev:
+    when_env: ["dev", "local"]
+    routes:
+      root:
+        level: DEBUG
+        sinks: [ console_text ]  # в dev читаемым текстом
+      "http.access":
+        level: INFO
+        sinks: [ console_text ]
+    sampling:
+      rules:
+        - match: { logger: http.access, path_regex: '^/(health|ready|metrics)$' }
+          rate: 0.0
+        - match: { level: DEBUG }
+          rate: 1.0
+
+  staging:
+    when_env: ["staging"]
+    routes:
+      root:
+        level: INFO
+        sinks: [ console_json, file_json ]
+      "http.access":
+        level: INFO
+        sinks: [ console_json, file_json ]
+
+  prod:
+    when_env: ["prod", "production"]
+    routes:
+      root:
+        level: INFO
+        sinks:
+          - console_json
+          - file_json
+          - ${OTLP_LOGS_ENABLED:-false} ? otlp
+          - ${SENTRY_ENABLED:-false} ? sentry
+      "http.access":
+        level: INFO
+        sinks: [ file_json ]   # доступы — в файл/агент
+    sampling:
+      rules:
+        - match: { logger: http.access, status_code: [200,201,204] }
+          rate: 0.05
+        - match: { logger: http.access, path_regex: '^/(health|ready|metrics)$' }
+          rate: 0.0
+        - match: { level: DEBUG }
+          rate: 0.0
+
+# Политики отказоустойчивости доставки (для сетевых приёмников)
+delivery:
+  retry:
+    initial_ms: 200
+    max_ms: 5000
+    multiplier: 2.0
+    jitter: true
+    max_retries: 8
+  queue:
+    in_memory_max: 50000
+    overflow_policy: drop_oldest
+
+# Маппинг стандартных полей из HTTP‑мидлвары (для языковых адаптеров)
+http_mapping:
+  method_key: http.method
+  path_key: http.path
+  status_key: http.status_code
+  client_ip_key: http.remote_addr
+  duration_ms_key: duration_ms
+  request_id_key: request_id
+  trace_id_key: trace_id
+  span_id_key: span_id

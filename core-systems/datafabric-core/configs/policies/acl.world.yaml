@@ -1,0 +1,339 @@
+# datafabric-core / configs / policies / acl.world.yaml
+# Единая мировая политика доступа (public/Internet edge).
+# Модель: RBAC + ABAC, default-deny, явные allow для безопасных операций.
+# Синтаксис условий — выражения в стиле CEL (common expression language).
+
+apiVersion: access.v1
+kind: PolicyBundle
+metadata:
+  name: world-acl
+  version: 1
+  owner: platform-security
+  environment: ${APP_ENV:-staging}
+  lastReviewedAt: "2025-08-01"
+
+defaults:
+  effect: deny            # жёсткий default-deny
+  precedence:             # порядок применения: сначала явные deny, потом allow
+    - deny
+    - allow
+  eval:
+    timezone: Europe/Stockholm
+    clockSkewSeconds: 60
+  audit:
+    enabled: true
+    level: detailed
+    redactFields: ["authorization","cookie","set-cookie","x-api-key","x-service-token"]
+  obligations:
+    onAllow:
+      - type: annotate
+        with:
+          source: world
+    onDeny:
+      - type: flag
+        severity: medium
+  breakGlass:
+    enabled: true
+    header: "X-Break-Glass"
+    allowedPrincipals: ["group:platform-oncall"]
+    requireChangeTicket: true
+    ttlSeconds: 900
+    auditTag: "break-glass"
+
+context:
+  zones:
+    - name: prod
+      cidrs: ["${WORLD_CIDRS_PROD:0.0.0.0/0}"]
+    - name: staging
+      cidrs: ["${WORLD_CIDRS_STG:0.0.0.0/0}"]
+  ipReputation:
+    provider: "${IPREP_PROVIDER:none}"
+  geo:
+    allowCountries: ["${WORLD_ALLOW_COUNTRIES:}"]     # пусто = не ограничено
+  authn:
+    modes: ["jwt","oidc","apiKey","none"]
+  tenants:
+    # Маппинг домен -> tenant (пример; опционально)
+    inferredByHost: true
+
+roles:
+  # Роль "world" — любой внешний субъект
+  - name: world
+    inherits: ["anonymous"]
+  - name: anonymous
+    description: "Неаутентифицированный внешний доступ"
+  - name: partner
+    description: "Внешние интеграции с ограниченными ключами"
+  - name: service
+    description: "Сервисные учётки внешних систем"
+  - name: blocked
+    description: "Явно заблокированные субъекты"
+
+subjects:
+  # Примеры маппинга в роли
+  - match: expr: request.auth.mode == "none"
+    as: ["anonymous","world"]
+  - match: expr: request.auth.mode in ["apiKey","jwt","oidc"] && request.auth.aud == "datafabric-core-partner"
+    as: ["partner","world"]
+  - match: expr: request.auth.mode in ["apiKey","jwt"] && has(request.auth.service)
+    as: ["service","world"]
+  - match: expr: ip.reputation == "malicious" || subject.tag == "abuse"
+    as: ["blocked"]
+
+attributes:
+  # Нормализация/обогащение контекста
+  - key: resource.sensitivity
+    default: "public" # public|internal|confidential|restricted
+  - key: resource.tenant
+    from: expr: request.labels["x-tenant"] ?? request.host.tenant ?? "public"
+  - key: request.isIdempotent
+    from: expr: request.method in ["GET","HEAD","OPTIONS"]
+  - key: request.isHealth
+    from: expr: startsWith(request.path, "/health") || startsWith(request.path, "/ready")
+  - key: request.isDocs
+    from: expr: request.path in ["/openapi.json","/swagger","/docs"]
+
+resources:
+  # Унифицированные дескрипторы ресурсов с шаблонами сопоставления
+
+  - type: http
+    match:
+      host: "${PUBLIC_API_HOST:api.example.org}"
+      path: "/*"
+    actions: ["read","write","admin"]
+
+  - type: kafka
+    match:
+      bootstrap: "${KAFKA_PUBLIC_BOOTSTRAP:kafka:9092}"
+      topic: "*"
+    actions: ["produce","consume","admin"]
+
+  - type: object
+    match:
+      endpoint: "${S3_PUBLIC_ENDPOINT:https://s3.example.org}"
+      bucket: "*"
+      key: "/*"
+    actions: ["get","put","list","delete"]
+
+  - type: db
+    match:
+      engine: "postgres"
+      database: "${POSTGRES_DB:datafabric}"
+      schema: "*"
+      table: "*"
+    actions: ["select","insert","update","delete","ddl"]
+
+rules:
+  # -------------------------
+  # ГЛОБАЛЬНЫЕ ЗАПРЕТЫ (DENY)
+  # -------------------------
+  - id: deny-non-idempotent-to-world
+    effect: deny
+    when: expr: "world" in subject.roles && !request.isIdempotent
+    reason: "Запрет неидемпотентных методов для внешнего мира"
+
+  - id: deny-admin-paths
+    effect: deny
+    resource: { type: http, match: { path: "/admin/*" } }
+    when: expr: true
+    reason: "Внешний доступ к /admin запрещён"
+
+  - id: deny-confidential-resources
+    effect: deny
+    when: expr: resource.sensitivity in ["confidential","restricted"]
+    reason: "Конфиденциальные ресурсы недоступны извне"
+
+  - id: deny-db-writes-from-world
+    effect: deny
+    resource: { type: db }
+    when: expr: "world" in subject.roles && action in ["insert","update","delete","ddl"]
+    reason: "Запрещены записи/DDL в БД с внешнего контура"
+
+  - id: deny-object-write-unknown-buckets
+    effect: deny
+    resource: { type: object }
+    when: expr: "world" in subject.roles && resource.bucket !~ "^pub(-[a-z0-9]+)?$"
+    reason: "Письмо в не‑публичные бакеты запрещено"
+
+  - id: deny-kafka-admin-world
+    effect: deny
+    resource: { type: kafka }
+    when: expr: "world" in subject.roles && action == "admin"
+    reason: "Администрирование Kafka недоступно из внешнего мира"
+
+  - id: deny-blocked-subjects
+    effect: deny
+    when: expr: "blocked" in subject.roles
+    reason: "Субъект заблокирован по репутации/политике"
+
+  # -------------------------
+  # БАЗОВЫЕ РАЗРЕШЕНИЯ (ALLOW)
+  # -------------------------
+  - id: allow-health-and-docs
+    effect: allow
+    resource: { type: http }
+    actions: ["read"]
+    when: expr: request.isHealth || request.isDocs
+    obligations:
+      - type: annotate
+        with: { cache: "public, max-age=60" }
+
+  - id: allow-public-api-read
+    effect: allow
+    resource:
+      type: http
+      match:
+        path: "/api/public/*"
+    actions: ["read"]
+    when: expr: resource.sensitivity == "public"
+    obligations:
+      - type: annotate
+        with: { cache: "public, max-age=120" }
+
+  - id: allow-partner-read-write-limited
+    effect: allow
+    subjects: ["partner","service"]
+    resource:
+      type: http
+      match:
+        path: "/api/partner/*"
+    actions: ["read","write"]
+    when: expr: request.auth.mode in ["apiKey","jwt","oidc"] && request.isIdempotent || request.method == "POST"
+    conditions:
+      - name: ip-geo
+        expr: (len(env("WORLD_ALLOW_COUNTRIES")) == 0) || (geo.country in split(env("WORLD_ALLOW_COUNTRIES"), ","))
+      - name: tenant-scope
+        expr: resource.tenant == subject.tenant || subject.tenant == "multi"
+    obligations:
+      - type: tag
+        with: { tier: "partner" }
+
+  - id: allow-kafka-produce-public-ingest
+    effect: allow
+    subjects: ["partner","service"]
+    resource:
+      type: kafka
+      match:
+        topic: "ingest.public.*"
+    actions: ["produce"]
+    conditions:
+      - name: auth-required
+        expr: request.auth.mode in ["apiKey","jwt","oidc"]
+      - name: safety-headers
+        expr: has(request.headers["x-idempotency-key"])
+    obligations:
+      - type: annotate
+        with: { qos: "low", retention: "168h" }
+
+  - id: allow-kafka-consume-public-broadcast
+    effect: allow
+    subjects: ["world"]
+    resource:
+      type: kafka
+      match:
+        topic: "broadcast.public.*"
+    actions: ["consume"]
+    when: expr: true
+
+  - id: allow-object-get-from-pub-buckets
+    effect: allow
+    resource:
+      type: object
+      match:
+        bucket: "pub*"
+        key: "/public/*"
+    actions: ["get","list"]
+    obligations:
+      - type: annotate
+        with: { cache: "public, max-age=300" }
+
+  - id: allow-object-put-only-via-presigned
+    effect: allow
+    resource:
+      type: object
+    actions: ["put","delete"]
+    conditions:
+      - name: presigned-only
+        expr: request.headers["x-presigned"] == "true" && request.auth.mode in ["none","apiKey","jwt","oidc"]
+      - name: bucket-scope
+        expr: resource.bucket =~ "^pub(-[a-z0-9]+)?$"
+    obligations:
+      - type: annotate
+        with: { integrity: "sha256-required" }
+
+  # -------------------------
+  # ЗОНЫ/СРЕДЫ
+  # -------------------------
+  - id: allow-staging-wider-read
+    effect: allow
+    resource: { type: http, match: { path: "/api/staging/*" } }
+    actions: ["read"]
+    when: expr: env("APP_ENV") == "staging"
+
+exceptions:
+  # Временные исключения — строго с TTL и тикетом изменения
+  - id: ex-incident-12345
+    ttl: "2025-08-20T00:00:00Z"
+    ticket: "CHG-12345"
+    effect: allow
+    subjects: ["partner"]
+    resource: { type: http, match: { path: "/api/partner/legacy/*" } }
+    actions: ["read"]
+    conditions:
+      - name: source-ip
+        expr: ip.cidr in ["198.51.100.0/24","203.0.113.10/32"]
+
+tests:
+  # Самодокументирующие проверки соответствия ожиданиям
+  - name: anonymous-post-to-public-denied
+    given:
+      subject: { roles: ["world","anonymous"] }
+      request: { method: "POST", path: "/api/public/submit" }
+      resource: { type: http, match: { path: "/api/public/submit" }, sensitivity: "public" }
+    expect: { effect: "deny" }
+
+  - name: health-allowed
+    given:
+      subject: { roles: ["world","anonymous"] }
+      request: { method: "GET", path: "/health" }
+      resource: { type: http, match: { path: "/health" }, sensitivity: "public" }
+    expect: { effect: "allow" }
+
+  - name: partner-produce-ingest-allowed
+    given:
+      subject: { roles: ["partner","world"], tenant: "acme" }
+      request:
+        auth: { mode: "apiKey" }
+        headers: { x-idempotency-key: "abc" }
+      resource: { type: kafka, match: { topic: "ingest.public.events" } }
+      action: "produce"
+    expect: { effect: "allow" }
+
+  - name: world-consume-broadcast-allowed
+    given:
+      subject: { roles: ["world","anonymous"] }
+      resource: { type: kafka, match: { topic: "broadcast.public.news" } }
+      action: "consume"
+    expect: { effect: "allow" }
+
+  - name: db-write-world-denied
+    given:
+      subject: { roles: ["world","anonymous"] }
+      resource: { type: db, match: { table: "users" } }
+      action: "insert"
+    expect: { effect: "deny" }
+
+operations:
+  # Политики эксплуатации
+  lint:
+    forbidWildcards:
+      - resource.type == "http" && resource.match.path == "/*" && (rule.effect == "allow")
+    requireReasonsForDeny: true
+  rollout:
+    mode: canary
+    samplePercent: 10
+    failOnDenyIncreasePercent: 2
+    healthSignals:
+      - metric: "acl_denies_total{source='world'}"
+        threshold: "+5%"
+        window: "10m"

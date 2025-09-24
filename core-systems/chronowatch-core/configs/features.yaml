@@ -1,0 +1,394 @@
+# configs/features.yaml
+# Промышленная конфигурация feature-флагов для chronowatch-core.
+# Схема поддерживает:
+# - environments: dev/staging/prod с наложением поверх defaults
+# - features: флаги, зависимости, конфликты, таргетинг, rollout, AB-тесты
+# - segments: переиспользуемые правила таргетинга
+# - safeguards: лимиты, rate-limit, circuit-breaker
+# - audit: политики аудита изменений
+# - evaluation: порядок оценки и правила резолвинга
+# Все времена в UTC, форматы ISO8601.
+
+schema:
+  version: 1
+  updated_at: "2025-08-28T00:00:00Z"
+  owner: "platform@neurocity.example"
+
+metadata:
+  service: "chronowatch-core"
+  component: "scheduling"
+  description: "Флаги возможностей ядра расписаний и наблюдаемости"
+  labels:
+    - chronowatch
+    - scheduling
+    - reliability
+
+defaults:
+  evaluation:
+    mode: "first_match_wins"     # first_match_wins | prioritize_by_weight
+    fail_on_conflict: true       # true -> конфликт зависимостей вызывает блокировку
+    unknown_feature: "deny"      # allow | deny
+  safeguards:
+    rate_limit_default:
+      window: "1s"
+      limit: 50
+      burst: 25
+    circuit_breaker_default:
+      failure_rate_threshold: 0.25   # 25% ошибок за окно
+      rolling_window: "60s"
+      min_throughput: 200
+      cool_down: "30s"
+  rollout_strategies:
+    standard:
+      steps:
+        - percent: 5
+          hold: "10m"
+        - percent: 25
+          hold: "30m"
+        - percent: 50
+          hold: "60m"
+        - percent: 100
+          hold: "0s"
+    conservative:
+      steps:
+        - percent: 1
+          hold: "30m"
+        - percent: 5
+          hold: "2h"
+        - percent: 20
+          hold: "6h"
+        - percent: 50
+          hold: "12h"
+        - percent: 100
+          hold: "24h"
+
+segments:
+  # Сегменты для таргетинга по окружению, тэгам, регионам и т. п.
+  internal-staff:
+    description: "Сотрудники платформенной команды"
+    match:
+      any:
+        - user.email_domain: ["neurocity.example", "aethernova.example"]
+        - user.groups: ["platform-core", "sre", "secops"]
+  beta-tenants:
+    description: "Клиенты, подписавшиеся на бета-программу"
+    match:
+      all:
+        - tenant.tier: ["beta", "design-partner"]
+        - tenant.contract_active: true
+  eu-region:
+    description: "Региональные ограничения для ЕС"
+    match:
+      any:
+        - request.region: ["eu-north-1", "eu-west-1", "eu-central-1"]
+        - request.country: ["SE", "DE", "NL", "PL"]
+  high-risk:
+    description: "Высокий риск по UEBA/аномалиям"
+    match:
+      any:
+        - user.risk_score_gte: 80
+        - request.ip_in_list: "blocklists/main"
+
+features:
+  # 1) Базовый HTTP API (должен быть всегда доступен; закрывается только аварийным переключателем)
+  http_api:
+    description: "Публичный HTTP API управления заданиями и статусами"
+    owner: "core@neurocity.example"
+    tags: ["api", "public", "stable"]
+    default: true
+    kill_switch: false
+    dependencies: []
+    conflicts: []
+    targeting:
+      deny_segments:
+        - high-risk
+    safeguards:
+      rate_limit:
+        window: "1s"
+        limit: 100
+        burst: 50
+      circuit_breaker:
+        failure_rate_threshold: 0.3
+        rolling_window: "120s"
+        min_throughput: 300
+        cool_down: "60s"
+
+  # 2) Планировщик cron
+  schedulers.cron_engine:
+    description: "Асимметричный планировщик cron с croniter и контролем дрейфа"
+    owner: "sre@neurocity.example"
+    tags: ["scheduling", "cron", "async"]
+    default: true
+    kill_switch: false
+    dependencies:
+      - time.timezone_auto
+    conflicts: []
+    rollout:
+      strategy: "standard"
+      hash_by: "job.id"
+      sticky: true
+    targeting:
+      allow_segments:
+        - internal-staff
+        - beta-tenants
+      rules:
+        - if:
+            request.namespace: ["chronowatch", "batch"]
+          then: "allow"
+    safeguards:
+      rate_limit:
+        window: "1s"
+        limit: 200
+        burst: 100
+      circuit_breaker:
+        failure_rate_threshold: 0.2
+        rolling_window: "60s"
+        min_throughput: 500
+        cool_down: "30s"
+
+  # 3) Асинхронный исполнитель задач
+  execution.async_executor:
+    description: "AnyIO/asyncio исполнитель с backpressure и очередями"
+    owner: "platform@neurocity.example"
+    tags: ["async", "executor"]
+    default: true
+    kill_switch: false
+    dependencies:
+      - observability.prometheus_metrics
+    conflicts: []
+    tuning:
+      queue:
+        max_inflight: 2000
+        max_queue: 10000
+        backpressure_threshold: 0.8
+      worker:
+        min: 4
+        max: 64
+        scale_policy: "cpu70-latency200ms"
+    safeguards:
+      rate_limit:
+        window: "500ms"
+        limit: 400
+        burst: 200
+
+  # 4) Автоопределение часовых поясов
+  time.timezone_auto:
+    description: "Автоопределение TZ на основе Pendulum/tzdata и политики проекта"
+    owner: "product@neurocity.example"
+    tags: ["time", "tz"]
+    default: true
+    kill_switch: false
+    dependencies: []
+    conflicts: []
+    targeting:
+      allow_segments:
+        - eu-region
+
+  # 5) Детектор дрейфа расписаний
+  scheduling.drift_detector:
+    description: "Детект дрейфа и компенсация при изменении системного времени/смещений"
+    owner: "sre@neurocity.example"
+    tags: ["reliability", "scheduling"]
+    default: false
+    kill_switch: true
+    dependencies:
+      - schedulers.cron_engine
+    conflicts: []
+    rollout:
+      strategy: "conservative"
+      hash_by: "tenant.id"
+    schedules:
+      active_windows:
+        - from: "2025-08-28T00:00:00Z"
+          to: "2026-12-31T23:59:59Z"
+    experiment:
+      kind: "ab"
+      hypothesis: "Снижение пропуска триггеров при дрейфе > 500ms"
+      metrics:
+        - name: "scheduling_missed_triggers_rate"
+          direction: "lower"
+      variants:
+        - name: "control"
+          weight: 0.5
+          params: { compensation_ms: 0 }
+        - name: "treatment"
+          weight: 0.5
+          params: { compensation_ms: 750 }
+
+  # 6) Экспорт метрик Prometheus
+  observability.prometheus_metrics:
+    description: "Экспорт внутренних метрик на /metrics"
+    owner: "observability@neurocity.example"
+    tags: ["metrics", "observability"]
+    default: true
+    kill_switch: true
+    dependencies: []
+    conflicts: []
+    targeting:
+      rules:
+        - if:
+            request.path_prefix: ["/metrics", "/health"]
+          then: "allow"
+
+  # 7) OpenTelemetry трассировка
+  observability.opentelemetry:
+    description: "Трассировка критических участков планировщика"
+    owner: "observability@neurocity.example"
+    tags: ["tracing", "otel"]
+    default: false
+    kill_switch: true
+    dependencies:
+      - observability.prometheus_metrics
+    conflicts: []
+    rollout:
+      strategy: "standard"
+      hash_by: "request.instance_id"
+    targeting:
+      allow_segments:
+        - internal-staff
+
+  # 8) Режим обслуживания
+  platform.maintenance_mode:
+    description: "Фоновое обслуживание с отказом на запись"
+    owner: "platform@neurocity.example"
+    tags: ["maintenance", "safety"]
+    default: false
+    kill_switch: true
+    dependencies: []
+    conflicts:
+      - execution.async_executor
+    targeting:
+      rules:
+        - if:
+            tenant.tier: ["free"]
+          then: "deny_write"
+        - if:
+            request.method: ["GET", "HEAD"]
+          then: "allow"
+
+  # 9) Админ-панель
+  admin.ui:
+    description: "Внутренняя панель управления заданиями и очередями"
+    owner: "product@neurocity.example"
+    tags: ["admin", "ui"]
+    default: false
+    kill_switch: true
+    dependencies:
+      - http_api
+      - observability.prometheus_metrics
+    conflicts: []
+    targeting:
+      allow_segments:
+        - internal-staff
+    schedules:
+      active_windows:
+        - cron: "0 7-19 * * 1-5"
+          timezone: "UTC"
+
+  # 10) Динамические определения заданий
+  jobs.dynamic_definitions:
+    description: "Загрузка описаний задач из внешнего реестра"
+    owner: "platform@neurocity.example"
+    tags: ["jobs", "registry"]
+    default: false
+    kill_switch: true
+    dependencies:
+      - http_api
+    conflicts: []
+    rollout:
+      steps:
+        - percent: 1
+          hold: "1h"
+        - percent: 10
+          hold: "6h"
+        - percent: 50
+          hold: "12h"
+        - percent: 100
+          hold: "24h"
+      hash_by: "tenant.id"
+
+environments:
+  dev:
+    overrides:
+      features:
+        admin.ui: { default: true }
+        observability.opentelemetry: { default: true }
+        scheduling.drift_detector: { default: true }
+      safeguards:
+        rate_limit_default:
+          window: "1s"
+          limit: 1000
+          burst: 500
+  staging:
+    overrides:
+      features:
+        admin.ui:
+          default: true
+          targeting:
+            allow_segments: [internal-staff]
+        scheduling.drift_detector:
+          rollout:
+            strategy: "standard"
+            hash_by: "tenant.id"
+        jobs.dynamic_definitions:
+          default: true
+          rollout:
+            steps:
+              - percent: 10
+                hold: "4h"
+              - percent: 50
+                hold: "12h"
+              - percent: 100
+                hold: "24h"
+  prod:
+    overrides:
+      evaluation:
+        mode: "first_match_wins"
+        fail_on_conflict: true
+      features:
+        observability.opentelemetry:
+          default: true
+          targeting:
+            allow_segments: [internal-staff, beta-tenants]
+          rollout:
+            strategy: "standard"
+            hash_by: "request.instance_id"
+        scheduling.drift_detector:
+          default: false
+          rollout:
+            strategy: "conservative"
+            hash_by: "tenant.id"
+        admin.ui:
+          default: false
+          targeting:
+            allow_segments: [internal-staff]
+        platform.maintenance_mode:
+          default: false
+
+audit:
+  policy:
+    required_reviewers: 2
+    change_freeze_windows:
+      - from: "2025-12-24T00:00:00Z"
+        to: "2026-01-02T23:59:59Z"
+    log_destination: "otlp"
+    redact_values: true
+  events:
+    - on: "feature_toggle_change"
+      notify: ["#chronowatch-alerts", "secops@neurocity.example"]
+    - on: "kill_switch_activated"
+      notify: ["#incident-bridge", "oncall@sre.neurocity.example"]
+
+validation:
+  # Примитивные правила валидации на стороне загрузчика
+  rules:
+    - check: "no_orphan_dependencies"
+    - check: "no_circular_dependencies"
+    - check: "all_features_have_owner"
+    - check: "rollout_steps_percent_monotonic"
+    - check: "schedules_cron_or_iso8601_valid"
+
+notes:
+  - "hash_by должен ссылаться на стабильный идентификатор (tenant.id, job.id, instance_id)."
+  - "При активном maintenance_mode запрещены операции записи, кроме исключений в targeting."
+  - "Для prod все kill_switch должны быть протестированы на staging."

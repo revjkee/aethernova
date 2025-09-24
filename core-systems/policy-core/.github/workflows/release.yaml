@@ -1,0 +1,232 @@
+# policy-core/.github/workflows/release.yaml
+# Статус: НЕ ВЕРИФИЦИРОВАНО — предполагается pyproject.toml и SemVer-теги вида vX.Y.Z
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        type: choice
+        description: Publish target
+        options: [pypi, testpypi, dry-run]
+        default: pypi
+      pre_release:
+        type: boolean
+        default: false
+        description: Mark GitHub release as prerelease
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  packages: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  PACKAGE_DIR: "."
+  DIST_DIR: "dist"
+
+jobs:
+  validate:
+    name: Validate (lint, types, tests, audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install ruff mypy pytest pytest-cov build twine pip-audit
+
+      - name: Validate version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - << 'PY'
+          import os, sys
+          ref = os.environ.get('GITHUB_REF', '')
+          tag = ref.split('/')[-1]
+          if not tag.startswith('v'):
+              sys.exit('Tag must start with v')
+          version_tag = tag[1:]
+          try:
+              import tomllib  # py311+
+          except Exception:
+              import tomli as tomllib
+          with open('pyproject.toml','rb') as f:
+              data = tomllib.load(f)
+          version = (data.get('project',{}) or data.get('tool',{}).get('poetry',{})).get('version')
+          if not version:
+              sys.exit('Cannot find version in pyproject.toml')
+          if version != version_tag:
+              sys.exit(f'Version mismatch: tag {version_tag} != pyproject version {version}')
+          print(f'Version OK: {version}')
+          PY
+
+      - name: Ruff
+        run: ruff check --output-format=github .
+
+      - name: Type check
+        run: mypy --install-types --non-interactive || true
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Dependency audit
+        run: pip-audit -r requirements.txt || true
+
+  build:
+    name: Build artifacts (sdist, wheel, SBOM, signatures)
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+          python -m build --outdir "${DIST_DIR}" "${PACKAGE_DIR}"
+
+      - name: Verify artifacts
+        run: |
+          ls -l "${DIST_DIR}"
+          python - << 'PY'
+          import glob, os
+          files = glob.glob(os.path.join(os.environ['DIST_DIR'],'*.whl')) + glob.glob(os.path.join(os.environ['DIST_DIR'],'*.tar.gz'))
+          assert files, 'No artifacts built'
+          print('Artifacts:', files)
+          PY
+
+      - name: Generate SBOM (CycloneDX)
+        continue-on-error: true
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py --format json -o "${DIST_DIR}/sbom.json" || exit 0
+
+      - name: Sign artifacts with Sigstore
+        continue-on-error: true
+        uses: sigstore/gh-action-sigstore-python@v2.1.1
+        with:
+          inputs: "${{ env.DIST_DIR }}/*.whl ${{ env.DIST_DIR }}/*.tar.gz"
+          overwrite: true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: policy-core-dist
+          path: |
+            ${{ env.DIST_DIR }}/*.whl
+            ${{ env.DIST_DIR }}/*.tar.gz
+            ${{ env.DIST_DIR }}/*.sig
+            ${{ env.DIST_DIR }}/*.pem
+            ${{ env.DIST_DIR }}/sbom.json
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "dist/*"
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    environment:
+      name: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: policy-core-dist
+          path: dist
+
+      - name: Generate changelog
+        id: cliff
+        uses: orhun/git-cliff-action@v2
+        with:
+          config: |
+            [changelog]
+            header = "Changelog"
+          args: --tag ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.cliff.outputs.content }}
+          prerelease: ${{ github.event.inputs.pre_release || contains(github.ref_name, '-rc') }}
+          draft: false
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.sig
+            dist/*.pem
+            dist/sbom.json
+
+  publish:
+    name: Publish to package index
+    runs-on: ubuntu-latest
+    needs: release
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: policy-core-dist
+          path: dist
+
+      - name: Publish to TestPyPI
+        if: ${{ github.event.inputs.target == 'testpypi' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+
+      - name: Publish to PyPI (Trusted Publishing)
+        if: ${{ github.event.inputs.target == 'pypi' || startsWith(github.ref, 'refs/tags/') }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+      - name: Dry run (no publish)
+        if: ${{ github.event.inputs.target == 'dry-run' }}
+        run: python -c "print('Dry run complete. Artifacts ready in dist/')"

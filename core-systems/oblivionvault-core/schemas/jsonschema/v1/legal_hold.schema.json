@@ -1,0 +1,478 @@
+{
+  "$id": "https://aethernova.dev/schemas/oblivionvault-core/jsonschema/v1/legal_hold.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Legal Hold",
+  "description": "Юридическая блокировка (legal hold) для предотвращения удаления/модификации данных в целях судопроизводства, расследований и регуляторных требований.",
+  "type": "object",
+  "additionalProperties": false,
+  "unevaluatedProperties": false,
+  "required": ["schema_version", "hold_id", "status", "type", "subject", "scope", "effective", "compliance", "approvals"],
+  "properties": {
+    "schema_version": {
+      "description": "Версия схемы (SemVer).",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
+      "default": "1.0.0"
+    },
+    "hold_id": {
+      "description": "Уникальный идентификатор блокировки (ULID/UUIDv7/UUID4).",
+      "type": "string",
+      "anyOf": [
+        { "$ref": "#/$defs/ulid" },
+        { "$ref": "#/$defs/uuid" }
+      ]
+    },
+    "external_ref": {
+      "description": "Внешняя ссылка/номер дела (docket/case ID/регистрационный номер).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "type": {
+      "description": "Тип юридической блокировки.",
+      "type": "string",
+      "enum": ["litigation", "investigation", "regulatory", "preservation_order", "other"]
+    },
+    "status": {
+      "description": "Текущий статус жизненного цикла legal hold.",
+      "type": "string",
+      "enum": ["draft", "active", "released", "superseded"]
+    },
+    "subject": {
+      "description": "Тема/описание основания блокировки.",
+      "type": "object",
+      "required": ["title"],
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string", "minLength": 3, "maxLength": 256 },
+        "description": { "type": "string", "maxLength": 4000 },
+        "jurisdictions": {
+          "description": "Список ISO 3166-1 alpha-2 кодов юрисдикций.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/iso_country" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "legal_matter": {
+          "description": "Сведения о деле/процессе.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "matter_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "docket_no": { "type": "string", "maxLength": 128 },
+            "court": { "type": "string", "maxLength": 256 }
+          }
+        },
+        "labels": { "$ref": "#/$defs/labels" }
+      }
+    },
+    "scope": {
+      "description": "Область действия блокировки (взаимоисключающие режимы).",
+      "oneOf": [
+        { "$ref": "#/$defs/scope_all" },
+        { "$ref": "#/$defs/scope_objects" },
+        { "$ref": "#/$defs/scope_tags" },
+        { "$ref": "#/$defs/scope_prefixes" },
+        { "$ref": "#/$defs/scope_query" }
+      ]
+    },
+    "effective": {
+      "description": "Сроки и активность блокировки.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["indefinite", "activated_at"],
+      "properties": {
+        "indefinite": { "type": "boolean", "default": false },
+        "activated_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "tz": { "type": "string", "default": "UTC" },
+        "grace_period": {
+          "description": "Льготный период после истечения (ISO 8601 duration, напр. PT24H).",
+          "type": "string",
+          "pattern": "^P(?!$)(\\d+Y)?(\\d+M)?(\\d+W)?(\\d+D)?(T(\\d+H)?(\\d+M)?(\\d+S)?)?$"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "indefinite": { "const": false } }, "required": ["indefinite"] },
+          "then": { "required": ["expires_at"] }
+        },
+        {
+          "if": { "properties": { "indefinite": { "const": true } }, "required": ["indefinite"] },
+          "then": { "not": { "required": ["expires_at"] } }
+        }
+      ]
+    },
+    "compliance": {
+      "description": "Компаенс-политики применяемые при блокировке.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prevent_delete", "prevent_update", "versioning_required"],
+      "properties": {
+        "prevent_delete": { "type": "boolean", "default": true },
+        "prevent_update": { "type": "boolean", "default": true },
+        "copy_on_write": { "type": "boolean", "default": true },
+        "versioning_required": { "type": "boolean", "default": true },
+        "immutable_storage": { "type": "boolean", "default": false },
+        "allow_read": { "type": "boolean", "default": true },
+        "exceptions": {
+          "description": "Явные исключения (например, системные объекты мониторинга).",
+          "type": "array",
+          "items": { "$ref": "#/$defs/object_id" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "custodians": {
+      "description": "Связанные пользователи/подразделения, ответственные за сохранность.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/actor" },
+      "minItems": 0,
+      "uniqueItems": true
+    },
+    "approvals": {
+      "description": "Цепочка одобрений и контроль версий решения.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "steps"],
+      "properties": {
+        "required": { "type": "integer", "minimum": 1, "maximum": 10, "default": 2 },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/approval_step" },
+          "minItems": 1
+        }
+      }
+    },
+    "release": {
+      "description": "Данные о релизе/снятии блокировки.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "released_at": { "$ref": "#/$defs/timestamp" },
+        "released_by": { "$ref": "#/$defs/actor" },
+        "reason": { "type": "string", "maxLength": 2000 },
+        "superseded_by": {
+          "description": "Идентификатор новой блокировки, заменившей текущую.",
+          "type": "string",
+          "anyOf": [
+            { "$ref": "#/$defs/ulid" },
+            { "$ref": "#/$defs/uuid" }
+          ]
+        }
+      }
+    },
+    "notifications": {
+      "description": "Правила уведомлений для событий жизненного цикла.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "recipients": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/notification_target" },
+          "uniqueItems": true
+        },
+        "triggers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["on_apply", "on_activate", "on_expire", "on_release", "on_violation"]
+          },
+          "uniqueItems": true,
+          "default": ["on_apply", "on_violation"]
+        }
+      }
+    },
+    "webhooks": {
+      "description": "Внешние callback-интеграции.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/webhook" },
+      "uniqueItems": true
+    },
+    "audit": {
+      "description": "Аудит событий по legal hold.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/audit_event" }
+    },
+    "labels": { "$ref": "#/$defs/labels" },
+    "extensions": {
+      "description": "Расширения вендора/проекта (пространство имён x-).",
+      "type": "object",
+      "propertyNames": { "pattern": "^x-[a-z0-9_.-]+$" }
+    },
+    "created_at": { "$ref": "#/$defs/timestamp", "readOnly": true },
+    "updated_at": { "$ref": "#/$defs/timestamp", "readOnly": true },
+    "created_by": { "$ref": "#/$defs/actor", "readOnly": true },
+    "updated_by": { "$ref": "#/$defs/actor", "readOnly": true },
+    "etag": {
+      "description": "Версия ресурса для оптимистической блокировки.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  },
+
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "released" } }, "required": ["status"] },
+      "then": { "required": ["release"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "superseded" } }, "required": ["status"] },
+      "then": { "required": ["release"], "properties": { "release": { "required": ["superseded_by"] } } }
+    }
+  ],
+
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "object_id": {
+      "description": "Идентификатор объекта/ресурса хранилища.",
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512
+    },
+    "iso_country": {
+      "type": "string",
+      "pattern": "^[A-Z]{2}$"
+    },
+    "labels": {
+      "description": "Ключ-значение для меток.",
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z0-9]([a-z0-9_.-]{0,61}[a-z0-9])?$" },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 256
+      }
+    },
+    "actor": {
+      "description": "Субъект действия (пользователь/сервис).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "type": { "type": "string", "enum": ["user", "service", "system"] },
+        "email": { "type": "string", "format": "email" },
+        "display_name": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "approval_step": {
+      "description": "Шаг согласования.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "status"],
+      "properties": {
+        "role": { "type": "string", "maxLength": 128 },
+        "assignee": { "$ref": "#/$defs/actor" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "comment": { "type": "string", "maxLength": 2000 },
+        "timestamp": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "audit_event": {
+      "description": "Аудит-событие по ресурсу.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["at", "actor", "action"],
+      "properties": {
+        "at": { "$ref": "#/$defs/timestamp" },
+        "actor": { "$ref": "#/$defs/actor" },
+        "action": { "type": "string", "maxLength": 64, "pattern": "^[a-z_]+$" },
+        "details": { "type": "object" }
+      }
+    },
+    "notification_target": {
+      "description": "Получатель уведомлений.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel"],
+      "properties": {
+        "channel": { "type": "string", "enum": ["email", "slack", "webhook"] },
+        "email": { "type": "string", "format": "email" },
+        "slack_webhook": { "type": "string", "format": "uri" },
+        "webhook": { "$ref": "#/$defs/webhook" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "channel": { "const": "email" } } },
+          "then": { "required": ["email"] }
+        },
+        {
+          "if": { "properties": { "channel": { "const": "slack" } } },
+          "then": { "required": ["slack_webhook"] }
+        },
+        {
+          "if": { "properties": { "channel": { "const": "webhook" } } },
+          "then": { "required": ["webhook"] }
+        }
+      ]
+    },
+    "webhook": {
+      "description": "HTTP вебхук.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "method"],
+      "properties": {
+        "url": { "type": "string", "format": "uri" },
+        "method": { "type": "string", "enum": ["POST", "PUT", "PATCH"] },
+        "secret_header": { "type": "string", "maxLength": 64, "default": "X-Signature" },
+        "secret_value_env": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "timeouts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "connect_ms": { "type": "integer", "minimum": 1, "maximum": 60000, "default": 3000 },
+            "read_ms": { "type": "integer", "minimum": 1, "maximum": 120000, "default": 5000 }
+          }
+        },
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "attempts": { "type": "integer", "minimum": 0, "maximum": 10, "default": 3 },
+            "backoff_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 2000 }
+          }
+        }
+      }
+    },
+
+    "scope_all": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "type": "string", "const": "all" }
+      }
+    },
+    "scope_objects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "object_ids"],
+      "properties": {
+        "mode": { "type": "string", "const": "objects" },
+        "object_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/object_id" },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "scope_tags": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "tags"],
+      "properties": {
+        "mode": { "type": "string", "const": "tags" },
+        "tags": { "$ref": "#/$defs/labels" }
+      }
+    },
+    "scope_prefixes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "prefixes"],
+      "properties": {
+        "mode": { "type": "string", "const": "prefixes" },
+        "prefixes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "scope_query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "query"],
+      "properties": {
+        "mode": { "type": "string", "const": "query" },
+        "query": {
+          "description": "Фильтр в синтаксисе поиска системы (KQL/SQL-like).",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        }
+      }
+    }
+  },
+
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "hold_id": "01J8G1Z8K8R7Z5C4Q3V2X1W0YZ",
+      "external_ref": "CASE-2025-0142",
+      "type": "litigation",
+      "status": "active",
+      "subject": {
+        "title": "Preservation for civil case",
+        "description": "Сохранение клиентских договоров и переписки по делу 2025-0142.",
+        "jurisdictions": ["SE", "DE"],
+        "legal_matter": { "matter_id": "LM-0142", "court": "Svea hovrätt" },
+        "labels": { "department": "legal", "priority": "high" }
+      },
+      "scope": {
+        "mode": "tags",
+        "tags": { "bucket": "contracts", "customer_segment": "enterprise" }
+      },
+      "effective": {
+        "indefinite": false,
+        "activated_at": "2025-08-01T09:00:00Z",
+        "expires_at": "2026-02-01T00:00:00Z",
+        "tz": "Europe/Stockholm",
+        "grace_period": "P7D"
+      },
+      "compliance": {
+        "prevent_delete": true,
+        "prevent_update": true,
+        "copy_on_write": true,
+        "versioning_required": true,
+        "immutable_storage": false,
+        "exceptions": []
+      },
+      "custodians": [
+        { "id": "u:alice", "type": "user", "email": "alice@example.com", "display_name": "Alice" },
+        { "id": "svc:archiver", "type": "service" }
+      ],
+      "approvals": {
+        "required": 2,
+        "steps": [
+          { "role": "legal_counsel", "status": "approved", "timestamp": "2025-08-01T08:30:00Z",
+            "assignee": { "id": "u:gc", "type": "user", "email": "gc@example.com" } },
+          { "role": "compliance_officer", "status": "approved", "timestamp": "2025-08-01T08:45:00Z",
+            "assignee": { "id": "u:co", "type": "user", "email": "co@example.com" } }
+        ]
+      },
+      "notifications": {
+        "recipients": [
+          { "channel": "email", "email": "legal-notify@example.com" }
+        ],
+        "triggers": ["on_apply", "on_violation"]
+      },
+      "webhooks": [
+        { "url": "https://hooks.example.com/legalhold", "method": "POST", "secret_header": "X-Signature", "secret_value_env": "WEBHOOK_SECRET" }
+      ],
+      "audit": [
+        { "at": "2025-08-01T08:00:00Z", "actor": { "id": "u:alice", "type": "user" }, "action": "create" },
+        { "at": "2025-08-01T08:45:00Z", "actor": { "id": "u:co", "type": "user" }, "action": "approve" }
+      ],
+      "labels": { "env": "staging" },
+      "created_at": "2025-08-01T08:00:00Z",
+      "updated_at": "2025-08-01T08:45:00Z",
+      "created_by": { "id": "u:alice", "type": "user" },
+      "updated_by": { "id": "u:co", "type": "user" },
+      "etag": "W/\"a1b2c3d4\""
+    }
+  ]
+}

@@ -1,0 +1,347 @@
+# OblivionVault Core — DEV environment overrides (industrial-grade)
+# Этот файл переопределяет prod-значения из configs/oblivionvault.yaml для локальной разработки.
+# Не используйте в PROD.
+
+env: "dev"
+version: "1.0"
+
+server:
+  bind_addr: "127.0.0.1"
+  port: 9443
+  # В DEV допускаем HTTP для удобства локальной отладки инструментами без TLS.
+  http_enabled: true
+  https_enabled: true
+  request_timeout: 60
+  read_header_timeout: 20
+  idle_timeout: 120
+  max_request_body_mb: 64
+  security_headers:
+    strict_transport_security: "max-age=0"     # в dev без HSTS
+    x_content_type_options: "nosniff"
+    x_frame_options: "SAMEORIGIN"
+    referrer_policy: "no-referrer"
+    content_security_policy: "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:"
+    permissions_policy: "geolocation=(), microphone=(), camera=()"
+  cors:
+    enabled: true
+    allow_origins: ["http://localhost:3000","http://127.0.0.1:3000","http://localhost:5173","http://127.0.0.1:5173"]
+    allow_methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+    allow_headers: ["Authorization","Content-Type","X-Request-Id","X-Tenant-Id"]
+    allow_credentials: true
+    max_age_seconds: 600
+  grpc:
+    enabled: false
+  unix_socket:
+    enabled: false
+
+tls:
+  # Разрешаем self-signed сертификат в DEV (или отключаем TLS при необходимости).
+  mode: "optional"        # required|optional|disabled
+  min_version: "TLS1.2"
+  prefer_server_ciphers: false
+  cipher_suites:
+    - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+    - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+    - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+  certificate_file: "/etc/oblivionvault/tls/server.crt"
+  private_key_file: "/etc/oblivionvault/tls/server.key"
+  client_ca_file: ""
+  ocsp:
+    stapling_enabled: false
+  session_tickets:
+    enabled: true
+  hsts_preload: false
+
+mtls:
+  enabled: false
+  require_san_match: false
+  san_allowed_dns: []
+  san_allowed_ips: []
+
+api:
+  base_path: "/api"
+  pagination:
+    default_limit: 100
+    max_limit: 1000
+  idempotency:
+    enabled: true
+    header: "Idempotency-Key"
+    ttl_seconds: 900
+
+authn:
+  # В DEV включаем static auth для удобства, остальные провайдеры в режиме off или mock.
+  order: ["static","jwt","oidc"]
+  oidc:
+    enabled: false
+    issuer: ""
+    client_id: ""
+    client_secret: ""
+    jwks_url: ""
+    scopes: ["openid","profile","email","groups"]
+    username_claim: "preferred_username"
+    groups_claim: "groups"
+    cache_ttl_seconds: 60
+  jwt:
+    enabled: false
+    issuers: []
+  static:
+    enabled: true
+    users:
+      # Пароль указывается в виде хеша (bcrypt/argon2). Пример ниже — пусто.
+      - username: "admin"
+        password_hash: "${OV_DEV_ADMIN_PASS_HASH:-}"
+        roles: ["admin"]
+      - username: "dev"
+        password_hash: "${OV_DEV_USER_PASS_HASH:-}"
+        roles: ["writer"]
+
+authz:
+  model: "rbac"
+  default_role: "reader"
+  roles:
+    - name: "admin"
+      description: "Full administrative access (DEV)"
+      privileges: ["*"]
+    - name: "writer"
+      description: "Create/update secrets and metadata"
+      privileges: ["secrets:create","secrets:update","secrets:read","secrets:list","status:read"]
+    - name: "reader"
+      description: "Read-only access"
+      privileges: ["secrets:read","secrets:list","status:read"]
+  policy_overrides_file: ""   # можно указать локальный путь к кастомной RBAC-политике
+
+tenancy:
+  mode: "single"
+  header_tenant_key: "X-Tenant-Id"
+  enforce_isolation: false
+
+storage:
+  engine: "file"
+  file:
+    path: "/var/lib/oblivionvault/data"
+    fsync_on_write: false   # в dev ускоряем запись
+  etcd:
+    endpoints: []
+  postgres:
+    dsn: ""
+  s3:
+    bucket: ""
+
+encryption:
+  master_key_source: "env"      # в dev берём ключ из ENV
+  env:
+    # Сгенерируйте 32/64-байтный ключ в base64: `openssl rand -base64 32`
+    key_b64: "${OV_DEV_MASTER_KEY_B64:-}"
+  file:
+    path: "/etc/oblivionvault/keys/master.key"
+  kms:
+    provider: "hashicorp"
+    hashicorp:
+      addr: "https://127.0.0.1:8200"
+      token: ""
+      transit_key: "ov-master-dev"
+      tls_skip_verify: true
+  key_rotation:
+    enabled: false           # ротацию в dev обычно выключаем
+    interval_days: 90
+    window_days: 30
+    reencrypt_batch_size: 50
+
+secrets:
+  max_secret_size_kb: 256
+  max_metadata_size_kb: 16
+  default_ttl_hours: 0
+  max_versions: 5
+  delete_protection: false
+  soft_delete_retention_days: 7
+  access_policy:
+    require_reason: false
+    record_reason_in_audit: false
+  namespaces:
+    reserved: ["system","internal","dev"]
+
+audit:
+  enabled: true
+  mode: "append-only"
+  redact_fields: ["data.value","credentials","token","password","secret"]
+  sinks:
+    - type: "file"
+      path: "/var/log/oblivionvault/audit.log"
+      rotate:
+        max_size_mb: 64
+        max_backups: 7
+        max_age_days: 14
+        compress: true
+  events:
+    include: ["authn.*","authz.*","secrets.*","system.policy.*"]
+    exclude: ["backup.*"]   # бэкапы обычно отключены в dev
+
+logging:
+  level: "debug"
+  format: "json"
+  file: "/var/log/oblivionvault/oblivionvault.log"
+  rotate:
+    max_size_mb: 64
+    max_backups: 10
+    max_age_days: 7
+    compress: true
+  sampling:
+    enabled: false
+
+telemetry:
+  prometheus:
+    enabled: true
+    bind_addr: "127.0.0.1"
+    port: 9464
+    path: "/metrics"
+  tracing:
+    enabled: true
+    exporter: "otlp"
+    otlp:
+      endpoint: "http://127.0.0.1:4318"
+      protocol: "http/protobuf"
+      timeout_seconds: 3
+    sampling_ratio: 1.0      # в dev полная трассировка
+  health:
+    liveness_path: "/healthz"
+    readiness_path: "/readyz"
+
+ratelimit:
+  enabled: true
+  global_rps: 10000
+  per_ip_rps: 500
+  burst: 2000
+  key_strategies: ["ip","user"]
+  penalty_box_seconds: 10
+
+quotas:
+  enabled: true
+  tenants:
+    default:
+      secrets_per_day: 100000
+      read_ops_per_min: 50000
+      write_ops_per_min: 5000
+    overrides: {}
+
+waf:
+  enabled: true
+  # В DEV режим отчётов, не блокируем — облегчаем отладку фронтенда.
+  report_only: true
+  blocklist_ips: []
+  allowlist_ips: ["127.0.0.1"]
+  max_uri_length: 4096
+  max_header_count: 128
+  deny_request_patterns:
+    - "(?i)<script[^>]*>"
+    - "(?i)(union\\s+select|information_schema)"
+
+cluster:
+  enabled: false
+  node_id: ""
+  advertise_addr: ""
+  peers: []
+  election_timeout_ms: 1500
+  heartbeat_ms: 200
+  shard_count: 4
+  consistency: "one"
+
+maintenance:
+  auto_compaction_hours: 0    # отключаем автокомпакцию в dev
+  auto_vacuum: false
+  defrag_percent: 0
+  orphan_sweeper:
+    enabled: true
+    interval_minutes: 10
+
+backups:
+  enabled: false
+  schedule_cron: "0 3 * * *"
+  retention_days: 7
+  target:
+    type: "file"
+    file:
+      path: "/var/backups/oblivionvault"
+    s3:
+      bucket: ""
+      prefix: "ov/backup"
+      region: ""
+      kms_key_id: ""
+      sse: "aws:kms"
+  verify:
+    enabled: false
+    strategy: "checksum"
+  throttle_mb_per_s: 0
+
+plugins:
+  allowed: ["*"]                         # разрешаем любые плагины в dev
+  dir: "/var/lib/oblivionvault/plugins"
+  sandbox:
+    enabled: true
+    allow_network: true                  # разрешаем сетевые вызовы плагинам в dev
+    max_cpu_percent: 50
+    memory_limit_mb: 512
+
+migrations:
+  auto_apply: true
+  wait_ready_seconds: 10
+
+features:
+  soft_delete: true
+  secret_sharing: true
+  sealed_secrets: true
+  ttl_enforce: false
+  api_keys:
+    enabled: true
+    prefix: "ovk_dev_"
+    length: 32
+
+compliance:
+  cis_level: 0               # в dev не требуем CIS
+  gdpr:
+    data_minimization: false
+    export_enabled: true
+    delete_on_request: false
+  logging_pii:
+    allowed_fields: ["email","username"]
+    drop_unknown: false
+
+observability:
+  request_id_header: "X-Request-Id"
+  correlation:
+    propagate_headers: ["X-Request-Id","X-Correlation-Id","traceparent"]
+  redaction:
+    patterns:
+      - "(?i)authorization: Bearer .*"
+      - "(?i)password=[^&\\s]+"
+      - "(?i)secret=[^&\\s]+"
+
+endpoints:
+  - path: "/api/v1/secrets"
+    methods: ["GET","POST","PUT","DELETE"]
+    required_privileges:
+      GET: ["secrets:read"]
+      POST: ["secrets:create"]
+      PUT: ["secrets:update"]
+      DELETE: ["secrets:delete"]
+  - path: "/api/v1/status"
+    methods: ["GET"]
+    required_privileges:
+      GET: ["status:read"]
+
+developer_tools:
+  # Утилиты для локальной разработки: сиды, фикстуры, мок‑провайдеры.
+  seed_on_boot: true
+  fixtures:
+    tenants:
+      - id: "dev"
+        name: "Development Tenant"
+    users:
+      - username: "dev"
+        roles: ["writer"]
+    secrets:
+      - name: "demo/api-key"
+        value_b64: "ZGVtby1hcGkta2V5LWRldi0xMjM="   # base64("demo-api-key-dev-123")
+        metadata:
+          description: "Demo key for local testing"
+          owner: "dev"

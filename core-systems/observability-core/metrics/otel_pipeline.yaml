@@ -1,0 +1,101 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+  memory_limiter:
+    check_interval: 2s
+    limit_mib: 512
+    spike_limit_mib: 128
+  attributes:
+    actions:
+      - key: tenant_id
+        value: ${TENANT_ID}
+        action: insert
+      - key: zone
+        value: genesis
+        action: upsert
+      - key: component
+        from_attribute: service.name
+        action: upsert
+
+  filter/deny_sensitive:
+    logs:
+      exclude:
+        match_type: strict
+        record_attributes:
+          - key: log.level
+            value: debug
+    traces:
+      exclude:
+        match_type: regexp
+        span_names:
+          - ".*password.*"
+          - ".*auth_token.*"
+
+exporters:
+  logging:
+    loglevel: info
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: otel
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  otlp/loki:
+    endpoint: http://loki:4317
+    tls:
+      insecure: true
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  file/log_archive:
+    path: /var/log/otel/genesis-archive.log
+    rotation:
+      max_megabytes: 100
+      max_backups: 5
+      max_age: 14
+  elasticsearch:
+    endpoint: http://elasticsearch:9200
+    tls:
+      insecure: true
+
+connectors:
+  spanmetrics:
+    histogram:
+      explicit:
+        bounds: [0.01, 0.05, 0.1, 0.5, 1, 2, 5]
+
+extensions:
+  health_check:
+  pprof:
+    endpoint: :1888
+  zpages:
+    endpoint: :55679
+  memory_ballast:
+    size_in_percentage: 20
+
+service:
+  extensions: [health_check, pprof, zpages, memory_ballast]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, attributes, filter/deny_sensitive]
+      exporters: [otlp/jaeger, otlp/tempo, logging]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, attributes]
+      exporters: [prometheus, logging]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, attributes, filter/deny_sensitive]
+      exporters: [otlp/loki, file/log_archive, elasticsearch]

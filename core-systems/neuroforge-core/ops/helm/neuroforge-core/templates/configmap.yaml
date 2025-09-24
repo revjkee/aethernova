@@ -1,0 +1,208 @@
+# file: neuroforge-core/ops/helm/neuroforge-core/templates/configmap.yaml
+{{- /*
+Industrial ConfigMap template.
+Supports:
+- Single map:   .Values.configMap
+- Multiple:     .Values.configMaps (array of objects with same schema as configMap)
+Fields per item:
+  enabled: bool (default true)
+  name: string (optional explicit name)
+  nameSuffix: string (appended to computed fullname, e.g., "-app")
+  labels: map[string]string
+  annotations: map[string]string
+  immutable: bool
+  data: map[string]string                # plain key -> value
+  tplData: map[string]string             # rendered via tpl against root
+  files: map[string]string               # key -> path inside chart (files/)
+  fileGlobs: []string                    # glob patterns; keys use base filename
+  binaryData: map[string]string          # key -> base64 string
+  binaryFiles: []string                  # file paths; keys use base filename (auto base64)
+Checksum (checksum/config) is computed over all data/binaryData/files/fileGlobs/tplData with sorted keys.
+*/ -}}
+
+{{- $root := . -}}
+
+{{- /* helper: safe base name for chart */ -}}
+{{- $chartName := default .Chart.Name .Values.nameOverride -}}
+
+{{- /* helper: build fullname */ -}}
+{{- $baseFullname := printf "%s-%s" .Release.Name $chartName | trunc 63 | trimSuffix "-" -}}
+
+{{- /* helper: produce deterministic serialized content for checksum */ -}}
+{{- define "nf.cfg.checksumSrc" -}}
+{{- $ctx := index . 0 -}}
+{{- $item := index . 1 -}}
+{{- $s := "" -}}
+{{- /* plain data */ -}}
+{{- if $item.data -}}
+  {{- $keys := keys $item.data | sortAlpha -}}
+  {{- range $keys -}}
+    {{- $k := . -}}
+    {{- $v := index $item.data $k -}}
+    {{- $s = printf "%sD:%s=%v\n" $s $k $v -}}
+  {{- end -}}
+{{- end -}}
+{{- /* tplData (rendered) */ -}}
+{{- if $item.tplData -}}
+  {{- $keys := keys $item.tplData | sortAlpha -}}
+  {{- range $keys -}}
+    {{- $k := . -}}
+    {{- $raw := index $item.tplData $k -}}
+    {{- $v := tpl $raw $ctx -}}
+    {{- $s = printf "%sT:%s=%v\n" $s $k $v -}}
+  {{- end -}}
+{{- end -}}
+{{- /* files (explicit map) */ -}}
+{{- if $item.files -}}
+  {{- $keys := keys $item.files | sortAlpha -}}
+  {{- range $keys -}}
+    {{- $k := . -}}
+    {{- $path := index $item.files $k -}}
+    {{- $content := $.Files.Get $path | default "" -}}
+    {{- $s = printf "%sF:%s@%s\n%s\n" $s $k $path $content -}}
+  {{- end -}}
+{{- end -}}
+{{- /* fileGlobs (collect all, use base filename as key) */ -}}
+{{- if $item.fileGlobs -}}
+  {{- range $g := $item.fileGlobs -}}
+    {{- $matches := $.Files.Glob $g -}}
+    {{- range $path, $_ := $matches -}}
+      {{- $key := base $path -}}
+      {{- $content := $.Files.Get $path | default "" -}}
+      {{- $s = printf "%sG:%s@%s\n%s\n" $s $key $path $content -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- /* binaryData explicit */ -}}
+{{- if $item.binaryData -}}
+  {{- $keys := keys $item.binaryData | sortAlpha -}}
+  {{- range $keys -}}
+    {{- $k := . -}}
+    {{- $v := index $item.binaryData $k -}}
+    {{- $s = printf "%sB:%s=%v\n" $s $k $v -}}
+  {{- end -}}
+{{- end -}}
+{{- /* binaryFiles collected */ -}}
+{{- if $item.binaryFiles -}}
+  {{- range $p := $item.binaryFiles -}}
+    {{- $content := $.Files.Get $p | default "" -}}
+    {{- $key := base $p -}}
+    {{- $b64 := b64enc $content -}}
+    {{- $s = printf "%sX:%s@%s\n%s\n" $s $key $p $b64 -}}
+  {{- end -}}
+{{- end -}}
+{{- $s -}}
+{{- end -}}
+
+{{- /* helper: render data map for output */ -}}
+{{- define "nf.cfg.renderData" -}}
+{{- $ctx := index . 0 -}}
+{{- $item := index . 1 -}}
+{{- $out := dict -}}
+{{- if $item.data -}}
+  {{- range $k, $v := $item.data -}}
+    {{- $_ := set $out $k $v -}}
+  {{- end -}}
+{{- end -}}
+{{- if $item.tplData -}}
+  {{- range $k, $tpl := $item.tplData -}}
+    {{- $_ := set $out $k (tpl $tpl $ctx) -}}
+  {{- end -}}
+{{- end -}}
+{{- if $item.files -}}
+  {{- range $k, $p := $item.files -}}
+    {{- $_ := set $out $k ($.Files.Get $p | default "") -}}
+  {{- end -}}
+{{- end -}}
+{{- if $item.fileGlobs -}}
+  {{- range $g := $item.fileGlobs -}}
+    {{- $matches := $.Files.Glob $g -}}
+    {{- range $p, $_ := $matches -}}
+      {{- $_ := set $out (base $p) ($.Files.Get $p | default "") -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $out -}}
+{{- end -}}
+
+{{- /* helper: render binaryData map for output */ -}}
+{{- define "nf.cfg.renderBinary" -}}
+{{- $ctx := index . 0 -}}
+{{- $item := index . 1 -}}
+{{- $out := dict -}}
+{{- if $item.binaryData -}}
+  {{- range $k, $v := $item.binaryData -}}
+    {{- $_ := set $out $k $v -}}
+  {{- end -}}
+{{- end -}}
+{{- if $item.binaryFiles -}}
+  {{- range $p := $item.binaryFiles -}}
+    {{- $_ := set $out (base $p) (b64enc ($.Files.Get $p | default "")) -}}
+  {{- end -}}
+{{- end -}}
+{{- $out -}}
+{{- end -}}
+
+{{- /* unify to an array: if .Values.configMaps present and non-empty, use it; otherwise wrap .Values.configMap */ -}}
+{{- $items := list -}}
+{{- if and .Values.configMaps (gt (len .Values.configMaps) 0) -}}
+  {{- $items = .Values.configMaps -}}
+{{- else -}}
+  {{- if not (hasKey .Values "configMap") -}}
+    {{- $items = list dict "enabled" true "nameSuffix" "-config" -}}
+  {{- else -}}
+    {{- $cm := .Values.configMap | default dict -}}
+    {{- $items = list $cm -}}
+  {{- end -}}
+{{- end -}}
+
+{{- /* render each item */ -}}
+{{- range $idx, $item := $items }}
+{{- if not (hasKey $item "enabled") }}{{- $_ := set $item "enabled" true -}}{{- end -}}
+{{- if $item.enabled }}
+{{- /* compute name */ -}}
+{{- $suffix := $item.nameSuffix | default "-config" -}}
+{{- $computedName := printf "%s%s" $baseFullname $suffix | trunc 63 | trimSuffix "-" -}}
+{{- $name := $item.name | default $computedName -}}
+{{- /* labels and annotations */ -}}
+{{- $baseLabels := dict
+      "app.kubernetes.io/name" $chartName
+      "app.kubernetes.io/instance" .Release.Name
+      "app.kubernetes.io/managed-by" "Helm"
+      "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_")
+-}}
+{{- $labels := merge (dict) $baseLabels (.Values.commonLabels | default (dict)) ($item.labels | default (dict)) -}}
+{{- $ann := merge (dict) (.Values.commonAnnotations | default (dict)) ($item.annotations | default (dict)) -}}
+{{- /* checksum */ -}}
+{{- $src := include "nf.cfg.checksumSrc" (list $root $item) -}}
+{{- $sum := sha256sum $src -}}
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+{{- toYaml $labels | nindent 4 }}
+  annotations:
+    checksum/config: {{ $sum | quote }}
+{{- if $ann }}
+{{ toYaml $ann | nindent 4 }}
+{{- end }}
+{{- if hasKey $item "immutable" }}
+immutable: {{ $item.immutable | default false }}
+{{- end }}
+data:
+{{- $data := (include "nf.cfg.renderData" (list $root $item) | fromYaml) -}}
+{{- if $data }}
+{{ toYaml $data | nindent 2 }}
+{{- else }}
+  {}
+{{- end }}
+{{- $bin := (include "nf.cfg.renderBinary" (list $root $item) | fromYaml) -}}
+{{- if $bin }}
+binaryData:
+{{ toYaml $bin | nindent 2 }}
+{{- end }}
+---
+{{- end }}
+{{- end }}

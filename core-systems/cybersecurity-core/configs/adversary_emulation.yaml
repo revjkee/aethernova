@@ -1,0 +1,379 @@
+# cybersecurity-core/configs/adversary_emulation.yaml
+# Конфигурация фреймворка имитации противника (Adversary Emulation)
+# Методологические опоры (проверяемые источники):
+# - NIST SP 800-115 (руководство по тестированию безопасности): https://csrc.nist.gov/publications/detail/sp/800-115/final
+# - NIST SP 800-207 (Zero Trust Architecture): https://csrc.nist.gov/publications/detail/sp/800-207/final
+# - CISA Zero Trust Maturity Model v2.0: https://www.cisa.gov/zero-trust-maturity-model
+# - MITRE ATT&CK (тактики/техники): https://attack.mitre.org/
+# - RFC 5280 (X.509 PKI): https://www.rfc-editor.org/rfc/rfc5280
+# - OAuth 2.0 (RFC 6749): https://www.rfc-editor.org/rfc/rfc6749
+# - OpenID Connect Core 1.0: https://openid.net/specs/openid-connect-core-1_0.html
+
+version: "1.0"
+
+schema:
+  # Семантика ключевых полей ровняется на практики MITRE CTID Adversary Emulation Library
+  # Источник: https://github.com/center-for-threat-informed-defense/adversary_emulation_library
+  scenario:
+    required: [id, name, steps]
+  step:
+    required: [id, name]
+  policy:
+    required: [deny_by_default]
+
+globals:
+  project: "Aethernova cybersecurity-core"
+  # Безопасные дефолты в духе NIST SP 800-115: dry-run включен, prod запрещен, деструктивные шаги запрещены
+  safety:
+    dry_run: true     # NIST SP 800-115 рекомендует безопасные методики и контроль риска
+    allow_prod: false
+    allow_destructive: false
+    max_concurrency: 2
+    default_timeout_s: 600
+    retry_attempts: 2
+    retry_backoff_base_s: 1.5
+    rate_limit_per_min: 60
+    artifact_retention_days: 180
+  logging:
+    level: INFO
+    json_formatter: true
+    stdout: true
+    file:
+      enabled: true
+      path: ./logs/adversary_emulation.log
+      rotate_mb: 100
+      backups: 10
+  audit:
+    enabled: true
+    dir: ./audit
+    file_prefix: adversary_emulation
+    redact:
+      enabled: true
+      patterns:
+        - '(?i)api[_-]?key'
+        - '(?i)secret'
+        - '(?i)password'
+  telemetry:
+    # OpenTelemetry — трассировка сценариев и шагов
+    # Практика производственного наблюдения, совместима с NIST SP 800-115 (логирование/отчётность)
+    opentelemetry:
+      enabled: true
+      exporter: otlp
+      endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
+      service_name: "adversary-emulation"
+  rbac:
+    # Базовый RBAC: роли и разрешения для запуска сценариев/доменных тестов
+    roles:
+      - name: ae_admin
+        permissions: ["scenario:*", "policy:override"]
+      - name: ae_operator
+        permissions: ["scenario:run", "scenario:list", "report:view"]
+      - name: ae_viewer
+        permissions: ["report:view"]
+    assignments:
+      # Идентификаторы субъектов — зависят от вашей IDM/SSO (OIDC 'sub' или email)
+      - subject: "${AE_ADMIN_SUB:-admin@example.org}"
+        roles: ["ae_admin"]
+  secrets:
+    # Рекомендуется хранить секреты вне файла: переменные окружения, vault, KMS.
+    # Здесь только «ссылки» на переменные окружения.
+    oidc:
+      issuer: "${OIDC_ISSUER:-https://issuer.example.com}"
+      audience: "${OIDC_AUDIENCE:-ae-audience}"
+      jwks_url: "${OIDC_JWKS_URL:-https://issuer.example.com/.well-known/jwks.json}"
+      algorithms: ["RS256","ES256"]  # JOSE безопасные по умолчанию
+      leeway_s: 60  # OIDC допускает небольшой leeway
+    mtls:
+      trust_store_pem: "${MTLS_TRUST_STORE:-./pki/trust_store.pem}"
+      min_tls_version: "TLSv1_2"     # Практически согласуется с NIST рекомендациями по TLS 1.2+
+      ciphers: null
+    opa:
+      url: "${OPA_URL:-http://localhost:8181/v1/data/ae/policy/allow}"
+      allow_on_unavailable: false
+
+environments:
+  lab:
+    inherits: [globals]
+    safety:
+      dry_run: true
+      allow_prod: false
+      allow_destructive: false
+      max_concurrency: 4
+  staging:
+    inherits: [globals]
+    safety:
+      dry_run: true
+      allow_prod: false
+      max_concurrency: 3
+  prod:
+    inherits: [globals]
+    # По умолчанию запрет на запуск в prod (NIST SP 800-115 — управление риском).
+    safety:
+      dry_run: true
+      allow_prod: false
+      allow_destructive: false
+      max_concurrency: 2
+
+# Политика принятия решений (PDP) — deny-by-default в духе NIST SP 800-207/CISA ZTMM
+policy:
+  deny_by_default: true   # NIST SP 800-207: явные проверки, явные разрешения
+  require_identity: true  # Identity домен (OIDC/OAuth2) — RFC 6749; OIDC Core
+  require_device: true    # Device posture (CISA ZTMM: Device домен)
+  require_network: true   # Network segmentation/path + TLS/mTLS (RFC 5280)
+  builtin:
+    # Минимальные правила: все обязательные домены должны пройти
+    conditions:
+      - any_of:
+          - identity.jwt_validation == true
+        description: "Identity OK (OIDC/OAuth2)"
+      - all_of:
+          - device.required_failed == false
+        description: "Device posture OK"
+      - all_of:
+          - network.required_failed == false
+        description: "Network path OK"
+  opa:
+    enabled: true
+    url: "${OPA_URL:-http://localhost:8181/v1/data/ae/policy/allow}"
+    allow_on_unavailable: false
+    input_template:
+      env: "${APP_ENV:-lab}"
+      system:
+        hostname: "${HOSTNAME:-unknown}"
+        ts: "__now__"
+
+# Общие проверки, используемые сценариями (DRY)
+checks:
+  identity:
+    jwt_rules: &jwt_rules
+      issuer: "${OIDC_ISSUER:-https://issuer.example.com}"   # RFC 6749; OIDC Core
+      audience: "${OIDC_AUDIENCE:-ae-audience}"
+      jwks_url: "${OIDC_JWKS_URL:-https://issuer.example.com/.well-known/jwks.json}"
+      algorithms: ["RS256","ES256"]
+      leeway_s: 60
+      required_claims: ["iss","aud","sub","exp","iat"]
+  transport:
+    mtls_rules: &mtls_rules
+      verify_chain: true           # RFC 5280
+      trust_store_pem: "${MTLS_TRUST_STORE:-./pki/trust_store.pem}"
+      verify_hostname: true
+      min_tls_version: "TLSv1_2"
+      ciphers:
+  device_posture:
+    rules: &device_rules
+      - name: managed_device
+        required: true
+        params:
+          mdm_required: true
+      - name: disk_encryption
+        required: true
+        params:
+          acceptable: ["BitLocker","FileVault","LUKS"]
+      - name: edr_present
+        required: true
+        params:
+          vendors: ["CrowdStrike","DefenderATP","SentinelOne","CarbonBlack"]
+      - name: patch_level
+        required: false
+        params:
+          max_days_since_patch: 30
+
+# Сценарии имитации противника (примерный набор) — тактики/техники по MITRE ATT&CK
+scenarios:
+  - id: "scn-001"
+    name: "Initial Access & Discovery (ATT&CK)"
+    description: "Эмуляция начального доступа и разведки в духе ATT&CK (TA0001, TA0007)"
+    version: "1.0"
+    environment: "${APP_ENV:-lab}"
+    tags: ["attack", "initial-access", "discovery"]
+    safety:
+      dry_run: true
+      allow_destructive: false
+    identity: *jwt_rules
+    transport: *mtls_rules
+    device_posture:
+      rules: *device_rules
+    network:
+      rules:
+        - target_host: "app.internal.local"
+          target_port: 443
+          must_be_reachable: true
+          timeout_s: 5
+          tls: true
+          sni: "app.internal.local"
+        - target_host: "db.internal.local"
+          target_port: 5432
+          must_be_reachable: false   # сегментация БД может блокировать доступ с клиентской зоны
+          timeout_s: 3
+          tls: false
+    policy:
+      use_builtin: true
+      use_opa: true
+    planner:
+      max_concurrency: 2
+      default_timeout_s: 300
+      retry_attempts: 2
+      rate_limit_per_min: 60
+    steps:
+      - id: "step-001"
+        name: "Spearphishing Link (simulation)"
+        description: "TA0001/T1566.002 — симуляция доставки фишинговой ссылки без реальной рассылки"
+        # MITRE ATT&CK: https://attack.mitre.org/techniques/T1566/002/
+        tactic: "TA0001"     # Initial Access
+        technique: "T1566.002"
+        privilege: "USER"
+        timeout_s: 60
+        destructive: false
+        idempotent: true
+        enabled: true
+        params:
+          simulate_only: true
+      - id: "step-002"
+        name: "System Information Discovery"
+        description: "TA0007/T1082 — сбор системной информации (только чтение)"
+        # MITRE ATT&CK: https://attack.mitre.org/techniques/T1082/
+        tactic: "TA0007"     # Discovery
+        technique: "T1082"
+        privilege: "USER"
+        timeout_s: 60
+        depends_on: ["step-001"]
+        destructive: false
+        idempotent: true
+        enabled: true
+        params:
+          collect: ["os","hostname","domain","users"]
+      - id: "step-003"
+        name: "Account Discovery"
+        description: "TA0007/T1087 — инвентаризация аккаунтов (read-only)"
+        # MITRE ATT&CK: https://attack.mitre.org/techniques/T1087/
+        tactic: "TA0007"
+        technique: "T1087"
+        privilege: "USER"
+        timeout_s: 120
+        depends_on: ["step-002"]
+        destructive: false
+        idempotent: true
+        enabled: true
+        params:
+          scope: ["local","domain"]
+
+  - id: "scn-002"
+    name: "Lateral Movement (ATT&CK) — read-only"
+    description: "Эмуляция предпосылок к латеральному перемещению без деструкции (TA0008)"
+    version: "1.0"
+    environment: "${APP_ENV:-lab}"
+    tags: ["attack", "lateral-movement"]
+    safety:
+      dry_run: true
+      allow_destructive: false
+    identity: *jwt_rules
+    transport: *mtls_rules
+    device_posture:
+      rules: *device_rules
+    network:
+      rules:
+        - target_host: "jump.internal.local"
+          target_port: 22
+          must_be_reachable: true
+          timeout_s: 5
+          tls: false
+        - target_host: "fileshare.internal.local"
+          target_port: 445
+          must_be_reachable: false
+          timeout_s: 5
+          tls: false
+    policy:
+      use_builtin: true
+      use_opa: true
+    planner:
+      max_concurrency: 2
+      default_timeout_s: 300
+      retry_attempts: 2
+      rate_limit_per_min: 30
+    steps:
+      - id: "step-201"
+        name: "Remote System Discovery"
+        description: "TA0007/T1018 — обнаружение удалённых систем (read-only)"
+        # MITRE ATT&CK: https://attack.mitre.org/techniques/T1018/
+        tactic: "TA0007"
+        technique: "T1018"
+        privilege: "USER"
+        timeout_s: 120
+        destructive: false
+        idempotent: true
+        enabled: true
+      - id: "step-202"
+        name: "Valid Accounts (pre-check, no use)"
+        description: "TA0006/T1078 — проверка валидности учёток без входа"
+        # MITRE ATT&CK: https://attack.mitre.org/techniques/T1078/
+        tactic: "TA0006"     # Credential Access / Defense Evasion соседние домены
+        technique: "T1078"
+        privilege: "USER"
+        timeout_s: 120
+        depends_on: ["step-201"]
+        destructive: false
+        idempotent: true
+        enabled: true
+        params:
+          validate_only: true
+
+runners:
+  # Определение раннеров для исполнения шагов (наследуются сценариями)
+  # Никаких деструктивных действий по умолчанию, согласуется с NIST SP 800-115.
+  local_shell:
+    enabled: true
+    allow_commands:
+      - "whoami"
+      - "hostname"
+      - "uname -a"
+      - "wmic*"
+      - "net*"
+    deny_patterns:
+      - "(?i)rm\\s+-rf"
+      - "(?i)format"
+      - "(?i)del\\s+/f"
+  ssh:
+    enabled: false
+    host: "${AE_SSH_HOST:-}"
+    user: "${AE_SSH_USER:-}"
+    key_path: "${AE_SSH_KEY:-}"
+    safe_mode: true
+  winrm:
+    enabled: false
+    endpoint: "${AE_WINRM_ENDPOINT:-}"
+    user: "${AE_WINRM_USER:-}"
+    password_env: "AE_WINRM_PASSWORD"
+    safe_mode: true
+  http_api:
+    enabled: true
+    safe_methods: ["GET","HEAD","OPTIONS","POST"]
+    deny_paths:
+      - "(?i)/admin/delete"
+      - "(?i)/danger"
+
+reports:
+  formats:
+    - json
+    - html
+    - markdown
+  output_dir: ./reports
+  include:
+    scenario_summary: true
+    steps: true
+    timings: true
+    environment: true
+    signature_sha256: true
+
+# Валидаторы ссылок на источники (опционально, чтобы автоматом проверять доступность методологических URL)
+source_links_validation:
+  enabled: true
+  timeout_s: 5
+  must_succeed: false
+  urls:
+    - "https://csrc.nist.gov/publications/detail/sp/800-115/final"
+    - "https://csrc.nist.gov/publications/detail/sp/800-207/final"
+    - "https://www.cisa.gov/zero-trust-maturity-model"
+    - "https://attack.mitre.org/"
+    - "https://www.rfc-editor.org/rfc/rfc5280"
+    - "https://www.rfc-editor.org/rfc/rfc6749"
+    - "https://openid.net/specs/openid-connect-core-1_0.html"

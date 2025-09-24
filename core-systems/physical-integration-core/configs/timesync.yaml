@@ -1,0 +1,256 @@
+schema:
+  version: 1
+  description: >
+    Unified time synchronization configuration for industrial environments.
+    Drives generation of chrony, ptp4l, phc2sys and systemd-timesyncd configs, units and monitors.
+
+global:
+  timezone: "UTC"
+  # Максимально допустимое одномоментное расхождение (сек) до объявления аварии
+  max_offset_alarm_seconds: 1.000
+  # Порог WARNING (сек) для метрик/алертов
+  warn_offset_seconds: 0.200
+  # Допустимый дрейф (ppm) до пересоздания сервиса/аларма
+  max_drift_ppm: 500
+  # Паника при слишком большом смещении на старте (chrony 'makestep' only during bootstrap)
+  bootstrap_makestep:
+    enabled: true
+    threshold_seconds: 0.5
+    limit_updates: 3
+  # Общие теги и идентификатор узла (для шаблонов конфигов и логов)
+  identity:
+    node_name: "${HOSTNAME}"
+    site: "default-site"
+    environment: "prod"
+  logging:
+    level: "INFO"   # DEBUG|INFO|WARN|ERROR
+    directory: "/var/log/timesync"
+    rotate:
+      enabled: true
+      max_size_mb: 50
+      max_backups: 5
+      max_age_days: 30
+  metrics:
+    prometheus:
+      enabled: true
+      # Путь для textfile‑экспортера node_exporter
+      textfile_dir: "/var/lib/node_exporter/textfile_collector"
+      filenames:
+        chrony: "chrony_metrics.prom"
+        ptp: "ptp_metrics.prom"
+        phc2sys: "phc2sys_metrics.prom"
+    journal_events:
+      enabled: true
+      facility: "daemon"
+
+profiles:
+  # Профиль ЦОД: первичен PTP (hardware PHC), затем NTP‑NTS как резерв, потом timesyncd
+  datacenter:
+    preferred_backend_order: ["ptp", "chrony", "timesyncd"]
+    health:
+      holdoff_seconds: 15
+      consecutive_failures_for_critical: 5
+    cpu_affinity:
+      ptp:
+        enabled: true
+        cpus: "2-3"
+      phc2sys:
+        enabled: true
+        cpus: "4"
+    network_qos:
+      ptp_vlan_priority: 6
+      dscp: 46
+  # Профиль EDGE: возможны джиттеры сети, агрессивнее фильтры и более частый polling
+  edge:
+    preferred_backend_order: ["chrony", "ptp", "timesyncd"]
+    health:
+      holdoff_seconds: 20
+      consecutive_failures_for_critical: 6
+    chrony_tuning:
+      minpoll: 4
+      maxpoll: 10
+      maxsources: 8
+  # ВМ/контейнеры: только NTP (NTS), PTP опционален при passthrough PHC
+  vm:
+    preferred_backend_order: ["chrony", "timesyncd"]
+    health:
+      holdoff_seconds: 30
+      consecutive_failures_for_critical: 8
+    chrony_tuning:
+      minpoll: 6
+      maxpoll: 10
+      maxsources: 4
+
+backends:
+  chrony:
+    enabled: true
+    # Включить NTS (Network Time Security) — требуется chrony >= 4 и доступ к NTS‑KE серверам
+    nts:
+      enabled: true
+      # Замените на утвержденные в вашей организации NTS‑серверы
+      servers:
+        - hostname: "time1.example-nts.org"
+          port: 4460
+          iburst: true
+          maxdelay: 0.2
+        - hostname: "time2.example-nts.org"
+          port: 4460
+          iburst: true
+          maxdelay: 0.2
+      trust_anchors:
+        # Пути к доверенным корневым сертификатам/пинам (PEM/Hash)
+        ca_bundle: "/etc/ssl/certs/ca-bundle.crt"
+        extra_certs: []
+      # Ограничения TLS версии/шифров (при поддержке сборкой)
+      tls:
+        min_version: "TLS1.2"
+        ciphersuites: []
+    # Обычные NTP‑серверы (fallback, если NTS недоступен)
+    servers:
+      - hostname: "ntp1.example.org"
+        iburst: true
+        prefer: true
+        maxdelay: 0.3
+      - hostname: "ntp2.example.org"
+        iburst: true
+        maxdelay: 0.3
+    pools: []
+    # Ограничение доступа сервера NTP (при работе как локальный реф‑источник)
+    allow_networks: []  # например ["10.0.0.0/8","192.168.0.0/16"]
+    deny_default: true
+    # Тонкая настройка chrony
+    tuning:
+      rtcsync: true
+      leapsectz: "right/UTC"
+      minsamples: 6
+      maxsamples: 12
+      maxslewrate_ppm: 500
+      maxupdateskew: 100.0
+      makestep:
+        enabled: true
+        threshold_seconds: 0.5
+        limit_updates: 3
+      driftfile: "/var/lib/chrony/drift"
+      logdir: "/var/log/chrony"
+      log:
+        - "measurements"
+        - "statistics"
+        - "tracking"
+      noclientlog: true
+      hwtimestamp: false
+      # Ключи/автоключи (если используется симметричная аутентификация)
+      keys:
+        enabled: false
+        file: "/etc/chrony.keys"
+      keyfile_autogen:
+        enabled: false
+        algorithm: "sha256"
+  ptp:
+    enabled: true
+    # Список интерфейсов, участвующих в PTP (IEEE 1588)
+    interfaces:
+      - name: "ens2f0"
+        # PTP‑домен
+        domain: 24
+        transport: "L2"          # L2|UDPv4|UDPv6
+        delay_mechanism: "E2E"   # E2E|P2P
+        priority1: 128
+        priority2: 128
+        # Фильтры и качество
+        freq_est_interval: 1
+        summary_interval: 1
+        neighbor_prop_delay_thresh_ns: 200000
+        tx_timestamp_timeout_ms: 10
+        # Аппаратные часы (PHC) на интерфейсе
+        phc_device: "/dev/ptp0"
+        # QoS и DSCP могут применяться через tc/ethtool извне генератора конфигов
+        qos:
+          dscp: 46
+          vlan_priority: 6
+    # Привязка системных часов к PHC/GMC с помощью phc2sys
+    phc2sys:
+      enabled: true
+      # Источник (‑s) и цель (‑c) — обычно PHC → CLOCK_REALTIME
+      source: "/dev/ptp0"
+      clock: "CLOCK_REALTIME"
+      step_threshold_ms: 0.5
+      poll_interval_ms: 1000
+      # Приоритет CPU
+      cpu_affinity: "4"
+      realtime_priority: 60
+    # Общая тонкая настройка ptp4l
+    tuning:
+      clockClass: 248
+      clockAccuracy: 0xFE
+      offsetScaledLogVariance: 0xFFFF
+      announceReceiptTimeout: 3
+      syncReceiptTimeout: 3
+      message_tagging: true
+      logging_level: 6      # 6=INFO
+      log_file: "/var/log/ptp/ptp4l.log"
+  timesyncd:
+    enabled: true
+    servers:
+      - "fallback1.example.org"
+      - "fallback2.example.org"
+    fallback_ntp: []
+    poll_interval_min_sec: 32
+    poll_interval_max_sec: 2048
+    root_distance_max_usec: 1500000
+    # Внимание: timesyncd не поддерживает NTS; используется как резерв
+
+# Маппинг профилей к конкретным узлам/ролям (опционально)
+assignment:
+  selectors:
+    - match:
+        site: "dc-eu-1"
+        environment: "prod"
+      profile: "datacenter"
+    - match:
+        site: "edge-se-1"
+        environment: "prod"
+      profile: "edge"
+    - match:
+        environment: "dev"
+      profile: "vm"
+
+# Политики контроля и проверки (валидаторы для CI/CD)
+policy:
+  validations:
+    - id: "require-secure-ntp"
+      description: "NTP должен использовать NTS при включенном chrony"
+      when:
+        backends.chrony.enabled: true
+      assert:
+        backends.chrony.nts.enabled: true
+    - id: "ptp-phc-required"
+      description: "PTP включает phc2sys только при наличии PHC‑устройства"
+      when:
+        backends.ptp.enabled: true
+        backends.ptp.phc2sys.enabled: true
+      assert:
+        backends.ptp.interfaces[*].phc_device: "present"
+    - id: "strict-offset-thresholds"
+      description: "Порог тревог должен быть согласован"
+      assert:
+        global.warn_offset_seconds: "<= global.max_offset_alarm_seconds"
+  generation:
+    # Целевые места вывода сгенерированных конфигов
+    outputs:
+      chrony_conf: "/etc/chrony.conf"
+      ptp4l_conf: "/etc/ptp4l.conf"
+      phc2sys_unit: "/etc/systemd/system/phc2sys.service.d/override.conf"
+      timesyncd_conf: "/etc/systemd/timesyncd.conf"
+    # Имена systemd unit‑ов, которые будет перезапускать автоматизация
+    systemd_units:
+      - "chronyd.service"
+      - "ptp4l.service"
+      - "phc2sys.service"
+      - "systemd-timesyncd.service"
+
+# Секреты/сертификаты (ссылки на файлы/хранилища — не храните приватное в этом YAML)
+secrets:
+  nts:
+    ke_client_cert: ""     # путь к клиентскому сертификату, если NTS‑KE у провайдера требует mTLS
+    ke_client_key: ""      # путь к ключу
+    ca_bundle: "/etc/ssl/certs/ca-bundle.crt"

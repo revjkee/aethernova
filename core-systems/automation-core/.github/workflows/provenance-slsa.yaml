@@ -1,0 +1,81 @@
+# automation-core/.github/workflows/provenance-slsa.yaml
+name: provenance-slsa
+
+on:
+  # Генерация provenance на релизах и тэгированных пушах
+  release:
+    types: [published]
+  push:
+    tags:
+      - "*"          # при необходимости сузьте, например: v*.*.*
+  # Ручной запуск
+  workflow_dispatch: {}
+
+# Избегаем гонок по одной и той же ссылке
+concurrency:
+  group: provenance-${{ github.ref }}
+  cancel-in-progress: true
+
+# Версию генератора держим в одном месте (обновляйте по мере выхода релизов)
+env:
+  SLSA_GENERATOR_VERSION: v2.1.0
+
+jobs:
+  build:
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      b64_subjects: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Замените блок ниже на реальные шаги сборки, складывающие артефакты в ./dist
+      - name: Example build step (placeholder)
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist
+          echo "example artifact from $GITHUB_SHA" > dist/example.txt
+          tar -czf dist/example.tgz -C dist example.txt
+
+      - name: Compute SLSA subjects (sha256, base64-encoded)
+        id: hash
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -d dist
+          # Берём все файлы в dist, исключая уже сгенерированные attestations при повторных запусках
+          mapfile -d '' files < <(find dist -type f ! -name '*.intoto.jsonl' -print0)
+          if (( ${#files[@]} == 0 )); then
+            echo "no build artifacts found in ./dist" >&2
+            exit 1
+          fi
+          sha256sum "${files[@]}" | base64 -w0 | tee /tmp/subjects.b64
+          echo "hashes=$(cat /tmp/subjects.b64)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/**
+
+  provenance:
+    name: Generate SLSA provenance (generic)
+    needs: [build]
+    # Права согласно рекомендациям SLSA: читать путь workflow, OIDC для подписи, при загрузке ассетов — contents:write
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    # Официальный генератор SLSA Level 3 для файловых артефактов (generic)
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      # Список subject-ов: sha256 в base64 одной строкой (как требует генератор)
+      base64-subjects: ${{ needs.build.outputs.b64_subjects }}
+      # При теге/релизе можно публиковать provenance как asset релиза
+      upload-assets: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'release' }}
+      # Необязательно: заголовок файла provenance в релизе
+      # provenance-name: "multiple.intoto.jsonl"
+    secrets: inherit

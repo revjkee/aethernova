@@ -1,0 +1,395 @@
+version: "1.0"
+meta:
+  owner: "platform-security"
+  system: "core-systems/security-core"
+  description: "Единая криптополитика и параметры провайдеров ключей"
+  lastReviewedAt: "2025-08-19"
+  compliance:
+    fips140_required: true
+    gdpr_data_regions: ["eu-north-1", "eu-central-1"]
+    piiclass_tags: ["PII", "SPI", "LOGS"]
+  changeControl:
+    require_approval: true
+    approvers_groups: ["secops-leads", "crypto-officers"]
+    m_of_n_unseal: "2-of-3"
+
+defaults:
+  environment: "prod"
+  fips_mode: true
+  key_reference_format: "uri"     # uri or alias
+  key_uri_scheme: "kms://"        # kms://, vault://, pkcs11://, local://
+  envelope_encryption: true
+  aead_default: "AES-256-GCM"     # fallback: CHACHA20-POLY1305 (non-FIPS)
+  hkdf:
+    hash: "SHA-256"
+    info_context_required: true
+  rng:
+    source: "system"
+    require_getrandom: true
+    drbg:
+      reseed_interval_ops: 100000
+      reseed_interval_time_s: 3600
+
+providers:
+  precedence: ["aws-kms", "vault-transit", "pkcs11-hsm", "local"]
+  aws-kms:
+    enabled: true
+    region: "eu-north-1"
+    alias_prefix: "alias/security-core/"
+    multi_region_keys: true
+    grant_principals_arns: []  # IAM роли, которым можно выдавать grants динамически
+  vault-transit:
+    enabled: true
+    address: "https://vault.internal:8200"
+    namespace: "neurocity"
+    mount: "transit"
+    token_source: "k8s-jwt"    # k8s-jwt or file
+    engine_names:
+      general: "sec-core-general"
+      tokens: "sec-core-tokens"
+  pkcs11-hsm:
+    enabled: false
+    module_path: "/usr/local/lib/softhsm/libsofthsm2.so"
+    slot: 0
+    token_label: "SEC_CORE"
+    user_pin_env: "PKCS11_USER_PIN"
+  local:
+    enabled: false
+    keystore_path: "/etc/security-core/keys"
+    file_permissions: "0600"
+
+algorithms:
+  asymmetric_sign:
+    preferred: ["Ed25519", "ECDSA-P256", "ECDSA-P384"]
+    fips_only: ["ECDSA-P256", "ECDSA-P384", "RSA-3072"]
+    legacy_denylist: ["RSA-1024", "DSA", "ECDSA-P192"]
+  asymmetric_kem:
+    preferred: ["X25519"]
+    fips_only: ["ECDH-P256", "ECDH-P384"]
+  symmetric:
+    preferred: ["AES-256-GCM", "AES-128-GCM"]
+    non_fips_optional: ["CHACHA20-POLY1305"]
+  hash:
+    preferred: ["SHA-256", "SHA-384"]
+    fips_only: ["SHA-256", "SHA-384", "SHA-512"]
+    legacy_denylist: ["MD5", "SHA1"]
+  kdf_password:
+    preferred: "Argon2id"
+    params:
+      argon2id:
+        memory_mib: 192
+        iterations: 3
+        parallelism: 2
+        salt_len: 16
+        tag_len: 32
+      scrypt:
+        n: 32768
+        r: 8
+        p: 1
+        salt_len: 16
+        tag_len: 32
+      pbkdf2_sha256:
+        iterations: 210000
+        salt_len: 16
+        tag_len: 32
+    fips_substitute: "PBKDF2-SHA256"
+  jwt_signing:
+    allowed_algs_fips: ["ES256", "ES384", "RS256", "PS256"]
+    allowed_algs_nonfips: ["EdDSA"]
+    jwk_cache_ttl_s: 300
+
+pq_preview:
+  enabled: false
+  tls_hybrid:
+    kex: "X25519+Kyber768"       # при enabled=true и наличии поддержки библиотек
+  signatures:
+    allowed: ["Dilithium2"]
+  policy: "shadow"                # shadow, canary, enforce
+
+key_classes:
+  # Ключи разделены по назначению с политиками ротации и источниками
+  application:
+    usage: ["sign", "verify", "decrypt", "encrypt"]
+    default_provider: "aws-kms"
+    aead: "AES-256-GCM"
+    rotation:
+      interval_days: 90
+      overlap_days: 14
+    key_specs:
+      sign_primary:
+        alg_select:
+          fips_mode: ["ECDSA-P256"]
+          non_fips: ["Ed25519"]
+        size_or_curve: "P-256"
+        exportable: false
+        policy:
+          require_attestation: false
+          throttling_qps: 500
+      enc_primary:
+        alg_select:
+          all: ["AES-256-GCM"]
+        size_or_curve: 256
+        exportable: false
+        policy:
+          wrap_with_dek: true
+          envelope_dek_alg: "AES-256-GCM"
+  transport_tls:
+    usage: ["tls_server", "tls_client"]
+    default_provider: "aws-kms"
+    rotation:
+      interval_days: 365
+      overlap_days: 30
+    key_specs:
+      server_cert:
+        alg_select:
+          fips_mode: ["ECDSA-P256"]
+          non_fips: ["Ed25519"]   # только при поддержке библиотеки
+        csr:
+          dn: "CN=security-core.internal,O=NeuroCity,L=Stockholm,C=SE"
+          san_dns: ["security-core.internal"]
+          san_ip: []
+        ca_reference: "vault://pki-int"
+        stapling_ocsp: true
+  tokens_jwt:
+    usage: ["sign", "verify"]
+    default_provider: "vault-transit"
+    rotation:
+      interval_days: 30
+      overlap_days: 7
+    key_specs:
+      access_token:
+        alg_select:
+          fips_mode: ["ES256"]
+          non_fips: ["Ed25519"]
+        kid_prefix: "jwt-at-"
+      refresh_token:
+        alg_select:
+          fips_mode: ["ES256"]
+          non_fips: ["Ed25519"]
+        kid_prefix: "jwt-rt-"
+  data_at_rest:
+    usage: ["encrypt", "decrypt"]
+    default_provider: "aws-kms"
+    rotation:
+      interval_days: 180
+      overlap_days: 30
+    key_specs:
+      pii_store:
+        alg_select:
+          all: ["AES-256-GCM"]
+        classification: ["PII", "SPI"]
+        require_audit: true
+      logs_store:
+        alg_select:
+          all: ["AES-256-GCM"]
+        classification: ["LOGS"]
+        require_audit: true
+  code_signing:
+    usage: ["sign", "verify"]
+    default_provider: "pkcs11-hsm"
+    rotation:
+      interval_days: 365
+      overlap_days: 30
+    key_specs:
+      release_artifacts:
+        alg_select:
+          fips_mode: ["ECDSA-P256"]
+          non_fips: ["Ed25519"]
+        require_attestation: true
+        notary:
+          cosign_key_ref: "pkcs11://slot/0/token/SEC_CORE/key/cosign"
+  backups:
+    usage: ["wrap", "unwrap"]
+    default_provider: "aws-kms"
+    rotation:
+      interval_days: 365
+      overlap_days: 30
+    key_specs:
+      wrap_key:
+        alg_select:
+          all: ["AES-256-GCM"]
+        exportable: false
+        usage_limited_to_paths: ["/var/backup"]
+        m_of_n_unwrap: "2-of-3"
+
+tls:
+  min_version: "TLS1.3"
+  max_version: "TLS1.3"
+  tls12_fallback:
+    enabled: true
+    ciphers:
+      - "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+      - "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+      - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+      - "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+  curves: ["X25519", "secp256r1", "secp384r1"]
+  session_resumption:
+    tickets_enabled: true
+    ticket_lifetime_s: 86400
+  client_auth:
+    mtls_required: true
+    ca_bundle_ref: "vault://pki-int/ca.crt"
+  ocsp:
+    stapling: true
+    must_staple: true
+    fail_open: false
+  hsts:
+    enabled: true
+    max_age_s: 31536000
+    include_subdomains: true
+    preload: false
+
+jwt:
+  issuer: "https://auth.neurocity"
+  audiences: ["security-core", "core-systems"]
+  leeway_s: 30
+  jwks:
+    remote_cache_ttl_s: 300
+    rotate_on_boot: true
+  signing:
+    class_ref: "tokens_jwt"
+    require_kid: true
+    alg_allowlist_fips: ["ES256", "ES384", "PS256"]
+    alg_allowlist_nonfips: ["EdDSA"]
+  claims:
+    require:
+      - "sub"
+      - "iat"
+      - "exp"
+      - "aud"
+      - "iss"
+    map:
+      tenant: "x-tenant"
+      roles: "x-roles"
+
+ssh:
+  algorithms:
+    host_keys: ["ecdsa-sha2-nistp256"]
+    client_pubkeys: ["ecdsa-sha2-nistp256", "ssh-ed25519"]
+    kex: ["curve25519-sha256", "ecdh-sha2-nistp256"]
+    macs: ["hmac-sha2-256", "hmac-sha2-512"]
+  policy:
+    disable_password_auth: true
+    disable_rsa_sha1: true
+    min_key_bits_rsa: 3072
+
+password_policy:
+  min_length: 12
+  max_length: 128
+  require_sets:
+    upper: 1
+    lower: 1
+    digits: 1
+    symbols: 1
+  reuse_history: 10
+  max_age_days: 365
+  kdf: "Argon2id"  # в FIPS-режиме: PBKDF2-SHA256 из algorithms.kdf_password
+
+data_classification:
+  PII:
+    key_ref: "kms://alias/security-core/pii_store"
+    encrypt_on_write: true
+  SPI:
+    key_ref: "kms://alias/security-core/pii_store"
+    encrypt_on_write: true
+  LOGS:
+    key_ref: "kms://alias/security-core/logs_store"
+    encrypt_on_write: true
+  DEFAULT:
+    key_ref: "kms://alias/security-core/general"
+    encrypt_on_write: true
+
+rotation:
+  schedule_cron: "0 2 * * *"
+  jitter_percent: 10
+  grace_overlaps_days: 14
+  revoke_on_compromise: true
+  reencrypt_data: on-demand  # on-demand or automatic
+
+audit:
+  enabled: true
+  sink: "stdout-jsonl"       # stdout-jsonl, file, http
+  redact_secrets: true
+  crypto_log_chain:
+    enabled: true
+    hmac_alg: "HMAC-SHA256"
+    rotate_days: 7
+  fields:
+    - timestamp
+    - actor
+    - action
+    - key_id
+    - algorithm
+    - result
+    - request_id
+    - client_ip
+    - resource
+  retention_days: 365
+
+access_control:
+  key_use_policies:
+    high_sensitivity:
+      require_mfa: true
+      network_allowlist_cidr: ["10.0.0.0/8", "192.168.0.0/16"]
+      time_windows_utc: ["08:00-20:00"]
+    default:
+      require_mfa: true
+  approvals:
+    sign_release:
+      m_of_n: "2-of-3"
+      approvers_groups: ["release-managers", "crypto-officers"]
+    unwrap_backup:
+      m_of_n: "2-of-3"
+      approvers_groups: ["secops-leads"]
+
+key_material_lifecycle:
+  generation:
+    entropy_check: true
+    attestation_required: false
+  storage:
+    export_prohibited: true
+    backup_wrapped_key: true
+  destruction:
+    zeroization_passes: 3
+    audit_required: true
+
+deprecations:
+  rsa_2048:
+    status: "planned-removal"
+    not_before: "2026-01-01"
+  tls12:
+    status: "allowed-fallback"
+    notes: "Разрешено только для совместимости с внешними интеграциями"
+
+overrides:
+  dev:
+    defaults:
+      environment: "dev"
+      fips_mode: false
+    providers:
+      aws-kms:
+        region: "eu-north-1"
+      vault-transit:
+        address: "https://vault.dev.internal:8200"
+    rotation:
+      schedule_cron: "0 3 * * *"
+    audit:
+      retention_days: 30
+  staging:
+    defaults:
+      environment: "staging"
+      fips_mode: true
+    rotation:
+      schedule_cron: "0 2 * * *"
+    audit:
+      retention_days: 90
+  prod:
+    defaults:
+      environment: "prod"
+      fips_mode: true
+    audit:
+      retention_days: 365
+    access_control:
+      key_use_policies:
+        high_sensitivity:
+          time_windows_utc: ["00:00-23:59"]  # 24x7, но с MFA и сетевыми ограничениями

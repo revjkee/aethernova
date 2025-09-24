@@ -1,0 +1,231 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mythos-core
+  namespace: mythos
+  labels:
+    app.kubernetes.io/name: mythos-core
+    app.kubernetes.io/instance: mythos-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: mythos
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: kubernetes
+  annotations:
+    # Чек-суммы конфигов/секретов для управляемого роллаута (патчится в overlays)
+    checksum/config: "REPLACED_BY_KUSTOMIZE"
+    checksum/secret: "REPLACED_BY_KUSTOMIZE"
+    # Аннотации для Prometheus (если используется прямой scrape)
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    prometheus.io/path: "/metrics"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mythos-core
+      app.kubernetes.io/instance: mythos-core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mythos-core
+        app.kubernetes.io/instance: mythos-core
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: mythos
+      annotations:
+        # Включение seccomp/AppArmor (для кластеров, где это требуется аннотациями)
+        container.apparmor.security.beta.kubernetes.io/app: runtime/default
+        seccomp.security.alpha.kubernetes.io/pod: runtime/default
+        # Обновляются патчем при изменении конфигов/секретов
+        checksum/config: "REPLACED_BY_KUSTOMIZE"
+        checksum/secret: "REPLACED_BY_KUSTOMIZE"
+    spec:
+      serviceAccountName: mythos-core
+      # Включайте при необходимости доступа к API. По умолчанию выключено ради безопасности.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      priorityClassName: "prod-critical"            # при необходимости переопределите в overlays
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      imagePullSecrets:
+        - name: regcred                           # переопределите под свой реестр
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # Распределение по нодам и отказоустойчивость
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: mythos-core
+              app.kubernetes.io/instance: mythos-core
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: mythos-core
+                    app.kubernetes.io/instance: mythos-core
+      tolerations: []  # при необходимости добавьте taints для prod-нод
+      # Инициализация (миграции БД, ожидание зависимостей)
+      initContainers:
+        - name: wait-deps
+          image: ghcr.io/groundcover-com/netcat:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - >
+              /bin/nc -zvw 3 ${DB_HOST:-postgres}:${DB_PORT:-5432} &&
+              /bin/nc -zvw 3 ${REDIS_HOST:-redis}:${REDIS_PORT:-6379}
+          env:
+            - name: DB_HOST
+              valueFrom: { configMapKeyRef: { name: mythos-core, key: DB_HOST } }
+            - name: DB_PORT
+              valueFrom: { configMapKeyRef: { name: mythos-core, key: DB_PORT } }
+            - name: REDIS_HOST
+              valueFrom: { configMapKeyRef: { name: mythos-core, key: REDIS_HOST } }
+            - name: REDIS_PORT
+              valueFrom: { configMapKeyRef: { name: mythos-core, key: REDIS_PORT } }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+        - name: migrate
+          image: registry.example.com/mythos-core/app:1.0.0@sha256:REPLACE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args: ["${MIGRATION_COMMAND:-python -m mythos_core.migrate}"]
+          envFrom:
+            - configMapRef: { name: mythos-core }
+            - secretRef:
+                name: mythos-core-secret
+                optional: true
+          volumeMounts:
+            - { name: config, mountPath: /app/config, readOnly: true }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: app
+          image: registry.example.com/mythos-core/app:1.0.0@sha256:REPLACE_DIGEST
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http,    containerPort: 8080, protocol: TCP }
+            - { name: metrics, containerPort: 9090, protocol: TCP }
+          env:
+            # Downward API
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: MYTHOS_VERSION
+              valueFrom: { fieldRef: { fieldPath: metadata.labels['app.kubernetes.io/version'] } }
+            # Чек-суммы для приложения (пробрасываются в логи/метрики)
+            - name: CONFIG_CHECKSUM
+              valueFrom: { fieldRef: { fieldPath: metadata.annotations['checksum/config'] } }
+            - name: SECRET_CHECKSUM
+              valueFrom: { fieldRef: { fieldPath: metadata.annotations['checksum/secret'] } }
+            # OpenTelemetry (если включено в приложении)
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.name=mythos-core,service.version=$(MYTHOS_VERSION),k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME)"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom: { configMapKeyRef: { name: mythos-core, key: OTEL_EXPORTER_OTLP_ENDPOINT, optional: true } }
+          envFrom:
+            - configMapRef: { name: mythos-core }
+            - secretRef:
+                name: mythos-core-secret
+                optional: true
+          volumeMounts:
+            - { name: config, mountPath: /app/config, readOnly: true }
+            - { name: tmp,    mountPath: /tmp }
+            - { name: cache,  mountPath: /var/cache/mythos }
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+              ephemeral-storage: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+              ephemeral-storage: "2Gi"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Пробы
+          startupProbe:
+            httpGet: { path: /healthz/startup, port: http }
+            failureThreshold: 30
+            periodSeconds: 2
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet: { path: /healthz/live, port: http }
+            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 1
+          readinessProbe:
+            httpGet: { path: /healthz/ready, port: http }
+            failureThreshold: 3
+            periodSeconds: 5
+            timeoutSeconds: 1
+          # Акуратное завершение
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          terminationMessagePolicy: FallbackToLogsOnError
+        # Sidecar-телеметрия (по желанию; вынесите конфиг коллекторa в отдельный ConfigMap)
+        - name: otel-agent
+          image: otel/opentelemetry-collector-contrib:0.104.0
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/otel.yaml"]
+          volumeMounts:
+            - { name: otel-conf, mountPath: /conf, readOnly: true }
+          ports:
+            - { name: otlp-grpc, containerPort: 4317 }
+            - { name: otlp-http, containerPort: 4318 }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "256Mi" }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap:
+            name: mythos-core
+            optional: false
+        - name: otel-conf
+          configMap:
+            name: otel-agent-config
+            optional: true
+        - name: tmp
+          emptyDir:
+            sizeLimit: "1Gi"
+        - name: cache
+          emptyDir:
+            sizeLimit: "2Gi"

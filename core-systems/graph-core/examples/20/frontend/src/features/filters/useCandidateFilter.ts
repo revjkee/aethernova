@@ -1,0 +1,1 @@
+// useCandidateFilter.ts - автогенерировано

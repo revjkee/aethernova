@@ -1,0 +1,248 @@
+# =====================================================================
+# Industrial CA CSR Template (security-core)
+# Version: 1.0
+# Purpose:
+#   Define a robust, auditable and automation-friendly template for
+#   generating a Certificate Signing Request (CSR) and private key for
+#   a Root CA or Intermediate CA in production.
+#
+# Notes:
+# - This file is tool-agnostic; your provisioning scripts should parse
+#   it and render an OpenSSL/CFSSL/step-ca config before key/CSR gen.
+# - Values like ${ENV_VAR} are substituted from environment variables.
+# - Critical CA semantics are enforced via X.509 extensions below.
+# - Do not commit real secrets; this file is a template only.
+# =====================================================================
+
+apiVersion: security-core/v1
+kind: CaCsrTemplate
+
+metadata:
+  template_id: "${CA_TEMPLATE_ID:-default-ca-csr}"
+  owner: "${SECOPS_OWNER:-secops@yourdomain.com}"
+  description: >
+    Production-grade CA CSR template with strict defaults, ENV overrides,
+    and policy-driven X.509 extensions for Root/Intermediate issuance.
+  created_at: "${CREATED_AT_ISO8601:-auto}"  # e.g., 2025-08-20T06:00:00Z
+  revision: 1
+
+profile:
+  # Allowed values: root-ca | intermediate-ca
+  type: "${CA_PROFILE_TYPE:-intermediate-ca}"
+
+subject:
+  # RFC 4514 attributes; keep CN concise and stable.
+  country: "${CA_SUBJECT_C:-SE}"
+  state: "${CA_SUBJECT_ST:-Stockholm}"
+  locality: "${CA_SUBJECT_L:-Stockholm}"
+  organization: "${CA_SUBJECT_O:-Example Trust Services AB}"
+  organizational_unit: "${CA_SUBJECT_OU:-Certification Authority}"
+  common_name: "${CA_SUBJECT_CN:-Example Intermediate CA 1}"
+
+# ---------------------------------------------------------------------
+# Key parameters (choose one algorithm; others are ignored by tooling)
+# ---------------------------------------------------------------------
+key:
+  algorithm: "${CA_KEY_ALG:-ECDSA}"   # ECDSA | RSA | ED25519
+
+  # RSA options
+  rsa:
+    bits: ${CA_RSA_BITS:-4096}        # 3072 min, 4096 recommended
+    public_exponent: ${CA_RSA_E:-65537}
+
+  # ECDSA options
+  ecdsa:
+    # Curves: P-256 | P-384 | P-521 ; P-384 is a strong default
+    curve: "${CA_ECDSA_CURVE:-P-384}"
+
+  # Ed25519 options
+  ed25519:
+    # Some HSMs use "pure" Ed25519 without prehash; leave true unless required.
+    pure: ${CA_ED25519_PURE:-true}
+
+  # Private key at-rest protection (software-keystore case; for HSM set enabled: false)
+  protect_private_key:
+    enabled: ${CA_PROTECT_KEY_ENABLED:-true}
+    cipher: "${CA_PROTECT_KEY_CIPHER:-aes-256-cbc}"
+    kdf: "${CA_PROTECT_KEY_KDF:-pbkdf2}"
+    pbkdf2:
+      iterations: ${CA_PROTECT_KEY_ITERS:-310000}
+      salt_len: ${CA_PROTECT_KEY_SALT_LEN:-16}
+
+  # If using an HSM/KMS, declare provider metadata here.
+  # Tooling should ignore software key-gen if provider.enabled=true.
+  provider:
+    enabled: ${CA_HSM_ENABLED:-false}
+    type: "${CA_HSM_TYPE:-pkcs11}"      # pkcs11 | cloud-kms | azure-kv | aws-kms | gcp-kms
+    slot: "${CA_HSM_SLOT:-0}"
+    key_label: "${CA_HSM_KEY_LABEL:-ca-key}"
+    module_path: "${CA_HSM_MODULE_PATH:-/usr/lib/softhsm/libsofthsm2.so}"
+    key_id: "${CA_HSM_KEY_ID:-}"        # for cloud KMS providers
+
+# ---------------------------------------------------------------------
+# Signature & validity (applies to the certificate to be issued from CSR)
+# ---------------------------------------------------------------------
+signature:
+  digest: "${CA_DIGEST:-sha384}"        # sha256 | sha384 | sha512
+  # Serial number policy for the issued cert (enforced by your signer)
+  serial_number:
+    random: true
+    # 16 bytes (128-bit) min; 20 bytes preferred for CAs
+    length_bytes: ${CA_SERIAL_LEN:-20}
+
+validity:
+  # Use explicit dates in your issuance pipeline; "now" is placeholder.
+  not_before: "${CA_NOT_BEFORE:-now}"
+  # Root CA: up to 25 years (org policy); Intermediate: e.g., 10 years.
+  # You may specify a duration OR explicit not_after date.
+  duration: "${CA_DURATION:-87600h}"    # 10y = 87600h; 5y = 43800h
+  # not_after: "2035-12-31T23:59:59Z"
+
+# ---------------------------------------------------------------------
+# X.509 Extensions (for CA cert issued from this CSR)
+# These MUST be enforced by the signer/issuer policy as critical where appropriate.
+# ---------------------------------------------------------------------
+extensions:
+  basic_constraints:
+    critical: true
+    ca: true
+    # Root CA usually path_len: 1..3 (if you plan intermediates); Intermediate CA often 0..1
+    path_len: ${CA_PATH_LEN:-1}
+
+  key_usage:
+    critical: true
+    usages:
+      - keyCertSign
+      - cRLSign
+
+  extended_key_usage:
+    # Typically empty for CA certs; keep empty unless required by a private profile.
+    critical: false
+    usages: []
+
+  subject_key_identifier:
+    enabled: true
+  authority_key_identifier:
+    enabled: true
+    # For self-signed roots this equals SKI; for intermediates it references issuer.
+
+  name_constraints:
+    # Generally not set for public CAs; for private PKI you may restrict name space.
+    critical: false
+    permitted:
+      dns: []          # e.g., ["example.com", "corp.local"]
+      email: []
+      ip: []           # e.g., ["10.0.0.0/8"]
+      uri: []
+    excluded:
+      dns: []
+      email: []
+      ip: []
+      uri: []
+
+  certificate_policies:
+    # OIDs and CPS/Policy URLs for auditability and relying parties
+    critical: false
+    policies:
+      - oid: "${CA_POLICY_OID:-2.23.140.1.2.2}"   # CA/BF TLS DV (example for private use; customize for your PKI)
+        cps_uri: "${CA_CPS_URI:-https://pki.example.com/cps}"
+        user_notice:
+          explicit_text: "${CA_POLICY_NOTICE:-This certificate is issued under Example CA CPS.}"
+
+  aia:  # Authority Information Access
+    ca_issuers:
+      - "${CA_AIA_ISSUERS_1:-http://pki.example.com/ca-issuers/intermediate.crt}"
+    ocsp:
+      - "${CA_AIA_OCSP_1:-http://ocsp.example.com}"
+
+  crl_distribution_points:
+    - "${CA_CRL_DP_1:-http://pki.example.com/crl/intermediate.crl}"
+
+  # Set TRUE only if you require critical SAN for CA identity assertions.
+  subject_alt_name:
+    critical: false
+    dns: []       # e.g., ["ca1.pki.example.com"]
+    email: []
+    uri: []
+    ip: []
+
+# ---------------------------------------------------------------------
+# Compliance & linting (executed by your pipeline before issuance)
+# ---------------------------------------------------------------------
+compliance:
+  enforce_min_key_size: true
+  allowed_key_algs: ["RSA", "ECDSA", "ED25519"]
+  min_rsa_bits: 3072
+  allowed_ecdsa_curves: ["P-256", "P-384", "P-521"]
+  allowed_hashes: ["sha256", "sha384", "sha512"]
+  lint:
+    x509lint: true
+    zlint: true
+    cab_forum_tls_server_profile: false  # Not applicable to CA certs; keep false.
+
+# ---------------------------------------------------------------------
+# Output & filesystem behavior (for non-HSM flows)
+# ---------------------------------------------------------------------
+output:
+  format: "pem"                          # pem | der
+  directory: "${CA_OUT_DIR:-./out/ca}"
+  files:
+    csr: "${CA_OUT_CSR_FILE:-ca.csr.pem}"
+    key: "${CA_OUT_KEY_FILE:-ca.key.pem}"
+    meta: "${CA_OUT_META_FILE:-ca.meta.json}"
+  permissions:
+    key_file_mode: "0600"
+    csr_file_mode: "0644"
+  overwrite: ${CA_OVERWRITE:-false}
+
+# ---------------------------------------------------------------------
+# Observability (non-secret metadata for audit logs)
+# ---------------------------------------------------------------------
+observability:
+  audit_log:
+    enabled: ${CA_AUDIT_ENABLED:-true}
+    sink: "${CA_AUDIT_SINK:-stdout}"     # stdout | file | syslog | http
+    file_path: "${CA_AUDIT_FILE:-./out/ca/audit.log}"
+  metrics:
+    enabled: ${CA_METRICS_ENABLED:-false}
+
+# ---------------------------------------------------------------------
+# Redaction policy (prevents accidental secret leakage in logs)
+# ---------------------------------------------------------------------
+redaction:
+  enabled: true
+  fields:
+    - "key"
+    - "protect_private_key"
+    - "provider"
+
+# ---------------------------------------------------------------------
+# Profiles for quick switching between root and intermediate defaults
+# Tooling may apply these as layered overrides if profile.type matches.
+# ---------------------------------------------------------------------
+profiles:
+  root-ca:
+    subject:
+      common_name: "${CA_SUBJECT_CN:-Example Root CA}"
+    validity:
+      duration: "${CA_DURATION:-219000h}"    # ~25 years
+    extensions:
+      basic_constraints:
+        path_len: ${CA_PATH_LEN:-2}
+    aia:
+      # Roots often omit AIA (self-signed); keep AIA minimal or empty.
+      ca_issuers: []
+      ocsp: []
+    crl_distribution_points:
+      - "${CA_CRL_DP_1:-http://pki.example.com/crl/root.crl}"
+
+  intermediate-ca:
+    subject:
+      common_name: "${CA_SUBJECT_CN:-Example Intermediate CA 1}"
+    validity:
+      duration: "${CA_DURATION:-87600h}"     # 10 years
+    extensions:
+      basic_constraints:
+        path_len: ${CA_PATH_LEN:-1}
+
+# End of file

@@ -1,0 +1,250 @@
+version: "3.9"
+
+# ---------- Общие якоря ----------
+x-common-labels: &common_labels
+  app.kubernetes.io/name: zero-trust-core
+  app.kubernetes.io/part-of: core-systems
+  app.kubernetes.io/component: service
+  security.neurocity.io/tier: critical
+
+x-security: &security_hardening
+  read_only: true
+  user: "10001:10001"
+  cap_drop: ["ALL"]
+  security_opt:
+    - "no-new-privileges:true"
+  tmpfs:
+    - "/tmp:rw,noexec,nodev,nosuid,size=64m"
+
+x-logging: &json_logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-health-http: &health_http
+  interval: 5s
+  timeout: 2s
+  retries: 10
+  start_period: 15s
+
+x-restart: &restart_policy
+  restart: unless-stopped
+
+x-deploy: &deploy_defaults   # учитывается в Swarm; в standalone игнорируется (не мешает)
+  resources:
+    limits:
+      cpus: "0.75"
+      memory: "768M"
+    reservations:
+      cpus: "0.25"
+      memory: "256M"
+
+# ---------- Сети ----------
+networks:
+  backend:
+    name: ztc_backend
+    driver: bridge
+  observability:
+    name: ztc_observability
+    driver: bridge
+
+# ---------- Секреты ----------
+# Файлы создаются в ./secrets/{db_password,redis_password,jwt_signing_key.pem}
+secrets:
+  db_password:
+    file: ./secrets/db_password
+  redis_password:
+    file: ./secrets/redis_password
+  jwt_signing_key_pem:
+    file: ./secrets/jwt_signing_key.pem
+
+# ---------- Томы ----------
+volumes:
+  pg_data:
+  grafana_data:
+
+# ---------- Сервисы ----------
+services:
+  app:
+    image: "registry.example.com/core-systems/zero-trust-core@sha256:<digest>"
+    container_name: ztc-app
+    <<: [*restart_policy]
+    deploy: *deploy_defaults
+    labels: *common_labels
+    environment:
+      # Базовые переменные: берутся из .env (не коммитить)
+      AVM_ENV: "${AVM_ENV:-prod}"
+      AVM_SERVICE: "zero-trust-core"
+      AVM_LOG_LEVEL: "${AVM_LOG_LEVEL:-INFO}"
+      AVM_LOG_JSON: "1"
+      AVM_HTTP_TIMEOUT: "${AVM_HTTP_TIMEOUT:-10}"
+      AVM_HTTP_RETRIES: "${AVM_HTTP_RETRIES:-2}"
+      # БД/кэш
+      AVM_DB_URL: "postgresql+asyncpg://${POSTGRES_USER:-ztc}:${POSTGRES_PASSWORD_FILE:+}@$${POSTGRES_HOST:-postgres}:5432/${POSTGRES_DB:-ztc}"
+      AVM_REDIS_URL: "redis://:${REDIS_PASSWORD_FILE:+}@$${REDIS_HOST:-redis}:6379/2"
+      # JWT ключ: приложение читает PEM из docker secret (см. ниже volume)
+      AVM_JWT_SIGNING_KEY_PEM_FILE: "/run/secrets/jwt_signing_key_pem"
+      # OTEL (включается профилем obs)
+      AVM_OTEL_ENABLED: "${AVM_OTEL_ENABLED:-0}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}"
+    env_file:
+      - ./.env
+    secrets:
+      - source: jwt_signing_key_pem
+        target: jwt_signing_key_pem
+    command: >
+      sh -lc '
+        export POSTGRES_PASSWORD_FILE=${POSTGRES_PASSWORD_FILE:-/run/secrets/db_password};
+        export REDIS_PASSWORD_FILE=${REDIS_PASSWORD_FILE:-/run/secrets/redis_password};
+        export POSTGRES_PASSWORD=$(cat $POSTGRES_PASSWORD_FILE 2>/dev/null || echo "");
+        export REDIS_PASSWORD=$(cat $REDIS_PASSWORD_FILE 2>/dev/null || echo "");
+        uvicorn zero_trust_core.app:app --host 0.0.0.0 --port 8080
+      '
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz/ready"]
+      <<: *health_http
+    volumes:
+      - type: bind
+        source: ./configs
+        target: /app/configs
+        read_only: true
+    networks:
+      - backend
+      - observability
+    logging: *json_logging
+    <<: *security_hardening
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ztc-postgres
+    <<: [*restart_policy]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: "1G"
+        reservations:
+          cpus: "0.25"
+          memory: "256M"
+    labels: *common_labels
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-ztc}"
+      POSTGRES_USER: "${POSTGRES_USER:-ztc}"
+      POSTGRES_PASSWORD_FILE: "/run/secrets/db_password"
+      PGDATA: "/var/lib/postgresql/data/pgdata"
+    secrets:
+      - source: db_password
+        target: db_password
+    command: >
+      postgres -c max_connections=200 -c shared_buffers=256MB
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - backend
+    logging: *json_logging
+
+  redis:
+    image: redis:7-alpine
+    container_name: ztc-redis
+    <<: [*restart_policy]
+    deploy: *deploy_defaults
+    labels: *common_labels
+    secrets:
+      - source: redis_password
+        target: redis_password
+    environment:
+      REDIS_PASSWORD_FILE: "/run/secrets/redis_password"
+    command: >
+      sh -lc '
+        PASS=$(cat $$REDIS_PASSWORD_FILE 2>/dev/null || echo "");
+        exec redis-server --appendonly yes --save "" --protected-mode yes ${PASS:+--requirepass $$PASS}
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$(cat /run/secrets/redis_password 2>/dev/null || true)\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - backend
+    logging: *json_logging
+
+  # Наблюдаемость (включите профилем obs)
+  otel-collector:
+    profiles: ["obs"]
+    image: otel/opentelemetry-collector:latest
+    container_name: ztc-otel
+    <<: [*restart_policy]
+    deploy: *deploy_defaults
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - type: bind
+        source: ./observability/otel-collector.yaml
+        target: /etc/otel-collector-config.yaml
+        read_only: true
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    networks:
+      - observability
+      - backend
+    logging: *json_logging
+
+  prometheus:
+    profiles: ["obs"]
+    image: prom/prometheus:latest
+    container_name: ztc-prometheus
+    <<: [*restart_policy]
+    deploy: *deploy_defaults
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=15d"]
+    volumes:
+      - type: bind
+        source: ./observability/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+    ports:
+      - "9090:9090"
+    networks:
+      - observability
+    logging: *json_logging
+
+  grafana:
+    profiles: ["obs"]
+    image: grafana/grafana:latest
+    container_name: ztc-grafana
+    <<: [*restart_policy]
+    deploy: *deploy_defaults
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - type: bind
+        source: ./observability/grafana/provisioning
+        target: /etc/grafana/provisioning
+        read_only: true
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+    networks:
+      - observability
+    logging: *json_logging

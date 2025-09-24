@@ -1,0 +1,156 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oblivionvault-core-config
+  namespace: oblivionvault
+  labels:
+    app.kubernetes.io/name: oblivionvault-core
+    app.kubernetes.io/part-of: oblivionvault
+    app.kubernetes.io/component: core
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "0.0.0"  # переопределите в оверлеях
+  annotations:
+    kubernetes.io/description: "Application, telemetry and logging configuration for OblivionVault Core. No secrets."
+immutable: true
+data:
+  # Основная конфигурация приложения. Не храните пароли/ключи здесь.
+  application.yaml: |-
+    app:
+      name: oblivionvault-core
+      environment: ${APP_ENV:prod}     # prod|staging|dev — читается приложением, не подставляется самим K8s
+      instance_id_from: pod.name       # как генерировать instance_id (pod.name|hostname|uuid)
+    server:
+      http:
+        port: 8080
+        request_timeout_s: 30
+        read_header_timeout_s: 10
+        keepalive_timeout_s: 75
+        max_request_body_mb: 16
+        graceful_shutdown_s: 20
+      health:
+        liveness_path: /healthz
+        readiness_path: /readyz
+        startup_path: /startupz
+    security:
+      allowed_hosts: ["*"]             # ограничьте в prod при наличии ingress-доменов
+      trust_proxy: true
+      cors:
+        allow_origins: []              # заполняется через второй ConfigMap или оверлей
+        allow_methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+        allow_headers: ["*"]
+        allow_credentials: false
+    api:
+      rate_limit:
+        requests_per_sec: 50
+        burst: 100
+      pagination:
+        default_limit: 50
+        max_limit: 500
+      timeouts_s:
+        upstream_connect: 5
+        upstream_read: 15
+    features:
+      enable_device_registration: true
+      enable_metrics: true
+      enable_tracing: true
+    storage:
+      # Доступы (user/password/DSN) берите из Secret/Env. Здесь — только несекретные параметры.
+      postgres:
+        host: ${PGHOST:postgres}
+        port: ${PGPORT:5432}
+        database: ${PGDATABASE:oblivionvault}
+        sslmode: require
+        pool:
+          max_open: 20
+          max_idle: 10
+          conn_max_lifetime_s: 600
+      redis:
+        host: ${REDIS_HOST:redis}
+        port: ${REDIS_PORT:6379}
+        db: 0
+        tls: false
+    telemetry:
+      metrics:
+        enabled: true
+        format: prometheus                 # app-экспортер на /metrics
+        endpoint: ":9090"                  # если используется внутренний экспортер
+      tracing:
+        enabled: true
+        exporter: otlp                     # otlp|none
+        otlp_endpoint: "http://otel-collector:4317"
+        sample_ratio: 0.1                  # 0..1
+      logs:
+        json: true
+        level: INFO                        # DEBUG|INFO|WARNING|ERROR
+        sampling:
+          rate_per_second: 5
+          burst: 10
+
+  # Конфигурация логирования Python (пример для logging + python-json-logger).
+  logging.yaml: |-
+    version: 1
+    disable_existing_loggers: false
+    formatters:
+      json:
+        "()": pythonjsonlogger.jsonlogger.JsonFormatter
+        fmt: "%(asctime)s %(levelname)s %(name)s %(message)s %(process)s %(thread)s %(trace_id)s %(span_id)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: json
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers: ["console"]
+    loggers:
+      uvicorn.error:
+        level: INFO
+      uvicorn.access:
+        level: INFO
+      asyncio:
+        level: WARNING
+
+  # Атрибуты ресурса OTEL (читаются приложением при инициализации SDK).
+  otel.resource.attributes: |-
+    service.name=oblivionvault-core
+    service.namespace=oblivionvault
+    service.version=${APP_VERSION:0.0.0}
+    deployment.environment=${APP_ENV:prod}
+    cloud.provider=kubernetes
+    k8s.namespace.name=${POD_NAMESPACE:oblivionvault}
+
+  # Белый список CORS источников — удобно переопределять в оверлеях/окружениях.
+  cors.allowed-origins: |-
+    https://portal.example.com
+    https://admin.example.com
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oblivionvault-core-env
+  namespace: oblivionvault
+  labels:
+    app.kubernetes.io/name: oblivionvault-core
+    app.kubernetes.io/part-of: oblivionvault
+    app.kubernetes.io/component: core
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    kubernetes.io/description: "Non-sensitive environment defaults for OblivionVault Core."
+immutable: true
+data:
+  # Нечувствительные дефолты окружения, которые удобно envFrom-ить в Deployment.
+  APP_ENV: "prod"
+  LOG_LEVEL: "INFO"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+  METRICS_ENABLED: "true"
+  TRACING_ENABLED: "true"
+  SERVER_PORT: "8080"
+  HEALTH_LIVENESS_PATH: "/healthz"
+  HEALTH_READINESS_PATH: "/readyz"
+  CORS_ALLOWED_ORIGINS_CM_KEY: "cors.allowed-origins"   # ключ внутри первого ConfigMap для sidecar, если он нужен
+  # Пример параметров хранилища без секретов:
+  PGHOST: "postgres"
+  PGPORT: "5432"
+  PGDATABASE: "oblivionvault"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"

@@ -1,0 +1,402 @@
+# cybersecurity-core/configs/cybersecurity.yaml
+# Единый конфиг политик безопасности и качественных стандартов.
+# Секреты не храним в файле: используем переменные окружения или секрет-хранилища (Vault/KMS/K8s Secret).
+
+schema_version: "1.0"
+
+meta:
+  service: "cybersecurity-core"
+  owner: "platform-security-core"
+  contact: "security@aethernova.local"
+  updated_at: "2025-09-02T00:00:00Z"
+
+# Унифицированная карта серьёзности и порогов блокировки релиза
+severity_policy: &severity_policy
+  levels: { low: 1, medium: 2, high: 3, critical: 4 }
+  block_build_on: "high"      # >= этого уровня релиз должен фейлиться
+  fail_if_tool_missing: false  # не валить сборку, если сканер недоступен (менять на true в prod)
+
+# Базовые безопасные дефолты для всех окружений
+defaults: &defaults
+  zero_trust:
+    enforce_mtls: true
+    device_trust_required: false
+    ip_allowlist: []           # Явные allow-CIDR; пусто = без исключений
+    egress_proxy_required: true
+
+  crypto:
+    tls:
+      min_version: "TLS1.2"
+      prefer_server_ciphers: true
+      ciphersuites:
+        - "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+        - "TLS_AES_128_GCM_SHA256"   # TLS1.3
+        - "TLS_AES_256_GCM_SHA384"
+      hsts:
+        enabled: true
+        max_age_seconds: 31536000
+        include_subdomains: true
+        preload: false
+    hashing:
+      password:
+        algorithm: "argon2id"
+        time_cost: 3
+        memory_kib: 65536
+        parallelism: 1
+        salt_bytes: 16
+    jwt:
+      alg: "RS256"              # предпочтительно асимметричная подпись
+      issuer: "https://auth.aethernova.local"
+      audience: "cybersecurity-core"
+      access_ttl: "15m"
+      refresh_ttl: "7d"
+      clock_skew: "60s"
+      jwks_url_env: "OIDC_JWKS_URL"       # URL JWKS берём из ENV
+      required_claims: ["sub", "iat", "exp", "aud", "iss"]
+
+  auth:
+    modes: ["jwt", "oidc"]
+    oidc:
+      provider_name: "keycloak"
+      discovery_url_env: "OIDC_DISCOVERY_URL"
+      client_id_env: "OIDC_CLIENT_ID"
+      client_secret_env: "OIDC_CLIENT_SECRET"
+      scopes: ["openid","profile","email"]
+    session:
+      enabled: false
+      secure_cookies: true
+      same_site: "Lax"
+
+  rbac:
+    # Пример минимальных ролей: разрешения задаются на уровне доменных действий
+    roles:
+      - name: "admin"
+        allow: ["*"]
+      - name: "security_analyst"
+        allow:
+          - "incident:read"
+          - "incident:update"
+          - "intel:read"
+          - "scan:trigger"
+      - name: "service"
+        allow:
+          - "telemetry:write"
+          - "artifact:verify"
+        deny: ["user:impersonate"]
+    default_role: "service"
+    deny_by_default: true
+
+  api_security:
+    rate_limit:
+      # базовый лимит IP/Token; конкретную реализацию выбирает API Gateway
+      ip_based:
+        window: "1m"
+        limit: 120
+        burst: 60
+      token_based:
+        window: "1m"
+        limit: 600
+        burst: 120
+    input_validation:
+      max_json_size_bytes: 1048576
+      forbid_unknown_fields: true
+      strict_content_types: true
+    file_uploads:
+      enabled: false
+      max_size_bytes: 0
+      allowed_mime: []
+
+  headers:
+    csp:
+      # Пример строгой CSP; донастраивайте под фронтенд/эндпойнты
+      default_src: ["'none'"]
+      script_src: ["'self'"]
+      style_src: ["'self'","'unsafe-inline'"]    # убрать в проде, если возможно
+      img_src: ["'self'","data:"]
+      connect_src: ["'self'"]
+      font_src: ["'self'"]
+      frame_ancestors: ["'none'"]
+    security:
+      x_frame_options: "DENY"
+      x_content_type_options: "nosniff"
+      referrer_policy: "no-referrer"
+      permissions_policy:
+        geolocation: []
+        camera: []
+        microphone: []
+      cross_origin_opener_policy: "same-origin"
+      cross_origin_embedder_policy: "require-corp"
+    cors:
+      enabled: false
+      allowed_origins: []
+      allowed_methods: ["GET","POST","PUT","DELETE","OPTIONS"]
+      allowed_headers: ["Authorization","Content-Type","Accept"]
+      allow_credentials: false
+      max_age_seconds: 600
+
+  data_protection:
+    classification: ["public","internal","confidential","restricted"]
+    default_classification: "internal"
+    storage:
+      encrypt_at_rest: true
+      kms_provider: "aws-kms"    # или "gcp-kms","hashicorp-vault"
+      kms_key_env: "KMS_KEY_ID"
+    retention:
+      logs_days: 30
+      pii_days: 365
+      backups_days: 30
+    dlp:
+      outgoing_scan_enabled: true
+      block_on_pattern: ["credit_card","ssn","api_key"]
+
+  supply_chain:
+    code_signing:
+      cosign_enforce: true
+      verify_on_startup: true
+      trusted_fulcio_issuers:
+        - "https://token.actions.githubusercontent.com"
+      required_annotations:
+        - "org.opencontainers.image.source"
+        - "org.opencontainers.image.revision"
+    artifacts:
+      require_digest_pinning: true
+      allowed_registries:
+        - "ghcr.io/your-org"
+        - "registry.aethernova.local"
+    licenses:
+      allowlist:
+        - "Apache-2.0"
+        - "MIT"
+        - "BSD-2-Clause"
+        - "BSD-3-Clause"
+      denylist:
+        - "GPL-3.0-only"
+        - "AGPL-3.0-only"
+
+  scanning:
+    <<: *severity_policy
+    tools:
+      secrets:
+        gitleaks:
+          enabled: true
+          config_path: ".gitleaks.toml"
+          additional_args: []
+        trufflehog:
+          enabled: true
+          allowlisted_paths: ["docs/**","**/*.md"]
+      sast:
+        semgrep:
+          enabled: true
+          config: "auto"
+          timeout_seconds: 120
+        bandit:
+          enabled: true
+          severity_block: "high"
+      sca:
+        pip_audit:
+          enabled: true
+          scan_type: "installed"  # or "requirements"
+        safety:
+          enabled: true
+      iac:
+        checkov:
+          enabled: true
+          skip_checks: []
+        tfsec:
+          enabled: true
+      container:
+        trivy:
+          enabled: true
+          checks: ["vuln","misconfig","secret"]
+          ignore_unfixed: true
+        grype:
+          enabled: true
+          fail_on: "medium"
+      sbom:
+        syft:
+          enabled: true
+          format: "spdx-json"
+      dast:
+        zap_baseline:
+          enabled: false
+          target_url_env: "DAST_TARGET_URL"
+    allowlist_cves: []         # CVE, разрешённые временно (исключения с баг-ID)
+    break_glass_issue_env: "SEC_EXCEPTION_JIRA"  # ссылка на тикет при временном снижении требований
+
+  k8s:
+    pod_security_standard: "restricted"
+    service_account:
+      automount_token: false
+    runtime:
+      seccomp: "RuntimeDefault"
+      apparmor: "runtime/default"
+      run_as_non_root: true
+      read_only_root_fs: true
+      drop_caps: ["ALL"]
+      fs_group: 2000
+      user: 10001
+      group: 10001
+    network_policies:
+      egress_only_to:
+        - "dns"
+        - "egress-proxy"
+      ingress_from:
+        - "namespace:ingress-nginx"
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+
+  observability:
+    logs:
+      level: "info"
+      json: true
+      redact_fields: ["password","authorization","set-cookie","credit_card","secret","token"]
+    metrics:
+      prometheus:
+        enabled: true
+        path: "/metrics"
+        port: 8080
+    tracing:
+      otel:
+        enabled: true
+        exporter_otlp_endpoint_env: "OTEL_EXPORTER_OTLP_ENDPOINT"
+        service_name: "cybersecurity-core"
+
+  incident_response:
+    rto: "2h"
+    rpo: "30m"
+    severity_mapping:
+      sev1: "critical"
+      sev2: "high"
+      sev3: "medium"
+    runbooks:
+      detection: "docs/runbooks/detection.md"
+      containment: "docs/runbooks/containment.md"
+      eradication: "docs/runbooks/eradication.md"
+      recovery: "docs/runbooks/recovery.md"
+    notifications:
+      channels:
+        - type: "slack"
+          webhook_env: "SLACK_IR_WEBHOOK"
+        - type: "email"
+          to: ["soc@aethernova.local"]
+
+  audit:
+    enabled: true
+    immutable_store: true
+    sink:
+      type: "stdout"            # stdout | kafka | s3
+      kafka:
+        brokers_env: "KAFKA_BROKERS"
+        topic: "audit.cybersecurity-core"
+      s3:
+        bucket_env: "AUDIT_S3_BUCKET"
+        prefix: "cybersecurity-core/"
+    fields:
+      include: ["ts","actor","action","resource","result","ip","user_agent","trace_id"]
+      hash_chain: true
+
+# Профили окружений (используют defaults и переопределяют различия)
+environments:
+  dev:
+    <<: *defaults
+    headers:
+      <<: *defaults.headers
+      cors:
+        enabled: true
+        allowed_origins:
+          - "http://localhost:3000"
+          - "http://127.0.0.1:3000"
+        allow_credentials: true
+    observability:
+      <<: *defaults.observability
+      logs:
+        level: "debug"
+    scanning:
+      <<: *defaults.scanning
+      fail_if_tool_missing: false
+      block_build_on: "critical"   # в dev мягче
+      dast:
+        zap_baseline:
+          enabled: false
+    k8s:
+      <<: *defaults.k8s
+      resources:
+        requests: { cpu: "50m",  memory: "128Mi" }
+        limits:   { cpu: "300m", memory: "384Mi" }
+
+  staging:
+    <<: *defaults
+    scanning:
+      <<: *defaults.scanning
+      block_build_on: "high"
+      dast:
+        zap_baseline:
+          enabled: true
+          target_url_env: "DAST_TARGET_URL_STAGING"
+    headers:
+      <<: *defaults.headers
+      cors:
+        enabled: true
+        allowed_origins:
+          - "https://staging.aethernova.local"
+        allow_credentials: true
+
+  prod:
+    <<: *defaults
+    zero_trust:
+      <<: *defaults.zero_trust
+      device_trust_required: true
+    headers:
+      <<: *defaults.headers
+      csp:
+        <<: *defaults.headers.csp
+        style_src: ["'self'"]    # убрано 'unsafe-inline'
+      cors:
+        enabled: false
+    scanning:
+      <<: *defaults.scanning
+      fail_if_tool_missing: true
+      block_build_on: "high"
+      allowlist_cves: []         # исключений быть не должно
+      dast:
+        zap_baseline:
+          enabled: true
+          target_url_env: "DAST_TARGET_URL_PROD"
+    k8s:
+      <<: *defaults.k8s
+      network_policies:
+        egress_only_to:
+          - "dns"
+          - "egress-proxy"
+          - "payments-gw"
+      resources:
+        requests: { cpu: "200m", memory: "512Mi" }
+        limits:   { cpu: "1",    memory: "1Gi" }
+
+# Список обязательных переменных окружения (валидируются приложением на старте)
+required_env:
+  - "KMS_KEY_ID"
+  - "OTEL_EXPORTER_OTLP_ENDPOINT"
+  - "OIDC_DISCOVERY_URL"
+  - "OIDC_CLIENT_ID"
+  - "OIDC_CLIENT_SECRET"
+  - "JWT_PUBLIC_KEYS"           # альтернатива JWKS, если оффлайн-ключи
+  - "COSIGN_EXPERIMENTAL"
+  - "DAST_TARGET_URL_STAGING"
+  - "DAST_TARGET_URL_PROD"
+
+# Глобальные исключения/правила безопасного отклонения (временно; под жёстким контролем)
+exceptions_policy:
+  require_ticket: true
+  ticket_system: "Jira"
+  approvers:
+    - "ciso@aethernova.local"
+    - "head-of-devsecops@aethernova.local"
+  max_duration: "14d"
+  audit_tag: "break-glass"

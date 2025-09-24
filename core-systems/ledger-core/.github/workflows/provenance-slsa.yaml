@@ -1,0 +1,192 @@
+# ledger-core/.github/workflows/provenance-slsa.yaml
+name: Provenance (SLSA) & Secure Publish
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*.*.*' ]
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read          # checkout, read tags
+  id-token: write         # OIDC for attestation
+  attestations: write     # create provenance attestations
+  packages: write         # push image to GHCR
+  actions: read
+
+concurrency:
+  group: provenance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Версия для тэгов образа: для tag = vX.Y.Z используем X.Y.Z, иначе -sha-<short>
+  VERSION: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && github.ref_name || '' }}
+
+jobs:
+  build-binaries:
+    name: Build & Attest Binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python (for build tooling if needed)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Go (skip if не требуется)
+        if: ${{ false }} # включите при необходимости
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade build
+
+      - name: Deterministic build (example)
+        run: |
+          mkdir -p dist
+          # Пример: python‑пакет
+          # python -m build --sdist --wheel --outdir dist
+          # Либо свой скрипт сборки:
+          ./scripts/build-binaries.sh dist
+        shell: bash
+
+      - name: List artifacts & hashes
+        run: |
+          ls -lah dist
+          find dist -type f -maxdepth 1 -print0 | xargs -0 -I {} sh -c 'sha256sum "{}"'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledger-core-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'dist/*'
+        # Результат: провенанс появится в Security → Attestations
+
+  build-container:
+    name: Build, Push & Attest Container
+    runs-on: ubuntu-latest
+    needs: [ build-binaries ]
+
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value={{date 'YYYYMMDD'}}-{{sha}}
+            type=ref,event=tag,pattern=v{{version}}
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=${{ github.ref }}
+
+      - name: Build & Push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          provenance: false           # провенанс создадим отдельно через attestations
+          platforms: linux/amd64,linux/arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Compute subject (image ref + digest)
+        id: subject
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          # Возьмём первый тег как subject-name (при необходимости сузьте стратегию)
+          FIRST_TAG="$(echo "${{ steps.meta.outputs.tags }}" | head -n1)"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest container provenance (SLSA)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ steps.subject.outputs.name }}
+          subject-digest: ${{ steps.subject.outputs.digest }}
+          push-to-registry: true
+        # Результат: провенанс прикреплён к конкретному digest образа в GHCR
+
+  sbom:
+    name: Generate SBOM (SPDX) for image
+    runs-on: ubuntu-latest
+    needs: [ build-container ]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      packages: read
+
+    steps:
+      - name: Generate SBOM via Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-container.outputs.digest || '' }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledger-core-sbom
+          path: sbom.spdx.json
+          retention-days: 14
+
+      # При необходимости SBOM также можно зааттестовать как build-subject файла:
+      - name: Attest provenance for SBOM
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'sbom.spdx.json'

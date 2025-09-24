@@ -1,0 +1,153 @@
+{{- /*
+  zero-trust-core / ServiceMonitor (industrial)
+  Requires: Prometheus Operator CRDs (monitoring.coreos.com/v1)
+  Values:
+    monitoring:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        nameOverride: ""
+        labels: { release: prometheus-operator }
+        annotations: {}
+        jobLabel: "app.kubernetes.io/name"
+        namespaceSelector:
+          any: false
+          matchNames: []     # пример: ["observability", "{{ .Release.Namespace }}"]
+        selector:
+          matchLabels: {}    # по умолчанию — selectorLabels чарта
+        targetLabels: []     # метки Service => target
+        podTargetLabels: []  # метки Pod => target
+        endpoints:
+          - port: "http-metrics"
+            path: /metrics
+            scheme: http
+            interval: 30s
+            scrapeTimeout: 10s
+            honorLabels: true
+            relabelings: []         # список правил Prometheus relabel_config
+            metricRelabelings: []   # список правил Prometheus metric_relabel_configs
+            bearerTokenSecret:      # (опционально) SecretKeySelector
+              name: ""
+              key: ""
+            tls:
+              enabled: false
+              insecureSkipVerify: false
+              serverName: ""        # SNI/ServerName для TLS
+              # Примечание: пути к файлам сертификатов на стороне Prometheus
+              # настраиваются в самом Prometheus; ServiceMonitor может задавать только параметры tlsConfig.
+*/ -}}
+{{- $hasSM := or (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor") -}}
+{{- if and .Values.monitoring.enabled .Values.monitoring.serviceMonitor.enabled $hasSM }}
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{- if .Values.monitoring.serviceMonitor.nameOverride -}}
+    {{ tpl .Values.monitoring.serviceMonitor.nameOverride . | quote }}
+  {{- else -}}
+    {{ printf "%s-servicemonitor" (include "zero-trust-core.fullname" .) | quote }}
+  {{- end }}
+  labels:
+    {{- include "zero-trust-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: "observability"
+    app.kubernetes.io/managed-by: "helm"
+    {{- with .Values.monitoring.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.monitoring.serviceMonitor.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+spec:
+  {{- with .Values.monitoring.serviceMonitor.jobLabel }}
+  jobLabel: {{ . | quote }}
+  {{- end }}
+
+  # Namespace discovery
+  namespaceSelector:
+    {{- if .Values.monitoring.serviceMonitor.namespaceSelector.any }}
+    any: true
+    {{- else }}
+    {{- with .Values.monitoring.serviceMonitor.namespaceSelector.matchNames }}
+    matchNames:
+      {{- range . }}
+      - {{ tpl (printf "%v" .) $ | quote }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
+  # Service selector
+  selector:
+    matchLabels:
+      {{- $ml := .Values.monitoring.serviceMonitor.selector.matchLabels | default (include "zero-trust-core.selectorLabels" . | fromYaml) -}}
+      {{- toYaml $ml | nindent 6 }}
+
+  {{- with .Values.monitoring.serviceMonitor.targetLabels }}
+  targetLabels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  {{- with .Values.monitoring.serviceMonitor.podTargetLabels }}
+  podTargetLabels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  endpoints:
+    {{- $eps := .Values.monitoring.serviceMonitor.endpoints | default list -}}
+    {{- if not $eps }}
+    # Endpoint по умолчанию, если список пуст
+    - port: "http-metrics"
+      path: /metrics
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true
+    {{- else }}
+    {{- range $i, $e := $eps }}
+    - port: {{ required (printf "endpoints[%d].port required" $i) $e.port | quote }}
+      {{- with $e.path }}
+      path: {{ . | quote }}
+      {{- end }}
+      {{- with $e.scheme }}
+      scheme: {{ . | quote }}
+      {{- end }}
+      {{- with $e.interval }}
+      interval: {{ . | quote }}
+      {{- end }}
+      {{- with $e.scrapeTimeout }}
+      scrapeTimeout: {{ . | quote }}
+      {{- end }}
+      {{- if hasKey $e "honorLabels" }}
+      honorLabels: {{ $e.honorLabels }}
+      {{- end }}
+
+      {{- with $e.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with $e.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- if and (hasKey $e "bearerTokenSecret") $e.bearerTokenSecret.name $e.bearerTokenSecret.key }}
+      bearerTokenSecret:
+        name: {{ $e.bearerTokenSecret.name | quote }}
+        key:  {{ $e.bearerTokenSecret.key  | quote }}
+      {{- end }}
+
+      {{- if and (hasKey $e "tls") $e.tls.enabled }}
+      tlsConfig:
+        {{- if hasKey $e.tls "insecureSkipVerify" }}
+        insecureSkipVerify: {{ $e.tls.insecureSkipVerify }}
+        {{- end }}
+        {{- with $e.tls.serverName }}
+        serverName: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
+{{- end }}

@@ -1,0 +1,100 @@
+# file: policy-core/ops/k8s/base/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: policy-core
+  namespace: policy
+  labels:
+    app.kubernetes.io/name: policy-core
+    app.kubernetes.io/part-of: policy-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: gitops
+  annotations:
+    autoscaling.alpha.kubernetes.io/conditions: "true"
+    autoscaling.alpha.kubernetes.io/current-metrics: "true"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: policy-core
+  minReplicas: 3
+  maxReplicas: 30
+
+  # Комбинированные метрики. Требуются:
+  # - Resource: CPU/Memory (встроенные)
+  # - Pods: агрегированная метрика на pod (нужен metrics.k8s.io + custom-metrics)
+  # - External: глобальная метрика (нужен external.metrics.k8s.io, напр. Prometheus Adapter)
+  metrics:
+    # 1) CPU: средняя утилизация на pod, держим ~60%
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+    # 2) Memory: целевое среднее значение на pod, чтобы избежать OOM (пример: 800Mi)
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: "800Mi"
+
+    # 3) Pods-метрика: число одновременных запросов на pod (in-flight)
+    #    Экспортируется приложением в Prometheus; адаптер публикует как pods metric.
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_in_flight
+        target:
+          type: AverageValue
+          averageValue: "50"
+
+    # 4) External-метрика: RPS на сервис (усреднённо на pod).
+    #    Требуется selector, который сопоставляет time-series в адаптере.
+    - type: External
+      external:
+        metric:
+          name: http_requests_per_second
+          selector:
+            matchLabels:
+              app: policy-core
+        target:
+          type: AverageValue
+          averageValue: "200"
+
+    # 5) External-метрика: длина очереди сообщений (например, RabbitMQ/Kafka) — backpressure.
+    - type: External
+      external:
+        metric:
+          name: queue_messages_ready
+          selector:
+            matchLabels:
+              vhost: policy
+              queue: policy_core_tasks
+        target:
+          type: AverageValue
+          averageValue: "100"
+
+  # Поведение масштабирования: защищаемся от флаппинга,
+  # ограничиваем скорость апскейла, держим длиннее стабилизацию на даунскейле.
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0        # реагируем быстро на рост
+      policies:
+        - type: Percent
+          value: 100                       # не более +100% за окно
+          periodSeconds: 60
+        - type: Pods
+          value: 4                         # и не более +4 pod за 60с
+          periodSeconds: 60
+      selectPolicy: Max                    # берём максимально разрешённый рост
+    scaleDown:
+      stabilizationWindowSeconds: 300      # сглаживаем спад нагрузки (5 минут)
+      policies:
+        - type: Percent
+          value: 50                        # не более -50% за окно
+          periodSeconds: 60
+      selectPolicy: Max

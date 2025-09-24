@@ -1,0 +1,219 @@
+# policy-core/ops/docker/docker-compose.yaml
+# Промышленный compose для policy-core.
+# Совместим с Docker Compose v2 и спецификацией 3.9.
+# Предполагается наличие:
+#  - ./secrets/postgres_password.txt
+#  - ./secrets/jwt_secret.txt
+#  - ./.env (необязательно) с базовыми переменными окружения
+
+name: policy-core
+
+x-common-env: &common-env
+  PYTHONUNBUFFERED: "1"
+  LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+  APP_PORT: "${APP_PORT:-8080}"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+  OTEL_RESOURCE_ATTRIBUTES: "service.name=policy-core,service.version=${APP_VERSION:-dev}"
+
+x-common-deploy: &common-deploy
+  restart: unless-stopped
+  # В swarm-режиме применяются лимиты. В обычном compose — документирование намерений.
+  resources:
+    limits:
+      cpus: "${LIMIT_CPUS:-1.00}"
+      memory: "${LIMIT_MEM:-512M}"
+    reservations:
+      cpus: "${RESV_CPUS:-0.25}"
+      memory: "${RESV_MEM:-256M}"
+
+x-common-logging: &common-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+    compress: "true"
+
+x-common-security: &common-security
+  read_only: true
+  cap_drop: [ "ALL" ]
+  security_opt:
+    - "no-new-privileges:true"
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  ulimits:
+    nofile:
+      soft: 4096
+      hard: 8192
+
+x-wait-healthy: &wait-healthy
+  condition: service_healthy
+
+services:
+  postgres:
+    image: "postgres:16-alpine"
+    container_name: policy-postgres
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "wal_level=replica"
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-policy}"
+      POSTGRES_USER: "${POSTGRES_USER:-policy}"
+      POSTGRES_PASSWORD_FILE: "/run/secrets/postgres_password"
+    secrets:
+      - postgres_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-policy} -d ${POSTGRES_DB:-policy} -h 127.0.0.1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - backend
+    deploy: *common-deploy
+    logging: *common-logging
+
+  redis:
+    image: "redis:7.2-alpine"
+    container_name: policy-redis
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - backend
+    deploy: *common-deploy
+    logging: *common-logging
+
+  jaeger:
+    image: "jaegertracing/all-in-one:1.58"
+    container_name: policy-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"   # включает OTLP gRPC:4317 и HTTP:4318
+    ports:
+      - "16686:16686"  # UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:16686 | grep -q Jaeger || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - observability
+      - backend
+    deploy: *common-deploy
+    logging: *common-logging
+    profiles: [ "observability" ]
+
+  policy-core:
+    # Если есть Dockerfile, сборка из исходников плюс тегирование образа:
+    build:
+      context: ../../
+      dockerfile: ops/docker/Dockerfile
+      target: runtime
+      args:
+        - APP_VERSION=${APP_VERSION:-dev}
+    image: "${IMAGE_NAME:-ghcr.io/aethernova/policy-core}:${APP_VERSION:-dev}"
+    container_name: policy-core
+    env_file:
+      - .env
+    environment:
+      <<: *common-env
+      DATABASE__HOST: "postgres"
+      DATABASE__PORT: "5432"
+      DATABASE__NAME: "${POSTGRES_DB:-policy}"
+      DATABASE__USER: "${POSTGRES_USER:-policy}"
+      DATABASE__PASSWORD_FILE: "/run/secrets/postgres_password"
+      REDIS__URL: "redis://redis:6379/0"
+      JWT__SECRET_FILE: "/run/secrets/jwt_secret"
+      UVICORN_WORKERS: "${UVICORN_WORKERS:-4}"
+      UVICORN_BACKLOG: "${UVICORN_BACKLOG:-2048}"
+      OTEL_TRACES_EXPORTER: "otlp"
+      OTEL_METRICS_EXPORTER: "none"
+      OTEL_LOGS_EXPORTER: "none"
+    secrets:
+      - postgres_password
+      - jwt_secret
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    expose:
+      - "8080"
+    depends_on:
+      postgres: *wait-healthy
+      redis: *wait-healthy
+      jaeger:
+        condition: service_started
+    healthcheck:
+      # HTTP healthcheck без внешних утилит: стандартный python-дистрибутив внутри контейнера
+      test:
+        - "CMD-SHELL"
+        - |
+          python - <<'PY'
+          import sys, urllib.request
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=2)
+              sys.exit(0)
+          except Exception:
+              sys.exit(1)
+          PY
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    networks:
+      - backend
+      - public
+    deploy: *common-deploy
+    logging: *common-logging
+    # Жесткая изоляция контейнера приложения
+    <<: *common-security
+    # При использовании read_only=true укажите явные точки записи:
+    volumes:
+      - type: tmpfs
+        target: /var/run
+        tmpfs:
+          size: 16m
+      - type: tmpfs
+        target: /home/app/.cache
+        tmpfs:
+          size: 64m
+    command:
+      - "bash"
+      - "-lc"
+      - >
+        poetry run uvicorn policy_core.app:app
+        --host 0.0.0.0 --port 8080
+        --workers ${UVICORN_WORKERS:-4}
+        --log-level ${LOG_LEVEL:-info}
+
+networks:
+  backend:
+    driver: bridge
+    internal: true
+  public:
+    driver: bridge
+  observability:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt

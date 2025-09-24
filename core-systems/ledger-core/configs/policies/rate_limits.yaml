@@ -1,0 +1,314 @@
+# ledger-core/ops/configs/policies/rate_limits.yaml
+schema:
+  version: 1
+  updatedAt: "2025-08-15T00:00:00Z"
+  owner: sre@company.example
+  description: Лимиты запросов и квоты для ledger-core (gateway, ingress, service filters)
+
+defaults:
+  decisionAlgorithm: "sliding_window"   # sliding_window | token_bucket | leaky_bucket
+  windowSeconds: 60
+  burst: 0                               # доп. токены сверх rate (для token_bucket)
+  rate: 120                              # запросов в окно/минуту по умолчанию
+  keyStrategy:
+    order: [apiKey, tenant, user, ip, path]
+    fallbackKey: "anonymous"
+  counters:
+    backend: "redis"                     # redis | inmem | dynamodb
+    namespace: "ledger:ratelimits"
+    consistency: "eventual"              # strong | eventual
+    ttlSeconds: 900
+  responseHeaders:
+    enabled: true
+    names:
+      limit: "X-RateLimit-Limit"
+      remaining: "X-RateLimit-Remaining"
+      reset: "X-RateLimit-Reset"
+      policy: "X-RateLimit-Policy"
+      retryAfter: "Retry-After"
+  retryAfterStrategy: "ceil(reset_epoch - now)"  # как заполнять Retry-After
+  shadowMode: false                     # если true — только логируем нарушения
+  emergency:
+    enabled: true
+    triggerOn:
+      cpuThrottlingRatio: 0.6
+      upstreamErrorRate: 0.2
+    actions:
+      - type: "tighten_all_by_percent"
+        value: 50
+      - type: "disable_non_essential_tags"
+        tags: ["export", "reports", "batch"]
+
+priorities:
+  # Чем выше число — тем выше приоритет, тем мягче лимиты
+  classes:
+    internal: 100
+    premium: 80
+    standard: 50
+    anonymous: 10
+  overrides:
+    # Специальные клиенты/тенанты
+    tenants:
+      - id: "tenant-internal-ops"
+        class: internal
+      - id: "tenant-high-touch"
+        class: premium
+    apiKeys:
+      - id: "api-live-abcdef"
+        class: premium
+
+exemptions:
+  # Полные исключения (например, для health)
+  paths:
+    - method: "GET"
+      pattern: "^/healthz$"
+    - method: "GET"
+      pattern: "^/metrics$"
+  cidrs:
+    - cidr: "10.0.0.0/8"
+      reason: "internal network"
+  identities:
+    users:
+      - id: "admin-root"
+        reason: "break-glass"
+        expiresAt: "2025-12-31T23:59:59Z"
+
+bans:
+  enabled: true
+  auto:
+    # Автобан по аномалиям
+    thresholds:
+      violationsPerMinute: 30
+      consecutiveWindows: 3
+    durationSeconds: 900
+    backoff: [900, 1800, 3600]
+  manual: []  # вносятся оперативно SRE
+
+quotas:
+  # Долгосрочные квоты на период
+  daily:
+    default: 100000
+    classes:
+      premium: 1000000
+      internal: 5000000
+      anonymous: 20000
+  monthly:
+    default: 2000000
+    classes:
+      premium: 10000000
+      internal: 50000000
+      anonymous: 300000
+  enforcement:
+    action: "reject_after_exhaustion"   # reject_after_exhaustion | degrade
+    degradeProfiles:
+      - name: "readonly"
+        effects:
+          disableTags: ["export", "bulk"]
+          setHeaders: {"X-Feature-Mode": "readonly"}
+
+limits:
+  # Политики по тегам эндпоинтов (рекомендуется тегировать маршруты)
+  tags:
+    # CRUD чтение
+    read:
+      windowSeconds: 60
+      algorithms:
+        - algorithm: "sliding_window"
+          rateByClass:
+            internal: 5000
+            premium: 1500
+            standard: 600
+            anonymous: 120
+          burstByClass:
+            internal: 0
+            premium: 100
+            standard: 50
+            anonymous: 0
+    # Модифицирующие операции
+    write:
+      windowSeconds: 60
+      algorithms:
+        - algorithm: "token_bucket"
+          rateByClass:
+            internal: 2000
+            premium: 300
+            standard: 120
+            anonymous: 30
+          burstByClass:
+            internal: 1000
+            premium: 150
+            standard: 60
+            anonymous: 15
+    # Тяжелые отчеты
+    reports:
+      windowSeconds: 300
+      algorithms:
+        - algorithm: "leaky_bucket"
+          rateByClass:
+            internal: 600
+            premium: 120
+            standard: 30
+            anonymous: 6
+          burstByClass:
+            internal: 200
+            premium: 40
+            standard: 10
+            anonymous: 2
+  # Точные правила по путям
+  paths:
+    - method: "POST"
+      pattern: "^/v1/transactions$"
+      description: "Создание транзакции"
+      algorithms:
+        - algorithm: "token_bucket"
+          windowSeconds: 60
+          rateByClass: {internal: 1500, premium: 200, standard: 60, anonymous: 20}
+          burstByClass: {internal: 500, premium: 80, standard: 20, anonymous: 5}
+      idempotency:
+        header: "Idempotency-Key"
+        required: true
+        dedupeWindowSeconds: 86400
+    - method: "GET"
+      pattern: "^/v1/transactions/[A-Za-z0-9_-]+$"
+      description: "Получение транзакции"
+      inheritTags: ["read"]
+      algorithms: []    # пусто => возьмем из тегов
+    - method: "POST"
+      pattern: "^/v1/exports$"
+      description: "Экспорт отчетов"
+      inheritTags: ["reports", "export"]
+      algorithms:
+        - algorithm: "leaky_bucket"
+          windowSeconds: 600
+          rateByClass: {internal: 300, premium: 30, standard: 6, anonymous: 1}
+          burstByClass: {internal: 100, premium: 10, standard: 2, anonymous: 1}
+      enqueueOnLimit:
+        enabled: true
+        queue: "exports"
+        maxEnqueuePerMinute: 50
+        headers:
+          set: {"X-Queued": "1"}
+
+graphql:
+  # Ограничения по "стоимости" запроса GraphQL
+  enabled: true
+  cost:
+    defaultNodeCost: 1
+    multipliers:
+      fieldRegex:
+        "^transactions": 3
+        "^exports": 5
+      argumentWeights:
+        "first": 0.1     # чем больше first, тем дороже
+        "limit": 0.1
+  budgets:
+    perRequest:
+      classes:
+        internal: 500
+        premium: 200
+        standard: 100
+        anonymous: 40
+    perMinute:
+      classes:
+        internal: 20000
+        premium: 4000
+        standard: 1500
+        anonymous: 300
+  actionOnExceed: "reject"  # reject | truncate
+
+ipPolicies:
+  # Ограничения по IP/CIDR, применяются до логики ключей
+  rules:
+    - cidr: "0.0.0.0/0"
+      method: "*"
+      pattern: "^/v1/.*$"
+      perIp:
+        windowSeconds: 60
+        rate: 300
+        burst: 50
+    - cidr: "203.0.113.0/24"
+      method: "*"
+      pattern: "^/.*$"
+      perIp:
+        windowSeconds: 60
+        rate: 60
+        burst: 10
+      note: "подозрительная подсеть, усиленные лимиты"
+
+abuseDetection:
+  enabled: true
+  signals:
+    highErrorRate:
+      windowSeconds: 120
+      threshold: 0.5
+      sourceMetric: "http_5xx_ratio"
+      action: "tighten_client_by_percent"
+      value: 70
+    requestAmplification:
+      windowSeconds: 60
+      threshold: 5
+      sourceMetric: "req_to_successful_op_ratio"
+      action: "ban_temp"
+      banSeconds: 900
+
+overrides:
+  # Точечные переопределения для клиентов/путей
+  clients:
+    - match:
+        apiKey: "api-live-abcdef"
+        path: "^/v1/transactions$"
+        method: "POST"
+      set:
+        algorithm: "token_bucket"
+        windowSeconds: 60
+        rate: 400
+        burst: 120
+        shadowMode: false
+  tenants:
+    - match:
+        tenant: "tenant-a1b2c3"
+        tags: ["reports"]
+      set:
+        rate: 60
+        windowSeconds: 300
+        burst: 10
+
+telemetry:
+  emit:
+    counters:
+      enabled: true
+      names:
+        allowed: "ratelimit_allowed_total"
+        limited: "ratelimit_limited_total"
+        shadowLimited: "ratelimit_shadow_limited_total"
+        banned: "ratelimit_banned_total"
+    histograms:
+      enabled: true
+      names:
+        decisionLatency: "ratelimit_decision_latency_seconds"
+    tracing:
+      enabled: true
+      attributes:
+        system: "ledger-core"
+        component: "ratelimiter"
+  logs:
+    level: "info"
+    sampleRate: 0.1
+
+testing:
+  # Генераторы тестов и контрольные кейсы для CI
+  cases:
+    - name: "anonymous_read_ok"
+      request: {method: "GET", path: "/v1/transactions/abc", class: "anonymous"}
+      expect: {allowed: true}
+    - name: "anonymous_write_limited"
+      request: {method: "POST", path: "/v1/transactions", class: "anonymous"}
+      expect: {allowed: false, retryAfterSecondsGte: 1}
+    - name: "premium_report_queue"
+      request: {method: "POST", path: "/v1/exports", class: "premium"}
+      expect: {allowed: true, headers: {"X-Queued": "1"}}
+
+notes:
+  - Лимиты по тегам объединяются с правилами по путям, при конфликте побеждает самое строгое.
+  - При включенном shadowMode все нарушения только логируются и маркируются в заголовке X-RateLimit-Policy.
+  - Для стабильности рекомендуется хранить счетчики в Redis с репликацией и настройкой TTL ≥ windowSeconds.

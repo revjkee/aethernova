@@ -1,0 +1,395 @@
+apiVersion: policy.chronowatch.aethernova.io/v1
+kind: WindowPolicy
+metadata:
+  policyId: chronowatch-core-window-default
+  policyVersion: 1.0.0
+  schemaVersion: 1.0.0
+  name: Chronowatch Core Windows
+  description: >
+    Политика временных окон для сервисов Chronowatch: ошибки, задержки, RPS,
+    аномалии, насыщение ресурсов, защита от бурстов и аварийные действия.
+  owner: platform-ops-core
+  labels:
+    project: chronowatch-core
+    environment: shared
+  annotations:
+    change.reason: "Initial industrial policy"
+    compliance.baseline: "SRE-2025-01"
+  createdAt: "2025-08-28T00:00:00Z"
+
+spec:
+  engine:
+    exprLang: cel              # cel | jmes | expr
+    timeSource: system         # system | ntp | trace
+    evaluation:
+      interval: 5s             # частота окна для пересчета состояний
+      maxSkew: 2s
+      gracePeriod: 10s         # защита от дребезга при флаппинге сигналов
+      jitter: 200ms
+    sources:
+      - name: otel_metrics
+        type: otel.metrics
+        discovery:
+          selector:
+            service.namespace: "chronowatch"
+      - name: k8s_metrics
+        type: k8s.metrics
+      - name: http_access
+        type: logs.json
+        formatHints: [nginx, envoy]
+    defaults:
+      groupBy: ["service.name", "k8s.namespace", "http.route"]
+      missingToZero: true
+
+  notifications:
+    channels:
+      pagerduty:
+        type: pagerduty
+        routingKeyFrom: secret://chronowatch/pagerduty-key
+        dedupKey: "${service.name}:${rule.id}"
+      ops-slack:
+        type: slack
+        webhookFrom: secret://chronowatch/slack-webhook
+        mention: "@oncall-sre"
+      email-noc:
+        type: email
+        to: ["noc@aethernova.io"]
+    retry:
+      backoff: exponential
+      initial: 5s
+      max: 2m
+      attempts: 5
+
+  actions:
+    # Предопределенные действия, на которые могут ссылаться правила
+    alertPagerduty:
+      type: alert
+      channel: pagerduty
+      severityFrom: context.severity
+    alertSlack:
+      type: alert
+      channel: ops-slack
+      title: "${rule.id} ${context.severity}"
+    webhookScaleUp:
+      type: webhook
+      method: POST
+      url: "http://platform-ops-gateway.scale.svc.cluster.local/v1/scale"
+      bodyTemplate:
+        app: "${service.name}"
+        namespace: "${k8s.namespace}"
+        factor: 2
+        ttl: "15m"
+    k8sDegradeModeOn:
+      type: k8s.patch
+      resource: "Deployment"
+      nameFrom: "${k8s.deployment}"
+      namespaceFrom: "${k8s.namespace}"
+      patch:
+        spec:
+          template:
+            metadata:
+              annotations:
+                chronowatch/audit: "degrade-on"
+                chronowatch/degrade-mode: "true"
+    k8sDegradeModeOff:
+      type: k8s.patch
+      resource: "Deployment"
+      nameFrom: "${k8s.deployment}"
+      namespaceFrom: "${k8s.namespace}"
+      patch:
+        spec:
+          template:
+            metadata:
+              annotations:
+                chronowatch/audit: "degrade-off"
+                chronowatch/degrade-mode: "false"
+
+  schedules:
+    blackout:  # периоды, когда алерты подавляются
+      - id: weekly-maintenance
+        cron: "0 1 * * 0"
+        timezone: "Europe/Stockholm"
+        duration: 2h
+        reason: "Плановое обслуживание"
+        appliesTo: ["*"]      # список rule.id или "*"
+    quietHours: []            # при необходимости аналогично blackout
+
+  overrides:
+    # Оверрайды по тенантам/неймспейсам/сервисам
+    byTenant:
+      - selector:
+          tenant.id: "alpha"
+        set:
+          windows.error_rate_5m.thresholds.warning.for: 15m
+          windows.rps_burst_1m.thresholds.critical.value: 2000
+    byService:
+      - selector:
+          service.name: "chronowatch-api"
+        set:
+          windows.latency_p95_5m.thresholds.warning.value: 250ms
+          windows.latency_p95_5m.thresholds.critical.value: 400ms
+
+  exemptions:
+    # Временные исключения с истечением срока
+    - selector:
+        service.name: "etl-batch"
+      rules: ["error_rate_5m", "latency_p95_5m"]
+      until: "2025-09-15T00:00:00Z"
+      reason: "Миграция схемы"
+
+  windows:
+    # ------------------------- Качество HTTP: Error Rate -------------------- #
+    - id: error_rate_5m
+      name: Error rate 5m
+      source: otel_metrics
+      selector:
+        metric.name: "http.server.requests"   # нормализованный счётчик запросов
+        http.method: "*"                     # можно ограничить, если нужно
+      groupBy: ["service.name", "http.route"]
+      window:
+        type: sliding_time
+        duration: 5m
+        step: 30s
+      compute:
+        # numerator: 5xx, denominator: все
+        vars:
+          num: rate(sum(if attr.http.status_code >= 500 then 1 else 0 end))
+          den: rate(count())
+        expr: num / max(den, 1)
+      thresholds:
+        warning:
+          when:
+            op: ">"
+            value: 0.05
+            for: 10m
+        critical:
+          when:
+            op: ">"
+            value: 0.10
+            for: 5m
+      actionsOnFire:
+        - use: alertPagerduty
+        - use: alertSlack
+      actionsOnResolve:
+        - use: alertSlack
+      labels:
+        slo: "availability"
+        owner: "api-team"
+
+    # ---------------------------- Производительность: p95 ------------------- #
+    - id: latency_p95_5m
+      name: Latency p95 5m
+      source: otel_metrics
+      selector:
+        metric.name: "http.server.duration"  # гистограмма или summary
+      groupBy: ["service.name", "http.route"]
+      window:
+        type: sliding_time
+        duration: 5m
+        step: 1m
+      compute:
+        expr: percentile(p=95.0, of="duration_ms")  # агрегат по гистограмме/квантилям
+      thresholds:
+        warning:
+          when:
+            op: ">"
+            value: 300ms
+            for: 10m
+        critical:
+          when:
+            op: ">"
+            value: 500ms
+            for: 5m
+      actionsOnFire:
+        - use: alertPagerduty
+        - use: webhookScaleUp
+      actionsOnResolve:
+        - use: alertSlack
+      labels:
+        slo: "latency"
+
+    # ------------------------- Пропускная способность и бурсты -------------- #
+    - id: rps_burst_1m
+      name: RPS burst per client 1m
+      source: http_access
+      selector:
+        log.stream: "ingress"
+      groupBy: ["service.name", "client.ip"]
+      window:
+        type: sliding_time
+        duration: 1m
+        step: 10s
+      compute:
+        expr: rate(count())  # запросы в секунду
+      thresholds:
+        warning:
+          when: { op: ">", value: 200, for: 1m }
+        critical:
+          when: { op: ">", value: 1000, for: 30s }
+      actionsOnFire:
+        - use: alertSlack
+      labels:
+        security: "burst-detection"
+
+    # ------------------------- Насыщение ресурсов на узлах ------------------ #
+    - id: node_saturation_5m
+      name: Node saturation 5m
+      source: k8s_metrics
+      selector:
+        metric.name: "node.utilization"
+      groupBy: ["k8s.node"]
+      window:
+        type: sliding_time
+        duration: 5m
+        step: 30s
+      compute:
+        vars:
+          cpu: avg(value where attr.resource == "cpu")
+          mem: avg(value where attr.resource == "memory")
+        expr: max(cpu, mem)
+      thresholds:
+        warning: { when: { op: ">", value: 0.80, for: 10m } }
+        critical: { when: { op: ">", value: 0.90, for: 5m } }
+      actionsOnFire:
+        - use: alertPagerduty
+      labels:
+        capacity: "node"
+
+    # --------------------------- Очереди и бэклог --------------------------- #
+    - id: queue_backlog_10m
+      name: Queue backlog growth 10m
+      source: otel_metrics
+      selector:
+        metric.name: "queue.backlog.size"
+      groupBy: ["service.name", "queue.name"]
+      window:
+        type: sliding_time
+        duration: 10m
+        step: 1m
+      compute:
+        vars:
+          last: last(value)
+          first: first(value)
+        expr: last - first  # чистый прирост
+      thresholds:
+        warning: { when: { op: ">", value: 1000, for: 10m } }
+        critical: { when: { op: ">", value: 5000, for: 5m } }
+      actionsOnFire:
+        - use: alertPagerduty
+        - use: webhookScaleUp
+      labels:
+        backlog: "queue"
+
+    # ------------------------ Аномалии на базе базлайна --------------------- #
+    - id: anomaly_zscore_15m
+      name: Anomaly detection p95 via zscore 15m
+      source: otel_metrics
+      selector:
+        metric.name: "http.server.duration"
+      groupBy: ["service.name", "http.route"]
+      window:
+        type: sliding_time
+        duration: 15m
+        step: 1m
+      compute:
+        vars:
+          p95: percentile(p=95.0, of="duration_ms")
+          mu: baseline.mean(period="7d", rollup="15m", metric="p95")
+          sigma: baseline.stddev(period="7d", rollup="15m", metric="p95")
+        expr: (p95 - mu) / max(sigma, 1.0)
+      thresholds:
+        warning: { when: { op: ">", value: 3.0, for: 10m } }
+        critical: { when: { op: ">", value: 5.0, for: 5m } }
+      actionsOnFire:
+        - use: alertPagerduty
+        - use: k8sDegradeModeOn
+      actionsOnResolve:
+        - use: k8sDegradeModeOff
+      labels:
+        anomaly: "zscore"
+
+    # -------------------------- Circuit Breaker на 5xx ---------------------- #
+    - id: circuit_breaker_5xx
+      name: Circuit breaker on sustained 5xx
+      source: otel_metrics
+      selector:
+        metric.name: "http.server.requests"
+      groupBy: ["service.name"]
+      window:
+        type: sliding_time
+        duration: 2m
+        step: 10s
+      compute:
+        vars:
+          num: rate(sum(if attr.http.status_code >= 500 then 1 else 0 end))
+          den: rate(count())
+          er: num / max(den, 1)
+        expr: er
+      thresholds:
+        critical: { when: { op: ">", value: 0.25, for: 1m } }
+      actionsOnFire:
+        - use: k8sDegradeModeOn
+        - use: alertPagerduty
+      actionsOnResolve:
+        - use: k8sDegradeModeOff
+      labels:
+        breaker: "true"
+
+  audit:
+    enabled: true
+    sink:
+      type: otlp
+      endpoint: "otel-collector.observability.svc:4317"
+    fields:
+      - rule.id
+      - context.severity
+      - context.group
+      - compute.vars
+      - compute.expr
+      - thresholds
+    retention: 30d
+
+  validation:
+    # Базовая валидация для CI до публикации политики
+    required:
+      - spec.engine
+      - spec.windows
+      - spec.notifications
+    limits:
+      maxWindows: 100
+      maxActionsPerRule: 5
+      maxGroupBy: 5
+
+tests:
+  - name: error_rate_warning_fires
+    rule: error_rate_5m
+    input:
+      stream: otel_metrics
+      series:
+        group:
+          service.name: "chronowatch-api"
+          http.route: "/v1/items"
+        points:
+          # имитация 5xx 8%, общее 100 rps
+          - { t: "2025-08-28T10:00:00Z", http.status_code: 500, count: 8 }
+          - { t: "2025-08-28T10:00:00Z", http.status_code: 200, count: 92 }
+    expect:
+      severity: "warning"
+  - name: latency_p95_critical
+    rule: latency_p95_5m
+    input:
+      stream: otel_metrics
+      series:
+        group:
+          service.name: "chronowatch-api"
+          http.route: "/v1/search"
+        p95_ms: [520, 540, 580, 600, 650, 700]
+        step: 60s
+    expect:
+      severity: "critical"
+
+signing:
+  required: false
+  issuer: "aethernova-build"
+  annotations:
+    provenance.ref: "${git.sha}"

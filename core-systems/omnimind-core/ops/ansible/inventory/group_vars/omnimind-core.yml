@@ -1,0 +1,271 @@
+# =====================================================================
+# OmniMind Core — Ansible group vars (production-grade defaults)
+# Группа: omnimind-core
+# Все секреты задаются через Ansible Vault (см. секцию vault_*).
+# =====================================================================
+
+# --- Базовые сведения о среде выполнения ---
+app:
+  name: omnimind-core
+  env: production                     # production / staging / dev
+  user: omnimind                      # системный пользователь приложения
+  group: omnimind
+  umask: "0027"                       # приватные права по умолчанию
+
+# Версионирование и артефакты (один из вариантов: tar.gz бинарей или образ Docker)
+release:
+  version: "1.0.0"                    # переопределяется в CI
+  channel: "stable"
+  artifact_url: ""                    # URL tar.gz/zip артефакта (если деплой не контейнерный)
+  artifact_sha256: ""                 # контрольная сумма (если используется artifact_url)
+  # Для контейнерного деплоя:
+  image: "ghcr.io/your-org/omnimind-core"
+  image_tag: "1.0.0"
+  # Аутентификация реестра — только через Vault:
+  registry_auth:
+    enabled: false
+    username: "{{ vault_registry_username | default(omit) }}"
+    password: "{{ vault_registry_password | default(omit) }}"
+
+# --- Пути и владение ---
+paths:
+  base_dir: "/opt/omnimind-core"
+  bin_dir:  "/opt/omnimind-core/bin"
+  data_dir: "/var/lib/omnimind-core"
+  log_dir:  "/var/log/omnimind-core"
+  run_dir:  "/run/omnimind-core"
+  tmp_dir:  "/tmp/omnimind-core"
+  config_dir: "/etc/omnimind-core"
+  permissions:
+    dir_mode: "0750"
+    file_mode: "0640"
+    log_mode: "0640"
+
+# --- Конфигурация приложения (env) ---
+config:
+  http_host: "0.0.0.0"
+  http_port: 8080
+  metrics_port: 9090
+  log_level: "info"                   # trace|debug|info|warn|error
+  graceful_timeout_sec: 30
+  # Дополнительные переменные окружения приложения
+  extra_env: {}
+  # Секреты приложения — только через Vault:
+  secrets:
+    jwt_signing_key: "{{ vault_jwt_signing_key | default('') }}"
+    db_dsn: "{{ vault_db_dsn | default('') }}"  # пример: postgres://user:pass@host:5432/db?sslmode=require
+    api_keys: "{{ vault_api_keys | default({}) }}"
+
+# --- Сетевые настройки и SSL/TLS ---
+network:
+  allowed_admin_cidrs: []             # пример: ["10.0.0.0/8", "192.168.0.0/16"]
+  cors_allowed_origins: []            # список строк Origins
+  proxy_protocol: false               # если трафик идёт через L4-прокси с Proxy Protocol
+
+ssl:
+  enabled: false
+  # Если true, задайте пути к сертификатам или используйте ACME-роль.
+  cert_path: "/etc/ssl/omnimind/fullchain.pem"
+  key_path:  "/etc/ssl/omnimind/privkey.pem"
+  ca_chain_path: "/etc/ssl/omnimind/chain.pem"
+  # ACME/Let’s Encrypt (пример интеграции — реализуется отдельной ролью)
+  acme:
+    enabled: false
+    email: "ops@example.com"
+    domains: []
+    challenge: "http"                 # http | dns
+    provider: ""                      # dns-провайдер при dns-challenge
+
+# --- Безопасность узла ---
+security:
+  selinux:
+    manage: true
+    state: "enforcing"                # enforcing|permissive|disabled (для RHEL-семейства)
+  firewall:
+    enabled: true
+    provider: "ufw"                   # ufw|firewalld|none
+    allow_ports:
+      - "22/tcp"                      # SSH
+      - "{{ config.http_port }}/tcp"  # HTTP сервиса
+      - "{{ config.metrics_port }}/tcp"
+  ssh:
+    allow_password_auth: false
+    allow_root_login: false
+    accepted_ciphers: []              # оставить пустым для дефолтов дистрибутива
+  sudo:
+    require_tty: true
+    allowed_groups:
+      - "omnimind"
+
+# --- Логи, ротация, аудит ---
+logging:
+  driver: "journald"                  # journald|files
+  file_rotate:
+    enabled: true
+    files:
+      - path: "{{ paths.log_dir }}/app.log"
+        rotate: 7
+        size: "50M"
+      - path: "{{ paths.log_dir }}/access.log"
+        rotate: 7
+        size: "50M"
+  journald:
+    rate_limit_interval: "30s"
+    rate_limit_burst: 1000
+  audit:
+    enabled: true
+    # Пример таблицы аудита: какие события писать в отдельный канал/файл
+    rules:
+      - name: "auth"
+        pattern: "auth*"
+      - name: "admin"
+        pattern: "admin*"
+
+# --- Системные лимиты и тюнинг ядра ---
+limits:
+  sysctl:
+    net.core.somaxconn: 4096
+    net.ipv4.tcp_fin_timeout: 30
+    net.ipv4.tcp_tw_reuse: 1
+    fs.file-max: 1048576
+    vm.max_map_count: 262144
+  pam:
+    nofile:
+      soft: 65535
+      hard: 65535
+    nproc:
+      soft: 32768
+      hard: 32768
+
+# --- Стратегия деплоя и systemd ---
+deploy:
+  strategy: "rolling"                 # rolling|blue_green
+  max_surge: "25%"
+  max_unavailable: "0"
+  healthcheck_timeout_sec: 10
+  after_deploy_wait_sec: 5
+  systemd:
+    unit_name: "omnimind-core.service"
+    restart: "on-failure"
+    restart_sec: 5
+    start_limit_burst: 5
+    start_limit_interval_sec: 60
+    # ExecStart задаётся в роли на основе путей/артефактов
+    environment_from_file: "{{ paths.config_dir }}/env"
+    hardening:
+      private_tmp: true
+      no_new_privileges: true
+      protect_system: "strict"
+      protect_home: true
+      ambient_capabilities: []
+      read_write_paths:
+        - "{{ paths.log_dir }}"
+        - "{{ paths.data_dir }}"
+        - "{{ paths.run_dir }}"
+
+# --- Контейнерный режим (опционально) ---
+docker:
+  enabled: false
+  runtime: "docker"                   # docker|containerd
+  container_name: "omnimind-core"
+  network_mode: "bridge"
+  ports:
+    - "{{ config.http_port }}:{{ config.http_port }}"
+    - "{{ config.metrics_port }}:{{ config.metrics_port }}"
+  volumes:
+    - "{{ paths.config_dir }}:/app/config:ro"
+    - "{{ paths.log_dir }}:/app/logs"
+    - "{{ paths.data_dir }}:/app/data"
+  extra_args: []
+  healthcheck:
+    cmd: ["CMD-SHELL", "curl -fsS http://127.0.0.1:{{ config.http_port }}/health || exit 1"]
+    interval: "30s"
+    timeout: "5s"
+    retries: 3
+    start_period: "10s"
+
+# --- Kubernetes режим (совместимость, управляется отдельно) ---
+k8s:
+  managed: false
+  namespace: "omnimind-prod"
+  service_account: "omnimind-core"
+  # Здесь только флаги; сами манифесты живут в ops/k8s
+
+# --- Мониторинг и алёртинг ---
+monitoring:
+  prometheus:
+    enabled: true
+    labels:
+      job: "omnimind-core"
+      env: "{{ app.env }}"
+    scrape_endpoint: "http://127.0.0.1:{{ config.metrics_port }}/metrics"
+    # Пороговые значения для алёртов (пример, реализуются в правилах Prometheus/Alertmanager):
+    alerts:
+      latency_p95_ms:
+        warn: 1500
+        crit: 3000
+      error_rate_pct:
+        warn: 1.0
+        crit: 5.0
+  exporters:
+    node_exporter: true
+    process_exporter: false
+
+# --- Бэкапы ---
+backup:
+  enabled: true
+  schedule: "daily"                   # daily|hourly|weekly (или cron отдельной ролью)
+  retention_days: 14
+  include_paths:
+    - "{{ paths.config_dir }}"
+    - "{{ paths.data_dir }}"
+    - "{{ paths.log_dir }}"
+  exclude_patterns:
+    - "*.tmp"
+    - "*.cache"
+  target:
+    type: "s3"                        # s3|nfs|local
+    s3:
+      bucket: "omnimind-backups"
+      prefix: "core/{{ app.env }}/"
+      region: "eu-central-1"
+      endpoint_url: ""                # кастомный S3 совместимый endpoint (опционально)
+      # Ключи — только из Vault:
+      access_key: "{{ vault_s3_access_key | default('') }}"
+      secret_key: "{{ vault_s3_secret_key | default('') }}"
+      sse: "AES256"
+
+# --- Обслуживание и обслуживание на уровне ОС ---
+maintenance:
+  autoremove_old_releases: true
+  keep_releases: 3
+  prune_docker_images: true
+
+# --- Ансибл-уровень ---
+ansible:
+  become: true
+  become_method: sudo
+  ansible_user: "deployer"
+  check_mode_safe: true
+
+# --- Плейбуки/роли могут использовать эти флаги, чтобы включать/выключать блоки задач ---
+feature_flags:
+  configure_sysctl: true
+  configure_firewall: true
+  configure_selinux: true
+  install_exporters: true
+  enable_audit: true
+  setup_logrotate: true
+
+# =====================================================================
+# СЕКРЕТЫ ЧЕРЕЗ ANSIBLE VAULT
+# Эти значения должны храниться в зашифрованном файле group_vars/omnimind-core.vault.yml
+# и подставляться плейбуками. Здесь только ссылки/заглушки.
+# =====================================================================
+# vault_registry_username: !vault |
+# vault_registry_password: !vault |
+# vault_jwt_signing_key:   !vault |
+# vault_db_dsn:            !vault |
+# vault_api_keys:          !vault |
+# vault_s3_access_key:     !vault |
+# vault_s3_secret_key:     !vault |

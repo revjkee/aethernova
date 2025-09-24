@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: planner-agent
+  namespace: agents
+  labels:
+    app.kubernetes.io/name: planner-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: teslaai
+    agent.type: planner
+    zero-trust: enforced
+    version: v20x-industrial
+spec:
+  replicas: 2
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: planner-agent
+  template:
+    metadata:
+      labels:
+        app: planner-agent
+        agent.type: planner
+        ai-intent.role: coordinator
+        telemetry.teslaai.io/enabled: "true"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+      annotations:
+        checksum/config: {{ .Values.plannerChecksum | default "REPLACE_WITH_HASH" }}
+        container.apparmor.security.beta.kubernetes.io/planner-agent: runtime/default
+    spec:
+      serviceAccountName: agent-planner-sa
+      priorityClassName: critical-ai-agent
+      securityContext:
+        runAsUser: 1011
+        fsGroup: 1011
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: planner-agent
+              topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: "ai-agent"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      nodeSelector:
+        node.teslaai.io/role: planner
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: planner-agent
+          image: registry.teslaai.io/agents/planner-agent:1.8.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - configMapRef:
+                name: planner-agent-config
+            - secretRef:
+                name: planner-agent-secret
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 4
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: planner-policy-cache
+              mountPath: /planner/policy
+              readOnly: false
+      volumes:
+        - name: planner-policy-cache
+          emptyDir:
+            sizeLimit: 256Mi

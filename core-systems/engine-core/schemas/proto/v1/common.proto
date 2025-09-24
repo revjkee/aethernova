@@ -1,0 +1,230 @@
+// Copyright ...
+// SPDX-License-Identifier: Apache-2.0
+//
+// engine-core/schemas/proto/v1/common.proto
+//
+// Промышленный набор общих типов:
+// - UUID/ULID/Id: идентификаторы ресурсов
+// - Money: денежные суммы (units + nanos) по канону Google
+// - Currency: ISO-4217 с опцией кастомных токенов по стандарту REV-1/REVA-20
+// - Vector2D/Vector3D/VectorND: векторные представления
+// - TimestampRange: полуоткрытые интервалы времени [start, end)
+// - Decimal128: десятичная точность в строковом виде для безопасной сериализации
+//
+// ВАЖНО: proto3 не поддерживает встроенные валидации; инварианты заданы комментариями и
+// должны проверяться на уровне приложения/IDL-валидаторов (buf, protovalidate и пр.).
+
+syntax = "proto3";
+
+package engine.v1.common;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// Общие опции генераторов для разных языков (правьте под ваш toolchain).
+option go_package        = "github.com/yourorg/engine-core/gen/proto/engine/v1/common;commonv1";
+option java_package      = "com.yourorg.engine.v1.common";
+option java_multiple_files = true;
+option csharp_namespace  = "YourOrg.Engine.V1.Common";
+option objc_class_prefix = "ENG";
+option php_namespace     = "YourOrg\\Engine\\V1\\Common";
+
+// -----------------------------
+// ИДЕНТИФИКАТОРЫ
+// -----------------------------
+
+// RFC 4122 UUID в каноническом текстовом виде (строка lower-case, тире).
+// Пример: "123e4567-e89b-12d3-a456-426614174000"
+// Инварианты:
+//  - len(value) == 36
+//  - regex: "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+message UUID {
+  string value = 1;
+  // reserved future fields
+  reserved 2 to 10;
+}
+
+// ULID (Crockford Base32, 26 символов, верхний регистр).
+// Пример: "01J3ZKQZ4C2X9Y6R2V4M8N1A3B"
+// Инварианты:
+//  - len(value) == 26
+//  - regex: "^[0-9A-HJKMNP-TV-Z]{26}$"
+message ULID {
+  string value = 1;
+  reserved 2 to 10;
+}
+
+// Универсальный идентификатор. Рекомендуется выбирать один стиль для домена,
+// но этот тип удобен для внешних API/событий.
+message Id {
+  oneof kind {
+    UUID uuid     = 1;
+    ULID ulid     = 2;
+    // Снежинка/инкрементные/чужие ID — строго как ASCII.
+    // Инвариант: 1..128 видимых символов, без пробелов.
+    string external = 3;
+  }
+  // Для трассировки/совместимости (не влияет на идентичность).
+  string namespace = 10; // e.g., "user", "order", "asset"
+  reserved 4 to 9, 11 to 20;
+}
+
+// Ссылка на ресурс по типу и идентификатору.
+// Пример: type="engine.user", id={uuid:"..."}
+message ResourceRef {
+  string type = 1; // семантическое имя ресурса, kebab/point-case
+  Id id       = 2;
+  reserved 3 to 10;
+}
+
+// -----------------------------
+// ВРЕМЯ
+// -----------------------------
+
+// Полуоткрытый интервал времени [start, end).
+// Инварианты:
+//  - start <= end
+//  - единицы: UTC (google.protobuf.Timestamp)
+//  - если end не задан, интервал открыт справа (бесконечность)
+message TimestampRange {
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end   = 2; // optional semantic; zero => open-ended
+  reserved 3 to 10;
+}
+
+// Смещение времени относительно "сейчас" для планировщиков/TTL.
+// Необязательная сущность для описания SLA, таймеров и т.п.
+message TimeOffset {
+  google.protobuf.Duration offset = 1; // может быть отрицательным
+  reserved 2 to 10;
+}
+
+// -----------------------------
+// ДЕНЕЖНЫЕ ТИПЫ
+// -----------------------------
+
+// Денежная сумма по канону Google (units + nanos).
+// Примеры:
+//   12.345 USD  => units=12, nanos=345000000
+//   -0.01 EUR   => units=0, nanos=-10000000
+// Инварианты:
+//  - -1e18 < units < 1e18
+//  - -999,999,999 <= nanos <= 999,999,999
+//  - знак у units и nanos должен совпадать
+//  - currency_code: ISO-4217 (или "X-REVA" для внутренних токенов стандарта REV-1/REVA-20)
+message Money {
+  string currency_code = 1; // ISO-4217, напр. "USD", "EUR", "SEK"; допускаются "X-REVA"
+  int64  units         = 2; // целые единицы валюты
+  int32  nanos         = 3; // наносы (1e-9)
+  reserved 4 to 10;
+}
+
+// Описание валюты. Может использоваться в каталогах тарифов/прайс‑листах.
+message Currency {
+  // ISO-4217 alpha-3 или внутренний код "X-REVA", "X-USDC" и пр.
+  string code = 1;
+  // Количество десятичных знаков отображения (обычно 2; для токенов 6/18).
+  uint32 scale = 2; // e.g., USD=2, USDC=6, REVA=18
+  string name  = 3; // человекочитаемое имя
+  reserved 4 to 10;
+}
+
+// Десятичное число фиксированной точности, сериализуемое как строка.
+// Используйте для сумм тарификации/котировок, где важна точность округления.
+// Инварианты:
+//  - regex: "^-?[0-9]+(\\.[0-9]+)?$"
+//  - max length: 128
+message Decimal128 {
+  string value = 1;
+  reserved 2 to 10;
+}
+
+// -----------------------------
+// ВЕКТОРА
+// -----------------------------
+
+// 2D-вектор (двойная точность).
+message Vector2D {
+  double x = 1;
+  double y = 2;
+  reserved 3 to 10;
+}
+
+// 3D-вектор (двойная точность).
+message Vector3D {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  reserved 4 to 10;
+}
+
+// Кватернион для поворотов в 3D (нормированный).
+// Инварианты: |q| ~= 1.0 (проверяется приложением).
+message Quaternion {
+  double w = 1;
+  double x = 2;
+  double y = 3;
+  double z = 4;
+  reserved 5 to 10;
+}
+
+// Произвольный N‑мерный вектор.
+// Инварианты:
+//  - len(values) == dimension, 1..4096
+message VectorND {
+  repeated double values = 1;
+  uint32 dimension       = 2;
+  reserved 3 to 10;
+}
+
+// -----------------------------
+// ПАГИНАЦИЯ/СОРТИРОВКА (часто нужна везде)
+// -----------------------------
+
+enum SortDirection {
+  SORT_DIRECTION_UNSPECIFIED = 0;
+  SORT_DIRECTION_ASC = 1;
+  SORT_DIRECTION_DESC = 2;
+}
+
+// Общая структура запроса для cursor-based пагинации.
+message PageRequest {
+  // Cursor (opaque): возвращается PageResponse.next_cursor.
+  string cursor = 1;
+  // Кол-во элементов (1..1000). Приложение нормализует.
+  uint32 page_size = 2;
+  // Поле сортировки, например "created_at".
+  string order_by = 3;
+  SortDirection direction = 4;
+  reserved 5 to 10;
+}
+
+// Ответ пагинации.
+message PageResponse {
+  string next_cursor = 1; // пусто, если достигнут конец
+  uint32 total_returned = 2;
+  reserved 3 to 10;
+}
+
+// -----------------------------
+// МЕТАДАННЫЕ ЗАПРОСА/ОТВЕТА
+// -----------------------------
+
+// Технические метаданные запроса.
+message RequestMeta {
+  string request_id      = 1; // корреляция (UUID/ULID)
+  string idempotency_key = 2; // ключ идемпотентности (до 128 ASCII)
+  string tenant_id       = 3;
+  string actor_id        = 4;
+  google.protobuf.Timestamp sent_at = 5;
+  reserved 6 to 20;
+}
+
+// Технические метаданные ответа.
+message ResponseMeta {
+  string request_id = 1;
+  google.protobuf.Timestamp received_at = 2;
+  // Полезно для rate-limit/квот и метрик.
+  map<string, string> ext = 3;
+  reserved 4 to 20;
+}

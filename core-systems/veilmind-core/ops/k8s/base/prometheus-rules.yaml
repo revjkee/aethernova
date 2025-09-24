@@ -1,0 +1,276 @@
+# File: veilmind-core/ops/k8s/base/prometheus-rules.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: veilmind-core-rules
+  namespace: monitoring              # поместите в namespace, где Operator считывает правила
+  labels:
+    app.kubernetes.io/name: veilmind-core
+    app.kubernetes.io/part-of: veilmind
+    prometheus: kube-prometheus      # либо: release: kube-prometheus-stack
+    role: alert-rules
+spec:
+  groups:
+
+  # -------------------------------
+  # Recording rules: агрегаты SLO
+  # -------------------------------
+  - name: veilmind.app.recording
+    interval: 30s
+    rules:
+      # HTTP запросы/ошибки API (замените job/namespace под ваши лейблы экспорта метрик)
+      - record: job:http_requests:rate5m
+        expr: |
+          sum by (namespace,job,route,status) (
+            rate(http_requests_total{namespace="veilmind",job=~"veilmind-core-api"}[5m])
+          )
+      - record: job:http_requests_errors:rate5m
+        expr: |
+          sum by (namespace,job,route) (
+            rate(http_requests_total{namespace="veilmind",job=~"veilmind-core-api",status=~"5.."}[5m])
+          )
+      - record: job:http_error_ratio:5m
+        expr: |
+          clamp_min(
+            job:http_requests_errors:rate5m
+            /
+            sum by (namespace,job,route) (job:http_requests:rate5m),
+          0)
+      # Латентность p95/p99 (мс) по bucket-гистограмме
+      - record: job:http_latency_p95_ms:5m
+        expr: |
+          1000 * histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(http_server_requests_seconds_bucket{namespace="veilmind",job=~"veilmind-core-api"}[5m])
+            )
+          )
+      - record: job:http_latency_p99_ms:5m
+        expr: |
+          1000 * histogram_quantile(
+            0.99,
+            sum by (le) (
+              rate(http_server_requests_seconds_bucket{namespace="veilmind",job=~"veilmind-core-api"}[5m])
+            )
+          )
+
+  # ----------------------------------------------------
+  # SLO burn-rate (многооконный по SRE; 5m/1h и 30m/6h)
+  # Настройте TARGET_ERROR_RATIO (доля допустимых ошибок, напр. 1%)
+  # ----------------------------------------------------
+  - name: veilmind.app.slo
+    interval: 30s
+    rules:
+      - alert: VeilmindAPISloburnFast
+        expr: |
+          (
+            sum(rate(http_requests_total{namespace="veilmind",job=~"veilmind-core-api",status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{namespace="veilmind",job=~"veilmind-core-api"}[5m]))
+          ) > (0.01 * 14.4)
+        for: 5m
+        labels:
+          severity: page
+          team: veilmind-core
+          service: api
+          slo: "true"
+          window: "5m/1h"
+        annotations:
+          summary: "SLO burn (быстрое окно) для API выше допустимого"
+          description: "Ошибка > 1% с повышенным коэффициентом (5m/1h). Немедленно проверьте логи/релизы/зависимости."
+          runbook_url: "https://runbooks.veilmind.local/api-slo"
+          dashboard: "https://grafana.local/d/veilmind/api-overview"
+
+      - alert: VeilmindAPISloburnSlow
+        expr: |
+          (
+            sum(rate(http_requests_total{namespace="veilmind",job=~"veilmind-core-api",status=~"5.."}[30m]))
+            /
+            sum(rate(http_requests_total{namespace="veilmind",job=~"veilmind-core-api"}[30m]))
+          ) > (0.01 * 6)
+        for: 30m
+        labels:
+          severity: ticket
+          team: veilmind-core
+          service: api
+          slo: "true"
+          window: "30m/6h"
+        annotations:
+          summary: "SLO burn (медленное окно) для API устойчиво превышен"
+          description: "Доля 5xx устойчиво повышена; требуется расследование и RCA."
+          runbook_url: "https://runbooks.veilmind.local/api-slo"
+          dashboard: "https://grafana.local/d/veilmind/api-overview"
+
+      - alert: VeilmindAPIHighLatencyP95
+        expr: job:http_latency_p95_ms:5m{namespace="veilmind"} > 300
+        for: 10m
+        labels:
+          severity: ticket
+          team: veilmind-core
+          service: api
+        annotations:
+          summary: "Высокая латентность API (p95 > 300ms)"
+          description: "p95={{ $value }}ms > 300ms. Проверьте БД, кэш, внешние интеграции."
+          runbook_url: "https://runbooks.veilmind.local/api-latency"
+
+      - alert: VeilmindAPIHighLatencyP99
+        expr: job:http_latency_p99_ms:5m{namespace="veilmind"} > 1000
+        for: 10m
+        labels:
+          severity: page
+          team: veilmind-core
+          service: api
+        annotations:
+          summary: "Критическая латентность API (p99 > 1s)"
+          description: "p99={{ $value }}ms > 1000ms; пользователи испытывают таймауты."
+          runbook_url: "https://runbooks.veilmind.local/api-latency"
+
+  # -----------------------------------------
+  # Доступность приложения и контроль подов
+  # -----------------------------------------
+  - name: veilmind.kube.workloads
+    interval: 30s
+    rules:
+      - alert: VeilmindAPIUnavailable
+        expr: |
+          (kube_deployment_status_replicas_available{namespace="veilmind",deployment="veilmind-core-api"} or on() vector(0))
+          < on(namespace, deployment)
+          kube_deployment_spec_replicas{namespace="veilmind",deployment="veilmind-core-api"}
+        for: 5m
+        labels:
+          severity: page
+          team: veilmind-core
+          service: api
+        annotations:
+          summary: "API: готовых реплик меньше запрошенных"
+          description: "Доступных={{ $value }}; проверьте события, логи, readiness/liveness."
+          runbook_url: "https://runbooks.veilmind.local/api-availability"
+
+      - alert: VeilmindWorkerUnavailable
+        expr: |
+          (kube_deployment_status_replicas_available{namespace="veilmind",deployment="veilmind-core-worker"} or on() vector(0))
+          < on(namespace, deployment)
+          kube_deployment_spec_replicas{namespace="veilmind",deployment="veilmind-core-worker"}
+        for: 10m
+        labels:
+          severity: ticket
+          team: veilmind-core
+          service: worker
+        annotations:
+          summary: "Worker: готовых реплик меньше запрошенных"
+          description: "Проверьте очередь, лимиты ресурсов и CrashLoop."
+          runbook_url: "https://runbooks.veilmind.local/worker-availability"
+
+      - alert: VeilmindPodCrashLooping
+        expr: |
+          increase(kube_pod_container_status_restarts_total{namespace="veilmind"}[5m]) > 3
+          or
+          max_over_time(kube_pod_container_status_waiting_reason{namespace="veilmind",reason="CrashLoopBackOff"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: page
+          team: veilmind-core
+        annotations:
+          summary: "Pod CrashLoopBackOff/частые рестарты"
+          description: "Контейнеры часто перезапускаются. Проверьте конфиги, секреты, зависимости."
+          runbook_url: "https://runbooks.veilmind.local/pod-crashloop"
+
+      - alert: VeilmindPodOOMKilled
+        expr: |
+          max_over_time(kube_pod_container_status_last_terminated_reason{namespace="veilmind",reason="OOMKilled"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: ticket
+          team: veilmind-core
+        annotations:
+          summary: "Контейнер(ы) завершены по OOMKilled"
+          description: "Увеличьте limits/request памяти, проверьте утечки."
+          runbook_url: "https://runbooks.veilmind.local/oom"
+
+  # -----------------------------------------
+  # Ресурсы/системное здоровье
+  # -----------------------------------------
+  - name: veilmind.kube.resources
+    interval: 30s
+    rules:
+      - alert: VeilmindContainerCPUThrottlingHigh
+        expr: |
+          (
+            sum by (namespace,pod,container) (rate(container_cpu_cfs_throttled_seconds_total{namespace="veilmind"}[5m]))
+            /
+            sum by (namespace,pod,container) (rate(container_cpu_cfs_periods_total{namespace="veilmind"}[5m]))
+          ) > 0.20
+        for: 10m
+        labels:
+          severity: ticket
+          team: veilmind-core
+        annotations:
+          summary: "Высокий CPU throttling (>20%)"
+          description: "Контейнеры ограничиваются по CPU. Пересмотрите requests/limits или оптимизацию."
+          runbook_url: "https://runbooks.veilmind.local/cpu-throttling"
+
+      - alert: VeilmindContainerMemoryNearLimit
+        expr: |
+          (
+            sum by (namespace,pod,container)(
+              container_memory_working_set_bytes{namespace="veilmind"}
+            )
+            /
+            sum by (namespace,pod,container)(
+              kube_pod_container_resource_limits_memory_bytes{namespace="veilmind"} > 0
+            )
+          ) > 0.90
+        for: 10m
+        labels:
+          severity: ticket
+          team: veilmind-core
+        annotations:
+          summary: "Память ~90% от limit"
+          description: "Риск OOM. Оптимизируйте память или увеличьте лимиты."
+          runbook_url: "https://runbooks.veilmind.local/memory-usage"
+
+      - alert: VeilmindNodeDiskPressure
+        expr: |
+          min by (node) (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay",mountpoint!~"/var/lib/kubelet/pods/.+"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay",mountpoint!~"/var/lib/kubelet/pods/.+"}
+          ) < 0.10
+        for: 15m
+        labels:
+          severity: ticket
+          team: veilmind-core
+        annotations:
+          summary: "Мало свободного места на диске узла (<10%)"
+          description: "Очистите логи/образы, расширьте файловую систему, проверьте ретеншн."
+          runbook_url: "https://runbooks.veilmind.local/disk-pressure"
+
+      - alert: VeilmindNodeMemoryPressure
+        expr: |
+          1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.90
+        for: 10m
+        labels:
+          severity: ticket
+          team: veilmind-core
+        annotations:
+          summary: "Низкий запас памяти на узле (>90% занято)"
+          description: "Рассмотрите перераспределение pod’ов, увеличение ресурсов."
+          runbook_url: "https://runbooks.veilmind.local/node-memory"
+
+  # -----------------------------------------
+  # Гигиена метрик/таргетов
+  # -----------------------------------------
+  - name: veilmind.metrics.hygiene
+    interval: 1m
+    rules:
+      - alert: VeilmindTargetMissing
+        expr: |
+          (count(up{job=~"veilmind-core-.*"} == 0) > 0)
+        for: 10m
+        labels:
+          severity: ticket
+          team: veilmind-core
+        annotations:
+          summary: "Некоторые таргеты veilmind-core недоступны"
+          description: "Экспортер/приложение недоступно для Prometheus (up==0). Проверьте Service/Endpoints и сетевые политики."
+          runbook_url: "https://runbooks.veilmind.local/metrics-targets"

@@ -1,0 +1,89 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: security-core
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/part-of: core-systems
+    app.kubernetes.io/component: security-core
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # Минимальная рекомендованная версия Kubernetes для behavior и memory: 1.23+
+    security.neurocity.dev/hpa-profile: "prod-safe"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: security-core
+
+  # Базовые пределы. Уточняются в оверлеях.
+  minReplicas: 3
+  maxReplicas: 30
+
+  # Метрики. Итоговое число реплик выбирается как максимум среди всех метрик.
+  metrics:
+    # 1) CPU как относительная загрузка от requests
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60   # целевая загрузка ~60% от cpu requests
+
+    # 2) Память как относительная загрузка от requests
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70   # память более инерционна, допускаем 70%
+
+    # 3) Пример дополнительных метрик (включать при наличии adapters)
+    # - type: Pods
+    #   pods:
+    #     metric:
+    #       name: http_requests_per_second   # custom.metrics.k8s.io
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "50"               # целевое среднее на Pod
+    #
+    # - type: External
+    #   external:
+    #     metric:
+    #       name: kafka_consumer_lag         # external.metrics.k8s.io
+    #       selector:
+    #         matchLabels:
+    #           topic: security-events
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "200"
+
+  # Контроль динамики масштабирования для устойчивости и быстрого роста нагрузки.
+  behavior:
+    scaleUp:
+      # Быстрый апскейл без ожидания, но ограниченный политиками ниже.
+      stabilizationWindowSeconds: 0
+      policies:
+        # Не более чем удвоение за минуту.
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        # И не более чем +4 реплики за минуту.
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+      selectPolicy: Max
+
+    scaleDown:
+      # Защита от флаппинга: ждем 5 минут стабильности перед уменьшением.
+      stabilizationWindowSeconds: 300
+      policies:
+        # Уменьшать не более чем на 50% за минуту.
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        # И не более чем на 2 пода за минуту.
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+      selectPolicy: Min

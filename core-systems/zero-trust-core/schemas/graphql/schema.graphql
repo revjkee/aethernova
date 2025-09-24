@@ -1,0 +1,1014 @@
+# zero-trust-core/schemas/graphql/schema.graphql
+
+############################################
+# Scalars
+############################################
+
+scalar UUID
+scalar DateTime
+scalar JSON
+scalar URL
+scalar Email
+scalar IP
+scalar CIDR
+scalar MAC
+scalar Duration
+scalar BigInt
+
+############################################
+# Directives
+############################################
+
+"""
+Маркирует объект или поле как принадлежащее конкретному арендатору.
+Резолвер обязан проверять совпадение контекста арендатора.
+"""
+directive @tenant(id: UUID!) on OBJECT | FIELD_DEFINITION
+
+"""
+Поле или объект требует авторизации по ресурсу и действию.
+requireAll=true означает, что все проверяемые условия должны пройти.
+"""
+directive @authz(
+  resource: String!
+  action: String!
+  requireAll: Boolean = true
+) on OBJECT | FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+"""
+Помечает поле как чувствительное. Резолвер должен возвращать маску,
+если вызывающий не имеет прав просмотра.
+"""
+directive @sensitive(mask: String = "REDACTED") on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+"""
+Логирование обращения к полю или мутации как аудито-события указанной категории.
+"""
+directive @audit(event: String) on FIELD_DEFINITION
+
+"""
+Ограничение частоты вызовов резолвера.
+"""
+directive @rateLimit(max: Int!, window: Duration!) on FIELD_DEFINITION
+
+############################################
+# Relay Node and Pagination
+############################################
+
+interface Node {
+  id: ID!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+############################################
+# Enums
+############################################
+
+enum SortDirection { ASC DESC }
+
+enum IdentityStatus { ACTIVE SUSPENDED DEPROVISIONED PENDING }
+
+enum RiskLevel { LOW MEDIUM HIGH CRITICAL UNKNOWN }
+
+enum TrustTier { T0 T1 T2 T3 T4 }
+
+enum SessionState { ACTIVE REVOKED EXPIRED }
+
+enum FactorType { PASSWORD TOTP WEBAUTHN PASSKEY PUSH SMS EMAIL U2F BIOMETRIC }
+
+enum DecisionEffect { ALLOW DENY CHALLENGE }
+
+enum AccessAction { READ WRITE DELETE EXECUTE ADMIN PUBLISH APPROVE REVOKE }
+
+enum ResourceType { API SERVICE DATASET TOPIC FILE SECRET VAULT DASHBOARD QUEUE FUNCTION ENDPOINT }
+
+enum ComplianceState { COMPLIANT NON_COMPLIANT UNKNOWN }
+
+enum PostureResult { PASS FAIL UNKNOWN }
+
+enum SignalSeverity { INFO LOW MEDIUM HIGH CRITICAL }
+
+enum PolicyEngine { OPA CEL NATIVE }
+
+enum AccessRequestStatus { PENDING APPROVED DENIED REVOKED EXPIRED }
+
+enum ErrorCode {
+  UNAUTHENTICATED
+  FORBIDDEN
+  NOT_FOUND
+  INVALID_INPUT
+  CONFLICT
+  RATE_LIMITED
+  INTERNAL
+  TENANT_MISMATCH
+  POLICY_VIOLATION
+  STEP_UP_REQUIRED
+  MFA_ENROLL_REQUIRED
+}
+
+enum DataClassification { PUBLIC INTERNAL CONFIDENTIAL RESTRICTED SECRET }
+
+############################################
+# Common Value Objects
+############################################
+
+type TrustScore {
+  value: Int! # 0..100
+  tier: TrustTier!
+  reasons: [TrustReason!]!
+  updatedAt: DateTime!
+}
+
+type TrustReason {
+  code: String!
+  message: String!
+  weight: Int!
+}
+
+type GeoContext {
+  country: String
+  region: String
+  city: String
+  latitude: Float
+  longitude: Float
+}
+
+type NetworkContext {
+  ip: IP
+  asn: BigInt
+  userAgent: String
+  zone: NetworkZone
+}
+
+############################################
+# Core Entities
+############################################
+
+type Tenant implements Node {
+  id: ID!
+  name: String!
+  slug: String!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type Role implements Node @tenant(id: "placeholder") {
+  id: ID!
+  tenantId: UUID!
+  name: String!
+  description: String
+  permissions: [Permission!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type Permission {
+  resourcePattern: String!
+  actions: [AccessAction!]!
+}
+
+type Entitlement {
+  key: String!
+  value: String!
+  expiresAt: DateTime
+}
+
+type Identity implements Node @tenant(id: "placeholder") {
+  id: ID!
+  tenantId: UUID!
+  username: String!
+  email: Email! @sensitive
+  displayName: String
+  status: IdentityStatus!
+  attributes: JSON
+  roles: [Role!]!
+  entitlements: [Entitlement!]!
+  factors: [AuthFactor!]!
+  trust: TrustScore!
+  risk: RiskLevel!
+  lastSeenAt: DateTime
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type AuthFactor implements Node {
+  id: ID!
+  type: FactorType!
+  label: String
+  enrolledAt: DateTime!
+  lastUsedAt: DateTime
+  verifiedAt: DateTime
+  metadata: JSON
+}
+
+type Device implements Node @tenant(id: "placeholder") {
+  id: ID!
+  tenantId: UUID!
+  owner: Identity
+  isManaged: Boolean!
+  compliance: ComplianceState!
+  os: String!
+  osVersion: String
+  model: String
+  serialNumber: String @sensitive
+  mac: MAC @sensitive
+  lastIP: IP
+  lastSeenAt: DateTime
+  posture: [PostureCheck!]!
+  attestations: [Attestation!]!
+  risk: RiskLevel!
+  trust: TrustScore!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type PostureCheck implements Node {
+  id: ID!
+  name: String!
+  result: PostureResult!
+  details: JSON
+  checkedAt: DateTime!
+}
+
+type Attestation implements Node {
+  id: ID!
+  provider: String! # TPM, Apple SEP, Android Keystore, SGX, TDX, WebAuthn
+  evidence: JSON @sensitive
+  validUntil: DateTime
+  createdAt: DateTime!
+}
+
+type Session implements Node @tenant(id: "placeholder") {
+  id: ID!
+  tenantId: UUID!
+  identity: Identity!
+  device: Device
+  state: SessionState!
+  startedAt: DateTime!
+  lastActiveAt: DateTime
+  expiresAt: DateTime
+  network: NetworkContext
+  geo: GeoContext
+  risk: RiskLevel!
+  trust: TrustScore!
+  mfaLevel: Int!
+}
+
+type Resource implements Node @tenant(id: "placeholder") {
+  id: ID!
+  tenantId: UUID!
+  type: ResourceType!
+  urn: String! # например urn:svc:inventory:read или api://orders/v1
+  owner: Identity
+  classification: DataClassification!
+  labels: [String!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type Policy implements Node @tenant(id: "placeholder") {
+  id: ID!
+  tenantId: UUID!
+  name: String!
+  description: String
+  version: Int!
+  isEnabled: Boolean!
+  priority: Int!
+  engine: PolicyEngine!
+  rules: [PolicyRule!]!
+  createdBy: Identity
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  publishedAt: DateTime
+}
+
+type PolicyRule implements Node {
+  id: ID!
+  name: String!
+  description: String
+  condition: String! # Rego, CEL, или выражение движка
+  effect: DecisionEffect!
+  target: TargetFilter!
+  obligations: [Obligation!]!
+}
+
+type TargetFilter {
+  subjects: SubjectFilter!
+  resources: ResourceFilter!
+  context: ContextFilter
+}
+
+type SubjectFilter {
+  identities: [UUID!]
+  rolesAnyOf: [String!]
+  entitlementsAllOf: [String!]
+  trustMin: Int
+  riskMax: RiskLevel
+}
+
+type ResourceFilter {
+  typesAnyOf: [ResourceType!]
+  urnsAnyOf: [String!]
+  labelsAllOf: [String!]
+  classificationMax: DataClassification
+}
+
+type ContextFilter {
+  timeWindows: [TimeWindow!]
+  networkZonesAnyOf: [UUID!]
+  deviceCompliance: ComplianceState
+  postureAllPass: Boolean
+  geoCountriesAnyOf: [String!]
+}
+
+type TimeWindow {
+  cron: String
+  tz: String
+}
+
+type Obligation {
+  requireFactorAnyOf: [FactorType!]
+  sessionMaxTTL: Duration
+  watermark: Boolean
+  redactFields: [String!]
+  logJustification: Boolean
+}
+
+type Decision implements Node {
+  id: ID!
+  tenantId: UUID!
+  subjectId: UUID!
+  resourceId: UUID!
+  action: AccessAction!
+  effect: DecisionEffect!
+  obligations: [Obligation!]!
+  reason: String
+  policy: Policy
+  rule: PolicyRule
+  evaluatedAt: DateTime!
+  trustAtDecision: TrustScore!
+  riskAtDecision: RiskLevel!
+}
+
+type RiskSignal implements Node @tenant(id: "placeholder") {
+  id: ID!
+  tenantId: UUID!
+  type: String!
+  severity: SignalSeverity!
+  scoreDelta: Int!
+  source: String!
+  attributes: JSON
+  session: Session
+  identity: Identity
+  device: Device
+  createdAt: DateTime!
+  expiresAt: DateTime
+}
+
+type AuditEvent implements Node @tenant(id: "placeholder") {
+  id: ID!
+  tenantId: UUID!
+  category: String!
+  actor: Identity
+  target: Resource
+  action: AccessAction
+  result: String!
+  correlationId: String
+  ip: IP
+  deviceId: UUID
+  sessionId: UUID
+  geo: GeoContext
+  severity: SignalSeverity!
+  attributes: JSON
+  createdAt: DateTime!
+}
+
+type NetworkZone implements Node @tenant(id: "placeholder") {
+  id: ID!
+  tenantId: UUID!
+  name: String!
+  cidrs: [CIDR!]!
+  trustTier: TrustTier!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+############################################
+# Connections
+############################################
+
+type IdentityEdge { node: Identity!, cursor: String! }
+type IdentityConnection {
+  edges: [IdentityEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type DeviceEdge { node: Device!, cursor: String! }
+type DeviceConnection {
+  edges: [DeviceEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type SessionEdge { node: Session!, cursor: String! }
+type SessionConnection {
+  edges: [SessionEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type PolicyEdge { node: Policy!, cursor: String! }
+type PolicyConnection {
+  edges: [PolicyEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type ResourceEdge { node: Resource!, cursor: String! }
+type ResourceConnection {
+  edges: [ResourceEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type AuditEventEdge { node: AuditEvent!, cursor: String! }
+type AuditEventConnection {
+  edges: [AuditEventEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type RiskSignalEdge { node: RiskSignal!, cursor: String! }
+type RiskSignalConnection {
+  edges: [RiskSignalEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type DecisionEdge { node: Decision!, cursor: String! }
+type DecisionConnection {
+  edges: [DecisionEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+############################################
+# Filters and Sorting
+############################################
+
+input TimeRange {
+  from: DateTime
+  to: DateTime
+}
+
+input IdentityFilter {
+  q: String
+  emailsAnyOf: [Email!]
+  statusAnyOf: [IdentityStatus!]
+  riskAnyOf: [RiskLevel!]
+  trustMin: Int
+  roleAnyOf: [String!]
+  createdAt: TimeRange
+}
+
+enum IdentitySortField { CREATED_AT UPDATED_AT USERNAME TRUST }
+input IdentitySort { field: IdentitySortField!, direction: SortDirection! }
+
+input DeviceFilter {
+  ownerIdsAnyOf: [UUID!]
+  isManaged: Boolean
+  complianceAnyOf: [ComplianceState!]
+  osAnyOf: [String!]
+  riskAnyOf: [RiskLevel!]
+  lastSeenAt: TimeRange
+}
+
+enum DeviceSortField { CREATED_AT UPDATED_AT LAST_SEEN RISK }
+input DeviceSort { field: DeviceSortField!, direction: SortDirection! }
+
+input SessionFilter {
+  identityIdsAnyOf: [UUID!]
+  stateAnyOf: [SessionState!]
+  riskAnyOf: [RiskLevel!]
+  startedAt: TimeRange
+  expiresAt: TimeRange
+}
+
+input PolicyFilter {
+  isEnabled: Boolean
+  engineAnyOf: [PolicyEngine!]
+  nameQ: String
+}
+
+input ResourceFilterInput {
+  typesAnyOf: [ResourceType!]
+  urnsAnyOf: [String!]
+  labelsAllOf: [String!]
+  classificationMax: DataClassification
+}
+
+input AuditFilter {
+  categoryAnyOf: [String!]
+  actorIdsAnyOf: [UUID!]
+  actionAnyOf: [AccessAction!]
+  resultAnyOf: [String!]
+  time: TimeRange
+  severityAnyOf: [SignalSeverity!]
+  resourceUrnAnyOf: [String!]
+  correlationId: String
+}
+
+############################################
+# Query
+############################################
+
+type Query {
+  node(id: ID!): Node
+
+  viewer: Identity @authz(resource: "identity:self", action: "READ")
+
+  tenant(id: UUID!): Tenant @authz(resource: "tenant", action: "READ")
+  tenants(first: Int = 20, after: String): [Tenant!]! @authz(resource: "tenant", action: "LIST")
+
+  identities(
+    filter: IdentityFilter
+    sort: IdentitySort = { field: UPDATED_AT, direction: DESC }
+    first: Int = 20
+    after: String
+  ): IdentityConnection @authz(resource: "identity", action: "LIST")
+
+  identity(id: UUID!): Identity @authz(resource: "identity", action: "READ")
+
+  devices(
+    filter: DeviceFilter
+    sort: DeviceSort = { field: LAST_SEEN, direction: DESC }
+    first: Int = 20
+    after: String
+  ): DeviceConnection @authz(resource: "device", action: "LIST")
+
+  device(id: UUID!): Device @authz(resource: "device", action: "READ")
+
+  sessions(
+    filter: SessionFilter
+    first: Int = 20
+    after: String
+  ): SessionConnection @authz(resource: "session", action: "LIST")
+
+  session(id: UUID!): Session @authz(resource: "session", action: "READ")
+
+  policies(
+    filter: PolicyFilter
+    first: Int = 20
+    after: String
+  ): PolicyConnection @authz(resource: "policy", action: "LIST")
+
+  policy(id: UUID!): Policy @authz(resource: "policy", action: "READ")
+
+  resources(
+    filter: ResourceFilterInput
+    first: Int = 20
+    after: String
+  ): ResourceConnection @authz(resource: "resource", action: "LIST")
+
+  resource(id: UUID!): Resource @authz(resource: "resource", action: "READ")
+
+  auditEvents(
+    filter: AuditFilter
+    first: Int = 50
+    after: String
+  ): AuditEventConnection @authz(resource: "audit", action: "LIST")
+
+  riskSignals(
+    first: Int = 50
+    after: String
+  ): RiskSignalConnection @authz(resource: "riskSignal", action: "LIST")
+
+  decisions(
+    first: Int = 50
+    after: String
+  ): DecisionConnection @authz(resource: "decision", action: "LIST")
+
+  networkZones(first: Int = 50, after: String): [NetworkZone!]! @authz(resource: "networkZone", action: "LIST")
+}
+
+############################################
+# Mutations: Payload Pattern
+############################################
+
+type UserError {
+  message: String!
+  code: ErrorCode!
+  field: [String!]
+}
+
+############################################
+# Mutations
+############################################
+
+input RegisterIdentityInput {
+  tenantId: UUID!
+  username: String!
+  email: Email!
+  displayName: String
+  roles: [String!]
+  attributes: JSON
+}
+
+type RegisterIdentityPayload {
+  identity: Identity
+  userErrors: [UserError!]!
+}
+
+input UpdateIdentityInput {
+  id: UUID!
+  displayName: String
+  status: IdentityStatus
+  roles: [String!]
+  attributes: JSON
+}
+
+type UpdateIdentityPayload {
+  identity: Identity
+  userErrors: [UserError!]!
+}
+
+input EnrollFactorInput {
+  identityId: UUID!
+  type: FactorType!
+  label: String
+  metadata: JSON
+}
+
+type EnrollFactorPayload {
+  factor: AuthFactor
+  userErrors: [UserError!]!
+}
+
+input RemoveFactorInput {
+  factorId: UUID!
+}
+
+type RemoveFactorPayload {
+  removed: Boolean!
+  userErrors: [UserError!]!
+}
+
+input CreateDeviceInput {
+  tenantId: UUID!
+  ownerId: UUID
+  isManaged: Boolean!
+  os: String!
+  osVersion: String
+  model: String
+  serialNumber: String
+}
+
+type CreateDevicePayload {
+  device: Device
+  userErrors: [UserError!]!
+}
+
+input UpdateDevicePostureInput {
+  deviceId: UUID!
+  checks: [PostureCheckInput!]!
+}
+
+input PostureCheckInput {
+  name: String!
+  result: PostureResult!
+  details: JSON
+}
+
+type UpdateDevicePosturePayload {
+  device: Device
+  userErrors: [UserError!]!
+}
+
+input AddAttestationInput {
+  deviceId: UUID!
+  provider: String!
+  evidence: JSON!
+  validUntil: DateTime
+}
+
+type AddAttestationPayload {
+  attestation: Attestation
+  device: Device
+  userErrors: [UserError!]!
+}
+
+input StartSessionInput {
+  tenantId: UUID!
+  identityId: UUID!
+  deviceId: UUID
+  ip: IP
+  userAgent: String
+}
+
+type StartSessionPayload {
+  session: Session
+  userErrors: [UserError!]!
+}
+
+input RevokeSessionInput {
+  sessionId: UUID!
+  reason: String
+}
+
+type RevokeSessionPayload {
+  session: Session
+  userErrors: [UserError!]!
+}
+
+input CreateResourceInput {
+  tenantId: UUID!
+  type: ResourceType!
+  urn: String!
+  classification: DataClassification = INTERNAL
+  labels: [String!]
+  ownerId: UUID
+}
+
+type CreateResourcePayload {
+  resource: Resource
+  userErrors: [UserError!]!
+}
+
+input UpdateResourceInput {
+  id: UUID!
+  classification: DataClassification
+  labels: [String!]
+}
+
+type UpdateResourcePayload {
+  resource: Resource
+  userErrors: [UserError!]!
+}
+
+input CreatePolicyInput {
+  tenantId: UUID!
+  name: String!
+  description: String
+  engine: PolicyEngine! = OPA
+  priority: Int = 100
+  rules: [PolicyRuleDraftInput!]!
+  isEnabled: Boolean = false
+}
+
+input PolicyRuleDraftInput {
+  name: String!
+  description: String
+  condition: String!
+  effect: DecisionEffect!
+  target: TargetDraftInput!
+  obligations: [ObligationDraftInput!]
+}
+
+input TargetDraftInput {
+  subjects: SubjectDraftInput!
+  resources: ResourceDraftInput!
+  context: ContextDraftInput
+}
+
+input SubjectDraftInput {
+  identities: [UUID!]
+  rolesAnyOf: [String!]
+  entitlementsAllOf: [String!]
+  trustMin: Int
+  riskMax: RiskLevel
+}
+
+input ResourceDraftInput {
+  typesAnyOf: [ResourceType!]
+  urnsAnyOf: [String!]
+  labelsAllOf: [String!]
+  classificationMax: DataClassification
+}
+
+input ContextDraftInput {
+  timeWindows: [TimeWindowDraftInput!]
+  networkZonesAnyOf: [UUID!]
+  deviceCompliance: ComplianceState
+  postureAllPass: Boolean
+  geoCountriesAnyOf: [String!]
+}
+
+input TimeWindowDraftInput {
+  cron: String
+  tz: String
+}
+
+input ObligationDraftInput {
+  requireFactorAnyOf: [FactorType!]
+  sessionMaxTTL: Duration
+  watermark: Boolean
+  redactFields: [String!]
+  logJustification: Boolean
+}
+
+type CreatePolicyPayload {
+  policy: Policy
+  userErrors: [UserError!]!
+}
+
+input UpdatePolicyInput {
+  id: UUID!
+  name: String
+  description: String
+  priority: Int
+  isEnabled: Boolean
+  rules: [PolicyRuleDraftInput!]
+}
+
+type UpdatePolicyPayload {
+  policy: Policy
+  userErrors: [UserError!]!
+}
+
+input PublishPolicyVersionInput { id: UUID! }
+type PublishPolicyVersionPayload {
+  policy: Policy
+  userErrors: [UserError!]!
+}
+
+input EvaluateAuthorizeInput {
+  tenantId: UUID!
+  subjectId: UUID!
+  resourceUrn: String!
+  action: AccessAction!
+  sessionId: UUID
+  context: JSON
+}
+
+type EvaluateAuthorizePayload {
+  decision: Decision
+  userErrors: [UserError!]!
+}
+
+input CreateAccessRequestInput {
+  tenantId: UUID!
+  requestorId: UUID!
+  resourceUrn: String!
+  action: AccessAction!
+  purpose: String
+}
+
+type CreateAccessRequestPayload {
+  accessRequest: AccessRequest
+  userErrors: [UserError!]!
+}
+
+type AccessRequest implements Node {
+  id: ID!
+  tenantId: UUID!
+  requestor: Identity!
+  resource: Resource!
+  action: AccessAction!
+  purpose: String
+  status: AccessRequestStatus!
+  decision: Decision
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+input DecideAccessRequestInput {
+  id: UUID!
+  approve: Boolean!
+  reason: String
+  obligations: [ObligationDraftInput!]
+}
+
+type DecideAccessRequestPayload {
+  accessRequest: AccessRequest
+  decision: Decision
+  userErrors: [UserError!]!
+}
+
+input LogAuditEventInput {
+  tenantId: UUID!
+  category: String!
+  actorId: UUID
+  targetResourceUrn: String
+  action: AccessAction
+  result: String!
+  correlationId: String
+  ip: IP
+  deviceId: UUID
+  sessionId: UUID
+  severity: SignalSeverity! = INFO
+  attributes: JSON
+}
+
+type LogAuditEventPayload {
+  event: AuditEvent
+  userErrors: [UserError!]!
+}
+
+input RecordRiskSignalInput {
+  tenantId: UUID!
+  type: String!
+  severity: SignalSeverity!
+  scoreDelta: Int!
+  source: String!
+  attributes: JSON
+  sessionId: UUID
+  identityId: UUID
+  deviceId: UUID
+  expiresAt: DateTime
+}
+
+type RecordRiskSignalPayload {
+  signal: RiskSignal
+  userErrors: [UserError!]!
+}
+
+type Mutation {
+  registerIdentity(input: RegisterIdentityInput!): RegisterIdentityPayload
+    @authz(resource: "identity", action: "CREATE") @audit(event: "identity.create")
+
+  updateIdentity(input: UpdateIdentityInput!): UpdateIdentityPayload
+    @authz(resource: "identity", action: "UPDATE") @audit(event: "identity.update")
+
+  enrollFactor(input: EnrollFactorInput!): EnrollFactorPayload
+    @authz(resource: "identity.factor", action: "CREATE") @audit(event: "factor.enroll")
+
+  removeFactor(input: RemoveFactorInput!): RemoveFactorPayload
+    @authz(resource: "identity.factor", action: "DELETE") @audit(event: "factor.remove")
+
+  createDevice(input: CreateDeviceInput!): CreateDevicePayload
+    @authz(resource: "device", action: "CREATE") @audit(event: "device.create")
+
+  updateDevicePosture(input: UpdateDevicePostureInput!): UpdateDevicePosturePayload
+    @authz(resource: "device.posture", action: "UPDATE") @audit(event: "device.posture.update")
+
+  addAttestation(input: AddAttestationInput!): AddAttestationPayload
+    @authz(resource: "device.attestation", action: "CREATE") @audit(event: "device.attestation.add")
+
+  startSession(input: StartSessionInput!): StartSessionPayload
+    @authz(resource: "session", action: "CREATE") @audit(event: "session.start")
+
+  revokeSession(input: RevokeSessionInput!): RevokeSessionPayload
+    @authz(resource: "session", action: "DELETE") @audit(event: "session.revoke")
+
+  createResource(input: CreateResourceInput!): CreateResourcePayload
+    @authz(resource: "resource", action: "CREATE") @audit(event: "resource.create")
+
+  updateResource(input: UpdateResourceInput!): UpdateResourcePayload
+    @authz(resource: "resource", action: "UPDATE") @audit(event: "resource.update")
+
+  createPolicy(input: CreatePolicyInput!): CreatePolicyPayload
+    @authz(resource: "policy", action: "CREATE") @audit(event: "policy.create")
+
+  updatePolicy(input: UpdatePolicyInput!): UpdatePolicyPayload
+    @authz(resource: "policy", action: "UPDATE") @audit(event: "policy.update")
+
+  publishPolicyVersion(input: PublishPolicyVersionInput!): PublishPolicyVersionPayload
+    @authz(resource: "policy", action: "PUBLISH") @audit(event: "policy.publish")
+
+  evaluateAuthorize(input: EvaluateAuthorizeInput!): EvaluateAuthorizePayload
+    @authz(resource: "decision", action: "CREATE") @audit(event: "authorize.evaluate")
+
+  createAccessRequest(input: CreateAccessRequestInput!): CreateAccessRequestPayload
+    @authz(resource: "accessRequest", action: "CREATE") @audit(event: "accessRequest.create")
+
+  decideAccessRequest(input: DecideAccessRequestInput!): DecideAccessRequestPayload
+    @authz(resource: "accessRequest", action: "APPROVE") @audit(event: "accessRequest.decide")
+
+  logAuditEvent(input: LogAuditEventInput!): LogAuditEventPayload
+    @authz(resource: "audit", action: "CREATE")
+
+  recordRiskSignal(input: RecordRiskSignalInput!): RecordRiskSignalPayload
+    @authz(resource: "riskSignal", action: "CREATE")
+}
+
+############################################
+# Subscriptions
+############################################
+
+type Subscription {
+  riskSignalAdded(tenantId: UUID!): RiskSignal
+    @authz(resource: "riskSignal", action: "LIST")
+
+  auditEventAppended(tenantId: UUID!): AuditEvent
+    @authz(resource: "audit", action: "LIST")
+
+  decisionEmitted(tenantId: UUID!, subjectId: UUID): Decision
+    @authz(resource: "decision", action: "LIST")
+}
+
+############################################
+# Root Schema
+############################################
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}

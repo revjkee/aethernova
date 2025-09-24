@@ -1,0 +1,229 @@
+{{- /*
+  physical-integration-core/templates/service.yaml
+  Промышленный шаблон Service для всех окружений.
+  Ожидаемые хелперы: "<chartname>.fullname", "<chartname>.name", "<chartname>.labels"
+*/ -}}
+{{- $fullname := include "physical-integration-core.fullname" . -}}
+{{- $labels := include "physical-integration-core.labels" . | fromYaml -}}
+{{- $svc := .Values.service | default dict -}}
+
+{{- if not $svc.enabled | default true -}}
+{{- /* Позволяет отключить основной Service */ -}}
+{{- else -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc.name | default $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+    app.kubernetes.io/component: service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: physical-integration-core
+  {{- with $svc.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  annotations:
+  {{- if $svc.annotations }}
+    {{- toYaml $svc.annotations | nindent 4 }}
+  {{- end }}
+  {{- if $svc.prometheus }}
+    {{- if $svc.prometheus.enabled }}
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "{{ $svc.prometheus.port | default ($svc.port | default 8080) }}"
+    prometheus.io/path: "{{ $svc.prometheus.path | default "/metrics" }}"
+    {{- end }}
+  {{- end }}
+spec:
+  {{- /* Тип сервиса и headless‑логика */ -}}
+  {{- $type := ($svc.type | default "ClusterIP") -}}
+  type: {{ $type }}
+  {{- if or (eq $type "ClusterIP") (eq $type "NodePort") (eq $type "LoadBalancer") }}
+  {{- if hasKey $svc "clusterIP" }}
+  clusterIP: {{ $svc.clusterIP | quote }}
+  {{- else if $svc.headless | default false }}
+  clusterIP: None
+  {{- end }}
+  {{- end }}
+
+  {{- /* Семейства IP и политика */ -}}
+  {{- with $svc.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $svc.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+
+  {{- /* Внутренняя/внешняя политика трафика (K8s 1.26+) */ -}}
+  {{- with $svc.internalTrafficPolicy }}
+  internalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with $svc.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+
+  {{- /* NodePorts и настройки LB при необходимости */ -}}
+  {{- if eq $type "LoadBalancer" }}
+  {{- with $svc.loadBalancerClass }}
+  loadBalancerClass: {{ . | quote }}
+  {{- end }}
+  {{- with $svc.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if hasKey $svc "allocateLoadBalancerNodePorts" }}
+  allocateLoadBalancerNodePorts: {{ $svc.allocateLoadBalancerNodePorts }}
+  {{- end }}
+  {{- with $svc.healthCheckNodePort }}
+  healthCheckNodePort: {{ . }}
+  {{- end }}
+  {{- end }}
+
+  {{- with $svc.externalIPs }}
+  externalIPs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  {{- if hasKey $svc "publishNotReadyAddresses" }}
+  publishNotReadyAddresses: {{ $svc.publishNotReadyAddresses }}
+  {{- end }}
+
+  {{- /* Session Affinity */ -}}
+  {{- with $svc.sessionAffinity }}
+  sessionAffinity: {{ .type | default "None" }}
+  {{- if eq (.type | default "None") "ClientIP" }}
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ .timeoutSeconds | default 10800 }}
+  {{- end }}
+  {{- end }}
+
+  {{- /* Селекторы: по умолчанию — метка имени приложения + возможные доп. селекторы */ -}}
+  selector:
+    app.kubernetes.io/name: {{ include "physical-integration-core.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- with $svc.extraSelectors }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+  {{- /* Порты */ -}}
+  ports:
+    {{- /* Основной порт */ -}}
+    - name: {{ default "http" $svc.portName }}
+      port: {{ default 80 $svc.port }}
+      protocol: {{ default "TCP" $svc.protocol }}
+      targetPort: {{ default "http" $svc.targetPort }}
+      {{- if and (or (eq $type "NodePort") (eq $type "LoadBalancer")) $svc.nodePort }}
+      nodePort: {{ $svc.nodePort }}
+      {{- end }}
+      {{- if $svc.appProtocol }}
+      appProtocol: {{ $svc.appProtocol | quote }}
+      {{- end }}
+    {{- /* Дополнительные порты массивом */ -}}
+    {{- with $svc.additionalPorts }}
+    {{- range . }}
+    - name: {{ .name }}
+      port: {{ .port }}
+      protocol: {{ default "TCP" .protocol }}
+      targetPort: {{ default .name .targetPort }}
+      {{- if and (or (eq $type "NodePort") (eq $type "LoadBalancer")) .nodePort }}
+      nodePort: {{ .nodePort }}
+      {{- end }}
+      {{- if .appProtocol }}
+      appProtocol: {{ .appProtocol | quote }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+{{- end }}
+
+{{- /* Дополнительные сервисы (массив), например отдельный gRPC/metrics/udp и т.д. */ -}}
+{{- $extra := .Values.additionalServices | default list -}}
+{{- range $i, $svc2 := $extra }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{- if $svc2.name -}}{{ $svc2.name }}{{- else -}}{{ printf "%s-%s" $fullname (default (printf "svc-%d" (add1 $i)) $svc2.suffix) }}{{- end }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+    app.kubernetes.io/component: service
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+  {{- with $svc2.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  annotations:
+  {{- with $svc2.annotations }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $svc2.type | default "ClusterIP" }}
+  {{- if or (eq ($svc2.type | default "ClusterIP") "ClusterIP") (eq $svc2.type "NodePort") (eq $svc2.type "LoadBalancer") }}
+  {{- if hasKey $svc2 "clusterIP" }}
+  clusterIP: {{ $svc2.clusterIP | quote }}
+  {{- else if $svc2.headless | default false }}
+  clusterIP: None
+  {{- end }}
+  {{- end }}
+  {{- with $svc2.ipFamilies }}ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $svc2.ipFamilyPolicy }}ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with $svc2.internalTrafficPolicy }}internalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with $svc2.externalTrafficPolicy }}externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with $svc2.loadBalancerClass }}loadBalancerClass: {{ . | quote }}
+  {{- end }}
+  {{- with $svc2.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if hasKey $svc2 "allocateLoadBalancerNodePorts" }}
+  allocateLoadBalancerNodePorts: {{ $svc2.allocateLoadBalancerNodePorts }}
+  {{- end }}
+  {{- with $svc2.healthCheckNodePort }}healthCheckNodePort: {{ . }}
+  {{- end }}
+  {{- with $svc2.externalIPs }}
+  externalIPs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if hasKey $svc2 "publishNotReadyAddresses" }}
+  publishNotReadyAddresses: {{ $svc2.publishNotReadyAddresses }}
+  {{- end }}
+  {{- with $svc2.sessionAffinity }}
+  sessionAffinity: {{ .type | default "None" }}
+  {{- if eq (.type | default "None") "ClientIP" }}
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ .timeoutSeconds | default 10800 }}
+  {{- end }}
+  {{- end }}
+  selector:
+    app.kubernetes.io/name: {{ include "physical-integration-core.name" $ }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    {{- with $svc2.extraSelectors }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  ports:
+    {{- if $svc2.ports }}
+    {{- range $p := $svc2.ports }}
+    - name: {{ $p.name }}
+      port: {{ $p.port }}
+      protocol: {{ default "TCP" $p.protocol }}
+      targetPort: {{ default $p.name $p.targetPort }}
+      {{- if and (or (eq ($svc2.type | default "ClusterIP") "NodePort") (eq ($svc2.type | default "ClusterIP") "LoadBalancer")) $p.nodePort }}
+      nodePort: {{ $p.nodePort }}
+      {{- end }}
+      {{- if $p.appProtocol }}appProtocol: {{ $p.appProtocol | quote }}{{- end }}
+    {{- end }}
+    {{- else }}
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    {{- end }}
+{{- end }}

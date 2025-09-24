@@ -1,0 +1,92 @@
+# ops/k8s/base/servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: datafabric-core
+  labels:
+    app.kubernetes.io/name: datafabric-core
+    app.kubernetes.io/instance: datafabric-core
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: datafabric
+    # Укажите релиз Prometheus (если используется label selector в CR Prometheus)
+    release: PLACEHOLDER_PROMETHEUS_RELEASE
+spec:
+  # namespaceSelector:
+  #   any: true
+  namespaceSelector:
+    matchNames:
+      - PLACEHOLDER_NAMESPACE
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: datafabric-core
+      app.kubernetes.io/instance: datafabric-core
+  endpoints:
+    - port: metrics                      # должен совпадать с именем порта в Service/Pod (например, 9090)
+      path: /metrics
+      scheme: http                       # переопределите на https при необходимости
+      interval: 15s
+      scrapeTimeout: 10s
+      honorLabels: true
+      relabelings:
+        # Сохраняем базовые лейблы цели
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - action: replace
+          sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_container_name]
+          targetLabel: container
+        # Упрощаем instance (удаляем порт/эндпоинт), чтобы снизить кардинальность
+        - action: replace
+          sourceLabels: [__address__]
+          regex: "([^:]+)(?::\\d+)?"
+          targetLabel: instance
+          replacement: "$1"
+        # Опционально: отбросить динамичные лейблы Kubernetes
+        - action: labeldrop
+          regex: "pod_template_hash|controller_revision_hash|job|pod_ip|endpoint|service_account|uid"
+      metricRelabelings:
+        # Удаляем высококардинальные/шумные метрики по шаблону (настройте под ваше приложение)
+        - action: drop
+          regex: "go_gc_heap_.+|go_memstats_.+_bytes_total"
+          sourceLabels: [__name__]
+        # Нормализуем лейбл instance в метриках, если экспортер выставляет свой
+        - action: replace
+          sourceLabels: [instance]
+          targetLabel: app_instance
+      tlsConfig:
+        # Включите при scheme: https и наличии секретов с CA/клиентскими ключами.
+        insecureSkipVerify: false
+        # ca:
+        #   secret:
+        #     name: PLACEHOLDER_CA_SECRET
+        #     key: ca.crt
+        # cert:
+        #   secret:
+        #     name: PLACEHOLDER_TLS_SECRET
+        #     key: tls.crt
+        # keySecret:
+        #   name: PLACEHOLDER_TLS_SECRET
+        #   key: tls.key
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      # proxyUrl: http://proxy.monitoring.svc.cluster.local:3128
+    # Дополнительный эндпоинт для профилирования/диагностики, если нужен
+    # - port: http
+    #   path: /debug/vars
+    #   interval: 30s
+    #   scrapeTimeout: 10s
+
+  targetLabels:
+    # Переносим стабильные метки сервиса в серию метрик (снижает cardinality взвешенно)
+    - app.kubernetes.io/name
+    - app.kubernetes.io/instance
+
+  sampleLimit: 0             # 0 = без лимита; задайте в оверлеях при риске перегруза
+  labelLimit: 0              # 0 = без лимита
+  labelNameLengthLimit: 0
+  labelValueLengthLimit: 0

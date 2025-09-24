@@ -1,0 +1,162 @@
+{{- /*
+  ConfigMaps for mythos-core.
+  IMPORTANT: Do NOT put secrets here (tokens, API keys). Use Kubernetes Secrets.
+*/ -}}
+
+{{- $fullname := include "mythos-core.fullname" . -}}
+{{- $labels := include "mythos-core.labels" . -}}
+
+{{- /* =========================
+       TRAINING WORKER ConfigMap
+       ========================= */ -}}
+{{- if .Values.trainingWorker.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-training-worker" $fullname }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: training-worker
+data:
+  # Non-secret configuration for the training worker.
+  training-worker.yaml: |
+    jobsRoot: {{ .Values.trainingWorker.jobsRoot | default "/data/jobs" | quote }}
+    logDir: {{ .Values.trainingWorker.logDir | default "/var/log/mythos/worker" | quote }}
+    http:
+      host: {{ .Values.trainingWorker.http.host | default "0.0.0.0" | quote }}
+      port: {{ .Values.trainingWorker.http.port | default 8080 }}
+    worker:
+      concurrency: {{ .Values.trainingWorker.concurrency | default 2 }}
+      pollInterval: {{ .Values.trainingWorker.pollInterval | default 1.0 }}
+      staleReclaimSeconds: {{ .Values.trainingWorker.staleReclaimSeconds | default 900.0 }}
+    logging:
+      level: {{ .Values.trainingWorker.logLevel | default "INFO" | quote }}
+
+  # Launcher transforms YAML settings into CLI flags for training_worker.py
+  launcher.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CONFIG_DIR="${CONFIG_DIR:-/etc/mythos}"
+    CFG="${CONFIG_DIR}/training-worker.yaml"
+    py="${PYTHON_BIN:-python}"
+
+    # tiny jqless YAML reader (line-oriented; expects flat keys we write above)
+    yq() { grep -E "^[a-zA-Z]" -n "$1" >/dev/null 2>&1 || true; }
+
+    jobs_root="$(awk -F': ' '/^jobsRoot:/{print $2}' "$CFG" | tr -d \" )"
+    log_dir="$(awk -F': ' '/^  logDir:/{print $2}' "$CFG" | tr -d \" )"
+    http_host="$(awk -F': ' '/^  host:/{print $2}' "$CFG" | head -n1 | tr -d \" )"
+    http_port="$(awk -F': ' '/^  port:/{print $2}' "$CFG" | head -n1 | tr -d \" )"
+    concurrency="$(awk -F': ' '/^  concurrency:/{print $2}' "$CFG" | tr -d \" )"
+    poll_interval="$(awk -F': ' '/^  pollInterval:/{print $2}' "$CFG" | tr -d \" )"
+    stale_reclaim="$(awk -F': ' '/^  staleReclaimSeconds:/{print $2}' "$CFG" | tr -d \" )"
+    log_level="$(awk -F': ' '/^  level:/{print $2}' "$CFG" | tr -d \" )"
+
+    exec "$py" neuroforge/workers/training_worker.py \
+      --jobs-root "$jobs_root" \
+      --log-dir "$log_dir" \
+      --http-host "$http_host" \
+      --http-port "$http_port" \
+      --concurrency "$concurrency" \
+      --poll-interval "$poll_interval" \
+      --stale-reclaim-seconds "$stale_reclaim" \
+      --log-level "$log_level"
+{{- end }}
+
+{{- /* ======================
+       SERVE LOCAL ConfigMap
+       ====================== */ -}}
+{{- if .Values.serveLocal.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-serve-local" $fullname }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: serve-local
+data:
+  # Non-secret configuration for cli/tools/serve_local.py
+  serve-local.yaml: |
+    root: {{ .Values.serveLocal.root | default "/data/artifacts" | quote }}
+    host: {{ .Values.serveLocal.host | default "0.0.0.0" | quote }}
+    port: {{ .Values.serveLocal.port | default 8081 }}
+    logDir: {{ .Values.serveLocal.logDir | default "/var/log/mythos/serve" | quote }}
+    logLevel: {{ .Values.serveLocal.logLevel | default "INFO" | quote }}
+    readonly: {{ .Values.serveLocal.readonly | default false }}
+    cors: {{ .Values.serveLocal.cors | default "*" | quote }}
+    maxUploadMB: {{ .Values.serveLocal.maxUploadMB | default 2048 }}
+    rateLimit:
+      rate: {{ .Values.serveLocal.rateLimit.rate | default 50.0 }}
+      burst: {{ .Values.serveLocal.rateLimit.burst | default 200.0 }}
+    tls:
+      certFile: {{ .Values.serveLocal.tls.certFile | default "" | quote }}    # mount from Secret
+      keyFile: {{ .Values.serveLocal.tls.keyFile  | default "" | quote }}    # mount from Secret
+
+  # Launcher builds CLI flags from YAML and executes serve_local.py
+  launcher.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CONFIG_DIR="${CONFIG_DIR:-/etc/mythos}"
+    CFG="${CONFIG_DIR}/serve-local.yaml"
+    py="${PYTHON_BIN:-python}"
+
+    root="$(awk -F': ' '/^root:/{print $2}' "$CFG" | tr -d \" )"
+    host="$(awk -F': ' '/^host:/{print $2}' "$CFG" | tr -d \" )"
+    port="$(awk -F': ' '/^port:/{print $2}' "$CFG" | tr -d \" )"
+    log_dir="$(awk -F': ' '/^logDir:/{print $2}' "$CFG" | tr -d \" )"
+    log_level="$(awk -F': ' '/^logLevel:/{print $2}' "$CFG" | tr -d \" )"
+    readonly="$(awk -F': ' '/^readonly:/{print $2}' "$CFG" | tr -d \" )"
+    cors="$(awk -F': ' '/^cors:/{print $2}' "$CFG" | tr -d \" )"
+    max_upload="$(awk -F': ' '/^maxUploadMB:/{print $2}' "$CFG" | tr -d \" )"
+    rl_rate="$(awk -F': ' '/^  rate:/{print $2}' "$CFG" | tr -d \" )"
+    rl_burst="$(awk -F': ' '/^  burst:/{print $2}' "$CFG" | tr -d \" )"
+    cert="$(awk -F': ' '/^  certFile:/{print $2}' "$CFG" | tr -d \" )"
+    key="$(awk -F': ' '/^  keyFile:/{print $2}' "$CFG" | tr -d \" )"
+
+    args=( cli/tools/serve_local.py --root "$root" --host "$host" --port "$port" --log-dir "$log_dir" --log-level "$log_level" --max-upload-mb "$max_upload" --rl-rate "$rl_rate" --rl-burst "$rl_burst" )
+    [[ "$readonly" == "true" ]] && args+=( --readonly )
+    if [[ -n "${cors:-}" && "$cors" != "\"\"" ]]; then args+=( --cors "$cors" ); fi
+    if [[ -n "${cert:-}" && -n "${key:-}" && "$cert" != "\"\"" && "$key" != "\"\"" ]]; then args+=( --certfile "$cert" --keyfile "$key" ); fi
+    exec "${py}" "${args[@]}"
+{{- end }}
+
+{{- /* ======================
+       LLM CHAT DEMO ConfigMap
+       ====================== */ -}}
+{{- if .Values.llmChat.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-llm-chat" $fullname }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: llm-chat-demo
+data:
+  # .env for examples/llm_chat_demo/app.py (non-secret)
+  llm-chat.env: |
+    HOST={{ .Values.llmChat.host | default "0.0.0.0" }}
+    PORT={{ .Values.llmChat.port | default 8090 }}
+    LOG_LEVEL={{ .Values.llmChat.logLevel | default "INFO" }}
+    CORS={{ .Values.llmChat.cors | default "*" }}
+    RATE_LIMIT_RPS={{ .Values.llmChat.rateLimit.rps | default 20 }}
+    RATE_LIMIT_BURST={{ .Values.llmChat.rateLimit.burst | default 60 }}
+    MAX_REQUEST_KB={{ .Values.llmChat.maxRequestKB | default 256 }}
+    PROVIDER={{ .Values.llmChat.provider | default "mock" }}
+    # OpenAI-compatible (keys/tokens must come from Secret/Env, not ConfigMap)
+    OPENAI_BASE_URL={{ .Values.llmChat.openai.baseUrl | default "https://api.openai.com/v1" }}
+    OPENAI_MODEL={{ .Values.llmChat.openai.model | default "gpt-4o-mini" }}
+    # OPENAI_API_KEY is intentionally absent here (use Secret)
+
+  # Optional launcher exporting .env then running the app
+  launcher.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ENV_FILE="${ENV_FILE:-/etc/mythos/llm-chat.env}"
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+    exec ${PYTHON_BIN:-python} examples/llm_chat_demo/app.py
+{{- end }}

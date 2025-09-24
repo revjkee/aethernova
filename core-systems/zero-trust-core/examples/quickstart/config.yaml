@@ -1,0 +1,286 @@
+# apiVersion и метаданные конфигурации
+apiVersion: zero-trust-core/v1
+kind: QuickstartConfig
+metadata:
+  name: zero-trust-core
+  owner: security-team
+  schema: v1
+
+# Якорь с общими значениями для всех профилей
+defaults: &defaults
+  logging:
+    level: INFO                  # DEBUG|INFO|WARN|ERROR
+    json: true                   # структурированные JSON-логи
+    destination: stdout          # stdout|file
+    filePath: /var/log/zt/zt-core.log
+    sampling:
+      rate: 1.0                  # 0..1, для DEBUG можно <1.0
+
+  tracing:
+    enabled: true
+    exporter: otlp               # otlp|noop
+    sampling: 0.1                # 10% сэмплирование
+    otlp:
+      endpoint: ${OTLP_ENDPOINT:-http://otel-collector:4317}
+      insecure: true
+      headers:                   # пример: заголовки для бэкэнда трейсинга
+        x-otlp-token: ${OTLP_TOKEN:-}
+
+  metrics:
+    enabled: true
+    prometheus:
+      bindAddress: 0.0.0.0
+      port: 9109                 # должен совпадать с PROM_PORT воркера
+      path: /metrics
+
+  featureFlags:
+    enableIstioAdapter: true
+    enableRiskWorker: true
+    enablePolicyEngine: true
+    denyByDefault: true          # политика по умолчанию
+
+  http:
+    bind: 0.0.0.0
+    port: 8080
+    healthPath: /healthz
+    readyPath: /readyz
+
+  k8s:
+    inCluster: true
+    kubeconfig: null
+    context: null
+    verifySSL: true
+    useAsyncClient: true
+    requestTimeoutSeconds: 15
+    fieldManager: zero-trust-core
+
+  # Конфигурация Istio-адаптера (согласована с istio_adapter.py)
+  istio:
+    namespace: production
+    forceApply: true
+    dryRun: false
+    labels:
+      zero-trust: "true"
+
+    # Глобальные политики безопасности
+    security:
+      mtlsMode: STRICT           # STRICT|PERMISSIVE|DISABLE
+      jwt:
+        issuer: https://auth.example.com/
+        jwksUri: https://auth.example.com/.well-known/jwks.json
+        audiences: [ "payments-api" ]
+        fromHeaders:
+          - name: Authorization
+            prefix: "Bearer "
+        fromParams: [ ]
+
+    # Примеры целевых объектов (можно включать/отключать в policyEngine.applySamples)
+    destinationRule:
+      host: payments.production.svc.cluster.local
+      sni: null
+    sidecar:
+      outboundTrafficPolicyMode: REGISTRY_ONLY
+      captureMode: DEFAULT
+      egressHosts:
+        - "./*"
+        - "istio-system/*"
+    selector:
+      matchLabels:
+        app: payments
+
+  # Политический движок: действия при уровнях риска
+  policyEngine:
+    applySamples: true           # при true применит примеры Istio-политик ниже
+    decisions:
+      - name: block-critical
+        match:
+          entityType: user
+        when:
+          riskAtLeast: CRITICAL
+        actions:
+          - BLOCK
+          - REQUIRE_IR                             # инцидент-ревью
+      - name: stepup-high
+        when:
+          riskAtLeast: HIGH
+        actions:
+          - STEP_UP_AUTH                           # требовать повышенную аутентификацию (MFA/Passkey)
+      - name: observe-medium
+        when:
+          riskAtLeast: MEDIUM
+        actions:
+          - OBSERVE                                # логировать/маркировать сессии
+      - name: allow-low
+        when:
+          riskBelow: MEDIUM
+        actions:
+          - ALLOW
+
+  # Настройки очередей (совместимы с воркером)
+  queue:
+    backend: ${RISK_QUEUE_BACKEND:-memory}         # memory|redis|kafka|rabbit
+    topic: ${RISK_QUEUE_TOPIC:-risk.events}
+    group: ${RISK_QUEUE_GROUP:-risk-worker}
+    dlq: ${RISK_DLQ:-risk.dlq}
+    redis:
+      url: ${REDIS_URL:-redis://redis:6379/0}
+    kafka:
+      bootstrapServers: ${KAFKA_BOOTSTRAP:-kafka:9092}
+    rabbit:
+      url: ${RABBIT_URL:-amqp://guest:guest@rabbitmq/}
+
+  # Хранилище профилей риска и агрегатов
+  storage:
+    backend: auto               # auto|redis|sqlite|memory ; auto => redis->sqlite->memory
+    redis:
+      url: ${REDIS_URL:-redis://redis:6379/0}
+    sqlite:
+      path: ${SQLITE_PATH:-/var/lib/zero-trust/risk_state.db}
+
+  # Настройки Risk Recalc Worker (совместимы с переменными воркера)
+  riskWorker:
+    maxParallel: ${RISK_MAX_PARALLEL:-16}
+    batchSize: ${RISK_BATCH_SIZE:-64}
+    shutdownTimeoutSec: ${SHUTDOWN_TIMEOUT:-30}
+    rateLimit:
+      bucket: ${RISK_RATE_BUCKET:-200}
+      refillPerSec: ${RISK_RATE_REFILL:-80}
+    dlq:
+      maxRetries: ${DLQ_MAX_RETRIES:-5}
+    # Окна видимости и экспоненциальное затухание
+    visibilityWindowSec: ${RISK_VIS_WINDOW_SEC:-3600}
+    expDecay: ${RISK_EXP_DECAY:-0.94}
+
+  # Движок риска: веса и пороги (синхронизированы с кодом)
+  riskEngine:
+    thresholds:
+      medium: ${RISK_THR_MEDIUM:-30.0}
+      high: ${RISK_THR_HIGH:-60.0}
+      critical: ${RISK_THR_CRIT:-80.0}
+    weights:
+      authFail: ${RISK_W_AUTH_FAIL:-14.0}
+      anomaly: ${RISK_W_ANOMALY:-18.0}
+      geoMismatch: ${RISK_W_GEO:-10.0}
+      devicePosture: ${RISK_W_POSTURE:-16.0}
+      privilege: ${RISK_W_PRIV:-12.0}
+      mfaPass: ${RISK_W_MFA_PASS:--8.0}   # снижение риска
+      replay: ${RISK_W_REPLAY:-20.0}
+      dlp: ${RISK_W_DLP:-22.0}
+
+# Профиль разработки (локально, безопасные дефолты и sqlite/memory)
+profiles:
+  dev:
+    <<: *defaults
+    logging:
+      <<: *{defaults.logging}   # подсказка: некоторые процессоры YAML не поддерживают inline-merge; ниже явное переопределение
+      level: DEBUG
+    tracing:
+      enabled: false
+    metrics:
+      enabled: true
+      prometheus:
+        bindAddress: 127.0.0.1
+        port: 9109
+        path: /metrics
+    k8s:
+      inCluster: false
+      kubeconfig: ${KUBECONFIG:-~/.kube/config}
+      context: ${KUBE_CONTEXT:-}
+    queue:
+      backend: ${RISK_QUEUE_BACKEND:-memory}
+    storage:
+      backend: sqlite
+      sqlite:
+        path: ${SQLITE_PATH:-./risk_state.db}
+    istio:
+      namespace: dev
+      security:
+        mtlsMode: STRICT
+        jwt:
+          issuer: https://dev-auth.example.com/
+          jwksUri: https://dev-auth.example.com/.well-known/jwks.json
+          audiences: [ "payments-api" ]
+          fromHeaders:
+            - name: Authorization
+              prefix: "Bearer "
+      selector:
+        matchLabels:
+          app: payments
+
+  # Профиль продакшн (in-cluster, Redis/Kafka, строгие политики)
+  prod:
+    <<: *defaults
+    logging:
+      level: INFO
+      json: true
+    tracing:
+      enabled: true
+      sampling: 0.05
+    metrics:
+      enabled: true
+    k8s:
+      inCluster: true
+      verifySSL: true
+    queue:
+      backend: ${RISK_QUEUE_BACKEND:-redis}     # по умолчанию Redis Streams
+      redis:
+        url: ${REDIS_URL:-redis://redis:6379/0}
+      kafka:
+        bootstrapServers: ${KAFKA_BOOTSTRAP:-kafka:9092}
+      rabbit:
+        url: ${RABBIT_URL:-amqp://guest:guest@rabbitmq/}
+    storage:
+      backend: ${RISK_STORAGE_BACKEND:-redis}
+      redis:
+        url: ${REDIS_URL:-redis://redis:6379/0}
+    istio:
+      namespace: production
+      forceApply: true
+      dryRun: false
+      security:
+        mtlsMode: STRICT
+        jwt:
+          issuer: https://auth.example.com/
+          jwksUri: https://auth.example.com/.well-known/jwks.json
+          audiences: [ "payments-api" ]
+          fromHeaders:
+            - name: Authorization
+              prefix: "Bearer "
+      destinationRule:
+        host: payments.production.svc.cluster.local
+        sni: null
+      sidecar:
+        outboundTrafficPolicyMode: REGISTRY_ONLY
+        captureMode: DEFAULT
+        egressHosts:
+          - "./*"
+          - "istio-system/*"
+      selector:
+        matchLabels:
+          app: payments
+    policyEngine:
+      applySamples: true
+      decisions:
+        - name: block-critical
+          when: { riskAtLeast: CRITICAL }
+          actions: [ BLOCK, REQUIRE_IR ]
+        - name: stepup-high
+          when: { riskAtLeast: HIGH }
+          actions: [ STEP_UP_AUTH ]
+        - name: observe-medium
+          when: { riskAtLeast: MEDIUM }
+          actions: [ OBSERVE ]
+        - name: allow-low
+          when: { riskBelow: MEDIUM }
+          actions: [ ALLOW ]
+
+# Активный профиль выбирается через ENV ACTIVE_PROFILE (dev|prod); по умолчанию dev
+activeProfile: ${ACTIVE_PROFILE:-dev}
+
+# Валидационные подсказки (не парсятся кодом, служат документацией для операторов)
+_docs:
+  notes:
+    - "Все переменные формата ${VAR:-default} можно переопределять через окружение контейнера."
+    - "prod профиль предполагает in-cluster выполнение и включенные мTLS/SSA в Istio."
+    - "PROM_PORT должен совпадать с metrics.prometheus.port."
+    - "При backend=auto хранилище пытается Redis → SQLite → InMemory."

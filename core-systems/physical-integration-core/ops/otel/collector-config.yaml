@@ -1,0 +1,270 @@
+# ================================================================
+# OpenTelemetry Collector — industrial config (Kubernetes)
+# For: physical-integration-core
+# Requires: otel/opentelemetry-collector-contrib image
+# k8s: run as DaemonSet (logs/hostmetrics) + Deployment (pipeline fanout) — по вашему выбору
+# Env vars are referenced with ${VAR:default}
+# ================================================================
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: ${OTLP_GRPC_ENDPOINT:0.0.0.0:4317}
+        # mTLS (опционально)
+        tls:
+          # enabled if files present; else disabled
+          cert_file: ${OTLP_TLS_CERT_FILE:}
+          key_file: ${OTLP_TLS_KEY_FILE:}
+          ca_file: ${OTLP_TLS_CA_FILE:}
+          # insecure: false (по умолчанию)
+      http:
+        endpoint: ${OTLP_HTTP_ENDPOINT:0.0.0.0:4318}
+        # CORS (если нужно принимать от фронтов)
+        cors:
+          allowed_origins: ${OTLP_HTTP_CORS_ORIGINS:*}
+  prometheus:
+    config:
+      global:
+        scrape_interval: ${PROM_SCRAPE_INTERVAL:30s}
+        scrape_timeout: ${PROM_SCRAPE_TIMEOUT:10s}
+      scrape_configs:
+        # Cбор сервисов physical‑integration‑core с serviceMonitor‑метками
+        - job_name: 'pic-services'
+          kubernetes_sd_configs:
+            - role: endpoints
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_service_label_app_kubernetes_io_part_of]
+              regex: physical-integration-core
+              action: keep
+            - source_labels: [__meta_kubernetes_service_label_observability_neurocity_dev_scrape]
+              regex: true
+              action: keep
+            - source_labels: [__meta_kubernetes_endpoint_ready]
+              regex: true
+              action: keep
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: kubernetes_namespace
+            - source_labels: [__meta_kubernetes_service_name]
+              target_label: kubernetes_service
+  hostmetrics:
+    collection_interval: ${HOSTMETRICS_INTERVAL:30s}
+    scrapers:
+      cpu: {}
+      disk: {}
+      filesystem: {}
+      memory: {}
+      network: {}
+      load: {}
+      process:
+        mute_process_user: true
+  kubeletstats:
+    collection_interval: ${KUBELETSTATS_INTERVAL:30s}
+    auth_type: serviceAccount
+    endpoint: ${KUBELET_ENDPOINT:https://${KUBE_NODE_NAME:}${KUBELET_PORT::10250}}
+    insecure_skip_verify: ${KUBELET_INSECURE:false}
+    metric_groups:
+      - node
+      - pod
+      - container
+  filelog:
+    include:
+      - ${LOGS_INCLUDE:/var/log/containers/*physical-integration-core*.log}
+    start_at: beginning
+    include_file_name: false
+    include_file_path: true
+    exclude:
+      - ${LOGS_EXCLUDE:/var/log/containers/*_istio-*.log}
+    operators:
+      - type: json_parser
+        parse_from: body
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: ${LOGS_TIME_LAYOUT:2006-01-02T15:04:05Z07:00}
+        severity:
+          parse_from: attributes.level
+      - type: move
+        from: attributes.log
+        to: body
+      - type: add
+        field: attributes.log_type
+        value: application
+
+processors:
+  # Ограничение памяти коллектора — критично для стабильности
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: ${OTEL_MEMORY_LIMIT_PERCENT:80}
+    spike_limit_percentage: ${OTEL_MEMORY_SPIKE_PERCENT:25}
+
+  # Атрибуция Kubernetes сущностей
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    # Привязываем по IP/Owner
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - k8s.node.name
+        - k8s.pod.uid
+      labels:
+        - key: app.kubernetes.io/name
+        - key: app.kubernetes.io/component
+        - key: app.kubernetes.io/instance
+        - key: app.kubernetes.io/version
+        - key: topology.kubernetes.io/zone
+    filter:
+      node_from_env_var: KUBE_NODE_NAME
+    pod_association:
+      - sources: [ { from: resource_attribute, name: k8s.pod.ip } ]
+      - sources: [ { from: connection } ]
+
+  # Обогащение ресурсных атрибутов узла/облака
+  resourcedetection:
+    detectors: [env, system, k8snode]
+    timeout: 2s
+    override: false
+
+  # Редакция PII/секретов и унификация уровней логов
+  attributes/sanitize:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: db.statement
+        action: hash
+      - key: password
+        action: delete
+      - key: token
+        action: delete
+      - key: log.severity
+        action: update
+        value: ${DEFAULT_LOG_SEVERITY:info}
+
+  # Нормализация названий и значений метрик/лейблов
+  transform/metrics:
+    error_mode: ignore
+    metric_statements:
+      - context: metric
+        statements:
+          - replace_all_patterns(name, "^(.+){1}$", "pic_${1}")
+          - set(description, "physical-integration-core metric: " + description)
+
+  # Tail-based sampling для контроля нагрузки трассировок
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 100000
+    expected_new_traces_per_sec: 1000
+    policies:
+      - name: error-spans
+        type: status_code
+        status_code:
+          status_codes: [ ERROR ]
+      - name: long-latency
+        type: latency
+        latency:
+          threshold_ms: ${TAIL_SAMPLING_LATENCY_MS:500}
+      - name: important-services
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values: [ "physical-integration-core", "device-bridge", "ingestion" ]
+      - name: probabilistic-rest
+        type: probabilistic
+        probabilistic:
+          hash_salt: "pic-salt"
+          sampling_percentage: ${TAIL_SAMPLING_PERCENT_REST:10}
+
+  batch:
+    timeout: 2s
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+
+exporters:
+  # Основной OTLP (Tempo/Jaeger/OTel Collector upsteam)
+  otlp:
+    endpoint: ${OTLP_EXPORT_ENDPOINT:otel-collector.observability.svc.cluster.local:4317}
+    tls:
+      insecure: ${OTLP_EXPORT_INSECURE:false}
+      ca_file: ${OTLP_EXPORT_CA_FILE:}
+    sending_queue:
+      enabled: true
+      num_consumers: 8
+      queue_size: 20000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 0s
+
+  # Prometheus Remote Write (VictoriaMetrics/Thanos/Cortex/Mimir)
+  prometheusremotewrite:
+    endpoint: ${PRW_ENDPOINT:http://victoria-metrics-vmagent.monitoring:8429/api/v1/write}
+    external_labels:
+      cluster: ${CLUSTER_NAME:prod-cluster}
+      namespace: ${NAMESPACE:physical-integration}
+      app: physical-integration-core
+    resource_to_telemetry_conversion:
+      enabled: true
+    tls:
+      insecure: ${PRW_INSECURE:false}
+    headers:
+      X-Scope-OrgID: ${PRW_TENANT:default}
+    timeout: 15s
+
+  # Loki для логов
+  loki:
+    endpoint: ${LOKI_ENDPOINT:http://loki-distributor.observability:3100/loki/api/v1/push}
+    labels:
+      resource:
+        k8s.namespace.name: "namespace"
+        k8s.pod.name: "pod"
+        k8s.node.name: "node"
+        app.kubernetes.io/name: "app"
+      attributes:
+        log_type: "log_type"
+        http.method: "http_method"
+        http.status_code: "http_status"
+    tenant_id: ${LOKI_TENANT:default}
+    timeout: 15s
+
+  # Debug (ограничить на проде)
+  logging:
+    loglevel: ${EXPORTER_LOG_LEVEL:warn}
+
+connectors:
+  # При необходимости фан-аут между пайплайнами (опционально)
+  # spanmetrics: {}  # если хотите агрегировать метрики из трасс
+
+extensions:
+  health_check:
+    endpoint: ${HEALTH_ENDPOINT:0.0.0.0:13133}
+  pprof:
+    endpoint: ${PPROF_ENDPOINT:0.0.0.0:1777}
+  zpages:
+    endpoint: ${ZPAGES_ENDPOINT:0.0.0.0:55679}
+
+service:
+  telemetry:
+    logs:
+      level: ${OTEL_LOG_LEVEL:info}
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, tail_sampling, batch]
+      exporters: [otlp, logging]
+
+    metrics:
+      receivers: [otlp, prometheus, hostmetrics, kubeletstats]
+      processors: [memory_limiter, k8sattributes, resourcedetection, transform/metrics, batch]
+      exporters: [prometheusremotewrite, otlp]
+
+    logs:
+      receivers: [otlp, filelog]
+      processors: [memory_limiter, k8sattributes, attributes/sanitize, batch]
+      exporters: [loki, otlp]

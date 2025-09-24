@@ -1,0 +1,385 @@
+# physical-integration-core/configs/security.yaml
+version: 1.0.0
+owner:
+  org: Aethernova
+  product: physical-integration-core
+  security_contacts:
+    - secops@aethernova.example
+    - csirt@aethernova.example
+last_review: "2025-08-22"
+next_review_due_days: 90
+
+trust_model:
+  zero_trust: true
+  identity:
+    sso_provider: "OIDC"
+    mfa_required: true
+    device_posture_checks: true
+  network_trust: "deny_by_default"
+  data_classification:
+    - name: PUBLIC
+      retention_days: 0
+      encryption_required: false
+    - name: INTERNAL
+      retention_days: 365
+      encryption_required: true
+    - name: CONFIDENTIAL
+      retention_days: 1095
+      encryption_required: true
+    - name: RESTRICTED
+      retention_days: 2555
+      encryption_required: true
+  privacy_by_design: true
+
+rbac:
+  # Роли уровня платформы
+  platform_roles:
+    - name: admin
+      description: "Full platform admin"
+      privileges: ["*"]
+      mfa: always
+    - name: devops
+      description: "Cluster and delivery ops"
+      privileges: ["cluster.manage","delivery.manage","secrets.read"]
+      mfa: always
+    - name: developer
+      description: "Build/deploy within namespace"
+      privileges: ["deploy.ns","logs.read","metrics.read"]
+      mfa: conditional
+    - name: auditor
+      description: "Read-only access to logs/configs"
+      privileges: ["audit.read","configs.read"]
+      mfa: always
+    - name: service
+      description: "Machine identity for workloads"
+      privileges: ["secrets.read.bound","kv.read.bound"]
+      mfa: n/a
+  namespace_policy:
+    default_namespace: "physical-integration"
+    isolation: "strict"   # nsNetworkPolicies=true
+  rbac_matrix:
+    - resource: "secrets"
+      admin: "rw"
+      devops: "r"
+      developer: "-"
+      auditor: "r"
+    - resource: "deployments"
+      admin: "rw"
+      devops: "rw"
+      developer: "rw"
+      auditor: "r"
+    - resource: "pods/exec"
+      admin: "rw"
+      devops: "rw"
+      developer: "request_approval"
+      auditor: "-"
+    - resource: "configmaps"
+      admin: "rw"
+      devops: "rw"
+      developer: "r"
+      auditor: "r"
+
+crypto:
+  kms:
+    provider: "aws-kms"
+    region: "eu-north-1"
+    required_key_policies:
+      - "deny-wildcard-principal"
+      - "require-aws:MultiFactorAuthPresent"
+    rotation_days: 180
+  key_management:
+    app_key_rotation_days: 90
+    jwt_issuer: "https://id.aethernova.example"
+    jwk_auto_rotate: true
+  tls:
+    min_version: "TLS1.2"
+    prefer_cipher_suites:
+      - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+      - "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+    hsts:
+      enabled: true
+      max_age: 31536000
+      include_subdomains: true
+      preload: true
+  hashing:
+    password: "argon2id"
+    params:
+      memory_kib: 65536
+      iterations: 3
+      parallelism: 2
+
+supply_chain:
+  build:
+    slsa_level: "L3"
+    provenance_required: true
+    reproducible_builds: true
+  signing:
+    container_images:
+      tool: "cosign"
+      key_mode: "keyless-oidc"
+      enforce_verify: true
+      allowlist_registries:
+        - "ghcr.io/aethernova"
+      denylist_registries:
+        - "*"
+      exceptions: [] # explicit only via change control
+    artifacts:
+      tool: "sigstore"
+      enforce_verify: true
+  dependencies:
+    allowed_licenses: ["Apache-2.0","MIT","BSD-2-Clause","BSD-3-Clause","MPL-2.0"]
+    banned_licenses: ["GPL-3.0-only","AGPL-3.0-only"]
+    vulnerability_policy:
+      fail_build_on:
+        cvss_v3: ">=7.0"
+        known_exploited: true
+      blocklist_cves_source: "cisa-kev"
+      allow_temporal_exceptions_days: 14
+    scanners:
+      - "grype"
+      - "trivy"
+  scm:
+    branch_protection:
+      required_reviews: 2
+      status_checks_required: true
+      require_signed_commits: true
+      prevent_force_push: true
+
+kubernetes:
+  pod_security_standards:
+    enforce: "restricted"
+    audit: "restricted"
+    warn: "restricted"
+  admission_control:
+    gatekeeper:
+      enabled: true
+      constraints:
+        disallow_privileged: true
+        drop_all_caps: true
+        readonly_rootfs: true
+        no_host_path: true
+        run_as_nonroot: true
+        seccomp_runtime_default: true
+        selinux_type: "restricted" # if SELinux available
+        image_signed_by: "cosign-keyless"
+    kyverno:
+      enabled: true
+      mutate_policies:
+        add_default_seccomp: true
+        add_image_pull_secrets: true
+  namespaces:
+    default_runtime_class: "gvisor" # или "kata" при наличии
+    automount_service_account_token: false
+  quotas:
+    cpu_requests: "20"
+    cpu_limits: "40"
+    memory_requests: "64Gi"
+    memory_limits: "128Gi"
+    pods: 500
+  images:
+    pull_policy: "IfNotPresent"
+    registry_mirrors: []
+    image_pull_secrets_ref: "registry-creds"
+  node_restrictions:
+    taints_required_for_prod_nodes:
+      - key: "workload"
+        value: "prod"
+        effect: "NoSchedule"
+  topology:
+    spread_constraints:
+      enable_default: true
+      keys: ["topology.kubernetes.io/zone","kubernetes.io/hostname"]
+  network_policies:
+    default_deny_all: true
+    allow_rules:
+      egress_dns:
+        ports: [53]
+        protocols: ["UDP","TCP"]
+      egress_mtls_services:
+        namespace_selector: "mesh=enabled"
+      ingress_from_gateway:
+        namespace_selector: "ingress=yes"
+  service_mesh:
+    enabled: true
+    mtls_mode: "strict"
+    certificate_issuer: "istio-ca" # пример
+
+secrets:
+  manager: "vault"
+  mount_path: "kv/physical-integration"
+  lease_seconds: 3600
+  rotation_days: 30
+  forbid_plain_k8s_secrets: true
+  seal:
+    auto_unseal: true
+    kms_integration: true
+  access_policies:
+    - role: "service"
+      path_prefix: "kv/physical-integration/app/*"
+      capabilities: ["read","list"]
+    - role: "devops"
+      path_prefix: "kv/physical-integration/*"
+      capabilities: ["create","update","read","list","delete"]
+  secret_formats:
+    database_url: "managed"
+    mqtt_credentials: "managed"
+  detection:
+    ci_scan_for_secrets: ["gitleaks","trufflehog"]
+    block_on_detection: true
+
+logging_observability:
+  tracing:
+    otel_exporter: "otlp"
+    sampling: 0.05
+    pii_redaction: true
+  logging:
+    level_default: "INFO"
+    json: true
+    route_to:
+      - "loki"
+      - "cloudwatch"
+    pii_masking:
+      enabled: true
+      patterns:
+        - "\\b\\d{16}\\b"     # PAN
+        - "\\b[\\w.%+-]+@[\\w.-]+\\.[A-Za-z]{2,}\\b" # email
+  metrics:
+    prometheus:
+      enforced_scrape: true
+      min_tls: "TLS1.2"
+  retention:
+    logs_days: 180
+    metrics_days: 400
+    traces_days: 14
+  integrity:
+    tamper_evident_storage: true
+    sign_logs: true
+
+runtime_security:
+  detectors:
+    falco:
+      enabled: true
+      rulesets:
+        - "k8s_sensitive_mounts"
+        - "crypto_mining_detection"
+        - "shell_in_container"
+        - "proc_credential_access"
+    eBPF:
+      enabled: true
+      provider: "tetragon"
+  response:
+    kill_on_high_severity: true
+    isolate_pod_on_breach: true
+
+alerting:
+  channels:
+    - type: "slack"
+      webhook_secret_ref: "kv/physical-integration/alerts/slack"
+      severity: ["high","critical"]
+    - type: "email"
+      to: ["soc@aethernova.example"]
+      severity: ["medium","high","critical"]
+  policies:
+    detection_to_ack_minutes:
+      high: 15
+      critical: 5
+    escalation_matrix:
+      - after_minutes: 15
+        to: "oncall-secops"
+      - after_minutes: 30
+        to: "ciso"
+  runbooks:
+    location: "https://runbooks.aethernova.example/pic"
+
+backup_dr:
+  backups:
+    schedule_cron: "0 */6 * * *"
+    encrypted: true
+    verify_restore_daily: true
+  rto_minutes: 30
+  rpo_minutes: 15
+  regions:
+    primary: "eu-north-1"
+    secondary: "eu-central-1"
+  data_sets:
+    - name: "timescaledb"
+      method: "physical_wal_archiving"
+    - name: "object-storage"
+      method: "versioned_s3"
+  disaster_scenarios_test_quarterly: true
+
+incident_response:
+  csirt:
+    declared: true
+    contact_window_24x7: true
+  severity_scale:
+    - SEV1: "Customer impact, data at risk"
+    - SEV2: "Service degraded, potential risk"
+    - SEV3: "Internal only, no customer impact"
+  steps:
+    - detect
+    - triage
+    - contain
+    - eradicate
+    - recover
+    - lessons_learned
+  evidence_handling:
+    chain_of_custody: true
+    clock_sync_ntp: true
+
+compliance:
+  standards:
+    - iso_27001
+    - soc2_type2
+    - cis_k8s_benchmark
+  audit_trails:
+    immutable_storage: true
+    retention_days: 2555
+  data_residency:
+    allowed_regions: ["eu-*"]
+  dpa_required_for_processors: true
+
+change_management:
+  approvals_required: 2
+  emergency_change_window_minutes: 120
+  freeze_windows:
+    - "12-20:12-31" # пример: декабрьские заморозки
+
+third_parties:
+  vendor_risk:
+    assessment_required: true
+    evidence:
+      - "pen-test-report<=12mo"
+      - "soc2<=12mo"
+      - "vuln-scan<=30d"
+  egress_control:
+    restrict_to_cidrs: ["0.0.0.0/0"] # further narrowed by policy
+    tls_inspection: false
+
+performance_safety_guards:
+  rate_limits:
+    api_rps_per_client: 200
+  payload_limits_mb: 10
+  sql_guardrails:
+    max_query_time_ms: 5000
+    block_unsafe_commands: ["COPY TO PROGRAM","UNLOGGED"]
+
+attestations:
+  # Проверяется в CI перед релизом
+  checklist:
+    - "Dependencies scanned and policy-compliant"
+    - "Image signed and verified"
+    - "SBOM attached (spdx/cyclonedx)"
+    - "K8s manifests pass Gatekeeper/Kyverno"
+    - "Secrets sourced from Vault only"
+    - "DR test not older than 90 days"
+
+overrides:
+  # Исключения оформляются тикетом с датой истечения
+  allow_temporary_policy_exceptions: true
+  max_exception_days: 30
+  approvers: ["ciso","head-of-platform"]
+
+metadata:
+  schema_version: "2025-08"
+  checksum: "" # заполняется CI

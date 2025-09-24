@@ -1,0 +1,95 @@
+---
+- name: Ensure required packages are installed
+  package:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - docker.io
+    - python3-pip
+    - curl
+
+- name: Ensure docker service is started
+  service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Pull latest engine-core image
+  docker_image:
+    name: "{{ engine_core_image }}"
+    source: pull
+    tag: "{{ engine_core_version }}"
+    force_source: yes
+  register: image_pull_result
+
+- name: Create configuration directory
+  file:
+    path: /opt/engine-core/config
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Deploy configuration file
+  template:
+    src: engine-core-config.yaml.j2
+    dest: /opt/engine-core/config/config.yaml
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart engine-core
+
+- name: Deploy secret file
+  copy:
+    content: "{{ engine_core_secret }}"
+    dest: /opt/engine-core/config/secret.key
+    mode: '0600'
+    owner: root
+    group: root
+  no_log: true
+  notify: restart engine-core
+
+- name: Ensure engine-core container is running
+  docker_container:
+    name: engine-core
+    image: "{{ engine_core_image }}:{{ engine_core_version }}"
+    state: started
+    restart_policy: unless-stopped
+    env:
+      ENVIRONMENT: production
+      CONFIG_PATH: /opt/engine-core/config/config.yaml
+    volumes:
+      - /opt/engine-core/config:/app/config:ro
+    ports:
+      - "8080:8080"
+    log_options:
+      max-size: "10m"
+      max-file: "5"
+  register: container_status
+  notify: restart engine-core
+
+- name: Validate container health
+  uri:
+    url: http://localhost:8080/health
+    method: GET
+    return_content: yes
+    status_code: 200
+  register: healthcheck
+  retries: 5
+  delay: 10
+  until: healthcheck.status == 200
+
+- name: Notify SRE team on deployment success
+  uri:
+    url: "{{ sre_webhook_url }}"
+    method: POST
+    headers:
+      Content-Type: application/json
+    body_format: json
+    body:
+      service: engine-core
+      version: "{{ engine_core_version }}"
+      status: deployed
+      environment: production
+  when: container_status.changed
+  delegate_to: localhost

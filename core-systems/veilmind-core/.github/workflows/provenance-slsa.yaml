@@ -1,0 +1,139 @@
+name: build-and-provenance (SLSA)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Минимальные права по умолчанию
+permissions:
+  contents: write        # для релиза по тегу
+  id-token: write        # для OIDC-аттестации
+  attestations: write    # публикация SLSA provenance
+  actions: read
+  packages: write        # на будущее (если будут публикации в GHCR)
+
+concurrency:
+  group: provenance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_OUTPUT_DIR: dist
+  ARTIFACT_NAME: veilmind-core
+
+jobs:
+  build_provenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Prepare toolchain (optional helpers)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          # Устанавливаем базовые инструменты (sha256sum включён по умолчанию в coreutils)
+          command -v tar >/dev/null || sudo apt-get install -y tar
+          # Для Node-проектов активируем corepack (если потребуется)
+          if command -v corepack >/dev/null 2>&1; then corepack enable || true; fi
+
+      - name: Build (Makefile → Node → Python → fallback)
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_OUTPUT_DIR"
+          if [[ -f Makefile ]]; then
+            make -j"$(nproc)" build
+          elif [[ -f package.json ]]; then
+            if command -v pnpm >/dev/null 2>&1; then
+              pnpm -v || corepack prepare pnpm@latest --activate
+              pnpm install --frozen-lockfile
+              pnpm run build
+            elif command -v yarn >/dev/null 2>&1; then
+              yarn install --frozen-lockfile
+              yarn build
+            else
+              npm ci
+              npm run build
+            fi
+            # Типичные директории фронтов
+            [[ -d build ]] && rsync -a --delete build/ "$BUILD_OUTPUT_DIR"/ || true
+            [[ -d dist ]]  && rsync -a --delete dist/  "$BUILD_OUTPUT_DIR"/ || true
+          elif [[ -f pyproject.toml || -f setup.py ]]; then
+            python3 -m pip install --upgrade pip build
+            python3 -m build --outdir "$BUILD_OUTPUT_DIR"
+          else
+            # Фолбэк: архив исходников без .git
+            tar --exclude-vcs -czf "$BUILD_OUTPUT_DIR/source.tar.gz" .
+          fi
+
+      - name: Normalize outputs
+        run: |
+          set -euo pipefail
+          test -d "$BUILD_OUTPUT_DIR"
+          shopt -s nullglob
+          files=( "$BUILD_OUTPUT_DIR"/* )
+          if (( ${#files[@]} == 0 )); then
+            echo "No build outputs found in $BUILD_OUTPUT_DIR" >&2
+            exit 2
+          fi
+          # Делать файлы неизменяемыми в ходе job
+          chmod -R a-w "$BUILD_OUTPUT_DIR" || true
+          find "$BUILD_OUTPUT_DIR" -maxdepth 1 -type f -printf '%P\n' || true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd "$BUILD_OUTPUT_DIR"
+          rm -f SHA256SUMS.txt
+          shopt -s nullglob
+          for f in *; do
+            [[ -f "$f" ]] || continue
+            sha256sum "$f" >> SHA256SUMS.txt
+          done
+          chmod a-w SHA256SUMS.txt
+          echo "Generated checksums:"
+          cat SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.ref_name || github.run_number }}
+          path: |
+            ${{ env.BUILD_OUTPUT_DIR }}/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
+
+      - name: Attest SLSA provenance (files)
+        uses: actions/attest-build-provenance@v1
+        with:
+          # Можно указать несколько путей/масок; provenance будет создана для каждого субъекта
+          subject-path: ${{ env.BUILD_OUTPUT_DIR }}/*
+          # predicate-type по умолчанию: https://slsa.dev/provenance/v1  (SLSA v1)
+          # builder-id и materials детектируются автоматически из контекста GitHub
+
+      - name: Create GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.BUILD_OUTPUT_DIR }}/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Print verification hints
+        if: always()
+        run: |
+          echo "Provenance published via GitHub Attestations."
+          echo "Consumers can verify via GitHub's attestations API or slsa-verifier."

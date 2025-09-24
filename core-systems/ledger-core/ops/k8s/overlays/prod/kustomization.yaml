@@ -1,0 +1,132 @@
+# ledger-core/ops/k8s/overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# --- Пространство имён для продакшена
+namespace: ledger-prod
+
+# --- Общие метки/аннотации для трассируемости и политики
+commonLabels:
+  app.kubernetes.io/name: ledger-core
+  app.kubernetes.io/instance: ledger-core-prod
+  app.kubernetes.io/part-of: ledger-core
+  app.kubernetes.io/component: api
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/version: "PLACEHOLDER_VERSION"
+  environment: prod
+
+commonAnnotations:
+  deploy.kubernetes.io/release: "prod"
+  meta.scaling.policy: "conservative-down-fast-up"
+  owner.team: "payments-ledger"
+  audit.change-id: "PLACEHOLDER_CHANGE_ID"
+  build.git.sha: "PLACEHOLDER_GIT_SHA"
+  build.git.ref: "refs/tags/PLACEHOLDER_TAG"
+  build.timestamp: "PLACEHOLDER_UTC_ISO8601"
+
+# --- Базовые ресурсы, которые расширяются оверлеем
+resources:
+  - ../../base/deployment.yaml
+  - ../../base/service.yaml
+  - ../../base/hpa.yaml
+  - ../../base/pdb.yaml
+  - ../../base/networkpolicy.yaml
+  - ../../base/ingress.yaml
+  - ../../base/servicemonitor.yaml
+
+# --- Генерация конфигов и секретов
+configMapGenerator:
+  - name: ledger-core-config
+    behavior: merge
+    literals:
+      - RUST_LOG=info
+      - LEDGER_ENV=prod
+    files:
+      - app-config.yaml=./config/app-config-prod.yaml
+      - logback.xml=./config/logback-prod.xml
+  - name: ledger-core-feature-flags
+    behavior: merge
+    literals:
+      - ENABLE_ASYNC_POSTINGS=true
+      - ENABLE_IDEMPOTENCY_KEYS=true
+
+secretGenerator:
+  - name: ledger-core-secrets
+    behavior: merge
+    type: Opaque
+    envs:
+      - ./secrets/application-prod.env # формат KEY=VALUE; файл не коммитить
+  - name: ledger-core-tls
+    behavior: merge
+    type: kubernetes.io/tls
+    files:
+      - tls.crt=./secrets/tls/tls.crt
+      - tls.key=./secrets/tls/tls.key
+
+# --- Контроль имён, чтобы генераторы были детерминированны
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    managed-by: kustomize
+
+# --- Фиксация образов и тегов
+images:
+  - name: PLACEHOLDER_REGISTRY/ledger-core-api
+    newName: PLACEHOLDER_REGISTRY/ledger-core-api
+    newTag: PLACEHOLDER_TAG_immutable # например, git‑sha или промотированный tag
+
+# --- Уточнение числа реплик для Deployment
+replicas:
+  - name: ledger-core-api
+    count: 6
+
+# --- Патчи (Strategic Merge) для PodSpec и сервисов
+patchesStrategicMerge:
+  # 1) Уточнение ресурсов/лимитов, securityContext, probes, env‑vars
+  - patches/deployment-resources.yaml
+  # 2) Anti‑affinity и topology spread для отказоустойчивости
+  - patches/deployment-affinity.yaml
+  # 3) Сервисные аннотации для балансировщика/ingress
+  - patches/service-annotations.yaml
+  # 4) PDB на прод с более строгой политикой
+  - patches/pdb-strict.yaml
+  # 5) NetworkPolicy ужесточение egress/ingress
+  - patches/networkpolicy-tight.yaml
+
+# --- Точечные JSON6902‑патчи для HPA и Ingress
+patches:
+  # 6) Увеличиваем maxReplicas и корректируем метрики HPA
+  - target:
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: ledger-core-api-hpa
+      namespace: ledger
+    path: patches/hpa-json6902.yaml
+  # 7) Принудительные securityHeaders для Ingress
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: ledger-core
+    path: patches/ingress-headers-json6902.yaml
+
+# --- Замены переменных (если необходимо инжектить значения из ConfigMap/Secret)
+vars:
+  - name: LEDGER_DB_HOST
+    objref:
+      kind: ConfigMap
+      name: ledger-core-config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.DB_HOST
+  - name: LEDGER_DB_NAME
+    objref:
+      kind: ConfigMap
+      name: ledger-core-config
+      apiVersion: v1
+    fieldref:
+      fieldpath: data.DB_NAME
+
+# --- Замена полей (в base/deployment.yaml должны быть $(LEDGER_DB_HOST) и т.п., если используется vars)
+configurations:
+  - kustomizeconfig/vars.yaml

@@ -1,0 +1,349 @@
+{{- if .Values.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ printf "%s-prometheus-rules" .Release.Name | trunc 63 | trimSuffix "-" }}
+  namespace: {{ default .Release.Namespace .Values.monitoring.namespace | quote }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/part-of: omnimind
+    app.kubernetes.io/component: api
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.monitoring.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    ###########################################################################
+    # Recording rules: агрегаты трафика/ошибок/латентности для стабильных алертов
+    ###########################################################################
+    - name: omnimind-core.recordings
+      interval: {{ default "30s" .Values.monitoring.recordingInterval }}
+      rules:
+        # Унифицированные селекторы
+        # Ожидается, что метрики экспонируются как:
+        # - http_server_requests_seconds_bucket (Prometheus/Histogram)
+        # - или histogram_quantile по request_duration_seconds_bucket
+        # Ниже используем generic имя с селекторами по job/namespace/pod.
+        - record: omnimind:http:requests:rate5m
+          expr: |
+            sum by (status_class) (
+              rate(
+                {{ .Values.monitoring.httpRequestsBucketMetric | default "http_server_requests_seconds_bucket" }}
+                { {{- if .Values.monitoring.matchers }}
+                  {{- .Values.monitoring.matchers | trim }}
+                  {{- else }}
+                  namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}",job=~"{{ .Values.monitoring.jobRegex | default ".*" }}"
+                  {{- end }}
+                }[5m])
+            )
+        - record: omnimind:http:errors:rate5m
+          expr: |
+            sum(
+              omnimind:http:requests:rate5m{status_class=~"5..|4.."}
+            )
+        - record: omnimind:http:requests_total:rate5m
+          expr: |
+            sum(omnimind:http:requests:rate5m)
+
+        # Error budget расход (доля ошибок за окно)
+        - record: omnimind:http:error_ratio:5m
+          expr: |
+            clamp_min(
+              omnimind:http:errors:rate5m
+              / ignoring(status_class) omnimind:http:requests_total:rate5m,
+              0
+            )
+
+        # Латентность p50/p95/p99 за 5m (пример с histogram_quantile)
+        - record: omnimind:http:latency:p50
+          expr: |
+            histogram_quantile(0.50,
+              sum by (le) (
+                rate(
+                  {{ .Values.monitoring.httpRequestsBucketMetric | default "http_server_requests_seconds_bucket" }}
+                  { {{- if .Values.monitoring.matchers }}
+                      {{- .Values.monitoring.matchers | trim }}
+                    {{- else }}
+                      namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}",job=~"{{ .Values.monitoring.jobRegex | default ".*" }}"
+                    {{- end }}
+                  }[5m])
+              )
+            )
+        - record: omnimind:http:latency:p95
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (
+                rate(
+                  {{ .Values.monitoring.httpRequestsBucketMetric | default "http_server_requests_seconds_bucket" }}
+                  { {{- if .Values.monitoring.matchers }}
+                      {{- .Values.monitoring.matchers | trim }}
+                    {{- else }}
+                      namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}",job=~"{{ .Values.monitoring.jobRegex | default ".*" }}"
+                    {{- end }}
+                  }[5m])
+              )
+            )
+        - record: omnimind:http:latency:p99
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(
+                  {{ .Values.monitoring.httpRequestsBucketMetric | default "http_server_requests_seconds_bucket" }}
+                  { {{- if .Values.monitoring.matchers }}
+                      {{- .Values.monitoring.matchers | trim }}
+                    {{- else }}
+                      namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}",job=~"{{ .Values.monitoring.jobRegex | default ".*" }}"
+                    {{- end }}
+                  }[5m])
+              )
+            )
+
+        # Насыщение CPU/Memory (avg per pod)
+        - record: omnimind:container:cpu_usage:ratio
+          expr: |
+            sum by (pod) (
+              rate(container_cpu_usage_seconds_total{
+                {{- if .Values.monitoring.cadvisorMatchers }}
+                  {{- .Values.monitoring.cadvisorMatchers | trim }}
+                {{- else }}
+                  namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}", image!=""
+                {{- end }}
+              }[5m])
+            )
+            /
+            sum by (pod) (
+              kube_pod_container_resource_requests{
+                resource="cpu",
+                {{- if .Values.monitoring.kubeStateMatchers }}
+                  {{- .Values.monitoring.kubeStateMatchers | trim }}
+                {{- else }}
+                  namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}"
+                {{- end }}
+              }
+            )
+        - record: omnimind:container:memory_workingset:ratio
+          expr: |
+            sum by (pod) (
+              container_memory_working_set_bytes{
+                {{- if .Values.monitoring.cadvisorMatchers }}
+                  {{- .Values.monitoring.cadvisorMatchers | trim }}
+                {{- else }}
+                  namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}", image!=""
+                {{- end }}
+              }
+            )
+            /
+            sum by (pod) (
+              kube_pod_container_resource_requests{
+                resource="memory",
+                {{- if .Values.monitoring.kubeStateMatchers }}
+                  {{- .Values.monitoring.kubeStateMatchers | trim }}
+                {{- else }}
+                  namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}"
+                {{- end }}
+              }
+            )
+
+    ###########################################################################
+    # Alerting rules: SLO/ошибки/латентность/ресурсы/стабильность/HPA
+    ###########################################################################
+    - name: omnimind-core.alerts
+      rules:
+        # 1) Доступность по error budget (короткое окно)
+        - alert: OmnimindSLOErrorBudgetFastBurn
+          expr: omnimind:http:error_ratio:5m > {{ .Values.monitoring.slo.errorRatioFast | default 0.050 }}
+          for: {{ .Values.monitoring.durations.fast | default "5m" }}
+          labels:
+            severity: critical
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "Быстрый расход error budget"
+            description: "Доля ошибок за 5m превышает {{ .Values.monitoring.slo.errorRatioFast | default 0.050 }}. Проверить релиз/зависимости/бэкенды."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/slo#error-budget" | quote }}
+
+        # 2) Доступность по error budget (длинное окно)
+        - alert: OmnimindSLOErrorBudgetSlowBurn
+          expr: |
+            avg_over_time(omnimind:http:error_ratio:5m[{{ .Values.monitoring.durations.slowWindow | default "1h" }}])
+            > {{ .Values.monitoring.slo.errorRatioSlow | default 0.010 }}
+          for: {{ .Values.monitoring.durations.slow | default "30m" }}
+          labels:
+            severity: warning
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "Замедленное выгорание error budget"
+            description: "Средняя доля ошибок за {{ .Values.monitoring.durations.slowWindow | default "1h" }} выше порога."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/slo#error-budget" | quote }}
+
+        # 3) Латентность p95
+        - alert: OmnimindLatencyP95High
+          expr: omnimind:http:latency:p95 > {{ div (default 300 .Values.monitoring.slo.latencyP95Ms) 1000.0 }}
+          for: {{ .Values.monitoring.durations.latency | default "10m" }}
+          labels:
+            severity: warning
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "Высокая латентность p95"
+            description: "p95 превышает {{ .Values.monitoring.slo.latencyP95Ms | default 300 }} ms."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/latency" | quote }}
+
+        # 4) Латентность p99 (критично)
+        - alert: OmnimindLatencyP99Degraded
+          expr: omnimind:http:latency:p99 > {{ div (default 800 .Values.monitoring.slo.latencyP99Ms) 1000.0 }}
+          for: {{ .Values.monitoring.durations.latencyCritical | default "5m" }}
+          labels:
+            severity: critical
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "Критичная латентность p99"
+            description: "p99 превышает {{ .Values.monitoring.slo.latencyP99Ms | default 800 }} ms."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/latency" | quote }}
+
+        # 5) Сатурация CPU
+        - alert: OmnimindCpuSaturation
+          expr: |
+            avg(omnimind:container:cpu_usage:ratio) by () > {{ .Values.monitoring.thresholds.cpuSaturation | default 0.8 }}
+          for: {{ .Values.monitoring.durations.resources | default "10m" }}
+          labels:
+            severity: warning
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "Высокая утилизация CPU"
+            description: "Средняя утилизация CPU > {{ mul 100 (default 0.8 .Values.monitoring.thresholds.cpuSaturation) }}% от requests. Рассмотрите масштабирование."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/resources#cpu" | quote }}
+
+        # 6) Сатурация Memory
+        - alert: OmnimindMemorySaturation
+          expr: |
+            avg(omnimind:container:memory_workingset:ratio) by () > {{ .Values.monitoring.thresholds.memSaturation | default 0.9 }}
+          for: {{ .Values.monitoring.durations.resources | default "10m" }}
+          labels:
+            severity: warning
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "Высокая утилизация памяти"
+            description: "WorkingSet превышает {{ mul 100 (default 0.9 .Values.monitoring.thresholds.memSaturation) }}% от memory.requests."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/resources#memory" | quote }}
+
+        # 7) Перезапуски подов
+        - alert: OmnimindPodRestartBurst
+          expr: |
+            increase(kube_pod_container_status_restarts_total{
+              {{- if .Values.monitoring.kubeStateMatchers }}
+                {{- .Values.monitoring.kubeStateMatchers | trim }}
+              {{- else }}
+                namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}"
+              {{- end }}
+            }[10m]) > {{ .Values.monitoring.thresholds.podRestarts10m | default 3 }}
+          for: {{ .Values.monitoring.durations.restarts | default "10m" }}
+          labels:
+            severity: warning
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "Бурст перезапусков контейнеров"
+            description: "Количество рестартов за 10m превысило порог."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/stability#restarts" | quote }}
+
+        # 8) OOMKilled
+        - alert: OmnimindPodOOMKilled
+          expr: |
+            sum by (pod) (kube_pod_container_status_last_terminated_reason{
+              reason="OOMKilled",
+              {{- if .Values.monitoring.kubeStateMatchers }}
+                {{- .Values.monitoring.kubeStateMatchers | trim }}
+              {{- else }}
+                namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}"
+              {{- end }}
+            }) > 0
+          for: {{ .Values.monitoring.durations.oom | default "1m" }}
+          labels:
+            severity: critical
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "Контейнеры завершены по OOMKilled"
+            description: "Обнаружены OOMKilled. Увеличьте memory limits/requests или оптимизируйте использование."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/resources#oom" | quote }}
+
+        # 9) CPU throttling (если экспонируется metric)
+        - alert: OmnimindCpuThrottlingHigh
+          expr: |
+            sum by () (
+              rate(container_cpu_cfs_throttled_seconds_total{
+                {{- if .Values.monitoring.cadvisorMatchers }}
+                  {{- .Values.monitoring.cadvisorMatchers | trim }}
+                {{- else }}
+                  namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}", image!=""
+                {{- end }}
+              }[5m])
+              /
+              rate(container_cpu_cfs_periods_total{
+                {{- if .Values.monitoring.cadvisorMatchers }}
+                  {{- .Values.monitoring.cadvisorMatchers | trim }}
+                {{- else }}
+                  namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}", image!=""
+                {{- end }}
+              }[5m])
+            ) > {{ .Values.monitoring.thresholds.cpuThrottleRatio | default 0.25 }}
+          for: {{ .Values.monitoring.durations.throttling | default "10m" }}
+          labels:
+            severity: warning
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "Высокий CPU throttling"
+            description: "Доля throttled periods > {{ mul 100 (default 0.25 .Values.monitoring.thresholds.cpuThrottleRatio) }}%."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/resources#cpu-throttling" | quote }}
+
+        # 10) HPA близко к пределу
+        - alert: OmnimindHPANearMaxCapacity
+          expr: |
+            max by (hpa) (
+              kube_horizontalpodautoscaler_status_current_replicas{
+                {{- if .Values.monitoring.kubeStateMatchers }}
+                  {{- .Values.monitoring.kubeStateMatchers | trim }}
+                {{- else }}
+                  namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}"
+                {{- end }}
+              }
+              /
+              kube_horizontalpodautoscaler_spec_max_replicas{
+                {{- if .Values.monitoring.kubeStateMatchers }}
+                  {{- .Values.monitoring.kubeStateMatchers | trim }}
+                {{- else }}
+                  namespace="{{ default .Release.Namespace .Values.monitoring.namespace }}"
+                {{- end }}
+              }
+            ) > {{ .Values.monitoring.thresholds.hpaNearMax | default 0.9 }}
+          for: {{ .Values.monitoring.durations.hpa | default "15m" }}
+          labels:
+            severity: warning
+            team: sre
+            service: {{ .Chart.Name }}
+            tier: application
+          annotations:
+            summary: "HPA близок к максимальной емкости"
+            description: "Текущие реплики приближаются к maxReplicas. Проверьте ресурсные лимиты/квоты/кластерную емкость."
+            runbook_url: {{ .Values.monitoring.runbookUrl | default "https://runbooks.example.com/omnimind/capacity#hpa" | quote }}
+{{- end }}

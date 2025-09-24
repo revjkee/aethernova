@@ -1,0 +1,325 @@
+apiVersion: security.neurocity.io/v1alpha2
+kind: SelfInhibitorPolicy
+metadata:
+  service: security-core
+  owner: platform-security
+  contact: secops@neurocity.example
+  revision: "2025.08.19"
+  lastModified: "2025-08-19T00:00:00Z"
+  annotations:
+    gitops.change-cause: "bootstrap self-inhibitor"
+    compliance.profiles: "ISO27001,NIST-800-53,PCI-DSS"
+    timezone: "UTC"
+
+spec:
+  mode: "enforce"            # enforce | monitor | off
+  defaultDecision: "deny"    # безопасный дефолт (если правило не нашлось)
+  evaluation:
+    engine: "opa"            # механизм оценки (opa/cedar/custom)
+    interval: "PT0S"         # немедленная оценка (on-request)
+    maxLatencyMs: 50
+
+  scope:
+    environments: ["production","staging","dev"]
+    enforcementPoints:
+      - type: "k8s.admission"        # ValidatingAdmissionWebhook/OPA Gatekeeper
+      - type: "ci.guardian"          # защита пайплайна
+      - type: "api.gateway"          # перед входом в бэкенд
+      - type: "db.proxy"             # SQL proxy (DDL/DML контроль)
+      - type: "egress.firewall"      # контроль исходящего трафика
+    resources:
+      - type: "kubernetes"
+        namespaces: ["security-core","platform-security"]
+        operations: ["create","update","patch","delete","exec","portforward"]
+      - type: "database.postgres"
+        operations: ["DDL","DML","ROLE","SEQUENCE"]
+      - type: "object-storage.s3"
+        operations: ["GET","PUT","DELETE","PUT-ACL","PUT-POLICY"]
+      - type: "cicd.github"
+        operations: ["workflow_dispatch","environment_protect","secrets_update","env_delete"]
+
+  protectedAssets:
+    - id: "k8s:secret/security-core/security-core-secrets"
+      criticality: "critical"
+    - id: "pg:security_core.public.users"
+      criticality: "high"
+    - id: "s3:arn:aws:s3:::neurocity-secrets"
+      criticality: "critical"
+    - id: "ghenv:production"
+      criticality: "high"
+
+  riskModel:
+    weights:
+      uebaScore: 0.40            # 0..100
+      assetCriticality: 0.30     # low/medium/high/critical -> 25/50/75/100
+      timeOfDayRisk: 0.10        # вне окна обслуживания
+      changeWindow: 0.10         # релизный/чёрный список окон
+      actorTrust: 0.10           # доверие субъекту (SA vs human, SSO, mfa)
+    thresholds:
+      softInhibit: 60
+      hardInhibit: 85
+    noiseBudget: 5               # антифлаппинг (снижает ложные срабатывания)
+
+  rules:
+    # ---- Жёсткие запреты (немедленный deny) ----
+    - id: "deny-destructive-sql-prod"
+      description: "DROP/TRUNCATE/ALTER SUPERUSER в prod"
+      match:
+        resource.type: "database.postgres"
+        environment: "production"
+        anyOfActions: ["DROP","TRUNCATE","ALTER ROLE SUPERUSER","DISABLE TRIGGER ALL"]
+      effect: "deny"
+      message: "Destructive SQL запрещён в production."
+    - id: "deny-disable-security-controls"
+      description: "Запрет отключения логов/аудита/лимитов"
+      match:
+        anyOfActions: ["DISABLE_AUDIT","DISABLE_LOGGING","DISABLE_RATE_LIMIT","DELETE_BACKUPS"]
+      effect: "deny"
+      message: "Отключение базовых средств безопасности запрещено."
+    - id: "deny-unsigned-deploy"
+      description: "Запрет деплоя образов без подписи и аттестации"
+      match:
+        resource.type: "kubernetes"
+        selector:
+          image:
+            signedBy: "sigstore://fulcio"
+            hasProvenance: true
+      effect: "require"
+      require:
+        approvals: 0
+      onViolation: "deny"
+      message: "Образ без подписи/attestation."
+    - id: "deny-privileged-containers"
+      description: "Запрет привилегированных контейнеров и hostPath"
+      match:
+        resource.type: "kubernetes"
+      validate:
+        not:
+          any:
+            - path: "spec.containers[*].securityContext.privileged"
+              equals: true
+            - path: "spec.volumes[*].hostPath"
+              exists: true
+      effect: "deny"
+      message: "privileged/hostPath запрещены."
+
+    # ---- Требующие подтверждения (four-eyes) ----
+    - id: "require-approvals-high-risk"
+      description: "Операции высокого риска требуют 2х утверждений"
+      match:
+        anyOfActions: ["secrets_update","environment_protect","PUT-POLICY","ROLE","CREATE_SERVICE_ACCOUNT","ROTATE_KMS_KEY"]
+      effect: "require"
+      require:
+        approvals: 2
+        approverGroups: ["secops","sre"]
+        mfa: true
+        maxTTL: "30m"
+      message: "Нужны 2 подтверждения (secops+sre)."
+
+    # ---- Динамические анти‑эксфиль правила ----
+    - id: "egress-spike-block"
+      description: "Блокировка аномального исходящего трафика"
+      match:
+        resource.type: "egress.firewall"
+      trigger:
+        metric: "egress_bytes_per_minute"
+        comparator: "greaterThanBaselinePct"
+        thresholdPct: 300
+        baselineWindow: "24h"
+        minFloorBytes: 104857600   # 100MB
+      effect: "hard-inhibit"
+      actions:
+        - "cut-egress"
+        - "rotate-tokens"
+        - "snapshot-forensics"
+      message: "Аномалия исходящего трафика."
+
+    - id: "secrets-access-burst"
+      description: "Всплеск чтений секрета — мягкая блокировка"
+      match:
+        resource.id: "k8s:secret/security-core/security-core-secrets"
+      trigger:
+        metric: "secret_reads_per_minute"
+        comparator: "gt"
+        threshold: 20
+      effect: "soft-inhibit"
+      actions:
+        - "require-step-up-mfa"
+        - "throttle-requests"
+      message: "Повышенная активность чтения секрета."
+
+    # ---- Анти‑саботаж CI/CD ----
+    - id: "protect-prod-env-vars"
+      description: "Изменение prod переменных окружения — только с утверждениями"
+      match:
+        resource.type: "cicd.github"
+        environment: "production"
+        anyOfActions: ["secrets_update","env_delete"]
+      effect: "require"
+      require:
+        approvals: 2
+        approverGroups: ["secops","platform-ops"]
+        mfa: true
+        maxTTL: "20m"
+      message: "Prod env vars защищены."
+
+  actions:
+    softInhibit:
+      steps:
+        - id: "flag-safe-mode"
+          type: "feature-flags"
+          payload:
+            set:
+              api.strict_input_validation_v2: true
+              runtime.readonly_fs_enforce: true
+        - id: "rate-limit-tighten"
+          type: "gateway-limit"
+          payload:
+            global_limit: 500
+            per_identity_limit: 100
+        - id: "require-step-up-mfa"
+          type: "auth-policy"
+          payload:
+            step_up: true
+      cooldown: "15m"
+
+    hardInhibit:
+      steps:
+        - id: "admission-deny"
+          type: "k8s.admission"
+          payload:
+            deny_all_mutations: true
+            namespaces: ["security-core"]
+        - id: "revoke-tokens"
+          type: "auth-tokens"
+          payload:
+            scopes: ["ci","deploy","api-root"]
+        - id: "cut-egress"
+          type: "egress.firewall"
+          payload:
+            mode: "deny"
+            exceptionsCidrs: ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"]
+        - id: "snapshot-forensics"
+          type: "forensics"
+          payload:
+            capture:
+              - "pod_memory_dump"
+              - "fs_snapshot"
+              - "network_pcaps"
+      duration: "30m"
+      autoReviewIn: "5m"
+
+  approvals:
+    providers:
+      - type: "oidc"
+        issuer: "https://auth.neurocity.example"
+        require_mfa: true
+        allowed_groups: ["secops","sre","platform-ops"]
+      - type: "hardware-key"
+        supported: ["webauthn","piv"]
+    quorum:
+      production: 2
+      staging: 1
+      dev: 1
+    expiry: "30m"
+    record:
+      include_request_hash: true
+      include_policy_revision: true
+
+  exemptions:
+    # Исключения точечные, строго с TTL и причинами
+    - subject: "sa://security-core/backup-operator"
+      resources: ["object-storage.s3"]
+      actions: ["PUT","GET","DELETE"]
+      reason: "Окно бэкапа"
+      ttl: "3h"
+      approvalsRequired: 1
+
+  breakGlass:
+    enabled: true
+    minApprovers: 2
+    requiredRoles: ["ciso","head-of-sre"]
+    ttl: "30m"
+    conditions:
+      - "incident.severity >= SEV-2"
+    obligations:
+      - "postmortem:72h"
+      - "full-audit-export"
+      - "keys-rotate-after:1h"
+
+  telemetry:
+    audit:
+      sink: "kafka"
+      topic: "audit.self-inhibitor.v1"
+      redact:
+        fields:
+          - "secrets"
+          - "tokens"
+      include:
+        - "request.hash"
+        - "actor.identity"
+        - "actor.groups"
+        - "risk.score"
+        - "decision"
+        - "rules.fired"
+        - "actions.applied"
+    alerts:
+      channels:
+        - type: "slack"
+          target: "#sec-incidents"
+        - type: "email"
+          target: "oncall@neurocity.example"
+
+  opa:
+    bundles:
+      - name: "core-guards"
+        ref: "oci://registry.neurocity.example/policy/core-guards:1.4.2"
+      - name: "k8s-safeguards"
+        ref: "oci://registry.neurocity.example/policy/k8s-safeguards:2.1.0"
+
+environments:
+  production:
+    spec:
+      mode: "enforce"
+      riskModel:
+        thresholds:
+          softInhibit: 55
+          hardInhibit: 80
+      actions:
+        hardInhibit:
+          duration: "45m"
+  staging:
+    spec:
+      mode: "enforce"
+      riskModel:
+        thresholds:
+          softInhibit: 65
+          hardInhibit: 90
+  dev:
+    spec:
+      mode: "monitor"
+      defaultDecision: "allow"
+
+tests:
+  dryRun:
+    - name: "Prod destructive SQL"
+      input:
+        environment: "production"
+        resource:
+          type: "database.postgres"
+        action: "DROP"
+      expect:
+        decision: "deny"
+        rule: "deny-destructive-sql-prod"
+    - name: "Unsigned image"
+      input:
+        environment: "staging"
+        resource:
+          type: "kubernetes"
+          image:
+            signedBy: null
+            hasProvenance: false
+        action: "deploy"
+      expect:
+        decision: "deny"
+        rule: "deny-unsigned-deploy"

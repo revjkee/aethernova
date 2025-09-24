@@ -1,0 +1,76 @@
+# File: aethernova-chain-core/ops/terraform/modules/policies/kyverno/policies/exceptions/templates/exception-template.yaml
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: example-exception
+  namespace: policy-exceptions            # Рекомендуемый выделенный ns под исключения
+  labels:
+    app.kubernetes.io/part-of: aethernova-chain-core
+    app.kubernetes.io/component: kyverno-policy-exception
+    kyverno.io/managed-by: gitops
+  annotations:
+    # Необязательно: срок действия исключения для операционного контроля/чистки
+    policies.aethernova.io/expiry: "2025-12-31T23:59:59Z"
+    policies.aethernova.io/owner: "platform-security"
+    policies.aethernova.io/change-ticket: "SEC-0000"
+
+spec:
+  # По умолчанию Exception влияет и на background-сканы PolicyReports (Fail -> Skip).
+  # Явно оставляем включённым для прозрачности отчётности.
+  background: true
+
+  # Какие политики/правила обойти. Можно указать policy namespace/policyName для Namespaced Policy,
+  # а также wildcard в ruleNames ("*") — с осторожностью.
+  exceptions:
+    - policyName: disallow-host-namespaces          # или "<ns>/<policy>" для Namespaced Policy
+      ruleNames:
+        - host-namespaces
+        - autogen-host-namespaces                   # важно при автогенерации для Pod-контроллеров
+        # - "*"                                     # разрешит обход всех правил политики (использовать только при жёсткой необходимости)
+
+  # Что именно можно пропустить через указанную политику/правила.
+  # В match/ исключениях используем any/all блоки (требование Kyverno).
+  match:
+    any:
+      - resources:
+          kinds:
+            - Pod
+            - Deployment
+            - StatefulSet
+            - DaemonSet
+            - Job
+            - CronJob
+          namespaces:
+            - delta                                  # пример целевого ns
+          # Для контроллеров учтите, что имена Pod'ов содержат хеши ReplicaSet/Pod,
+          # поэтому используйте wildcard, если исключение задаётся по имени.
+          names:
+            - important-tool*                        # wildcard для Pod-ов из контроллера
+
+  # Явные исключения зоны действия самого исключения (good practice).
+  exclude:
+    any:
+      - resources:
+          namespaces:
+            - kube-system
+            - kyverno
+
+  # Уточняющие условия (JMESPath) по содержимому запрашиваемого объекта.
+  # Полезно ограничивать исключения по меткам/аннотациям релиза, окружению и т.п.
+  conditions:
+    any:
+      - key: "{{ request.object.metadata.labels.env || '' }}"
+        operator: Equals
+        value: "dev"
+      # пример на аннотации изменения: допускаем только согласованные тикеты
+      - key: "{{ request.object.metadata.annotations.\"policies.aethernova.io/change-ticket\" || '' }}"
+        operator: In
+        value: ["SEC-0000", "SEC-1234"]
+
+  # Необязательно: точечные исключения контролей Pod Security (если базовая политика использует validate.podSecurity).
+  # Полезно для сетевых initContainer'ов сервис-мешей и т.п.
+  podSecurity:
+    - controlName: Capabilities
+      images:
+        - "istio/*"
+        - "linkerd/*"

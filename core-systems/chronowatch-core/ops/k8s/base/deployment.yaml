@@ -1,0 +1,198 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronowatch-core
+  namespace: chronowatch
+  labels:
+    app.kubernetes.io/name: chronowatch-core
+    app.kubernetes.io/instance: chronowatch-core
+    app.kubernetes.io/component: scheduling
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/version: "1.0.0"   # обновляется CI
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # Аннотация для принудительного рестарта подов при изменении конфигов (подставьте checksum через Kustomize/Helm)
+    checksum/config: "REPLACE_ME_BY_KUSTOMIZE"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronowatch-core
+      app.kubernetes.io/instance: chronowatch-core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chronowatch-core
+        app.kubernetes.io/instance: chronowatch-core
+        app.kubernetes.io/component: scheduling
+        app.kubernetes.io/part-of: neurocity
+        # Метки для выбора сервисом метрик/логики
+        observability.neurocity.dev/scrape: "true"
+        observability.neurocity.dev/metrics-port: "9464"
+      annotations:
+        # Пример аннотаций для трейсинга/логирования (опционально)
+        co.elastic.logs/enabled: "true"
+        # Prometheus обычно скрапит через ServiceMonitor; оставляем подсказку
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: chronowatch-core
+      priorityClassName: high-priority # создайте при необходимости, иначе удалите
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      # Анти-аффинити и распределение по зонам для стойкости
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: chronowatch-core
+                    app.kubernetes.io/instance: chronowatch-core
+                topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: chronowatch-core
+              app.kubernetes.io/instance: chronowatch-core
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: chronowatch-core
+              app.kubernetes.io/instance: chronowatch-core
+      # Нода-селектор/толерации по необходимости:
+      # nodeSelector: { nodepool: general }
+      # tolerations:
+      #   - key: "workload"
+      #     operator: "Equal"
+      #     value: "critical"
+      #     effect: "NoSchedule"
+      securityContext:
+        fsGroup: 2000
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: chronowatch-core
+          # Укажите реальный образ (immutable digest в проде)
+          image: ghcr.io/aethernova/chronowatch-core:1.0.0
+          imagePullPolicy: IfNotPresent
+          # Основной процесс (пример для Python)
+          command: ["python", "-m", "chronowatch_core"]
+          args:
+            - "--config=/etc/chronowatch/config.yaml"
+            - "--log-level=INFO"
+            - "--metrics-bind=0.0.0.0:9464"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9464
+          env:
+            - name: TZ
+              value: UTC
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: OTEL_SERVICE_NAME
+              value: chronowatch-core
+            - name: OTEL_TRACES_EXPORTER
+              value: "none" # замените на "otlp" при включении
+          envFrom:
+            - configMapRef:
+                name: chronowatch-core-config
+            - secretRef:
+                name: chronowatch-core-secrets
+          volumeMounts:
+            - name: config
+              mountPath: /etc/chronowatch
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/chronowatch
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          # Пробы: сначала startup, затем readiness/liveness
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    echo "Received SIGTERM, draining..."
+                    # даём времени завершить задачи
+                    sleep 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: chronowatch-core-config
+            # при включении check-sum аннотации перезапускаем поды на изменениях
+            optional: false
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi
+        - name: cache
+          emptyDir: {}
+      imagePullSecrets:
+        - name: ghcr-creds
+---
+# Пример ServiceAccount (можно вынести в отдельный файл)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chronowatch-core
+  namespace: chronowatch
+  labels:
+    app.kubernetes.io/name: chronowatch-core
+    app.kubernetes.io/instance: chronowatch-core

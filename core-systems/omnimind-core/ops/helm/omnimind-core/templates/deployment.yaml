@@ -1,0 +1,303 @@
+{{- /*
+Industrial-grade Deployment template for omnimind-core.
+Assumes helpers in _helpers.tpl, but provides safe fallbacks.
+*/ -}}
+{{- $fullname := (include "omnimind-core.fullname" . | default (printf "%s-%s" .Release.Name .Chart.Name)) -}}
+{{- $labels := (include "omnimind-core.labels" . | default "") -}}
+{{- $selectorLabels := (include "omnimind-core.selectorLabels" . | default (printf "app.kubernetes.io/name: %s\napp.kubernetes.io/instance: %s" .Chart.Name .Release.Name)) -}}
+{{- $svcAccountName := (include "omnimind-core.serviceAccountName" . | default (printf "%s-sa" $fullname)) -}}
+{{- $chart := printf "%s-%s" .Chart.Name (.Chart.Version | replace "+" "_") -}}
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/part-of: omnimind-core
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ $chart }}
+{{- if .Values.commonLabels }}
+{{ toYaml .Values.commonLabels | nindent 4 }}
+{{- end }}
+  annotations:
+    kubernetes.io/change-cause: {{ .Values.changeCause | default (printf "release %s at %s" .Release.Revision (now | date "2006-01-02T15:04:05Z07:00")) | quote }}
+{{- if .Values.commonAnnotations }}
+{{ toYaml .Values.commonAnnotations | nindent 4 }}
+{{- end }}
+spec:
+{{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount | default 2 }}
+{{- end }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit | default 10 }}
+  progressDeadlineSeconds: {{ .Values.progressDeadlineSeconds | default 600 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .Values.updateStrategy.rollingUpdate.maxSurge | default "25%" | quote }}
+      maxUnavailable: {{ .Values.updateStrategy.rollingUpdate.maxUnavailable | default "0%" | quote }}
+  selector:
+    matchLabels:
+{{- if $selectorLabels }}
+{{ $selectorLabels | nindent 6 }}
+{{- else }}
+      app.kubernetes.io/name: {{ .Chart.Name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+  template:
+    metadata:
+      labels:
+{{- if $labels }}
+{{ $labels | nindent 8 }}
+{{- else }}
+        app.kubernetes.io/name: {{ .Chart.Name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/part-of: omnimind-core
+{{- end }}
+{{- if .Values.podLabels }}
+{{ toYaml .Values.podLabels | nindent 8 }}
+{{- end }}
+      annotations:
+        checksum/config: {{ (toYaml .Values.config | default "" | sha256sum) | quote }}
+        checksum/secret: {{ (toYaml .Values.secrets | default "" | sha256sum) | quote }}
+        prometheus.io/scrape: {{ ternary "true" "false" (and .Values.metrics.enabled .Values.metrics.podScrape) | quote }}
+        prometheus.io/port: {{ (dig "metrics" "port"  "http" "port"  .Values  (dict) | default 9090) | quote }}
+        prometheus.io/path: {{ (dig "metrics" "path" .Values | default "/metrics") | quote }}
+{{- if .Values.podAnnotations }}
+{{ toYaml .Values.podAnnotations | nindent 8 }}
+{{- end }}
+    spec:
+      serviceAccountName: {{ $svcAccountName }}
+      enableServiceLinks: {{ .Values.enableServiceLinks | default false }}
+{{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+{{- end }}
+{{- if .Values.runtimeClassName }}
+      runtimeClassName: {{ .Values.runtimeClassName }}
+{{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+{{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+{{- else }}
+      dnsPolicy: {{ .Values.dnsPolicy | default "ClusterFirst" }}
+{{- end }}
+{{- if .Values.dnsConfig }}
+      dnsConfig:
+{{ toYaml .Values.dnsConfig | nindent 8 }}
+{{- end }}
+{{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{- range .Values.imagePullSecrets }}
+        - name: {{ . | quote }}
+{{- end }}
+{{- end }}
+
+      securityContext:
+        fsGroup: {{ .Values.podSecurityContext.fsGroup | default 2000 }}
+        fsGroupChangePolicy: {{ .Values.podSecurityContext.fsGroupChangePolicy | default "OnRootMismatch" | quote }}
+        runAsNonRoot: {{ .Values.podSecurityContext.runAsNonRoot | default true }}
+        seccompProfile:
+          type: {{ .Values.podSecurityContext.seccompProfile.type | default "RuntimeDefault" }}
+
+{{- if .Values.initContainers }}
+      initContainers:
+{{- range $idx, $c := .Values.initContainers }}
+        - name: {{ $c.name | quote }}
+          image: {{- if $c.image.digest -}}{{ printf "%s@%s" $c.image.repository $c.image.digest | quote }}{{- else -}}{{ printf "%s:%s" $c.image.repository ($c.image.tag | default "latest") | quote }}{{- end }}
+          imagePullPolicy: {{ $c.image.pullPolicy | default "IfNotPresent" }}
+{{- if $c.command }}          command: {{ toYaml $c.command | nindent 12 }}{{- end }}
+{{- if $c.args }}             args: {{ toYaml $c.args | nindent 12 }}{{- end }}
+{{- if $c.env }}              env: {{ toYaml $c.env | nindent 12 }}{{- end }}
+{{- if $c.envFrom }}          envFrom: {{ toYaml $c.envFrom | nindent 12 }}{{- end }}
+{{- if $c.volumeMounts }}     volumeMounts: {{ toYaml $c.volumeMounts | nindent 12 }}{{- end }}
+{{- if $c.resources }}        resources: {{ toYaml $c.resources | nindent 12 }}{{- end }}
+{{- if $c.securityContext }}  securityContext: {{ toYaml $c.securityContext | nindent 12 }}{{- end }}
+{{- if $c.lifecycle }}        lifecycle: {{ toYaml $c.lifecycle | nindent 12 }}{{- end }}
+{{- if $c.workingDir }}       workingDir: {{ $c.workingDir | quote }}{{- end }}
+{{- end }}
+{{- end }}
+
+      containers:
+        - name: {{ .Values.nameOverride | default "app" | quote }}
+          image: {{- if .Values.image.digest -}}{{ printf "%s@%s" .Values.image.repository .Values.image.digest | quote }}{{- else -}}{{ printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) | quote }}{{- end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+{{- if .Values.command }}  command: {{ toYaml .Values.command | nindent 10 }}{{- end }}
+{{- if .Values.args }}     args: {{ toYaml .Values.args | nindent 10 }}{{- end }}
+
+{{- if .Values.ports }}
+          ports:
+{{- range .Values.ports }}
+            - name: {{ .name | default "http" | quote }}
+              containerPort: {{ .containerPort }}
+              protocol: {{ .protocol | default "TCP" }}
+{{- if .appProtocol }}      appProtocol: {{ .appProtocol | quote }}{{- end }}
+{{- end }}
+{{- else }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort | default 8080 }}
+              protocol: TCP
+              appProtocol: http
+{{- end }}
+
+{{- if .Values.env }}
+          env:
+{{ toYaml .Values.env | nindent 12 }}
+{{- end }}
+{{- if or .Values.envFrom.configMaps .Values.envFrom.secrets .Values.envFrom.additional }}
+          envFrom:
+{{- range .Values.envFrom.configMaps }}
+            - configMapRef:
+                name: {{ . | quote }}
+{{- end }}
+{{- range .Values.envFrom.secrets }}
+            - secretRef:
+                name: {{ . | quote }}
+{{- end }}
+{{- if .Values.envFrom.additional }}
+{{ toYaml .Values.envFrom.additional | nindent 12 }}
+{{- end }}
+{{- end }}
+
+          resources:
+            requests:
+              cpu: {{ (dig "resources" "requests" "cpu" .Values | default "100m") | quote }}
+              memory: {{ (dig "resources" "requests" "memory" .Values | default "256Mi") | quote }}
+{{- if hasKey .Values.resources.requests "ephemeral-storage" }}
+              ephemeral-storage: {{ .Values.resources.requests.ephemeral-storage | quote }}
+{{- end }}
+            limits:
+              cpu: {{ (dig "resources" "limits" "cpu" .Values | default "500m") | quote }}
+              memory: {{ (dig "resources" "limits" "memory" .Values | default "512Mi") | quote }}
+{{- if hasKey .Values.resources.limits "ephemeral-storage" }}
+              ephemeral-storage: {{ .Values.resources.limits.ephemeral-storage | quote }}
+{{- end }}
+
+          securityContext:
+            allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation | default false }}
+            readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem | default true }}
+            runAsNonRoot: {{ .Values.securityContext.runAsNonRoot | default true }}
+            runAsUser: {{ .Values.securityContext.runAsUser | default 10001 }}
+            runAsGroup: {{ .Values.securityContext.runAsGroup | default 10001 }}
+            capabilities:
+              drop:
+                - ALL
+
+{{- if .Values.lifecycle }}
+          lifecycle:
+{{ toYaml .Values.lifecycle | nindent 12 }}
+{{- else }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","sleep {{ .Values.preStopSleepSeconds | default 5 }}"]
+{{- end }}
+
+{{- if .Values.startupProbe }}
+          startupProbe:
+{{ toYaml .Values.startupProbe | nindent 12 }}
+{{- else }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path | default "/healthz/startup" | quote }}
+              port: {{ (index (.Values.ports | default (list (dict "name" "http" "containerPort" (.Values.containerPort | default 8080)))) 0).name | default "http" | quote }}
+            failureThreshold: 30
+            periodSeconds: 5
+{{- end }}
+
+{{- if .Values.livenessProbe }}
+          livenessProbe:
+{{ toYaml .Values.livenessProbe | nindent 12 }}
+{{- else }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path | default "/healthz/live" | quote }}
+              port: {{ (index (.Values.ports | default (list (dict "name" "http" "containerPort" (.Values.containerPort | default 8080)))) 0).name | default "http" | quote }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 10 }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
+{{- end }}
+
+{{- if .Values.readinessProbe }}
+          readinessProbe:
+{{ toYaml .Values.readinessProbe | nindent 12 }}
+{{- else }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path | default "/healthz/ready" | quote }}
+              port: {{ (index (.Values.ports | default (list (dict "name" "http" "containerPort" (.Values.containerPort | default 8080)))) 0).name | default "http" | quote }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 5 }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
+{{- end }}
+
+{{- if .Values.volumeMounts }}
+          volumeMounts:
+{{ toYaml .Values.volumeMounts | nindent 12 }}
+{{- end }}
+
+{{- if .Values.extraContainers }}
+{{ toYaml .Values.extraContainers | nindent 8 }}
+{{- end }}
+
+{{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+{{ toYaml .Values.topologySpreadConstraints | nindent 8 }}
+{{- else if .Values.highAvailability.defaultTopologySpread }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+{{- if $selectorLabels }}
+{{ $selectorLabels | nindent 14 }}
+{{- else }}
+              app.kubernetes.io/name: {{ .Chart.Name }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.affinity }}
+      affinity:
+{{ toYaml .Values.affinity | nindent 8 }}
+{{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+{{- if $selectorLabels }}
+{{ $selectorLabels | nindent 20 }}
+{{- else }}
+                    app.kubernetes.io/name: {{ .Chart.Name }}
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+                topologyKey: kubernetes.io/hostname
+{{- end }}
+
+{{- if .Values.nodeSelector }}
+      nodeSelector:
+{{ toYaml .Values.nodeSelector | nindent 8 }}
+{{- end }}
+
+{{- if .Values.tolerations }}
+      tolerations:
+{{ toYaml .Values.tolerations | nindent 8 }}
+{{- end }}
+
+{{- if or .Values.volumes .Values.extraVolumes }}
+      volumes:
+{{- if .Values.volumes }}
+{{ toYaml .Values.volumes | nindent 8 }}
+{{- end }}
+{{- if .Values.extraVolumes }}
+{{ toYaml .Values.extraVolumes | nindent 8 }}
+{{- end }}
+{{- end }}

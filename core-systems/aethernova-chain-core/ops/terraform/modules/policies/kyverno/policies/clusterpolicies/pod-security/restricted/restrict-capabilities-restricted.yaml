@@ -1,0 +1,93 @@
+# aethernova-chain-core/ops/terraform/modules/policies/kyverno/policies/clusterpolicies/pod-security/restricted/restrict-capabilities-restricted.yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-capabilities-restricted
+  annotations:
+    policies.kyverno.io/title: Restrict Linux Capabilities (PSS: restricted)
+    policies.kyverno.io/category: Pod Security Standards
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >
+      Enforce PSS "restricted" capabilities posture: require drop: ["ALL"]
+      and allow only NET_BIND_SERVICE to be added across containers,
+      initContainers, and ephemeralContainers.
+  labels:
+    app.kubernetes.io/managed-by: kyverno
+    app.kubernetes.io/part-of: aethernova-chain-core
+    app.kubernetes.io/component: policies
+    policy.aethernova.io/tier: strict
+spec:
+  background: true
+  validationFailureAction: Enforce
+  rules:
+    # 1) Требуем явный drop: ["ALL"] для всех типов контейнеров
+    - name: require-drop-all
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: >-
+          All containers must explicitly drop ALL Linux capabilities
+          (securityContext.capabilities.drop: ["ALL"]) per PSS restricted.
+        foreach:
+          - list: "request.object.spec.initContainers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.capabilities.drop[] | contains(@, 'ALL') }}"
+                    operator: Equals
+                    value: false
+            # Если deny не сработал, выполняем позитивную проверку через pattern:
+            # (Kyverno обрабатывает deny раньше; наличие 'ALL' удовлетворяет требованию)
+          - list: "request.object.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.capabilities.drop[] | contains(@, 'ALL') }}"
+                    operator: Equals
+                    value: false
+          - list: "request.object.spec.ephemeralContainers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.capabilities.drop[] | contains(@, 'ALL') }}"
+                    operator: Equals
+                    value: false
+
+    # 2) Запрещаем add любых способностей, кроме NET_BIND_SERVICE
+    - name: restrict-added-capabilities
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: >-
+          Adding Linux capabilities is disallowed except NET_BIND_SERVICE
+          per PSS restricted policy.
+        foreach:
+          - list: "request.object.spec.initContainers[]"
+            deny:
+              conditions:
+                any:
+                  # Если add отсутствует — ок; если присутствует,
+                  # допускается только NET_BIND_SERVICE.
+                  - key: "{{ element.securityContext.capabilities.add[] | difference(@, ['NET_BIND_SERVICE']) | length(@) }}"
+                    operator: GreaterThan
+                    value: 0
+          - list: "request.object.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.capabilities.add[] | difference(@, ['NET_BIND_SERVICE']) | length(@) }}"
+                    operator: GreaterThan
+                    value: 0
+          - list: "request.object.spec.ephemeralContainers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.capabilities.add[] | difference(@, ['NET_BIND_SERVICE']) | length(@) }}"
+                    operator: GreaterThan
+                    value: 0

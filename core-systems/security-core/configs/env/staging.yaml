@@ -1,0 +1,310 @@
+apiVersion: "aethernova.io/config/v1"
+kind: SecurityCoreConfig
+metadata:
+  environment: "staging"
+  version: "1.0.0"
+  region: "eu"
+  labels:
+    app.kubernetes.io/name: "security-core"
+    app.kubernetes.io/part-of: "core-systems"
+    environment: "staging"
+
+app:
+  name: "security-core"
+  instance: "${POD_NAME:-security-core-stg}"
+  readOnlyMode: false
+  featureFlags:
+    enableMetrics: true
+    enableTracing: true
+    enablePPROF: false
+    enforceTenantIsolation: true
+    stepUpMFARequired: true
+    redactPII: true
+    strictCORS: true
+    strictRateLimits: true
+
+server:
+  http:
+    bind: "0.0.0.0:8080"
+    publicBaseURL: "https://staging-security-core.example.com"
+    cors:
+      allowedOrigins:
+        - "https://staging-console.example.com"
+        - "https://staging-api-gateway.example.com"
+      allowedMethods: ["GET","POST","PUT","DELETE","OPTIONS"]
+      allowedHeaders: ["Authorization","Content-Type","X-Request-Id","X-Trace-Id"]
+      allowCredentials: false
+      maxAgeSeconds: 600
+    timeouts:
+      read: "15s"
+      write: "15s"
+      idle: "60s"
+      header: "5s"
+    limits:
+      maxRequestBodyMB: 10
+      maxConcurrentRequests: 1000
+  grpc:
+    enabled: true
+    bind: "0.0.0.0:9090"
+    maxRecvMB: 16
+    maxSendMB: 16
+    keepaliveTime: "30s"
+    keepaliveTimeout: "5s"
+  tls:
+    enabled: true
+    minVersion: "TLS1.3"
+    certificate:
+      certFile: "/etc/security-core/tls/tls.crt"
+      keyFile: "/etc/security-core/tls/tls.key"
+    clientCA:
+      bundleFile: "/etc/security-core/tls/ca-bundle.pem"
+  mtls:
+    # Требуем mTLS для внутренних путей (S2S)
+    requiredForInternal: true
+    internalPaths:
+      - "/v1/keys/"
+      - "/v1/policy/"
+      - "/v1/events/"
+    spiffe:
+      required: true
+      allowedPrefix: "spiffe://aethernova/internal/security-core/"
+  securityHeaders:
+    hsts: "max-age=63072000; includeSubDomains; preload"
+    xContentTypeOptions: "nosniff"
+    xFrameOptions: "DENY"
+    referrerPolicy: "no-referrer"
+    contentSecurityPolicy: "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+  csrf:
+    enabled: true
+    sameSite: "Lax"
+    headerName: "X-CSRF-Token"
+  ipFiltering:
+    trustedProxiesCIDR:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+
+authn:
+  oidc:
+    enabled: true
+    issuer: "${OIDC_ISSUER_STAGING}"
+    audience: "security-core"
+    jwksCacheTTL: "300s"
+    requiredClaims:
+      - "sub"
+      - "tenant_id"
+      - "roles"
+    clockSkew: "60s"
+  sessions:
+    # Stateless JWT, серверных сессий нет
+    enabled: false
+
+authz:
+  # Подключение к политике авторизации (см. configs/authz.yaml)
+  policyFile: "/etc/security-core/policy/authz.yaml"
+  cacheTTL: "10s"
+  decisionLog:
+    enabled: true
+    includeRequestSample: false
+
+tenancy:
+  enforce: true
+  defaultTenant: "staging"
+  header: "X-Tenant-Id"
+  claim: "tenant_id"
+
+data:
+  postgres:
+    dsn: "${POSTGRES_DSN}"                # Например: postgres://user:pass@host:5432/db?sslmode=verify-full
+    ssl:
+      mode: "verify-full"
+      rootCAFile: "/etc/security-core/db/ca.pem"
+    pool:
+      maxOpen: 40
+      maxIdle: 10
+      connMaxLifetime: "30m"
+      connMaxIdleTime: "10m"
+    migrations:
+      runAtStartup: true
+      path: "/etc/security-core/migrations"
+  redis:
+    url: "${REDIS_URL_TLS}"               # Например: rediss://user:pass@host:6379/0
+    tls:
+      enabled: true
+      rootCAFile: "/etc/security-core/redis/ca.pem"
+    pool:
+      size: 20
+      minIdle: 5
+      maxConnAge: "30m"
+  objectStorage:
+    enabled: true
+    driver: "s3"
+    endpoint: "${S3_ENDPOINT}"            # staging‑endpoint (MinIO/S3 совместимый)
+    region: "${S3_REGION:-eu-central-1}"
+    bucket: "security-core-staging"
+    pathStyle: true
+    tls: true
+    credentials:
+      accessKeyEnv: "S3_ACCESS_KEY"
+      secretKeyEnv: "S3_SECRET_KEY"
+
+messaging:
+  nats:
+    enabled: true
+    url: "${NATS_URL_TLS}"                # Например: tls://nats.staging.svc:4222
+    tls:
+      rootCAFile: "/etc/security-core/nats/ca.pem"
+    jetstream:
+      enable: true
+      streams:
+        - name: "events_security_core"
+          subjects: ["security.core.events.*"]
+          retention: "limits"
+          maxBytes: 536870912
+          replicas: 3
+  kafka:
+    enabled: false
+
+crypto:
+  vault:
+    enabled: true
+    address: "${VAULT_ADDR}"              # Например: https://vault.staging.svc:8200
+    auth:
+      method: "kubernetes"
+      kube:
+        role: "security-core"
+        jwtPath: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        mount: "${VAULT_K8S_MOUNT_PATH:-kubernetes}"
+    transit:
+      path: "transit/"
+      keys:
+        signingKey: "${VAULT_SIGN_KEY_NAME:-security-core-sign}"
+        decryptKey: "${VAULT_DECRYPT_KEY_NAME:-security-core-dec}"
+    kv:
+      paths:
+        - "secret/security-core/"
+    cacheTTL: "60s"
+
+ratesLimits:
+  ip:
+    window: "1m"
+    burst: 300
+    sustainedPerMinute: 120
+  user:
+    window: "1m"
+    burst: 120
+    sustainedPerMinute: 60
+  s2s:
+    window: "1m"
+    burst: 900
+    sustainedPerMinute: 300
+  backend:
+    provider: "redis"
+
+quotas:
+  enabled: true
+  daily:
+    eventsIngest: 250000
+
+observability:
+  logging:
+    level: "DEBUG"                        # Staging: детальнее, чем prod
+    format: "json"
+    destination: "stdout"
+    redactFields:
+      - "$.request.headers.authorization"
+      - "$.request.body.password"
+      - "$.response.body.secrets"
+  tracing:
+    enabled: true
+    exporter: "otlp"
+    protocol: "grpc"
+    endpoint: "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-otel-collector.observability:4317}"
+    samplingRatio: 0.2
+  metrics:
+    enabled: true
+    exporter: "otlp"
+    endpoint: "${OTEL_EXPORTER_OTLP_METRICS_ENDPOINT:-otel-collector.observability:4317}"
+    runtimeCollectors:
+      gc: true
+      process: true
+      system: true
+  audit:
+    level: "decision"
+    sinks:
+      - type: "otlp"
+        endpoint: "${OTEL_EXPORTER_OTLP_LOGS_ENDPOINT:-otel-collector.observability:4317}"
+        timeout: "2s"
+      - type: "file"
+        path: "/var/log/security-core/audit.log"
+        rotation:
+          maxSizeMB: 50
+          maxBackups: 7
+          maxAgeDays: 14
+
+health:
+  livenessPath: "/healthz"
+  readinessPath: "/readyz"
+  startupPath: "/startup"
+  gracePeriod: "10s"
+
+httpClients:
+  defaults:
+    timeout: "3s"
+    retry:
+      attempts: 3
+      backoff: "200ms"
+      maxBackoff: "2s"
+  services:
+    policyEngine:
+      baseURL: "http://security-core-policy.staging.svc.cluster.local:8080"
+      timeout: "2s"
+    keyService:
+      baseURL: "http://security-core-keys.staging.svc.cluster.local:8080"
+      timeout: "2s"
+
+integrations:
+  opa:
+    enabled: false
+    endpoint: ""
+  webhook:
+    enabled: false
+    url: ""
+    authHeaderEnv: "WEBHOOK_TOKEN"
+
+maintenance:
+  drainTimeout: "20s"
+  shutdownDelay: "5s"
+  readOnlyOnStartFailure: true
+
+files:
+  # Пути монтируются из ConfigMap/Secret/CSI
+  policyFile: "/etc/security-core/policy/authz.yaml"
+  tls:
+    cert: "/etc/security-core/tls/tls.crt"
+    key: "/etc/security-core/tls/tls.key"
+    caBundle: "/etc/security-core/tls/ca-bundle.pem"
+  db:
+    ca: "/etc/security-core/db/ca.pem"
+  redis:
+    ca: "/etc/security-core/redis/ca.pem"
+  nats:
+    ca: "/etc/security-core/nats/ca.pem"
+
+slo:
+  apiAvailability:
+    target: 99.5
+    windowDays: 30
+    burnRateAlerts:
+      - shortWindow: "5m"
+        longWindow: "1h"
+        threshold: 14.4
+      - shortWindow: "30m"
+        longWindow: "6h"
+        threshold: 6.0
+
+invariants:
+  requireTLS: true
+  requireMTLSForInternalPaths: true
+  forbidPlaintextSecretsInConfig: true
+  defaultDenyAuthorization: true

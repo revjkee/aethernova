@@ -1,0 +1,140 @@
+name: provenance-slsa
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write         # для загрузки в релиз
+  id-token: write         # для Sigstore keyless
+  attestations: write     # для GitHub Attestations
+  actions: read
+
+concurrency:
+  group: provenance-slsa-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DIST_DIR: dist
+  SBOM_FILE: dist/sbom.spdx.json
+  CHECKSUM_FILE: dist/sha256sum.txt
+
+jobs:
+  build-and-package:
+    name: Build, package, checksums, SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare dist dir
+        run: |
+          rm -rf "${DIST_DIR}"
+          mkdir -p "${DIST_DIR}"
+
+      - name: Create source archive (tar.gz)
+        run: |
+          tar --exclude-vcs --exclude='.github' \
+              -czf "${DIST_DIR}/source-${{ github.sha }}.tar.gz" .
+
+      - name: Compute SHA256 checksums
+        run: |
+          cd "${DIST_DIR}"
+          sha256sum * > sha256sum.txt
+
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: ${{ env.SBOM_FILE }}
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ github.sha }}
+          path: |
+            ${{ env.DIST_DIR }}/
+            ${{ env.SBOM_FILE }}
+
+  attest-and-sign:
+    name: SLSA provenance, sign SBOM & checksums
+    needs: build-and-package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ github.sha }}
+          path: ${{ env.DIST_DIR }}
+
+      - name: Attest build provenance (GitHub Attestations)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            ${{ env.DIST_DIR }}/*.tar.gz
+            ${{ env.DIST_DIR }}/sha256sum.txt
+            ${{ env.SBOM_FILE }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Keyless sign checksums with Cosign (OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "${CHECKSUM_FILE}.sig" \
+            --output-certificate "${CHECKSUM_FILE}.pem" \
+            "${CHECKSUM_FILE}"
+
+      - name: Keyless sign SBOM with Cosign (OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "${SBOM_FILE}.sig" \
+            --output-certificate "${SBOM_FILE}.pem" \
+            "${SBOM_FILE}"
+
+      - name: Upload signed meta
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-meta-${{ github.sha }}
+          path: |
+            ${{ env.CHECKSUM_FILE }}*
+            ${{ env.SBOM_FILE }}*
+
+  publish-release-assets:
+    name: Publish assets to GitHub Release (if applicable)
+    needs: [build-and-package, attest-and-sign]
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ github.sha }}
+          path: ${{ env.DIST_DIR }}
+
+      - name: Download signatures
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-meta-${{ github.sha }}
+          path: ${{ env.DIST_DIR }}
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.DIST_DIR }}/*.tar.gz
+            ${{ env.DIST_DIR }}/sha256sum.txt
+            ${{ env.DIST_DIR }}/sha256sum.txt.sig
+            ${{ env.DIST_DIR }}/sha256sum.txt.pem
+            ${{ env.SBOM_FILE }}
+            ${{ env.SBOM_FILE }}.sig
+            ${{ env.SBOM_FILE }}.pem

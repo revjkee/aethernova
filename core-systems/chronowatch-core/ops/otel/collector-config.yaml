@@ -1,0 +1,244 @@
+# chronowatch-core/ops/otel/collector-config.yaml
+# OpenTelemetry Collector (otelcol-contrib) — production-grade gateway для Kubernetes.
+
+extensions:
+  health_check:
+    endpoint: ${OTEL_HEALTH_ENDPOINT:0.0.0.0:13133}
+  pprof:
+    endpoint: ${OTEL_PPROF_ENDPOINT:0.0.0.0:1777}
+  zpages:
+    endpoint: ${OTEL_ZPAGES_ENDPOINT:0.0.0.0:55679}
+
+receivers:
+  # Приём от приложений (ChronoWatch API, воркеры, фронт-прокси)
+  otlp:
+    protocols:
+      grpc:
+        endpoint: ${OTEL_OTLP_GRPC_ENDPOINT:0.0.0.0:4317}
+        max_recv_msg_size_mib: ${OTEL_OTLP_MAX_RECV_MIB:32}
+      http:
+        endpoint: ${OTEL_OTLP_HTTP_ENDPOINT:0.0.0.0:4318}
+        include_metadata: true
+
+  # Сбор метрик приложений и инфраструктуры через pull (/metrics)
+  prometheus:
+    config:
+      scrape_configs:
+        # Скрейп сервисов в namespace=chronowatch
+        - job_name: chronowatch-services
+          kubernetes_sd_configs:
+            - role: endpoints
+          scrape_interval: ${PROM_SCRAPE_INTERVAL:15s}
+          scrape_timeout: ${PROM_SCRAPE_TIMEOUT:10s}
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_namespace]
+              regex: ${SCRAPE_NAMESPACE:chronowatch}
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              regex: "true"
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+              action: replace
+              target_label: __metrics_path__
+              regex: (.+)
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+              action: replace
+              target_label: __address__
+              regex: (.*)
+              replacement: $1
+        # Скрейп kubelet cAdvisor (ресурсы контейнеров)
+        - job_name: kubelet-cadvisor
+          kubernetes_sd_configs:
+            - role: node
+          scheme: https
+          tls_config:
+            insecure_skip_verify: true
+          bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+          metrics_path: /metrics/cadvisor
+          scrape_interval: 30s
+          relabel_configs:
+            - target_label: job
+              replacement: kubelet
+
+  # Метрики узла (CPU, mem, диск, сеть)
+  hostmetrics:
+    collection_interval: ${HOSTMETRICS_INTERVAL:30s}
+    scrapers:
+      cpu: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      network: {}
+      load: {}
+      process: {}
+
+  # Сбор логов контейнеров Kubernetes
+  filelog:
+    include:
+      - ${K8S_LOG_PATH:/var/log/containers/*chronowatch*}.log
+      - ${K8S_LOG_PATH_FALLBACK:/var/log/containers/*.log}
+    start_at: ${FILELOG_START:beginning}
+    include_file_name: false
+    include_file_path: true
+    operators:
+      - type: json_parser
+        id: k8s_json
+        timestamp:
+          parse_from: attributes.time
+          layout_type: strptime
+          layout: '%Y-%m-%dT%H:%M:%S.%fZ'
+        severity:
+          parse_from: attributes.severity
+      - type: move
+        from: attributes.log
+        to: body
+      - type: add
+        field: resource.log.file_path
+        value: '${file.path}'
+
+processors:
+  # Жёсткий лимит памяти коллектора
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: ${MEM_LIMIT_PERCENT:80}
+    spike_limit_percentage: ${MEM_SPIKE_PERCENT:20}
+
+  # Сборка батчей для экономии сети/бекенда
+  batch:
+    send_batch_size: ${BATCH_SIZE:8192}
+    timeout: ${BATCH_TIMEOUT:5s}
+
+  # Автообогащение ресурсами из Kubernetes
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.namespace.name
+        - k8s.node.name
+        - k8s.pod.uid
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - k8s.container.name
+        - k8s.replicaset.name
+    # Привязка по атрибутам логов/метрик/трейсов
+    pod_association:
+      - from: resource_attribute
+        name: k8s.pod.ip
+      - from: resource_attribute
+        name: host.name
+      - from: connection
+
+  # Обнаружение окружения/провайдера
+  resourcedetection:
+    detectors: [env, system]
+    override: false
+
+  # Унификация имён сервиса/пространства
+  resource:
+    attributes:
+      - action: upsert
+        key: service.namespace
+        value: ${SERVICE_NAMESPACE:chronowatch}
+      - action: upsert
+        key: deployment.environment
+        value: ${ENV:production}
+
+  # Удаление потенциально PII-заголовков из логов/спанов
+  attributes/sanitize:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: http.response.header.set-cookie
+        action: delete
+      - key: user.email
+        action: delete
+
+  # Семплинг трейсов (по умолчанию 10%)
+  probabilistic_sampler:
+    hash_seed: ${SAMPLER_SEED:1}
+    sampling_percentage: ${SAMPLING_PERCENT:10}
+
+  # Трансформации метрик (пример: нормализация unit/названий)
+  metricstransform:
+    transforms:
+      - include: http_server_duration
+        match_type: strict
+        action: update
+        operations:
+          - action: update_description
+            new_value: "HTTP server duration (seconds)"
+
+connectors:
+  # RED-метрики из трейсов
+  spanmetrics:
+    namespace: spanmetrics
+    dimensions:
+      - service.name
+      - http.method
+      - http.route
+      - http.status_code
+    latency_histogram:
+      buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s, 10s]
+
+exporters:
+  # Универсальный экспорт по OTLP (traces/metrics/logs) — в ваш APM/TSDB
+  otlp:
+    endpoint: ${OTLP_EXPORT_ENDPOINT:otel-aggregator:4317}
+    tls:
+      insecure: ${OTLP_EXPORT_INSECURE:false}
+    headers:
+      x-otlp-tenant: ${OTLP_TENANT_ID:default}
+    sending_queue:
+      enabled: true
+      num_consumers: ${OTLP_QUEUE_CONSUMERS:4}
+      queue_size: ${OTLP_QUEUE_SIZE:131072}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  # Prometheus Remote Write (если используется Prometheus/Thanos/Mimir)
+  prometheusremotewrite:
+    endpoint: ${PRW_ENDPOINT:https://prw.example.com/api/v1/write}
+    tls:
+      insecure: ${PRW_INSECURE:false}
+    external_labels:
+      cluster: ${CLUSTER_NAME:prod-cluster}
+      namespace: ${SERVICE_NAMESPACE:chronowatch}
+    resource_to_telemetry_conversion:
+      enabled: true
+    retry_on_failure:
+      enabled: true
+
+  # Отладочный экспортёр (можно выключить в проде)
+  logging:
+    verbosity: ${LOGGING_VERBOSITY:basic}
+
+service:
+  telemetry:
+    logs:
+      level: ${OTELCOL_LOG_LEVEL:info}
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    # Трейсы: приём OTLP -> k8sattrs -> санитария -> семплинг -> batch -> экспорт + коннектор RED
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, resource, attributes/sanitize, probabilistic_sampler, batch]
+      exporters: [otlp, logging, spanmetrics]
+
+    # Метрики: OTLP + Prometheus + Host -> нормализация -> batch -> OTLP/PRW
+    metrics:
+      receivers: [otlp, prometheus, hostmetrics, spanmetrics]
+      processors: [memory_limiter, k8sattributes, resourcedetection, resource, metricstransform, batch]
+      exporters: [otlp, prometheusremotewrite, logging]
+
+    # Логи: filelog + OTLP -> k8sattrs -> санитария -> batch -> OTLP
+    logs:
+      receivers: [filelog, otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, resource, attributes/sanitize, batch]
+      exporters: [otlp, logging]

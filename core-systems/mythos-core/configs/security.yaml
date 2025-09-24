@@ -1,0 +1,395 @@
+# Mythos Core - Industrial Security Configuration
+# Все значения переопределяемы через переменные окружения вида ${ENV_NAME} при загрузке конфига.
+
+version: "1.0"
+
+profiles:
+  # Профили задают только отличия; базовые дефолты описаны ниже.
+  dev:
+    audit.logging.level: debug
+    cors.allowedOrigins: ["http://localhost:3000", "http://127.0.0.1:3000"]
+    rateLimit.global.requestsPerSecond: 50
+    waf.enabled: false
+  staging:
+    audit.logging.level: info
+    rateLimit.global.requestsPerSecond: 20
+  prod:
+    audit.logging.level: info
+    rateLimit.global.requestsPerSecond: 10
+    waf.paranoiaLevel: 2
+
+identity:
+  # Множественная аутентификация: JWT, OAuth2, mTLS, API ключи (по необходимости)
+  modes: ["jwt", "mtls"]  # возможные: jwt, oauth2, mtls, api_key
+  clockSkewSeconds: 60
+  maxTokenAgeSeconds: 3600
+
+  jwt:
+    enabled: true
+    issuers:
+      - name: primary
+        issuer: "${JWT_ISSUER}"
+        audiences: ["${JWT_AUD}", "mythos-core"]
+        jwks:
+          # Либо URI, либо статический JSON
+          jwksUri: "${JWT_JWKS_URI}"
+          refreshSeconds: 300
+        requiredClaims: ["sub", "iat", "exp"]
+        algorithmsAllowlist: ["RS256", "ES256"]
+        requireKid: true
+        leewaySeconds: 30
+    rejectIfMissing: true
+    mapToPrincipal:
+      claim: "sub"  # какое поле использовать как идентификатор пользователя
+
+  oauth2:
+    enabled: false
+    providers: []
+    # пример:
+    # providers:
+    #   - name: auth0
+    #     discoveryUrl: "https://auth.example/.well-known/openid-configuration"
+    #     clientId: "${OAUTH_CLIENT_ID}"
+    #     clientSecret: "${OAUTH_CLIENT_SECRET}"
+    #     scopes: ["openid","profile","email"]
+
+  apiKey:
+    enabled: false
+    header: "X-API-Key"
+    queryParam: "api_key"
+    # список хешей ключей, сами ключи не хранить
+    sha256Allowlist: []  # ["<sha256-hex>"]
+
+  mtls:
+    enabled: true
+    clientCAs: "${MTLS_CLIENT_CA_BUNDLE_PATH}"   # путь до PEM с доверенными CA
+    requireClientCert: true
+    subjectAllowlist: []  # список regex по Subject DN или SAN
+    spiffe:
+      required: false
+      trustDomain: ""
+    revocation:
+      crlCheck: "soft"  # off|soft|hard
+      ocspCheck: "soft" # off|soft|hard
+
+authorization:
+  # Модель авторизации: RBAC и/или внешняя политика (OPA/Rego)
+  model: "RBAC"   # RBAC|ABAC|OPA
+  rbac:
+    defaultDeny: true
+    adminRoles: ["admin"]
+    roleAssignments: []  # [{role:"reader", subjects:["user:123","group:data-analysts"]}]
+    rules:
+      - role: "reader"
+        resources: ["inference:read","metrics:read"]
+        actions: ["GET"]
+      - role: "operator"
+        resources: ["inference:*","queue:*","health:*"]
+        actions: ["GET","POST","DELETE"]
+  opa:
+    enabled: false
+    decisionEndpoint: "${OPA_URL:/v1/data/mythos/allow}"
+    bundle:
+      enabled: false
+      url: ""
+      pollingSeconds: 60
+    query: "data.mythos.allow == true"
+    failClosed: true
+
+cors:
+  enabled: true
+  allowedOrigins: ["${CORS_ORIGIN}"]  # используйте точные источники
+  allowedMethods: ["GET","POST","PUT","DELETE","OPTIONS"]
+  allowedHeaders: ["Authorization","Content-Type","X-Request-Id"]
+  exposeHeaders: ["X-Request-Id"]
+  allowCredentials: false
+  maxAgeSeconds: 600
+
+headers:
+  hsts:
+    enabled: true
+    maxAgeSeconds: 31536000
+    includeSubDomains: true
+    preload: false
+  xFrameOptions: "DENY"
+  xContentTypeOptions: "nosniff"
+  referrerPolicy: "no-referrer"
+  permissionsPolicy: "geolocation=(), microphone=(), camera=()"
+  xXssProtection: "0"
+  contentSecurityPolicy:
+    enabled: true
+    # CSP применяется к фронтенду, если он проксируется через этот сервис
+    policy: "default-src 'none'; connect-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'"
+
+rateLimit:
+  # Ограничители и краткосрочная блокировка
+  backend: "memory"  # memory|redis
+  redis:
+    url: "${RATE_REDIS_URL}"
+    tls: false
+  global:
+    requestsPerSecond: 10
+    burst: 20
+  perIp:
+    enabled: true
+    requestsPerMinute: 600
+    burst: 120
+  perPrincipal:
+    enabled: true
+    requestsPerMinute: 300
+    burst: 60
+  penalties:
+    banOnAbuse: true
+    threshold429PerMinute: 30
+    banDurationSeconds: 900
+
+botManagement:
+  enabled: true
+  userAgentDenylist:
+    - "python-requests"
+    - "curl/"
+  challenge:
+    enabled: false
+
+ipLists:
+  # Последовательность применения: deny -> allow (allow имеет приоритет)
+  deny: ["0.0.0.0/8","10.0.0.0/8","127.0.0.0/8","169.254.0.0/16","172.16.0.0/12","192.168.0.0/16","::1/128","fc00::/7","fe80::/10"]
+  allow: []  # например: ["203.0.113.0/24"]
+  geoBlock:
+    enabled: false
+    countriesDeny: []  # ISO-коды, например ["KP"]
+
+waf:
+  enabled: true
+  mode: "block"     # detect|block
+  paranoiaLevel: 1  # 1..4
+  bodyLimitBytes: 1048576
+  jsonMaxDepth: 20
+  xml:
+    enabled: false
+    externalEntities: "deny"
+  rules:
+    sqli: true
+    xss: true
+    rce: true
+    cmdi: true
+    pathTraversal: true
+    prototypePollution: true
+  exclusions:
+    paths: []        # исключения по путям API
+    headers: []      # поля заголовков для игнорирования
+
+inputValidation:
+  normalizeUnicode: true
+  stripControlChars: true
+  forbidNullBytes: true
+  trimWhitespace: true
+  maxStringLen: 4096
+  jsonSchema:
+    enabled: true
+    # Для каждого endpoint укажите путь к схеме
+    schemas: {}  # {"/v1/infer:POST": "schemas/infer.request.json"}
+  mimeTypes:
+    allowed: ["application/json","text/plain"]
+    disallowed: ["application/xml","text/html"]
+  query:
+    maxParams: 100
+    maxParamLen: 512
+  headers:
+    maxHeaderLen: 8192
+    denylist: ["X-Original-URL","X-Rewrite-URL"]
+  fileUploads:
+    enabled: false
+    maxFileSizeMB: 15
+    allowedExtensions: [".txt",".json",".csv"]
+    forbiddenExtensions: [".php",".exe",".dll",".jsp",".asp",".sh"]
+    antivirus:
+      enabled: false
+      command: "/usr/bin/clamscan"
+      quarantinePath: "/var/quarantine"
+
+ssrfProtection:
+  enabled: true
+  blockPrivateRanges: true
+  allowedDestinations: []  # точные хосты или CIDR для исходящих HTTP запросов
+  dnsRebindProtection: true
+  allowedSchemes: ["https","http"]
+  maxRedirects: 2
+  outboundTimeoutMs: 3000
+
+egressPolicy:
+  # Белые списки исходящих обращений сервиса
+  httpAllowlist: []   # ["https://api.example.com","https://s3.example.com"]
+  dnsAllowlist: []    # ["_._.example.com"]
+
+secretsManagement:
+  provider: "env"     # env|vault|awskms|gcpkms|azurekeyvault
+  env:
+    prefix: "MYTHOS_"
+  vault:
+    address: "${VAULT_ADDR}"
+    role: "${VAULT_ROLE}"
+    path: "kv/mythos-core"
+    renewSeconds: 1800
+    tlsSkipVerify: false
+  kms:
+    # Унифицированные ссылки на ключи провайдера
+    dataEncryptionKeyRef: "${DATA_KEY_REF}"
+    tokenSigningKeyRef: "${JWT_SIGNING_KEY_REF}"
+  rotation:
+    enabled: true
+    maxKeyAgeDays: 90
+    schedule: "0 3 * * *"  # ежедневная проверка ротации
+
+encryption:
+  atRest:
+    enabled: true
+    algorithm: "aes-256-gcm"
+    keyRef: "${DATA_KEY_REF}"
+    envelopeKeyRef: ""
+  inTransit:
+    tlsMinVersion: "1.2"
+    preferServerCiphers: true
+    ciphers:
+      - "TLS_AES_256_GCM_SHA384"
+      - "TLS_CHACHA20_POLY1305_SHA256"
+      - "TLS_AES_128_GCM_SHA256"
+    ocspStapling: true
+    sessionResumption: false
+
+pki:
+  serverCertPath: "${TLS_CERT_PATH}"
+  serverKeyPath: "${TLS_KEY_PATH}"
+  caBundlePath: "${TLS_CA_BUNDLE}"
+
+audit:
+  logging:
+    enabled: true
+    level: "info"     # debug|info|warn|error
+    sink: "stdout"    # stdout|file|syslog|loki
+    filePath: "/var/log/mythos-core/audit.log"
+    json: true
+    includeRequestHeaders: true
+    includeRequestBody: false
+    includeResponseBody: false
+    redactFields:
+      - "authorization"
+      - "cookie"
+      - "set-cookie"
+      - "x-api-key"
+      - "password"
+      - "token"
+    hashBodyInsteadOfLog: true
+    sampling:
+      enabled: true
+      rules:
+        - selector: "status>=500"
+          rate: 1.0
+        - selector: "status<500"
+          rate: 0.1
+  trace:
+    enabled: false
+    exporter: "otlp"
+    endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
+    sampleRatio: 0.05
+
+privacy:
+  dataClassification:
+    categories: ["public","internal","confidential","restricted"]
+    defaultCategory: "internal"
+    fieldTags: {}  # {"user.email":"confidential"}
+  piiRedaction:
+    enabled: true
+    strategies:
+      email: "[REDACTED:EMAIL]"
+      phone: "[REDACTED:PHONE]"
+      secret: "[REDACTED:SECRET]"
+  retention:
+    policies:
+      logsDays: 30
+      tmpDataHours: 24
+      piiMaxDays: 365
+  legal:
+    gdpr:
+      enabled: true
+      dataSubjectExport: true
+      dataSubjectDelete: true
+
+threatDetection:
+  enabled: true
+  bruteForce:
+    windowSeconds: 300
+    attemptsThreshold: 10
+    action: "ban"  # log|ban
+    banSeconds: 900
+  tokenAbuse:
+    refreshReuseThreshold: 3
+  anomaly:
+    rateSpikeFactor: 5.0
+    status5xxRate: 0.2
+    notify:
+      enabled: true
+      webhook: "${SEC_ALERTS_WEBHOOK}"
+
+ddosProtection:
+  enabled: true
+  circuitBreakers:
+    inflightRequests:
+      threshold: 2000
+      action: "shed"  # shed|block
+    queueLatencyMs:
+      threshold: 500
+      action: "degrade"
+  slowloris:
+    headerTimeoutMs: 5000
+    bodyTimeoutMs: 10000
+
+dependenciesPolicy:
+  sbom:
+    required: true
+    format: "cyclonedx-json"
+  vulnerabilities:
+    blockBuildIfSeverityAtLeast: "high"  # none|low|medium|high|critical
+    maxKnownVulns: 0
+    allowLicenses:
+      - "Apache-2.0"
+      - "MIT"
+      - "BSD-2-Clause"
+      - "BSD-3-Clause"
+    denyLicenses:
+      - "GPL-3.0-only"
+      - "AGPL-3.0-only"
+
+exposureControl:
+  serviceDiscovery:
+    advertiseInternalOnly: true
+  errorResponses:
+    includeStacktrace: false
+    includeExceptionMessage: false
+  debugEndpoints:
+    enabled: false
+    allowFrom: []
+
+redaction:
+  # Дополнительная защита логов и ответов
+  patterns:
+    - name: "aws_akid"
+      regex: "\\bAKIA[0-9A-Z]{16}\\b"
+      replacement: "[REDACTED:AKID]"
+    - name: "generic_secret"
+      regex: "\\b(api|secret|token|key)[_:\\s=]{1,5}[A-Za-z0-9/+=\\-]{16,}\\b"
+      replacement: "[REDACTED:SECRET]"
+
+ops:
+  health:
+    livenessPath: "/healthz"
+    readinessPath: "/readyz"
+    startupPath: "/healthz"
+  requestId:
+    header: "X-Request-Id"
+    generateIfMissing: true
+
+# Пример переопределяемых переменных окружения:
+# JWT_ISSUER, JWT_AUD, JWT_JWKS_URI, RATE_REDIS_URL, OPA_URL, MTLS_CLIENT_CA_BUNDLE_PATH,
+# DATA_KEY_REF, JWT_SIGNING_KEY_REF, TLS_CERT_PATH, TLS_KEY_PATH, TLS_CA_BUNDLE,
+# OTEL_EXPORTER_OTLP_ENDPOINT, SEC_ALERTS_WEBHOOK, CORS_ORIGIN

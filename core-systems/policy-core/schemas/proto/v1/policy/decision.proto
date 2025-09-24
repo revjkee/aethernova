@@ -1,0 +1,389 @@
+// policy-core/schemas/proto/v1/policy/decision.proto
+syntax = "proto3";
+
+package aethernova.policy.v1;
+
+option go_package             = "github.com/aethernova/policy-core/schemas/proto/v1/policy;policyv1";
+option java_multiple_files    = true;
+option java_package           = "io.aethernova.policy.v1";
+option java_outer_classname   = "DecisionProto";
+option csharp_namespace       = "Aethernova.Policy.V1";
+option php_namespace          = "Aethernova\\Policy\\V1";
+option ruby_package           = "Aethernova::Policy::V1";
+option objc_class_prefix      = "ANP";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/rpc/status.proto";
+
+// -----------------------------
+// Service
+// -----------------------------
+service PolicyEngine {
+  // Синхронное принятие решения по одной паре Subject/Resource/Action.
+  rpc Decide(DecisionRequest) returns (DecisionResponse);
+
+  // Пакетная оценка нескольких запросов (один бандл).
+  rpc DecideBatch(DecisionRequestBatch) returns (DecisionBatchResponse);
+
+  // Двунаправленный стрим для высоконагруженных сценариев.
+  rpc DecideStream(stream DecisionStreamRequest) returns (stream DecisionStreamResponse);
+}
+
+// -----------------------------
+// Enums
+// -----------------------------
+enum Effect {
+  EFFECT_UNSPECIFIED = 0;
+  EFFECT_ALLOW       = 1;
+  EFFECT_DENY        = 2;
+}
+
+enum Action {
+  ACTION_UNSPECIFIED = 0;
+  ACTION_READ        = 1;
+  ACTION_WRITE       = 2;
+  ACTION_DELETE      = 3;
+  ACTION_EXPORT      = 4;
+  ACTION_METADATA    = 5;
+}
+
+enum MaskType {
+  MASK_TYPE_UNSPECIFIED = 0;
+  MASK_HASH             = 1;
+  MASK_TOKENIZE         = 2;
+  MASK_PARTIAL          = 3;
+  MASK_NULLIFY          = 4;
+}
+
+enum CompOp {
+  COMP_OP_UNSPECIFIED = 0;
+  COMP_EQ             = 1;  // =
+  COMP_NEQ            = 2;  // !=
+  COMP_LT             = 3;  // <
+  COMP_LTE            = 4;  // <=
+  COMP_GT             = 5;  // >
+  COMP_GTE            = 6;  // >=
+  COMP_IN             = 7;  // IN (...)
+  COMP_NOT_IN         = 8;  // NOT IN (...)
+  COMP_LIKE           = 9;  // LIKE
+}
+
+enum CacheHit {
+  CACHE_HIT_UNSPECIFIED = 0;
+  CACHE_MISS            = 1;
+  CACHE_HIT_WEAK        = 2; // например, по ключу без учёта soft-атрибутов
+  CACHE_HIT_STRONG      = 3; // полный ключ
+}
+
+enum ReasonCode {
+  REASON_CODE_UNSPECIFIED            = 0;
+  REASON_ROLE_FORBIDS_ACTION         = 1;
+  REASON_TENANT_ISOLATION            = 2;
+  REASON_INSUFFICIENT_CLEARANCE      = 3;
+  REASON_CONSENT_REQUIRED            = 4;
+  REASON_INSECURE_NETWORK            = 5;
+  REASON_GEO_RESTRICTED              = 6;
+  REASON_MFA_REQUIRED                = 7;
+  REASON_PII_EXPORT_REQUIRES_DPO     = 8;
+  REASON_WRITE_DELETE_CLEARANCE_LOW  = 9;
+}
+
+// -----------------------------
+// Requests
+// -----------------------------
+message DecisionRequest {
+  string request_id   = 1;   // для идемпотентности и трассировки
+  Subject subject     = 2;
+  Resource resource   = 3;
+  Action action       = 4;
+  Context context     = 5;
+
+  // Доп. атрибуты для расширения контракта (ABAC)
+  map<string, google.protobuf.Value> attributes = 6;
+
+  // Идентификаторы активного набора политик (для аудита/кэша)
+  string policy_bundle   = 7;  // имя/канал бандла
+  string policy_revision = 8;  // ревизия/хэш бандла
+
+  // Подсказки движку (не влияют на семантику решения)
+  repeated string obligation_hints = 9;
+
+  google.protobuf.Timestamp requested_at = 10;
+
+  // Reserved for future fields (миграции без wire-конфликта)
+  reserved 100 to 119;
+}
+
+message DecisionRequestBatch {
+  repeated DecisionRequest requests = 1;
+  // Reserved
+  reserved 100 to 119;
+}
+
+message DecisionStreamRequest {
+  DecisionRequest request = 1;
+  // Reserved
+  reserved 100 to 119;
+}
+
+// -----------------------------
+// Responses
+// -----------------------------
+message DecisionResponse {
+  Decision decision      = 1;
+  google.rpc.Status status = 2; // OK или подробности ошибки
+  // Reserved
+  reserved 100 to 119;
+}
+
+message DecisionBatchResponse {
+  repeated DecisionResponse responses = 1;
+  // Reserved
+  reserved 100 to 119;
+}
+
+message DecisionStreamResponse {
+  DecisionResponse response = 1;
+  // Reserved
+  reserved 100 to 119;
+}
+
+// -----------------------------
+// Core decision model
+// -----------------------------
+message Decision {
+  string decision_id = 1;     // коррелирует с request_id либо генерируется движком
+  Effect effect      = 2;     // ALLOW/DENY
+  repeated Reason reasons = 3; // нормализованные причины (код + человекочитаемо)
+
+  // Маскирования по колонкам (DLP/PII)
+  repeated Mask mask = 4;
+
+  // Структурный фильтр (RLS). Клиенты с SQL могут транслировать в SQL.
+  Filter filter = 5;
+
+  // Обязательства (обогащение, аудит, нотификация, агрегирование и т.д.)
+  repeated Obligation obligations = 6;
+
+  // Время жизни решения (сек) — после истечения требуется переоценка
+  uint32 ttl_sec = 7;
+
+  // Метаданные политики/модуля, давшего решение
+  PolicyMetadata policy = 8;
+
+  // Метрики выполнения и диагностика
+  EvaluationMeta eval = 9;
+
+  // Сведения о кэше
+  CacheMeta cache = 10;
+
+  // Произвольные расширения
+  map<string, google.protobuf.Value> attributes = 11;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message Reason {
+  ReasonCode code = 1;
+  string message  = 2; // краткое объяснение для журнала и UI
+  // Reserved
+  reserved 100 to 119;
+}
+
+message Mask {
+  string column  = 1;
+  MaskType type  = 2;
+  // Доп. параметры маскирования (например, saltId, формат и т.п.)
+  map<string, google.protobuf.Value> params = 3;
+  // Reserved
+  reserved 100 to 119;
+}
+
+message Filter {
+  // Структурные условия "AND" верхнего уровня.
+  repeated Condition where = 1;
+
+  // Необязательная строковая форма (для отладки/логов).
+  string sql_preview = 2;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message Condition {
+  string column = 1;
+  CompOp op     = 2;
+  // Универсальное значение
+  google.protobuf.Value value = 3;
+
+  // Для IN/NOT_IN
+  repeated google.protobuf.Value values = 4;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message Obligation {
+  // Тип (audit, notify, watermark, masking, aggregation_required, break_glass и др.)
+  string type = 1;
+  // Параметры обязательства
+  map<string, google.protobuf.Value> params = 2;
+  // Каналы/синки, если применимо (audit, security, pager и т.п.)
+  repeated string sinks = 3;
+  // Критичность выполнения
+  bool critical = 4;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message PolicyMetadata {
+  string engine_name     = 1;  // идентификатор движка/модуля
+  string policy_package  = 2;  // пакет/модуль (например, policy_core.data_access)
+  string rule_path       = 3;  // конкретное правило/entrypoint
+  string bundle          = 4;  // имя/канал бандла
+  string bundle_hash     = 5;  // sha256 бандла
+  string revision        = 6;  // ревизия/версия
+  google.protobuf.Timestamp loaded_at = 7;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message EvaluationMeta {
+  // Длительность оценки
+  google.protobuf.Duration eval_duration = 1;
+  // Кол-во сопоставленных правил
+  uint32 matched_rules = 2;
+  // Перечень совпадений для объяснимости
+  repeated RuleMatch matches = 3;
+
+  // Оценка риска и уверенности (0..1)
+  float risk_score  = 4;
+  float confidence  = 5;
+
+  // Режим break-glass применён
+  bool break_glass  = 6;
+
+  // Корреляция с трассировкой
+  TraceContext trace = 7;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message RuleMatch {
+  string module   = 1; // имя файла/модуля (например, data_access.rego)
+  string rule     = 2; // имя правила
+  uint32 line     = 3; // приблизительная строка
+  Effect effect   = 4; // локальный эффект
+  repeated Reason reasons = 5;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message CacheMeta {
+  CacheHit hit                       = 1;
+  string key                         = 2;
+  string etag                        = 3;
+  google.protobuf.Timestamp cached_at  = 4;
+  google.protobuf.Timestamp expires_at = 5;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+// -----------------------------
+// Input model (ABAC/RBAC-friendly)
+// -----------------------------
+message Subject {
+  string id          = 1;
+  repeated string roles = 2;
+  string tenant_id   = 3;
+  string department  = 4;
+  string clearance   = 5; // public|internal|confidential|restricted|secret
+  bool mfa           = 6;
+  string purpose     = 7; // analytics|support|fraud|ops|audit|training|export
+
+  // Согласия по ресурсам/датасетам
+  map<string, bool> consent = 8;
+
+  Device device = 9;
+
+  map<string, google.protobuf.Value> attributes = 10;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message Device {
+  string id           = 1;
+  string trust_level  = 2; // low|medium|high
+  string ip           = 3;
+  string user_agent   = 4;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message Resource {
+  string id               = 1;
+  string type             = 2; // dataset|table|view|column|object
+  string name             = 3;
+  string owner_tenant_id  = 4;
+  string classification   = 5; // public|internal|confidential|restricted|secret
+  bool pii                = 6;
+  string geo_zone         = 7; // global|eea|local
+  repeated Column columns = 8;
+  repeated string tags    = 9;
+
+  map<string, google.protobuf.Value> attributes = 10;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message Column {
+  string name           = 1;
+  string classification = 2;
+  bool pii              = 3;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message Context {
+  string environment  = 1; // dev|staging|prod|…
+  string network      = 2; // public|vpn|private
+  string geo_country  = 3; // ISO-код, напр. SE
+  bool out_of_hours   = 4;
+  repeated string approvals = 5;
+  bool emergency      = 6;
+
+  google.protobuf.Timestamp request_time = 7;
+
+  // Необязательный allow-лист стран, перекрывающий дефолт политики
+  repeated string allowed_countries = 8;
+
+  // Произвольные доп. атрибуты
+  map<string, google.protobuf.Value> attributes = 9;
+
+  // Контекст трассировки
+  TraceContext trace = 10;
+
+  // Reserved
+  reserved 100 to 119;
+}
+
+message TraceContext {
+  string trace_id       = 1;
+  string span_id        = 2;
+  string parent_span_id = 3;
+  string source         = 4; // например, "gateway", "sdk-python"
+  // Reserved
+  reserved 100 to 119;
+}

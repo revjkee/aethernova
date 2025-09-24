@@ -1,0 +1,364 @@
+---
+# Role: datafabric-core
+# Variables (примерные, задайте в inventory/group_vars):
+# dfc_user: "datafabric"
+# dfc_group: "datafabric"
+# dfc_uid: 1001
+# dfc_gid: 1001
+# dfc_root: "/opt/datafabric-core"
+# dfc_venv: "/opt/datafabric-core/.venv"
+# dfc_env: "prod"
+# dfc_bind_host: "0.0.0.0"
+# dfc_bind_port: 8080
+# dfc_metrics_port: 9102
+# dfc_workers: 2
+# dfc_log_format: "json"
+# dfc_env_kv: {}                # map => .env content
+# dfc_secrets: {}               # map => app secrets (written to .env, mode 0600)
+# dfc_systemd_env_extra: {}     # extra env for unit drop-in
+# dfc_src_type: "artifact"      # artifact|git
+# dfc_artifact_src: ""          # path or URL to wheel/tar.gz
+# dfc_artifact_checksum: ""     # sha256:xxxx (если URL)
+# dfc_git_repo: ""              # git URL (если dfc_src_type=git)
+# dfc_git_version: "main"
+# dfc_pip_extras: "dev"         # optional extras to install
+# dfc_pip_index_url: ""         # custom index
+# dfc_service_name: "datafabric-core"
+# dfc_uvicorn_app: "datafabric_core.api.app:app"
+# dfc_python: "python3.11"
+# dfc_manage_firewall: true
+# dfc_manage_selinux: true
+# dfc_restart_on_change: true
+# dfc_healthcheck_url: "http://127.0.0.1:8080/health"
+# dfc_health_timeout: 30
+
+- name: "Assert minimal variables"
+  ansible.builtin.assert:
+    that:
+      - dfc_root is defined
+      - dfc_service_name is defined
+      - dfc_src_type in ['artifact', 'git']
+      - (dfc_src_type == 'artifact' and dfc_artifact_src|length > 0) or (dfc_src_type == 'git' and dfc_git_repo|length > 0)
+    fail_msg: "Missing required dfc_* variables."
+
+- name: "Detect OS family"
+  ansible.builtin.set_fact:
+    _is_debian: "{{ ansible_facts.os_family == 'Debian' }}"
+    _is_redhat: "{{ ansible_facts.os_family == 'RedHat' }}"
+
+- name: "Install system packages"
+  tags: [packages]
+  block:
+    - name: "Debian/Ubuntu packages"
+      ansible.builtin.apt:
+        name:
+          - "{{ dfc_python }}"
+          - "{{ dfc_python }}-venv"
+          - python3-venv
+          - gcc
+          - git
+          - curl
+          - ca-certificates
+          - pkg-config
+          - libffi-dev
+          - libssl-dev
+        state: present
+        update_cache: true
+      when: _is_debian
+
+    - name: "RHEL/CentOS packages"
+      ansible.builtin.yum:
+        name:
+          - "{{ dfc_python | regex_replace('python3\\.', 'python3') }}"
+          - python3-pip
+          - python3-virtualenv
+          - gcc
+          - git
+          - curl
+          - ca-certificates
+          - pkgconfig
+          - libffi-devel
+          - openssl-devel
+        state: present
+      when: _is_redhat
+
+- name: "Create group {{ dfc_group }}"
+  tags: [user]
+  ansible.builtin.group:
+    name: "{{ dfc_group }}"
+    gid: "{{ dfc_gid | default(omit) }}"
+    state: present
+    system: true
+
+- name: "Create user {{ dfc_user }}"
+  tags: [user]
+  ansible.builtin.user:
+    name: "{{ dfc_user }}"
+    uid: "{{ dfc_uid | default(omit) }}"
+    group: "{{ dfc_group }}"
+    shell: /usr/sbin/nologin
+    create_home: false
+    system: true
+    state: present
+
+- name: "Create directories"
+  tags: [user,deploy]
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ dfc_user }}"
+    group: "{{ dfc_group }}"
+    mode: "0750"
+  loop:
+    - "{{ dfc_root }}"
+    - "{{ dfc_root }}/releases"
+    - "{{ dfc_root }}/current"
+    - "{{ dfc_root }}/logs"
+    - "{{ dfc_root }}/run"
+
+- name: "Create Python venv {{ dfc_venv }}"
+  tags: [venv]
+  ansible.builtin.command: "{{ dfc_python }} -m venv {{ dfc_venv }}"
+  args:
+    creates: "{{ dfc_venv }}/bin/activate"
+  register: _venv_created
+  changed_when: _venv_created.rc == 0
+
+- name: "Upgrade pip/setuptools/wheel"
+  tags: [venv]
+  ansible.builtin.command: "{{ dfc_venv }}/bin/pip install --upgrade pip setuptools wheel"
+  changed_when: "'Successfully installed' in _pip_upg.stdout or 'installed' in _pip_upg.stdout|default('')"
+  register: _pip_upg
+
+- name: "Set pip index (if provided)"
+  tags: [venv]
+  ansible.builtin.lineinfile:
+    path: "{{ dfc_venv }}/pip.conf"
+    create: true
+    mode: "0644"
+    line: "index-url = {{ dfc_pip_index_url }}"
+  when: dfc_pip_index_url|length > 0
+
+- name: "Deploy application (artifact)"
+  when: dfc_src_type == 'artifact'
+  tags: [deploy]
+  block:
+    - name: "Fetch artifact to releases/"
+      ansible.builtin.get_url:
+        url: "{{ dfc_artifact_src }}"
+        dest: "{{ dfc_root }}/releases/"
+        mode: "0644"
+        checksum: "{{ dfc_artifact_checksum | default(omit) }}"
+      when: dfc_artifact_src is match('^https?://')
+
+    - name: "Copy local artifact"
+      ansible.builtin.copy:
+        src: "{{ dfc_artifact_src }}"
+        dest: "{{ dfc_root }}/releases/"
+        mode: "0644"
+      when: dfc_artifact_src is not match('^https?://')
+
+    - name: "Pick artifact path"
+      ansible.builtin.set_fact:
+        _dfc_art_file: "{{ (dfc_artifact_src is match('^https?://')) | ternary((dfc_root ~ '/releases/' ~ dfc_artifact_src | basename), (dfc_root ~ '/releases/' ~ (dfc_artifact_src | basename))) }}"
+
+    - name: "Install artifact into venv"
+      ansible.builtin.command: >-
+        {{ dfc_venv }}/bin/pip install
+        "{{ _dfc_art_file }}"
+        {{ (dfc_pip_extras|length>0) | ternary('[' ~ dfc_pip_extras ~ ']', '') }}
+      register: _pip_install
+      changed_when: "'Successfully installed' in _pip_install.stdout or 'Installing collected packages' in _pip_install.stdout"
+
+- name: "Deploy application (git)"
+  when: dfc_src_type == 'git'
+  tags: [deploy]
+  block:
+    - name: "Checkout repository"
+      ansible.builtin.git:
+        repo: "{{ dfc_git_repo }}"
+        dest: "{{ dfc_root }}/current/src"
+        version: "{{ dfc_git_version }}"
+        depth: 1
+        force: true
+        accept_hostkey: true
+      register: _git
+
+    - name: "Install from source (editable)"
+      ansible.builtin.command: >-
+        {{ dfc_venv }}/bin/pip install -e {{ dfc_root }}/current/src{{ (dfc_pip_extras|length>0) | ternary('[' ~ dfc_pip_extras ~ ']', '') }}
+      register: _pip_editable
+      changed_when: "'Successfully installed' in _pip_editable.stdout or _git.changed | default(false)"
+
+- name: "Ensure ownership of tree"
+  tags: [deploy]
+  ansible.builtin.file:
+    path: "{{ dfc_root }}"
+    state: directory
+    recurse: true
+    owner: "{{ dfc_user }}"
+    group: "{{ dfc_group }}"
+
+- name: "Render .env"
+  tags: [config]
+  ansible.builtin.copy:
+    dest: "{{ dfc_root }}/current/.env"
+    owner: "{{ dfc_user }}"
+    group: "{{ dfc_group }}"
+    mode: "0640"
+    content: |-
+      APP_NAME=datafabric-core
+      APP_ENV={{ dfc_env }}
+      UVICORN_HOST={{ dfc_bind_host }}
+      UVICORN_PORT={{ dfc_bind_port }}
+      PROMETHEUS_PORT={{ dfc_metrics_port }}
+      UVICORN_WORKERS={{ dfc_workers }}
+      LOG_FORMAT={{ dfc_log_format }}
+      {% for k, v in (dfc_env_kv | default({})).items() -%}
+      {{ k }}={{ v }}
+      {% endfor %}
+  notify: restart {{ dfc_service_name }}
+
+- name: "Render secrets into .env.secrets (0600)"
+  tags: [config]
+  ansible.builtin.copy:
+    dest: "{{ dfc_root }}/current/.env.secrets"
+    owner: "{{ dfc_user }}"
+    group: "{{ dfc_group }}"
+    mode: "0600"
+    content: |-
+      {% for k, v in (dfc_secrets | default({})).items() -%}
+      {{ k }}={{ v }}
+      {% endfor %}
+  when: (dfc_secrets | default({})) | length > 0
+  notify: restart {{ dfc_service_name }}
+
+- name: "Systemd unit for {{ dfc_service_name }}"
+  tags: [service,config]
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ dfc_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |-
+      [Unit]
+      Description=Datafabric Core API
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User={{ dfc_user }}
+      Group={{ dfc_group }}
+      WorkingDirectory={{ dfc_root }}/current
+      EnvironmentFile={{ dfc_root }}/current/.env
+      {% if (dfc_secrets | default({})) | length > 0 -%}
+      EnvironmentFile={{ dfc_root }}/current/.env.secrets
+      {% endif -%}
+      {% for k, v in (dfc_systemd_env_extra | default({})).items() -%}
+      Environment={{ k }}={{ v }}
+      {% endfor -%}
+      ExecStart={{ dfc_venv }}/bin/uvicorn {{ dfc_uvicorn_app }} --host ${UVICORN_HOST} --port ${UVICORN_PORT} --workers {{ dfc_workers }} --timeout-keep-alive 30
+      Restart=always
+      RestartSec=3
+      TimeoutStopSec=30
+      KillSignal=SIGTERM
+      NoNewPrivileges=true
+      PrivateTmp=true
+      ProtectSystem=full
+      ProtectHome=true
+      RuntimeDirectory={{ dfc_service_name }}
+      RuntimeDirectoryMode=0750
+      StandardOutput=journal
+      StandardError=journal
+      # Uncomment if journald JSON parser in place
+      # LogExtraFields=service={{ dfc_service_name }} environment={{ dfc_env }}
+
+      [Install]
+      WantedBy=multi-user.target
+  notify:
+    - daemon-reload
+    - restart {{ dfc_service_name }}
+
+- name: "Systemd daemon-reload"
+  tags: [service]
+  ansible.builtin.systemd:
+    daemon_reload: true
+  listen: daemon-reload
+
+- name: "Enable and start service"
+  tags: [service]
+  ansible.builtin.systemd:
+    name: "{{ dfc_service_name }}"
+    state: started
+    enabled: true
+
+- name: "Open firewall (optional)"
+  when: dfc_manage_firewall | default(true)
+  tags: [firewall]
+  block:
+    - name: "Try firewalld rules"
+      when: ansible_facts.services['firewalld'] is defined or (ansible_facts.os_family == 'RedHat')
+      ansible.posix.firewalld:
+        port: "{{ item.port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - { port: "{{ dfc_bind_port }}" }
+        - { port: "{{ dfc_metrics_port }}" }
+      ignore_errors: true
+
+    - name: "Try ufw rules"
+      when: _is_debian
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: tcp
+      loop:
+        - { port: "{{ dfc_bind_port }}" }
+        - { port: "{{ dfc_metrics_port }}" }
+      ignore_errors: true
+
+- name: "SELinux allow ports (optional)"
+  when: dfc_manage_selinux | default(true)
+  tags: [selinux]
+  block:
+    - name: "Install policycoreutils-python-utils if needed"
+      when: _is_redhat
+      ansible.builtin.yum:
+        name: policycoreutils-python-utils
+        state: present
+      ignore_errors: true
+
+    - name: "Open custom ports for httpd_t"
+      community.general.seport:
+        ports: "{{ item }}"
+        proto: tcp
+        setype: http_port_t
+        state: present
+      loop:
+        - "{{ dfc_bind_port }}"
+        - "{{ dfc_metrics_port }}"
+      ignore_errors: true
+
+- name: "Health check"
+  tags: [health]
+  ansible.builtin.uri:
+    url: "{{ dfc_healthcheck_url }}"
+    status_code: [200,204]
+    return_content: false
+    validate_certs: false
+    timeout: "{{ dfc_health_timeout }}"
+  register: _health
+  retries: 10
+  delay: 3
+  until: _health is succeeded
+
+# Handlers (local to tasks file via 'listen' above)
+- name: "Restart service"
+  listen: "restart {{ dfc_service_name }}"
+  when: dfc_restart_on_change | default(true)
+  ansible.builtin.systemd:
+    name: "{{ dfc_service_name }}"
+    state: restarted

@@ -1,0 +1,138 @@
+{{- /*
+HPA для datafabric-core (autoscaling/v2)
+
+Ожидаемые helpers:
+  - "datafabric-core.fullname"
+  - "datafabric-core.labels"
+  - "datafabric-core.selectorLabels"
+
+Включается, если .Values.autoscaling.enabled = true
+*/ -}}
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "datafabric-core.fullname" . }}
+  labels:
+    {{- include "datafabric-core.labels" . | nindent 4 }}
+  {{- with .Values.autoscaling.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  annotations:
+  {{- with .Values.autoscaling.annotations }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "datafabric-core.fullname" . }}
+
+  minReplicas: {{ default 2 .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ default 10 .Values.autoscaling.maxReplicas }}
+
+  {{- /* Поведение скейлинга с управляемыми окнами и лимитами */}}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: {{ default 0 .Values.autoscaling.behavior.scaleUp.stabilizationWindowSeconds }}
+      selectPolicy: {{ default "Max" .Values.autoscaling.behavior.scaleUp.selectPolicy }}
+      policies:
+        - type: Pods
+          value: {{ default 5 .Values.autoscaling.behavior.scaleUp.policies.pods.value }}
+          periodSeconds: {{ default 60 .Values.autoscaling.behavior.scaleUp.policies.pods.periodSeconds }}
+        - type: Percent
+          value: {{ default 100 .Values.autoscaling.behavior.scaleUp.policies.percent.value }}
+          periodSeconds: {{ default 60 .Values.autoscaling.behavior.scaleUp.policies.percent.periodSeconds }}
+    scaleDown:
+      stabilizationWindowSeconds: {{ default 300 .Values.autoscaling.behavior.scaleDown.stabilizationWindowSeconds }}
+      selectPolicy: {{ default "Max" .Values.autoscaling.behavior.scaleDown.selectPolicy }}
+      policies:
+        - type: Percent
+          value: {{ default 30 .Values.autoscaling.behavior.scaleDown.policies.percent.value }}
+          periodSeconds: {{ default 60 .Values.autoscaling.behavior.scaleDown.policies.percent.periodSeconds }}
+
+  metrics:
+    {{- /* CPU метрика */}}
+    {{- if .Values.autoscaling.metrics.cpu.enabled }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          {{- if hasKey .Values.autoscaling.metrics.cpu "averageUtilization" }}
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.metrics.cpu.averageUtilization }}
+          {{- else }}
+          type: AverageValue
+          averageValue: {{ default "500m" .Values.autoscaling.metrics.cpu.averageValue | quote }}
+          {{- end }}
+    {{- end }}
+
+    {{- /* Память */}}
+    {{- if .Values.autoscaling.metrics.memory.enabled }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          {{- if hasKey .Values.autoscaling.metrics.memory "averageUtilization" }}
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.metrics.memory.averageUtilization }}
+          {{- else }}
+          type: AverageValue
+          averageValue: {{ default "600Mi" .Values.autoscaling.metrics.memory.averageValue | quote }}
+          {{- end }}
+    {{- end }}
+
+    {{- /* Pods‑метрика (например, RPS на под через Prometheus Adapter) */}}
+    {{- if and .Values.autoscaling.metrics.pods.enabled .Values.autoscaling.metrics.pods.name }}
+    - type: Pods
+      pods:
+        metric:
+          name: {{ .Values.autoscaling.metrics.pods.name | quote }}
+          {{- with .Values.autoscaling.metrics.pods.selector }}
+          selector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- end }}
+        target:
+          type: {{ default "AverageValue" .Values.autoscaling.metrics.pods.target.type }}
+          {{- if eq (default "AverageValue" .Values.autoscaling.metrics.pods.target.type) "AverageValue" }}
+          averageValue: {{ default "20" .Values.autoscaling.metrics.pods.target.averageValue | quote }}
+          {{- else if eq .Values.autoscaling.metrics.pods.target.type "Utilization" }}
+          averageUtilization: {{ .Values.autoscaling.metrics.pods.target.averageUtilization }}
+          {{- end }}
+    {{- end }}
+
+    {{- /* Внешняя метрика (например, размер очереди) */}}
+    {{- if and .Values.autoscaling.metrics.external.enabled .Values.autoscaling.metrics.external.name }}
+    - type: External
+      external:
+        metric:
+          name: {{ .Values.autoscaling.metrics.external.name | quote }}
+          {{- with .Values.autoscaling.metrics.external.selector }}
+          selector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- end }}
+        target:
+          type: {{ default "AverageValue" .Values.autoscaling.metrics.external.target.type }}
+          {{- if eq (default "AverageValue" .Values.autoscaling.metrics.external.target.type) "AverageValue" }}
+          averageValue: {{ default "100" .Values.autoscaling.metrics.external.target.averageValue | quote }}
+          {{- else if eq .Values.autoscaling.metrics.external.target.type "Value" }}
+          value: {{ .Values.autoscaling.metrics.external.target.value | quote }}
+          {{- end }}
+    {{- end }}
+
+    {{- /* Дополнительные resource‑метрики (например, GPU) */}}
+    {{- range $i, $m := .Values.autoscaling.metrics.extraResources }}
+    - type: Resource
+      resource:
+        name: {{ $m.name | quote }}
+        target:
+          type: {{ default "AverageValue" $m.target.type }}
+          {{- if eq (default "AverageValue" $m.target.type) "AverageValue" }}
+          averageValue: {{ $m.target.averageValue | quote }}
+          {{- else if eq $m.target.type "Utilization" }}
+          averageUtilization: {{ $m.target.averageUtilization }}
+          {{- end }}
+    {{- end }}
+{{- end }}

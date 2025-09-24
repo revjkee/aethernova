@@ -1,0 +1,286 @@
+# core-systems/security-core/configs/policies/token.yaml
+# Schema: security-core/policy/token/v1
+version: 1
+schema: security-core/policy/token/v1
+updated_at: "2025-08-19T00:00:00Z"
+
+metadata:
+  system: core-systems
+  module: security-core
+  owner_team: security-engineering
+  environment: prod
+  tags:
+    zero_trust: "true"
+    managed_by: "IaC"
+
+defaults: &defaults
+  issuer: "https://auth.CHANGE_ME.com"
+  audience_default: "core-systems"
+  clock_skew_seconds: 60
+  leeway_seconds: 30
+  jwks:
+    publish: true
+    url: "https://auth.CHANGE_ME.com/.well-known/jwks.json"
+    cache_ttl_seconds: 300
+  signing:
+    # Разрешенные алгоритмы подписи; запрет none/HS*
+    allowed_algs: ["PS256", "EdDSA"]
+    blocked_algs: ["none", "HS256", "HS384", "HS512"]
+    rotation_days: 30
+    kid_required: true
+    require_private_key_in_hsm: true
+    keys:
+      - id: "kid-ps256-active"
+        alg: "PS256"
+        ref: "kms://jwt-signing"     # соответствует security.yaml.crypto.kms.keys
+        primary: true
+      - id: "kid-eddsa-canary"
+        alg: "EdDSA"
+        ref: "hsm://jwt-eddsa"
+        primary: false
+  token_binding:
+    # Привязка токена к каналу/клиенту
+    require_any: ["mtls", "dpop"]
+    mtls:
+      cnf_x5t_sha256_required: true   # RFC 8705
+    dpop:
+      require_jkt: true               # RFC 9449
+      iat_max_age_seconds: 120
+      alg_allowed: ["ES256", "EdDSA"]
+  anti_replay:
+    jti_required: true
+    jti_ttl_seconds: 900
+    nonce_required_for_auth_code: true
+    store: "redis://redis.CHANGE_ME.internal/2"
+  refresh_tokens:
+    enabled: false   # по умолчанию отключены; включать точечно
+  breakglass:
+    enabled: true
+    ttl_seconds: 900
+    require_mfa: true
+    audit_strict: true
+
+profiles:
+  # Пользовательские токены
+  user_access_jwt:
+    <<: *defaults
+    type: "JWT"
+    audience: ["core-systems", "api-gateway"]
+    lifetime_seconds: 900
+    claims:
+      required: ["iss", "sub", "aud", "exp", "iat", "jti", "scope"]
+      optional: ["roles", "groups", "acr", "amr"]
+      constraints:
+        sub_regex: "^user:[a-zA-Z0-9._-]+$"
+        scope_max_count: 20
+        roles_max_count: 10
+    token_binding:
+      <<: *defaults.token_binding
+    refresh_tokens:
+      enabled: false
+    consent:
+      required_scopes: []
+  user_id_jwt:
+    <<: *defaults
+    type: "JWT"
+    audience: ["core-systems"]
+    lifetime_seconds: 900
+    claims:
+      required: ["iss", "sub", "aud", "exp", "iat"]
+      optional: ["email", "name", "locale"]
+    token_binding:
+      require_any: []  # ID токен не используется для доступа; проверяется только по OIDC
+  # Сервисные токены (PoP строго обязателен)
+  svc_token_jwt:
+    <<: *defaults
+    type: "JWT"
+    audience: ["core-systems", "internal"]
+    lifetime_seconds: 3600
+    claims:
+      required: ["iss", "sub", "aud", "exp", "iat", "jti", "scp", "cnf"]
+      optional: ["spiffe_id"]
+      constraints:
+        sub_regex: "^svc:[a-z0-9-]+(/[a-z0-9-]+)*$"
+    token_binding:
+      require_any: ["mtls"]   # только mTLS; DPoP для машин не используется
+  # PASETO для внутренних высокочастотных путей (локальная симметричная криптография)
+  svc_paseto_v4_local:
+    issuer: "core-systems-internal"
+    type: "PASETO"
+    version: "v4"
+    purpose: "local"
+    audience: ["internal"]
+    lifetime_seconds: 600
+    key_ref: "kms://paseto-v4l"       # симметричный ключ с ротацией
+    claims:
+      required: ["iss", "sub", "aud", "exp", "iat"]
+    token_binding:
+      require_any: ["mtls"]
+
+scope_registry:
+  # Нормализация скоупов → разрешения (permissions)
+  model: "deny_by_default"
+  scopes:
+    # Пользовательские
+    - name: "profile:read"
+      description: "Чтение профиля пользователя"
+      permissions: ["profile.get"]
+    - name: "account:manage"
+      description: "Управление учетной записью"
+      permissions: ["account.update", "account.delete"]
+      requires_mfa: true
+    - name: "billing:read"
+      description: "Чтение биллинга"
+      permissions: ["billing.get"]
+    # Сервисные
+    - name: "ledger:write"
+      description: "Запись в реестр платежей"
+      permissions: ["ledger.append"]
+      subject_constraint:
+        sub_prefix: "svc:payments"
+    - name: "secrets:read"
+      description: "Чтение секретов через брокер"
+      permissions: ["secrets.get"]
+      subject_constraint:
+        sub_prefix: "svc:*"
+      token_binding_required: "mtls"
+  constraints:
+    max_scopes_per_token: 20
+    forbidden_scopes: ["admin:*"]   # админские права выдаются ролями, не скоупами
+
+role_mapping:
+  # Отображение ролей в permission‑наборы (OPA будет принимать решения по input.subject)
+  roles:
+    security-admin:
+      permissions: ["*"]
+    auditor:
+      permissions: ["audit.read", "logs.read"]
+    service-payments:
+      permissions: ["ledger.append", "secrets.get"]
+
+resource_servers:
+  - id: "api-gateway"
+    audience: "api-gateway"
+    required_binding: ["mtls", "dpop"]
+    scope_whitelist: ["profile:read", "billing:read", "account:manage"]
+  - id: "secrets-broker"
+    audience: "internal"
+    required_binding: ["mtls"]
+    scope_whitelist: ["secrets:read"]
+  - id: "ledger"
+    audience: "internal"
+    required_binding: ["mtls"]
+    scope_whitelist: ["ledger:write"]
+
+validation:
+  # Унифицированные правила валидации на стороне PEP
+  common:
+    check_signature: true
+    check_exp: true
+    check_nbf: true
+    check_aud: true
+    check_iss: true
+    check_jti: true
+    require_tls_1_3: true
+  jwt_specific:
+    require_kid: true
+    allowed_algs: ["PS256", "EdDSA"]
+    blocked_algs: ["none", "HS256", "HS384", "HS512"]
+  paseto_specific:
+    version_allowed: ["v4"]
+    purposes_allowed: ["local"]
+  binding:
+    mtls:
+      require_cnf_x5t: true
+      require_cert_verified: true
+    dpop:
+      require_dpop_header: true
+      validate_dpop_proof: true
+      check_htm: true    # метод
+      check_htu: true    # целевой URI
+      jkt_matches_cnf: true
+  replay_protection:
+    jti_cache_ttl_seconds: 900
+    accept_one_use_only: true
+
+revocation:
+  # Отзыв и черные списки
+  sources:
+    - type: "introspection"
+      url: "https://auth.CHANGE_ME.com/oauth2/introspect"
+      mtls: true
+    - type: "blocklist"
+      backend: "redis://redis.CHANGE_ME.internal/3"
+  revoke_on:
+    - "compromised_key"
+    - "user_disabled"
+    - "session_terminated"
+    - "policy_violation"
+  propagate_latency_slo_ms: 500
+
+exchange_and_delegation:
+  # OAuth 2.0 Token Exchange (RFC 8693) и ограниченная делегация
+  rfc8693_enabled: true
+  allowed_subject_token_types: ["urn:ietf:params:oauth:token-type:access_token"]
+  allowed_actor_token_types: ["urn:ietf:params:oauth:token-type:access_token"]
+  delegation:
+    allowed: true
+    max_chain_depth: 1
+    require_actor_claim: true
+    audience_must_shrink: true
+    scope_must_shrink: true
+
+introspection:
+  enabled: true
+  require_mtls: true
+  response_fields_whitelist: ["active", "sub", "aud", "scope", "exp", "iat", "cnf"]
+
+privacy:
+  minimize_claims: true
+  redact_sensitive_in_logs: ["sub", "jti", "cnf", "dpop", "upn", "email"]
+
+observability:
+  audit:
+    enabled: true
+    event_types:
+      - "token.issued"
+      - "token.introspected"
+      - "token.revoked"
+      - "token.exchanged"
+    sink: "tls://audit-tokens.CHANGE_ME.internal:6514"
+    retention_days: 365
+  metrics:
+    exporter: "prometheus"
+    labels:
+      env: "prod"
+      module: "token"
+  tracing:
+    enabled: true
+    sampler: "parentbased_always_on"
+    endpoint: "http://otel-collector.CHANGE_ME.svc:4317"
+
+compliance_mapping:
+  oauth2_oidc:
+    rfc6749: "authorization framework"
+    rfc7519: "JWT"
+    rfc8693: "token exchange"
+    rfc8705: "mtls sender constrained"
+    rfc9449: "DPoP"
+  iso27001_annex_a:
+    A_9_Access_Control: "scopes/roles, TTL, PoP"
+    A_12_Logging: "audit событий токенов"
+    A_18_Compliance: "строгие алгоритмы, запрет none/HS*"
+
+bootstrap_checks:
+  require_items:
+    - "defaults.signing.allowed_algs contains 'PS256'"
+    - "defaults.signing.blocked_algs contains 'none'"
+    - "profiles.user_access_jwt.lifetime_seconds <= 1800"
+    - "profiles.svc_token_jwt.token_binding.require_any[0] == 'mtls'"
+    - "revocation.sources[0].type == 'introspection'"
+    - "resource_servers[0].required_binding contains 'dpop'"
+
+notes:
+  - "Все CHANGE_ME заполнить через CI/CD и секрет‑менеджер; ключи — в KMS/HSM."
+  - "DPoP включать для публичных API; сервис‑к‑сервис — только mTLS."
+  - "Скоупы не равны ролям: роли → permissions через OPA, скопы → ограничение API."

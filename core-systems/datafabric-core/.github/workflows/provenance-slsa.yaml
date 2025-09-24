@@ -1,0 +1,167 @@
+name: provenance-slsa
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # публикация релизов/ассетов и доступ к репо
+  id-token: write          # OIDC для подписи/аттестаций
+  actions: read            # доступ к метаданным раннера
+  attestations: write      # GitHub-нативные attestations
+  packages: write          # на будущее для публикаций
+  security-events: write   # на будущее для SARIF
+
+env:
+  PYTHON_VERSION: "3.11"
+  PACKAGE_DIR: "src/datafabric_core"
+
+jobs:
+  build:
+    name: Build sdist/wheel and checksums
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Enable pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip wheel
+          pip install build==1.2.1 hatchling>=1.25
+
+      - name: Reproducible build (sdist/wheel)
+        run: |
+          python -m build --sdist --wheel --outdir dist
+        env:
+          # Опционально фиксируем время модификации файлов для большей детерминированности
+          SOURCE_DATE_EPOCH: "1700000000"
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release_assets:
+    name: Attach release assets (optional)
+    needs: build
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Upload assets to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+  slsa_provenance:
+    name: SLSA provenance (SLSA3 generic)
+    needs: build
+    if: always()
+    # Используем переиспользуемый workflow slsa-framework для generic-артефактов
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    permissions:
+      id-token: write
+      contents: write
+      actions: read
+    with:
+      # Путь к артефактам, для которых нужно сгенерировать provenance
+      artifacts: "dist/*"
+      # Загрузить артефакты: укажем, что берем из предыдущей job
+      upload-assets: true
+    secrets: inherit
+
+  github_attestation:
+    name: GitHub build provenance attestation
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+      actions: read
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Attest build provenance (subjects by file path)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+          # Если workflow запущен по тегу — аттестации привяжутся к коммиту тега.
+
+  verify_integrity:
+    name: Verify checksums and subjects
+    needs: [build, github_attestation]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Verify SHA256SUMS
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS
+
+  summary:
+    name: Provenance summary
+    needs: [slsa_provenance, github_attestation, verify_integrity]
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - name: Print outcome
+        run: |
+          echo "SLSA provenance job:   ${{ needs.slsa_provenance.result }}"
+          echo "GH attestation job:   ${{ needs.github_attestation.result }}"
+          echo "Integrity verification: ${{ needs.verify_integrity.result }}"

@@ -1,0 +1,91 @@
+# automation-core/k8s/base/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myapp-hpa
+  namespace: default
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/part-of: myapp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+  minReplicas: 3         # базовая избыточность
+  maxReplicas: 50        # верхняя граница для защиты кластера
+  behavior:
+    scaleUp:
+      # Агрессия апскейла: максимум +100% за 15с; выбираем максимальную политику
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 10
+          periodSeconds: 15
+    scaleDown:
+      # Консервативный даунскейл: окно стабилизации 5 минут, минимальная политика
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+  metrics:
+    # 1) Классический CPU по pod'ам — средняя утилизация к запросам (Resource)
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization            # % от requests
+          averageUtilization: 70
+
+    # 2) Классическая Memory по pod'ам — средняя утилизация к запросам (Resource)
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+    # 3) Контейнер-специфичная CPU-метрика (ContainerResource)
+    #    Полезно игнорировать «шумные» сайдкары и масштабироваться по критичному контейнеру.
+    - type: ContainerResource
+      containerResource:
+        name: cpu
+        container: web                  # имя контейнера из pod spec
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+    # 4) Пер-подовая бизнес-метрика (Pods): среднее значение по подам
+    #    Пример: http_requests_per_second (через custom metrics API как pod metric)
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+          selector:
+            matchLabels:
+              app: myapp
+        target:
+          type: AverageValue
+          averageValue: "100"          # среднее по поду (единицы — как публикует адаптер)
+
+    # 5) Внешняя метрика (External): например, длина очереди
+    #    Требуется установленный metrics-adapter (Prometheus Adapter/KEDA/иное).
+    - type: External
+      external:
+        metric:
+          name: queue_messages_ready
+          selector:
+            matchLabels:
+              queue: myapp
+        target:
+          type: AverageValue
+          averageValue: "30"

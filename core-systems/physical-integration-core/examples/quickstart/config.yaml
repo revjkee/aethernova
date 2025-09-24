@@ -1,0 +1,276 @@
+# examples/quickstart/config.yaml
+# Схема: конфиг для physical-integration-core
+# Совместим с:
+#  - physical_integration/adapters/resilience_adapter.py (ResilienceConfig)
+#  - physical_integration/workers/twin_sync_worker.py (TwinSyncConfig)
+#  - physical_integration/calibration/validators.py (CalibrationValidationConfig)
+#
+# Переменные окружения подставляются рантаймом (например, через os.getenv в лоадере).
+# Формат: ${ENV_NAME:default_value}
+
+schema_version: 1
+metadata:
+  project: physical-integration-core
+  component: quickstart
+  owner: ops@your-domain.example
+  generated_by: examples/quickstart/config.yaml
+  description: >
+    Единый конфиг для устойчивых вызовов к устройствам, синхронизации Digital Twin
+    и промышленной валидации калибровочных данных.
+  environment: ${ENV:dev}  # dev|stage|prod
+
+# ---------------------------
+# Глобальные параметры
+# ---------------------------
+logging:
+  level: ${LOG_LEVEL:INFO}         # DEBUG|INFO|WARN|ERROR
+  format: "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
+  destination:
+    stdout: true
+    file:
+      enabled: ${LOG_TO_FILE:false}
+      path: ${LOG_PATH:/var/log/physical-integration/core.log}
+      rotate_max_bytes: 104857600
+      rotate_keep: 5
+
+telemetry:
+  metrics:
+    prometheus:
+      enabled: ${METRICS_ENABLED:true}
+      bind: ${METRICS_BIND:0.0.0.0}
+      port: ${METRICS_PORT:9464}
+  tracing:
+    otlp:
+      enabled: ${OTLP_ENABLED:false}
+      endpoint: ${OTLP_ENDPOINT:http://localhost:4317}
+      insecure: ${OTLP_INSECURE:true}
+      service_name: physical-integration-core
+
+security:
+  tls:
+    ca_file: ${TLS_CA_FILE:}
+    cert_file: ${TLS_CERT_FILE:}
+    key_file: ${TLS_KEY_FILE:}
+    verify_peer: ${TLS_VERIFY:true}
+  # Секреты читаются из ENV. Никогда не храните реальные значения в YAML.
+  secrets:
+    twin_api_token: ${TWIN_API_TOKEN:}
+    opcua_username: ${OPCUA_USER:}
+    opcua_password: ${OPCUA_PASS:}
+    hmac_key_id_default: ${HMAC_KEY_ID:calib-key-1}
+    hmac_key_hex_default: ${HMAC_KEY_HEX:}  # 64 hex chars (HMAC-SHA256 key)
+
+storage:
+  # Чекпоинты и идемпотентные ключи воркера TwinSync
+  checkpoint_sqlite: ${CHECKPOINT_DB:./twin_sync.sqlite}
+  sqlite_pragma:
+    synchronous: NORMAL
+    journal_mode: WAL
+
+# ---------------------------
+# Профиль устойчивости (ResilienceConfig)
+# ---------------------------
+resilience_profiles:
+  # Базовый профиль для операций чтения/записи
+  default: &resilience_default
+    max_retries: ${RES_MAX_RETRIES:3}
+    backoff_initial_s: ${RES_BACKOFF_INITIAL:0.05}
+    backoff_max_s: ${RES_BACKOFF_MAX:2.0}
+    backoff_multiplier: ${RES_BACKOFF_MULT:2.0}
+    backoff_jitter_s: ${RES_BACKOFF_JITTER:0.02}
+    call_timeout_s: ${RES_TIMEOUT:3.0}
+    cb_failure_threshold: ${RES_CB_FAILS:5}
+    cb_recovery_timeout_s: ${RES_CB_RECOVERY:10.0}
+    cb_half_open_probe_count: ${RES_CB_PROBES:2}
+    bulkhead_limit: ${RES_BULKHEAD:8}
+    rate_limit_per_sec: ${RES_RATELIMIT:}
+    rate_burst: ${RES_BURST:1}
+    service_name: ${RES_SERVICE:device}
+    resource_id: ${RES_RESOURCE:*}
+    guard_acquire_timeout_s: ${RES_GUARD_TIMEOUT:5.0}
+
+  # Агрессивный профиль для нестабильных каналов (например, сотовая сеть)
+  unstable_link: &resilience_unstable
+    <<: *resilience_default
+    max_retries: ${RES_U_MAX_RETRIES:5}
+    backoff_initial_s: ${RES_U_BACKOFF_INITIAL:0.1}
+    backoff_max_s: ${RES_U_BACKOFF_MAX:5.0}
+    call_timeout_s: ${RES_U_TIMEOUT:5.0}
+    cb_failure_threshold: ${RES_U_CB_FAILS:3}
+    cb_recovery_timeout_s: ${RES_U_CB_RECOVERY:20.0}
+
+# ---------------------------
+# Конфигурация валидаторов калибровки (CalibrationValidationConfig)
+# ---------------------------
+calibration:
+  defaults: &validator_defaults
+    expected_rate_hz: ${CAL_EXP_RATE:}
+    max_jitter_ratio: ${CAL_MAX_JITTER:0.1}
+    allow_equal_timestamps: ${CAL_ALLOW_EQUAL_TS:false}
+    min_value: ${CAL_MIN:}
+    max_value: ${CAL_MAX:}
+    mad_threshold: ${CAL_MAD_THR:6.0}
+    max_rmse: ${CAL_MAX_RMSE:}
+    min_determinant: ${CAL_MIN_DET:0.000001}
+    max_condition: ${CAL_MAX_COND:1000000.0}
+    max_dot_tol: ${CAL_MAX_DOT_TOL:0.01}
+    norm_tol: ${CAL_NORM_TOL:0.05}
+    lut_y_monotonic: ${CAL_LUT_Y:}  # increasing|decreasing|empty
+    max_drift_ppm_per_C: ${CAL_MAX_DRIFT:}
+    max_undercount_ratio: ${CAL_MAX_UNDER:0.05}
+    default_unit: "1"
+    require_signature: ${CAL_REQ_SIG:false}
+
+  # Ключи HMAC для подписи калибровок передаются в контексте выполнения
+  keyring:
+    default_key_id: ${HMAC_KEY_ID:calib-key-1}
+    keys:
+      - id: ${HMAC_KEY_ID:calib-key-1}
+        hex_key: ${HMAC_KEY_HEX:}  # обязателен при require_signature=true
+
+  # Профили датчиков с переопределениями
+  sensor_profiles:
+    accelerometer:
+      <<: *validator_defaults
+      expected_rate_hz: ${ACC_RATE:1000}
+      min_value: ${ACC_MIN:-160.0}
+      max_value: ${ACC_MAX:160.0}
+      max_rmse: ${ACC_RMSE:0.01}
+      max_drift_ppm_per_C: ${ACC_DRIFT:200}
+    gyroscope:
+      <<: *validator_defaults
+      expected_rate_hz: ${GYRO_RATE:1000}
+      min_value: ${GYRO_MIN:-4000.0}
+      max_value: ${GYRO_MAX:4000.0}
+      max_rmse: ${GYRO_RMSE:0.05}
+      max_drift_ppm_per_C: ${GYRO_DRIFT:500}
+    temperature:
+      <<: *validator_defaults
+      expected_rate_hz: ${TEMP_RATE:10}
+      min_value: ${TEMP_MIN:-55.0}
+      max_value: ${TEMP_MAX:150.0}
+      lut_y_monotonic: increasing
+
+# ---------------------------
+# Описание endpoints устройств и twin
+# ---------------------------
+endpoints:
+  # Быстрый старт: in-memory (для dev). В prod укажите реальные адаптеры.
+  device:
+    type: memory  # memory|opcua|modbus|mqtt|rest
+    # Для prod-подключений используйте соответствующие секции ниже.
+    opcua:
+      url: ${OPCUA_URL:opc.tcp://127.0.0.1:4840}
+      security_policy: ${OPCUA_SEC:None}      # None|Basic256Sha256 ...
+      security_mode: ${OPCUA_MODE:None}       # None|Sign|SignAndEncrypt
+      username: ${OPCUA_USER:}
+      password: ${OPCUA_PASS:}
+      node_map: {}  # device_id -> { read_nodes: [...], write_nodes: {...} }
+    modbus:
+      transport: ${MODBUS_TRANSPORT:tcp}      # tcp|rtu
+      host: ${MODBUS_HOST:127.0.0.1}
+      port: ${MODBUS_PORT:502}
+      unit_id: ${MODBUS_UNIT:1}
+      timeout_s: ${MODBUS_TIMEOUT:2.0}
+    mqtt:
+      broker: ${MQTT_BROKER:tcp://127.0.0.1:1883}
+      client_id_prefix: ${MQTT_CLIENT_PREFIX:phys-int}
+      username: ${MQTT_USER:}
+      password: ${MQTT_PASS:}
+      tls: ${MQTT_TLS:false}
+  twin:
+    type: memory  # memory|rest
+    rest:
+      base_url: ${TWIN_API:https://twin-api.example/api}
+      auth_header: "Bearer ${TWIN_API_TOKEN:}"
+      timeout_s: ${TWIN_API_TIMEOUT:5.0}
+
+# ---------------------------
+# Воркеры
+# ---------------------------
+workers:
+  twin_sync:
+    defaults: &twin_sync_defaults
+      devices: ${DEVICES:dev-001,dev-002}  # строка через запятую или список
+      poll_interval_s: ${SYNC_POLL:1.0}
+      concurrency: ${SYNC_CONCURRENCY:8}
+      batch_size: ${SYNC_BATCH:32}
+      conflict_policy: ${SYNC_POLICY:last_write_wins} # device_wins|twin_wins|last_write_wins
+      partial_updates: ${SYNC_PARTIAL:true}
+      allow_deletes: ${SYNC_ALLOW_DELETE:true}
+      max_patch_bytes: ${SYNC_MAX_PATCH:131072}
+      idempotency_ttl_s: ${SYNC_IDEM_TTL:86400}
+      checkpoint_path: ${CHECKPOINT_DB:./twin_sync.sqlite}
+      service_name: twin-sync
+      guard_timeout_s: ${SYNC_GUARD_TIMEOUT:5.0}
+    # Привязка resilience-профилей к endpoint'ам
+    resilience:
+      device: *resilience_unstable
+      twin: *resilience_default
+
+# ---------------------------
+# Профили окружений
+# ---------------------------
+profiles:
+  dev:
+    logging:
+      level: DEBUG
+    endpoints:
+      device:
+        type: memory
+      twin:
+        type: memory
+    workers:
+      twin_sync:
+        defaults:
+          <<: *twin_sync_defaults
+          devices:
+            - dev-001
+            - dev-002
+  stage:
+    logging:
+      level: INFO
+    endpoints:
+      device:
+        type: opcua
+      twin:
+        type: rest
+    workers:
+      twin_sync:
+        resilience:
+          device:
+            <<: *resilience_unstable
+            rate_limit_per_sec: 10
+            rate_burst: 5
+          twin:
+            <<: *resilience_default
+            call_timeout_s: 4.0
+  prod:
+    logging:
+      level: WARN
+    telemetry:
+      tracing:
+        otlp:
+          enabled: true
+    endpoints:
+      device:
+        type: opcua
+      twin:
+        type: rest
+    workers:
+      twin_sync:
+        defaults:
+          <<: *twin_sync_defaults
+          concurrency: 24
+          batch_size: 256
+          poll_interval_s: 0.5
+        resilience:
+          device:
+            <<: *resilience_unstable
+            max_retries: 6
+            cb_failure_threshold: 3
+            cb_recovery_timeout_s: 30.0
+          twin:
+            <<: *resilience_default
+            max_retries: 4
+            call_timeout_s: 6.0

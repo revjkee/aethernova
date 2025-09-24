@@ -1,0 +1,716 @@
+# mythos-core/examples/samples/questline.yaml
+# Промышленная спецификация квестовой линии для Mythos Core.
+# Совместима с пайплайном контент-сборки, статической валидацией и безопасным исполнением.
+
+apiVersion: mythos.aethernova.io/v1
+kind: Questline
+
+$schema: https://schemas.aethernova.io/mythos-core/questline-1.0.json
+
+metadata:
+  id: "questline.neurocity.genesis.pilgrim"
+  title:
+    default: "Паломник Нейрогорода"
+    i18n:
+      en: "Pilgrim of NeuroCity"
+      ru: "Паломник Нейрогорода"
+  version: "1.0.0"
+  revision: 3
+  contentHash: "sha256:0000000000000000000000000000000000000000000000000000000000000000" # заполнится билд-пайплайном
+  signature:
+    type: "pgp"
+    signer: "content-signing@aethernova.io"
+    value: "PGP-SIGNATURE-PLACEHOLDER" # заполняется в release-цикле
+  labels:
+    product: "NeuroCity"
+    track: "onboarding"
+    difficulty: "story+systems"
+    audience: "all"
+  authors:
+    - name: "Mythos Systems Council"
+      role: "Narrative System Architect"
+  createdAt: "2025-08-28T07:30:00Z"
+  updatedAt: "2025-08-28T07:30:00Z"
+  terms:
+    license: "Aethernova Content License v1"
+    ageRating: "12+"
+  compliance:
+    gdpr: true
+    coppa: false
+    telemetryNotice: true
+
+# Глобальные пресеты, якоря и переиспользуемые блоки
+presets:
+  actions:
+    emitTelemetry: &emitTelemetry
+      kind: telemetry.emit
+      spec:
+        namespace: "mythos.quest"
+        attributes:
+          questline_id: "${metadata.id}"
+          user_id: "${context.user.id}"
+          step_id: "${context.step.id}"
+          session_id: "${context.session.id}"
+
+    grantXp: &grantXp
+      kind: reward.xp
+      spec:
+        amount: 150
+        reason: "step-complete"
+        caps:
+          daily: 3000
+          weekly: 12000
+
+    grantBadgePilgrim: &grantBadgePilgrim
+      kind: reward.badge
+      spec:
+        badge_id: "badge.pilgrim.1"
+        title:
+          en: "Pilgrim I"
+          ru: "Паломник I"
+
+    giveRevaSmall: &giveRevaSmall
+      kind: onchain.jetton.transfer
+      spec:
+        token: "REVA20"
+        network: "ton"
+        amount: "5"          # формат string для больших чисел/десятичных
+        decimals: 9
+        to: "${context.user.wallet}"
+        safeguards:
+          kyc_required: false
+          tx_rate_limit: "10/m"
+
+    openUIGuide: &openUIGuide
+      kind: ui.open
+      spec:
+        view: "guide"
+        params:
+          doc: "neurocity/introduction"
+
+    antiAbuseMark: &antiAbuseMark
+      kind: security.flag
+      spec:
+        reason: "rate-limit-hit"
+        ttl: "24h"
+
+    signProgressEvent: &signProgressEvent
+      kind: security.sign
+      spec:
+        algo: "ed25519"
+        payload:
+          questline_id: "${metadata.id}"
+          user_id: "${context.user.id}"
+          step_id: "${context.step.id}"
+        outVar: "sig.step"
+
+  conditions:
+    notFlagged: &notFlagged
+      anyOf:
+        - equals: { left: "${context.user.flags.abuse}", right: false }
+        - equals: { left: "${context.user.flags.abuse}", right: null }
+
+    hasWallet: &hasWallet
+      allOf:
+        - exists: "${context.user.wallet}"
+        - regex:
+            value: "${context.user.wallet}"
+            pattern: "^[A-Za-z0-9_\\-]{24,64}$"
+
+    pfsSupported: &pfsSupported
+      equals: { left: "${context.session.crypto.pfs}", right: true }
+
+    notOverDailyCap: &notOverDailyCap
+      lt:
+        left: "${metrics.user.daily_rewards.reva20}"
+        right: 50
+
+  rateLimits:
+    defaultSoft: &rlDefaultSoft
+      bucket: "questline:${metadata.id}:${context.user.id}"
+      limits:
+        per_minute: 30
+        burst: 10
+    sensitive: &rlSensitive
+      bucket: "questline:${metadata.id}:${context.user.id}:sensitive"
+      limits:
+        per_minute: 6
+        burst: 3
+
+variables:
+  # Переменные уровня квестлайна, доступны как ${vars.*}
+  vars:
+    cityShard: "alpha"
+    introDocKey: "neurocity/introduction"
+    rewardMultiplier: 1.0
+    xpPerStep: 150
+  # Внешние источники значений
+  providers:
+    - name: "oracle.userSegment"
+      kind: oracle.http
+      spec:
+        url: "http+unix:///run/mythos/oracles.sock:/user-segment"
+        cacheTtl: "10m"
+    - name: "chain.balance"
+      kind: onchain.balance
+      spec:
+        token: "REVA20"
+        network: "ton"
+        account: "${context.user.wallet}"
+        cacheTtl: "30s"
+
+entities:
+  # Декларация ключевых сущностей, на которые ссылаются шаги
+  - id: "npc.sage"
+    kind: npc
+    name:
+      en: "Sage"
+      ru: "Мудрец"
+    traits: [mentor, cryptic]
+  - id: "place.agora"
+    kind: location
+    name:
+      en: "Agora"
+      ru: "Агора"
+    zone: "public"
+
+prerequisites:
+  # Требования к старту квестлайна
+  allOf:
+    - *notFlagged
+    - anyOf:
+        - *hasWallet
+        - equals: { left: "${context.session.mode}", right: "guest" }
+
+telemetry:
+  # OpenTelemetry-мэппинг
+  otel:
+    service_name: "mythos-core"
+    spans:
+      step_enter: "mythos.quest.step.enter"
+      step_complete: "mythos.quest.step.complete"
+      branch_taken: "mythos.quest.branch"
+      reward_granted: "mythos.quest.reward"
+    metrics:
+      counter_completions: "mythos_quest_completions_total"
+      histogram_duration: "mythos_quest_step_duration_seconds"
+
+security:
+  # Политики безопасности контента
+  sandbox:
+    syscalls: [ "fs_read", "net_out_unix", "crypto_sign", "clock" ]
+    net_allow:
+      - "unix:///run/mythos/oracles.sock"
+    fs_allow:
+      - "/etc/mythos/whitelist/*.json"
+  antiAbuse:
+    rateLimits:
+      default: *rlDefaultSoft
+      sensitive: *rlSensitive
+    duplicateGuard:
+      scope: "user+step"
+      window: "10s"
+    heuristics:
+      impossibleTravel:
+        enabled: true
+        threshold_km: 500
+      macroDetection:
+        enabled: true
+
+economy:
+  rewardsCaps:
+    xp:
+      daily: 3000
+      weekly: 12000
+    reva20:
+      daily: 50
+      weekly: 200
+  accounting:
+    ledger: "internal+onchain"
+    settlePolicy: "t+0"
+
+i18n:
+  defaultLocale: "ru"
+  supported: ["en", "ru"]
+  fallbackChain:
+    ru: ["en"]
+    en: ["ru"]
+
+lifecycle:
+  startOnAccept: true
+  expireAfter: "30d"
+  resumable: true
+
+graph:
+  # DAG квестовой линии с ветвлением
+  steps:
+    - id: "step.001.intro"
+      name:
+        en: "Arrival"
+        ru: "Прибытие"
+      description:
+        en: "Arrive at the Agora and speak with the Sage."
+        ru: "Прибудьте на Агоре и поговорите с Мудрецом."
+      entities: ["npc.sage", "place.agora"]
+      objectives:
+        - id: "obj.talk.sage"
+          type: dialog
+          with: "npc.sage"
+          dialogKey: "intro.hello"
+      constraints:
+        rateLimit: *rlDefaultSoft
+        conditions:
+          allOf:
+            - *notFlagged
+      onEnter:
+        - *emitTelemetry
+        - *openUIGuide
+      onComplete:
+        - *grantXp
+        - *signProgressEvent
+        - kind: state.set
+          spec:
+            key: "sage.trust"
+            op: "inc"
+            by: 1
+        - kind: telemetry.emit
+          spec:
+            namespace: "mythos.quest"
+            event: "step_complete"
+            attributes:
+              step: "step.001.intro"
+      next:
+        default: "step.002.keys"
+        branches:
+          - when:
+              equals:
+                left: "${vars.cityShard}"
+                right: "alpha"
+            to: "step.002.keys"
+
+    - id: "step.002.keys"
+      name:
+        en: "Keys to the City"
+        ru: "Ключи Города"
+      description:
+        en: "Establish a secure session with Perfect Forward Secrecy."
+        ru: "Установите защищённую сессию с Perfect Forward Secrecy."
+      objectives:
+        - id: "obj.pfs.enable"
+          type: system
+          check:
+            equals: { left: "${context.session.crypto.pfs}", right: true }
+        - id: "obj.wallet.verify"
+          type: system
+          check:
+            anyOf:
+              - *hasWallet
+              - equals: { left: "${context.session.mode}", right: "guest" }
+      constraints:
+        rateLimit: *rlSensitive
+        conditions:
+          allOf:
+            - *notFlagged
+      onEnter:
+        - *emitTelemetry
+      onComplete:
+        - *grantXp
+        - *signProgressEvent
+        - kind: reward.title
+          spec:
+            title_id: "title.city.init"
+            title:
+              en: "City-Linked"
+              ru: "Связанный с Городом"
+      next:
+        branches:
+          - when: *pfsSupported
+            to: "step.003.agreement"
+          - when:
+              equals: { left: "${context.session.crypto.pfs}", right: false }
+            to: "step.002a.pfs.help"
+        default: "step.003.agreement"
+
+    - id: "step.002a.pfs.help"
+      name:
+        en: "Enable PFS"
+        ru: "Включить PFS"
+      description:
+        en: "Follow the guide to enable PFS, then retry."
+        ru: "Следуйте инструкции, чтобы включить PFS, затем повторите."
+      objectives:
+        - id: "obj.open.help"
+          type: ui
+          view: "guide"
+          params:
+            doc: "security/pfs"
+      onEnter:
+        - *emitTelemetry
+        - *openUIGuide
+      onComplete:
+        - kind: state.set
+          spec:
+            key: "pfs.retry.allowed"
+            op: "set"
+            value: true
+      next:
+        default: "step.002.keys"
+
+    - id: "step.003.agreement"
+      name:
+        en: "Civic Oath"
+        ru: "Гражданская Клятва"
+      description:
+        en: "Sign the civic oath and register your presence."
+        ru: "Подпишите гражданскую клятву и зарегистрируйте присутствие."
+      objectives:
+        - id: "obj.read.oath"
+          type: ui
+          view: "doc"
+          params:
+            doc: "neurocity/civic-oath"
+        - id: "obj.sign.oath"
+          type: cryptographic.sign
+          payload:
+            oath_id: "oath.v1"
+            user_id: "${context.user.id}"
+          algo: "ed25519"
+          outVar: "sig.oath"
+      constraints:
+        rateLimit: *rlSensitive
+      onEnter:
+        - *emitTelemetry
+      onComplete:
+        - *grantXp
+        - *signProgressEvent
+        - kind: onchain.event.emit
+          spec:
+            network: "ton"
+            contract: "CivicRegistry"
+            event: "OathSigned"
+            args:
+              user: "${context.user.wallet}"
+              sig: "${vars.sig.oath}"
+            safeguards:
+              requireWallet: true
+              dryRunOnFail: true
+        - kind: telemetry.emit
+          spec:
+            namespace: "mythos.quest"
+            event: "oath_signed"
+      next:
+        default: "step.004.trial"
+
+    - id: "step.004.trial"
+      name:
+        en: "Trial of Signals"
+        ru: "Испытание Сигналов"
+      description:
+        en: "Collect three clean signals without tripping anti-abuse."
+        ru: "Соберите три чистых сигнала, не активируя анти-абьюз."
+      objectives:
+        - id: "obj.signal.clean1"
+          type: system
+          check:
+            equals: { left: "${context.flags.abuseTrip}", right: false }
+        - id: "obj.signal.clean2"
+          type: system
+          check:
+            lt:
+              left: "${metrics.user.input.error_rate}"
+              right: 0.05
+        - id: "obj.signal.clean3"
+          type: oracle
+          provider: "oracle.userSegment"
+          check:
+            notEquals:
+              left: "${oracle.oracle.userSegment.label}"
+              right: "bot"
+      constraints:
+        rateLimit: *rlDefaultSoft
+        conditions:
+          allOf:
+            - *notFlagged
+      onEnter:
+        - *emitTelemetry
+      onComplete:
+        - *grantXp
+        - kind: reward.bundle
+          spec:
+            items:
+              - *giveRevaSmall
+              - *grantBadgePilgrim
+        - kind: telemetry.emit
+          spec:
+            namespace: "mythos.quest"
+            event: "trial_passed"
+      onFail:
+        - *antiAbuseMark
+      next:
+        default: "step.005.fork"
+
+    - id: "step.005.fork"
+      name:
+        en: "Paths of the City"
+        ru: "Пути Города"
+      description:
+        en: "Choose your initial path: Builder or Watcher."
+        ru: "Выберите начальный путь: Созидатель или Наблюдатель."
+      objectives:
+        - id: "obj.choice.path"
+          type: choice
+          options:
+            - id: "path.builder"
+              name:
+                en: "Builder"
+                ru: "Созидатель"
+            - id: "path.watcher"
+              name:
+                en: "Watcher"
+                ru: "Наблюдатель"
+      onEnter:
+        - *emitTelemetry
+      onComplete:
+        - *grantXp
+        - kind: state.set
+          spec:
+            key: "path.selected"
+            op: "set"
+            value: "${result.choice.id}"
+      next:
+        branches:
+          - when:
+              equals: { left: "${state.path.selected}", right: "path.builder" }
+            to: "step.010.builder.init"
+          - when:
+              equals: { left: "${state.path.selected}", right: "path.watcher" }
+            to: "step.020.watcher.init"
+        default: "step.099.end"
+
+    # Ветка Builder
+    - id: "step.010.builder.init"
+      name:
+        en: "Blueprint"
+        ru: "Чертёж"
+      description:
+        en: "Draft a minimal blueprint in the Agora registry."
+        ru: "Создайте минимальный чертёж в реестре Агоры."
+      objectives:
+        - id: "obj.blueprint.create"
+          type: ui.form.submit
+          view: "agora/blueprint"
+          schema: "agora.blueprint.v1"
+      onEnter:
+        - *emitTelemetry
+      onComplete:
+        - *grantXp
+        - kind: onchain.event.emit
+          spec:
+            network: "ton"
+            contract: "AgoraRegistry"
+            event: "BlueprintDrafted"
+            args:
+              author: "${context.user.wallet}"
+              blueprint_id: "${result.form.id}"
+      next:
+        default: "step.011.builder.provision"
+
+    - id: "step.011.builder.provision"
+      name:
+        en: "Provision Node"
+        ru: "Развернуть Узел"
+      description:
+        en: "Provision a sandbox node and pass health checks."
+        ru: "Разверните песочничный узел и пройдите health-проверки."
+      objectives:
+        - id: "obj.node.ok"
+          type: system
+          check:
+            allOf:
+              - equals: { left: "${metrics.node.health.ready}", right: true }
+              - gte:
+                  left: "${metrics.node.health.score}"
+                  right: 0.9
+      constraints:
+        rateLimit: *rlSensitive
+      onComplete:
+        - *grantXp
+        - *signProgressEvent
+      next:
+        default: "step.012.builder.review"
+
+    - id: "step.012.builder.review"
+      name:
+        en: "Peer Review"
+        ru: "Пир-ревью"
+      description:
+        en: "Submit the blueprint for a lightweight peer review."
+        ru: "Отправьте чертёж на легковесное пир-ревью."
+      objectives:
+        - id: "obj.review.ok"
+          type: oracle
+          provider: "oracle.userSegment"
+          check:
+            in:
+              left: "${oracle.oracle.userSegment.reviewPanel}"
+              right:
+                - "approved"
+                - "auto-approved"
+      onComplete:
+        - *grantXp
+      next:
+        default: "step.099.end"
+
+    # Ветка Watcher
+    - id: "step.020.watcher.init"
+      name:
+        en: "Signal Watch"
+        ru: "Дозор Сигналов"
+      description:
+        en: "Configure a personal watchlist and acknowledge alert hygiene."
+        ru: "Настройте личный список наблюдения и подтвердите гигиену алертов."
+      objectives:
+        - id: "obj.watchlist.create"
+          type: ui.form.submit
+          view: "watchlist/create"
+          schema: "watchlist.v1"
+        - id: "obj.hygiene.ack"
+          type: checkbox
+          label:
+            en: "I will not spam alerts"
+            ru: "Я не буду спамить алертами"
+      onEnter:
+        - *emitTelemetry
+      onComplete:
+        - *grantXp
+      next:
+        default: "step.021.watcher.signal"
+
+    - id: "step.021.watcher.signal"
+      name:
+        en: "First Signal"
+        ru: "Первый Сигнал"
+      description:
+        en: "Handle a synthetic low-risk signal following SOP."
+        ru: "Обработайте синтетический низкорисковый сигнал по SOP."
+      objectives:
+        - id: "obj.signal.handle"
+          type: simulation
+          scenario: "watcher.lowrisk.v1"
+          successCheck:
+            allOf:
+              - lte:
+                  left: "${metrics.incident.response_time_s}"
+                  right: 60
+              - equals:
+                  left: "${metrics.incident.escalated}"
+                  right: false
+      onComplete:
+        - *grantXp
+      next:
+        default: "step.099.end"
+
+    # Завершение
+    - id: "step.099.end"
+      name:
+        en: "Citizen"
+        ru: "Гражданин"
+      description:
+        en: "You are now a recognized citizen of NeuroCity."
+        ru: "Теперь вы признанный гражданин Нейрогорода."
+      objectives:
+        - id: "obj.finalize"
+          type: system
+          check:
+            equals: { left: true, right: true }
+      onEnter:
+        - *emitTelemetry
+      onComplete:
+        - kind: reward.title
+          spec:
+            title_id: "title.citizen"
+            title:
+              en: "Citizen of NeuroCity"
+              ru: "Гражданин Нейрогорода"
+        - kind: reward.bundle
+          spec:
+            items:
+              - kind: reward.xp
+                spec:
+                  amount: 300
+                  reason: "questline-complete"
+              - kind: onchain.jetton.transfer
+                spec:
+                  token: "REVA20"
+                  network: "ton"
+                  amount: "10"
+                  decimals: 9
+                  to: "${context.user.wallet}"
+                  safeguards:
+                    kyc_required: false
+                    tx_rate_limit: "6/m"
+        - kind: telemetry.emit
+          spec:
+            namespace: "mythos.quest"
+            event: "questline_complete"
+        - kind: security.sign
+          spec:
+            algo: "ed25519"
+            payload:
+              questline_id: "${metadata.id}"
+              user_id: "${context.user.id}"
+              status: "completed"
+            outVar: "sig.questline"
+
+validation:
+  # Машиночитаемые правила валидации перед публикацией
+  rules:
+    - id: "unique-ids"
+      description: "Все step.id и objective.id должны быть уникальны в пределах квестлайна."
+      kind: builtin.uniqueIds
+      level: error
+    - id: "branches-exist"
+      description: "Ветви должны ссылаться на существующие шаги."
+      kind: builtin.branchTargetsExist
+      level: error
+    - id: "economy-caps"
+      description: "Награды не должны превышать дневные/недельные лимиты."
+      kind: builtin.rewardCaps
+      level: error
+    - id: "i18n-coverage"
+      description: "Все локализуемые поля должны иметь покрытие для поддерживаемых языков или фоллбек."
+      kind: builtin.i18nCoverage
+      level: warn
+    - id: "sandbox-policies"
+      description: "Доступные системные вызовы ограничены белым списком."
+      kind: builtin.sandboxPolicy
+      level: error
+
+publishing:
+  # Политика релизов
+  channels:
+    - name: "canary"
+      trafficPercent: 5
+      criteria:
+        maxErrorRate: 0.02
+        minCSAT: 4.2
+    - name: "stable"
+      trafficPercent: 95
+      promoteFrom: "canary"
+      criteria:
+        minCompletions: 1000
+        maxErrorRate: 0.01
+        minCSAT: 4.5
+
+observability:
+  logs:
+    level: "INFO"
+    redact:
+      - "${context.user.wallet}"
+      - "${context.user.email}"
+  exports:
+    - kind: otlp.grpc
+      endpoint: "unix:///run/otlp/collector.sock"
+
+notes:
+  - "Этот файл — эталон промышленного образца для mythos-core. Секции можно расширять без смены apiVersion."

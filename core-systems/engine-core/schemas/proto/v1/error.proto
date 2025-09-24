@@ -1,0 +1,304 @@
+// SPDX-License-Identifier: Apache-2.0
+// engine-core/schemas/proto/v1/error.proto
+//
+// Унифицированные ошибки для REST/gRPC:
+//  - Error: основной контейнер ошибки
+//  - ErrorCode: канонические коды домена
+//  - Severity: уровни критичности
+//  - Подробности (details/*): типизированные структуры причин/советов/ограничений
+//
+// Принципы:
+//  * Стабильные коды (ErrorCode) для клиента, текст message — человекочитаемый.
+//  * Маппинг на HTTP/gRPC код обязателен.
+//  * Любые дополнительные факты — через details (строго типизированные) или Any‑расширения.
+//  * Поля request_id/trace_id обязательны для продакшн‑логики.
+
+syntax = "proto3";
+
+package engine.v1.error;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// Общие опции генераторов
+option go_package           = "github.com/yourorg/engine-core/gen/proto/engine/v1/error;errorv1";
+option java_package         = "com.yourorg.engine.v1.error";
+option java_multiple_files  = true;
+option csharp_namespace     = "YourOrg.Engine.V1.Error";
+option objc_class_prefix    = "ENG";
+option php_namespace        = "YourOrg\\Engine\\V1\\Error";
+
+// -----------------------------
+// Базовые перечисления
+// -----------------------------
+
+// Канонические коды ошибок. Стабильны и обратносуместимы.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+
+  // Валидность/ввод
+  INVALID_ARGUMENT = 1;          // 400 / INVALID_ARGUMENT
+  FAILED_PRECONDITION = 2;       // 400 / FAILED_PRECONDITION
+  OUT_OF_RANGE = 3;              // 400 / OUT_OF_RANGE
+
+  // Аутентификация/авторизация
+  UNAUTHENTICATED = 4;           // 401 / UNAUTHENTICATED
+  PERMISSION_DENIED = 5;         // 403 / PERMISSION_DENIED
+
+  // Идентификаторы/ресурсы
+  NOT_FOUND = 6;                 // 404 / NOT_FOUND
+  ALREADY_EXISTS = 7;            // 409 / ALREADY_EXISTS
+  CONFLICT = 8;                  // 409 / ABORTED
+
+  // Ограничения/QoS
+  RESOURCE_EXHAUSTED = 9;        // 429 / RESOURCE_EXHAUSTED
+  CANCELLED = 10;                // 499 / CANCELLED
+
+  // Внутренние/инфраструктура
+  INTERNAL = 11;                 // 500 / INTERNAL
+  UNKNOWN = 12;                  // 500 / UNKNOWN
+  UNIMPLEMENTED = 13;            // 501 / UNIMPLEMENTED
+  UNAVAILABLE = 14;              // 503 / UNAVAILABLE
+  DEADLINE_EXCEEDED = 15;        // 504 / DEADLINE_EXCEEDED
+
+  // Бизнес‑правила/доменные
+  POLICY_VIOLATION = 16;         // 400/403 в зависимости от контекста
+  ECONOMY_REJECTED = 17;         // 409 экономический модуль
+  ANTI_CHEAT_BLOCK = 18;         // 423 условная блокировка античита
+}
+
+// Уровень критичности. Для алертов и приоритизации инцидентов.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  INFO = 1;
+  WARNING = 2;
+  ERROR = 3;
+  CRITICAL = 4;
+}
+
+// gRPC Status code (подмножество для явной фиксации).
+// Значения совпадают с официальными кодами gRPC.
+enum GrpcCode {
+  GRPC_CODE_UNSPECIFIED = 0;
+  OK = 0;
+  CANCELLED = 1;
+  UNKNOWN_CODE = 2;
+  INVALID_ARGUMENT_CODE = 3;
+  DEADLINE_EXCEEDED_CODE = 4;
+  NOT_FOUND_CODE = 5;
+  ALREADY_EXISTS_CODE = 6;
+  PERMISSION_DENIED_CODE = 7;
+  RESOURCE_EXHAUSTED_CODE = 8;
+  FAILED_PRECONDITION_CODE = 9;
+  ABORTED_CODE = 10;
+  OUT_OF_RANGE_CODE = 11;
+  UNIMPLEMENTED_CODE = 12;
+  INTERNAL_CODE = 13;
+  UNAVAILABLE_CODE = 14;
+  DATA_LOSS_CODE = 15;
+  UNAUTHENTICATED_CODE = 16;
+}
+
+// -----------------------------
+// Основной контейнер ошибки
+// -----------------------------
+
+message Error {
+  ErrorCode code = 1;               // Канонический код
+  string message = 2;               // Локализуемое человекочитаемое сообщение
+  Severity severity = 3;            // Важность
+  int32 http_status = 4;            // HTTP status для REST
+  GrpcCode grpc_code = 5;           // gRPC код для RPC
+
+  // Трассировка и корреляция
+  string request_id = 6;            // Корреляция (UUID/ULID)
+  string trace_id = 7;              // W3C Trace Context
+  string span_id = 8;
+
+  // Временные и контекстные атрибуты
+  google.protobuf.Timestamp occurred_at = 9;
+  string locale = 10;               // Например, "en-US", "ru-RU"
+  string domain = 11;               // Подсистема/домен (e.g., "security", "economy")
+
+  // Иерархия причин (цепочка ошибок)
+  repeated Cause causes = 12;
+
+  // Детали в строго типизированных структурах (см. ниже)
+  repeated Detail details = 13;
+
+  // Произвольные расширения для нестандартных кейсов
+  repeated google.protobuf.Any extensions = 14;
+
+  // Метаданные (для логов или клиента), небольшие по объёму
+  map<string, string> metadata = 15;
+
+  // Зарезервировано под будущее расширение
+  reserved 16 to 29;
+}
+
+// Связь с первопричинами (цепочка ошибок).
+message Cause {
+  ErrorCode code = 1;
+  string message = 2;
+  string domain = 3;
+  // Локальная привязка к полю/ресурсу, если есть
+  string field = 4;
+  string resource_type = 5;
+  string resource_id = 6;
+  reserved 7 to 10;
+}
+
+// -----------------------------
+// Типизированные детали ошибки
+// -----------------------------
+
+// Универсальная обёртка деталей (вместо Any для строгой схемы).
+message Detail {
+  oneof kind {
+    FieldViolations field_violations = 1;
+    ResourceInfo resource_info = 2;
+    RetryInfo retry_info = 3;
+    QuotaFailure quota_failure = 4;
+    RequestInfo request_info = 5;
+    Help help = 6;
+    LocalizedMessage localized_message = 7;
+    PreconditionFailure precondition_failure = 8;
+    RateLimitInfo rate_limit_info = 9;
+    AntiCheatInfo anti_cheat_info = 10;
+    PolicyFailure policy_failure = 11;
+  }
+  reserved 12 to 20;
+}
+
+// Набор нарушений по полям запроса.
+message FieldViolations {
+  repeated FieldViolation violations = 1;
+}
+
+message FieldViolation {
+  string field = 1;          // путь к полю (dot/bracket notation)
+  string description = 2;    // что не так
+  string rule = 3;           // имя правила/валидатора
+  reserved 4 to 10;
+}
+
+// Информация о ресурсе (тип/id/владелец), применима к NOT_FOUND/ALREADY_EXISTS/CONFLICT.
+message ResourceInfo {
+  string resource_type = 1;  // "engine.user", "engine.order"
+  string resource_id = 2;
+  string owner_id = 3;
+  string description = 4;
+  reserved 5 to 10;
+}
+
+// Рекомендации по повтору операции.
+message RetryInfo {
+  google.protobuf.Duration retry_delay = 1; // подождать не менее
+  google.protobuf.Duration max_delay = 2;   // верхняя граница
+  string policy = 3;                        // например "exponential_backoff"
+  reserved 4 to 10;
+}
+
+// Сведения о превышении квот.
+message QuotaFailure {
+  repeated Violation violations = 1;
+
+  message Violation {
+    string subject = 1;      // напр., "write_requests_per_minute"
+    string description = 2;  // детализация
+    reserved 3 to 10;
+  }
+}
+
+// Технические атрибуты запроса (вспомогательные).
+message RequestInfo {
+  string request_id = 1;
+  string caller_ip = 2;
+  string user_agent = 3;
+  string method = 4;         // HTTP метод / RPC имя
+  string route = 5;          // нормализованный маршрут
+  reserved 6 to 10;
+}
+
+// Справка/ссылки для пользователя/разработчика.
+message Help {
+  repeated Link links = 1;
+
+  message Link {
+    string description = 1;
+    string url = 2;          // может быть относительным путем API
+    reserved 3 to 10;
+  }
+}
+
+// Локализованное сообщение для клиента.
+message LocalizedMessage {
+  string locale = 1;         // IETF BCP 47
+  string message = 2;
+  reserved 3 to 10;
+}
+
+// Нарушенные предусловия (для FAILED_PRECONDITION).
+message PreconditionFailure {
+  repeated Violation violations = 1;
+
+  message Violation {
+    string type = 1;         // "STATE", "LOCK", "VERSION"
+    string subject = 2;      // "order.version"
+    string description = 3;  // "expected >= 5"
+    reserved 4 to 10;
+  }
+}
+
+// Информация о rate limit (для 429).
+message RateLimitInfo {
+  string bucket = 1;                 // имя ведра
+  int64 limit = 2;                   // потолок
+  int64 remaining = 3;               // остаток
+  google.protobuf.Timestamp reset_at = 4; // когда сбросится
+  reserved 5 to 10;
+}
+
+// Детали античита (для бизнес‑блокировок/теневых банов).
+message AntiCheatInfo {
+  string bucket = 1;                 // watch/suspect/fraud
+  int32 risk_score = 2;              // 0..100
+  repeated string detectors = 3;     // сработавшие детекторы
+  string appeal_channel = 4;         // как обжаловать
+  reserved 5 to 10;
+}
+
+// Политические ограничения домена (например, economy/security).
+message PolicyFailure {
+  string policy_id = 1;              // "economy.core", "acl.world"
+  string rule_id = 2;                // конкретное правило
+  string description = 3;
+  reserved 4 to 10;
+}
+
+// -----------------------------
+// Утилиты маппинга HTTP/gRPC
+// -----------------------------
+
+// Опциональная таблица маппинга для конфиг‑привязок (если требуется на клиенте/шлюзе).
+message CodeMapping {
+  ErrorCode code = 1;
+  int32 http_status = 2;
+  GrpcCode grpc_code = 3;
+  reserved 4 to 10;
+}
+
+// Коллекция маппингов (может поставляться как часть конфигурации).
+message CodeRegistry {
+  repeated CodeMapping mappings = 1;
+}
+
+// -----------------------------
+// Примеры безопасной эволюции
+// -----------------------------
+//
+// * Не переиспользуйте удалённые поля — помечайте их reserved.
+// * При добавлении новых вариантов в Detail.oneof увеличивайте номера с запасом.
+// * Клиент должен игнорировать незнакомые детали и extensions.
+

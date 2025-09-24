@@ -1,0 +1,120 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: physical-integration-core
+  namespace: default
+  labels:
+    app.kubernetes.io/name: physical-integration-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: physical-integration-core
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # Окно усреднения метрик (минуты); фактическая агрегация зависит от адаптера метрик
+    autoscaling.kubernetes.io/metrics-refresh-period: "30s"
+    # Документация: ссылка на runbook/справку SRE (заполнить вашей ссылкой)
+    sre.runbook/url: "https://runbooks.example.internal/physical-integration-core/hpa"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: physical-integration-core
+  minReplicas: 2
+  maxReplicas: 20
+
+  # Современная многомерная цель масштабирования
+  metrics:
+    # 1) CPU: целевая утилизация 60%
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+    # 2) Память: целевая утилизация 70%
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # 3) Бизнес‑метрика RPS на под: требует установленного Custom Metrics API (напр., prometheus-adapter)
+    #    Метрика должна экспонироваться как pods metric "requests_per_second"
+    - type: Pods
+      pods:
+        metric:
+          name: requests_per_second
+        target:
+          type: AverageValue
+          # Цель: 50 req/s на под. При превышении — масштабирование вверх.
+          averageValue: "50"
+
+  # Управление поведением масштабирования: защита от флаппинга и «ступени» изменения
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60     # не перескакивать из‑за кратких всплесков
+      policies:
+        # Не более +100% за раз, но также не более +4 реплик за 30с — берётся минимально ограничивающее
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Min
+    scaleDown:
+      stabilizationWindowSeconds: 300    # даём сервису «успокоиться» перед уменьшением
+      policies:
+        # Плавное уменьшение: не более −50% или −2 пода за 60с
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+      selectPolicy: Max
+
+---
+# (Опционально) Вариант HPA для канареек: более консервативный масштаб‑даун и жёсткий лимит maxReplicas.
+# Разкомментируйте и измените namespace/name при наличии canary‑Deployment.
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: physical-integration-core-canary
+#   namespace: default
+#   labels:
+#     app.kubernetes.io/name: physical-integration-core
+#     app.kubernetes.io/component: api
+#     app.kubernetes.io/part-of: physical-integration-core
+#     app.kubernetes.io/managed-by: kustomize
+#     rollout: canary
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: physical-integration-core-canary
+#   minReplicas: 1
+#   maxReplicas: 5
+#   metrics:
+#     - type: Resource
+#       resource:
+#         name: cpu
+#         target:
+#           type: Utilization
+#           averageUtilization: 55
+#   behavior:
+#     scaleUp:
+#       stabilizationWindowSeconds: 60
+#       policies:
+#         - type: Pods
+#           value: 2
+#           periodSeconds: 60
+#       selectPolicy: Min
+#     scaleDown:
+#       stabilizationWindowSeconds: 600
+#       policies:
+#         - type: Percent
+#           value: 30
+#           periodSeconds: 60
+#       selectPolicy: Max

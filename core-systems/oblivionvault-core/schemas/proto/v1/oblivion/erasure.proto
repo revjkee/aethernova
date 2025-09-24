@@ -1,0 +1,383 @@
+syntax = "proto3";
+
+package oblivion.erasure.v1;
+
+option go_package        = "github.com/aethernova/oblivionvault-core/gen/go/oblivion/erasure/v1;erasurev1";
+option java_multiple_files = true;
+option java_package      = "com.aethernova.oblivion.erasure.v1";
+option csharp_namespace  = "Aethernova.Oblivion.Erasure.V1";
+option php_namespace     = "Aethernova\\Oblivion\\Erasure\\V1";
+option ruby_package      = "Aethernova::Oblivion::Erasure::V1";
+option objc_class_prefix = "OV";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/empty.proto";
+import "google/rpc/status.proto";
+
+// ===========================
+// Conventions & Compatibility
+// ===========================
+// - Только добавление новых полей с новыми номерами (не изменять/не удалять существующие).
+// - Для удаления используйте reserved.
+// - Все ID — строковые ULID/UUIDv7.
+// - Размеры в байтах (uint64). Времена — Duration/Timestamp.
+
+// ======== Enums =========
+
+enum ErasureCodeType {
+  ERASURE_CODE_TYPE_UNSPECIFIED = 0;
+  ERASURE_CODE_TYPE_RS          = 1; // Reed-Solomon (systematic)
+  ERASURE_CODE_TYPE_LRC         = 2; // Local Reconstruction Codes
+  ERASURE_CODE_TYPE_RDP         = 3; // Row Diagonal Parity
+  ERASURE_CODE_TYPE_XOR         = 4; // Simple XOR parity (baseline)
+}
+
+enum ChecksumAlgo {
+  CHECKSUM_ALGO_UNSPECIFIED = 0;
+  CHECKSUM_ALGO_SHA256      = 1;
+  CHECKSUM_ALGO_BLAKE3      = 2;
+  CHECKSUM_ALGO_CRC32C      = 3;
+  CHECKSUM_ALGO_MD5         = 4 [deprecated = true]; // Не использовать в новых системах.
+}
+
+enum ShardState {
+  SHARD_STATE_UNSPECIFIED = 0;
+  SHARD_STATE_OK          = 1;
+  SHARD_STATE_MISSING     = 2;
+  SHARD_STATE_CORRUPT     = 3;
+  SHARD_STATE_STALE       = 4;
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_READY       = 1;
+  NODE_STATE_DEGRADED    = 2;
+  NODE_STATE_OFFLINE     = 3;
+}
+
+// ======== Common Value Objects =========
+
+message Checksum {
+  ChecksumAlgo algo = 1;
+  bytes digest      = 2; // raw bytes of digest
+}
+
+message Labels {
+  map<string, string> items = 1;
+}
+
+message RequestContext {
+  // Метаданные запроса для трассировки и аудита:
+  string request_id       = 1; // внешний X-Request-ID
+  string tenant_id        = 2;
+  string actor_id         = 3; // пользователь/сервис
+  string ip               = 4; // исходный IP
+  string user_agent       = 5;
+  google.protobuf.Timestamp time = 6;
+  map<string, string> extra = 7;
+}
+
+message Pagination {
+  int32 page_size    = 1;
+  string page_token  = 2;
+}
+
+message PageInfo {
+  string next_page_token = 1;
+  int64 total_count      = 2; // может быть приблизительным
+}
+
+message ResourceVersion {
+  // Для оптимистической блокировки
+  string etag = 1;
+}
+
+// ======== Placement & Nodes =========
+
+message FailureDomain {
+  // Иерархия отказоустойчивости: например, ["region","az","rack","host"]
+  repeated string levels = 1;
+}
+
+message PlacementPolicy {
+  // Мин. количество уникальных доменов отказа для размещения k+m шардов.
+  uint32 min_domains = 1;
+  bool rack_aware    = 2;
+  FailureDomain domain_model = 3;
+}
+
+message NodeRef {
+  string node_id       = 1;
+  string hostname      = 2;
+  string grpc_endpoint = 3; // "host:port"
+  NodeState state      = 4;
+  Labels labels        = 5;
+}
+
+message ShardLocation {
+  string node_id              = 1;
+  string shard_url            = 2; // опционально: pre-signed URL/URI для доступа
+  google.protobuf.Timestamp url_expires_at = 3;
+}
+
+// ======== Scheme / Profile =========
+
+message ErasureScheme {
+  string scheme_id         = 1;
+  string name              = 2;
+  ErasureCodeType code     = 3;
+  uint32 data_shards       = 4; // k
+  uint32 parity_shards     = 5; // m
+  // LRC параметры (если применимо):
+  uint32 local_parity      = 6; // l
+  uint32 locality_group    = 7; // размер локальной группы
+  // Общие параметры:
+  bool   systematic        = 8; // true: исходные блоки присутствуют как часть набора
+  uint64 stripe_size_bytes = 9; // размер полосы до шардирования
+  ChecksumAlgo checksum    = 10; // алгоритм контрольной суммы по шард/сегментам
+  PlacementPolicy placement = 11;
+  Labels labels            = 12;
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+  ResourceVersion version  = 15;
+
+  reserved 100 to 199; // для будущих несовместимых расширений
+}
+
+// ======== Data Plane Structures =========
+
+message ObjectRef {
+  string object_id = 1; // логический идентификатор (ULID/UUIDv7/URN)
+  string content_type = 2;
+  uint64 size_bytes = 3; // известный размер, если есть
+  Labels labels = 4;
+}
+
+message Segment {
+  string segment_id = 1;
+  uint64 offset     = 2; // смещение в объекте
+  uint64 length     = 3; // длина полезных данных
+  Checksum checksum = 4; // checksum сегмента до шардирования
+}
+
+message Shard {
+  string shard_id       = 1;
+  uint32 index          = 2; // 0..k+m-1 (первые k — data если systematic=true)
+  uint64 length         = 3;
+  Checksum checksum     = 4; // checksum конкретного шарда
+  ShardState state      = 5;
+  ShardLocation location = 6;
+  Labels labels         = 7;
+}
+
+message Stripe {
+  // stripe -> shards
+  string stripe_id = 1;
+  uint64 stripe_offset = 2; // смещение полоса->в объекте
+  repeated Shard shards = 3;
+}
+
+// Поток передачи данных
+
+message DataChunk {
+  bytes data       = 1; // 0..N-1
+  uint64 offset    = 2; // смещение в объекте
+  bool eof         = 3; // последний чанк
+  Checksum chunk_checksum = 4; // опционально для on-the-fly проверки
+}
+
+message EncodeInit {
+  RequestContext ctx = 1;
+  string scheme_id   = 2;
+  ObjectRef object   = 3;
+}
+
+message EncodeRequest {
+  oneof payload {
+    EncodeInit init = 1;
+    DataChunk chunk = 2;
+  }
+}
+
+message EncodeAck {
+  uint64 received_bytes = 1;
+  double progress       = 2; // 0..1
+}
+
+message EncodeResult {
+  ObjectRef  object = 1;
+  repeated Segment segments = 2;
+  repeated Stripe  stripes  = 3;
+  Checksum object_checksum  = 4;
+}
+
+message EncodeResponse {
+  oneof payload {
+    EncodeAck ack       = 1;
+    EncodeResult result = 2;
+    google.rpc.Status error = 3;
+  }
+}
+
+// Decode
+
+message DecodeRequest {
+  RequestContext ctx = 1;
+  string object_id   = 2;
+  // Опционально ограничение диапазона:
+  uint64 read_offset = 3;
+  uint64 read_length = 4; // 0 = до конца
+  // Проверка целостности на выходе:
+  bool verify_checksum = 5;
+}
+
+message DecodeChunk {
+  bytes data    = 1;
+  uint64 offset = 2;
+  bool eof      = 3;
+}
+
+// Verify
+
+message VerifyRequest {
+  RequestContext ctx = 1;
+  string object_id   = 2;
+  bool deep          = 3; // глубокая проверка с декодированием
+}
+
+message VerifyReport {
+  string object_id     = 1;
+  bool ok              = 2;
+  Checksum expected    = 3;
+  Checksum actual      = 4; // при несоответствии
+  repeated Shard bad_shards = 5;
+}
+
+// Repair
+
+message RepairTarget {
+  string object_id = 1;
+  // Явно указанные отсутствующие/битые шарды. Если пусто — определить автоматически.
+  repeated uint32 missing_indices = 2;
+}
+
+message RepairRequest {
+  RequestContext ctx = 1;
+  RepairTarget target = 2;
+}
+
+message RepairProgress {
+  string object_id = 1;
+  double progress  = 2; // 0..1
+  repeated Shard repaired_shards = 3;
+}
+
+message RepairResult {
+  string object_id = 1;
+  bool ok          = 2;
+  repeated Shard final_shards = 3;
+}
+
+message RepairResponse {
+  oneof payload {
+    RepairProgress progress = 1;
+    RepairResult   result   = 2;
+    google.rpc.Status error = 3;
+  }
+}
+
+// ======== Control Plane: Schemes CRUD =========
+
+message CreateSchemeRequest {
+  RequestContext ctx = 1;
+  ErasureScheme scheme = 2; // scheme_id может быть пустым — сгенерировать на сервере
+}
+
+message CreateSchemeResponse {
+  ErasureScheme scheme = 1;
+}
+
+message GetSchemeRequest {
+  RequestContext ctx = 1;
+  string scheme_id = 2;
+}
+
+message GetSchemeResponse {
+  ErasureScheme scheme = 1;
+}
+
+message UpdateSchemeRequest {
+  RequestContext ctx = 1;
+  ErasureScheme scheme = 2; // обновляемые поля
+  google.protobuf.FieldMask update_mask = 3; // список полей для патча
+}
+
+message UpdateSchemeResponse {
+  ErasureScheme scheme = 1;
+}
+
+message DeleteSchemeRequest {
+  RequestContext ctx = 1;
+  string scheme_id = 2;
+  string etag      = 3; // если задан — проверка версии
+}
+
+message ListSchemesRequest {
+  RequestContext ctx = 1;
+  Pagination page    = 2;
+  string query       = 3; // фильтры по имени/меткам
+}
+
+message ListSchemesResponse {
+  repeated ErasureScheme schemes = 1;
+  PageInfo page_info = 2;
+}
+
+// ======== Introspection =========
+
+message ListObjectShardsRequest {
+  RequestContext ctx = 1;
+  string object_id   = 2;
+}
+
+message ListObjectShardsResponse {
+  string object_id = 1;
+  repeated Stripe stripes = 2;
+}
+
+// =============== Services ===============
+
+service ErasureControlService {
+  // CRUD по схемам
+  rpc CreateScheme(CreateSchemeRequest) returns (CreateSchemeResponse);
+  rpc GetScheme(GetSchemeRequest)       returns (GetSchemeResponse);
+  rpc UpdateScheme(UpdateSchemeRequest) returns (UpdateSchemeResponse);
+  rpc DeleteScheme(DeleteSchemeRequest) returns (google.protobuf.Empty);
+  rpc ListSchemes(ListSchemesRequest)   returns (ListSchemesResponse);
+
+  // Инспекция объектов
+  rpc ListObjectShards(ListObjectShardsRequest) returns (ListObjectShardsResponse);
+}
+
+service ErasureDataService {
+  // Двунаправленное потоковое кодирование:
+  // Клиент отправляет init + поток чанков, получает ack/progress и финальный mapping.
+  rpc Encode(stream EncodeRequest) returns (stream EncodeResponse);
+
+  // Серверный стрим декодированных данных.
+  rpc Decode(DecodeRequest) returns (stream DecodeChunk);
+
+  // Верификация целостности (с отчетом).
+  rpc Verify(VerifyRequest) returns (VerifyReport);
+
+  // Ремонт шардов: прогресс + итог.
+  rpc Repair(RepairRequest) returns (stream RepairResponse);
+}
+
+// ========= Reserved tags for safe evolution =========
+
+message ReservedForFuture {
+  reserved 1 to 50;
+}

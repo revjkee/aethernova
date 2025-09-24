@@ -1,0 +1,266 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "zero-trust-core.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zero-trust-core.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount | default 2 }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit | default 10 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .Values.updateStrategy.maxSurge | default "25%" }}
+      maxUnavailable: {{ .Values.updateStrategy.maxUnavailable | default "0" }}
+  selector:
+    matchLabels:
+      {{- include "zero-trust-core.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "zero-trust-core.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: pep
+      annotations:
+        prometheus.io/scrape: "{{ .Values.metrics.scrape | default true }}"
+        prometheus.io/port: "{{ .Values.ports.metrics | default 9464 }}"
+        prometheus.io/path: "{{ .Values.metrics.path | default "/metrics" }}"
+        checksum/pep-config: {{ tpl (toYaml (.Values.config.pep | default dict)) . | sha256sum }}
+        checksum/opa-config: {{- if .Values.pdp.enabled }} {{ tpl (toYaml (.Values.config.opa | default dict)) . | sha256sum }} {{- else }} "disabled" {{- end }}
+        checksum/app-env: {{ tpl (toYaml (.Values.config.appEnv | default dict)) . | sha256sum }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "zero-trust-core.serviceAccountName" . }}
+      priorityClassName: {{ .Values.priorityClassName | default "" | quote }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+      enableServiceLinks: false
+      securityContext:
+        {{- toYaml (.Values.podSecurityContext | default (dict "runAsNonRoot" true "fsGroup" 10001 "seccompProfile" (dict "type" "RuntimeDefault"))) | nindent 8 }}
+      topologySpreadConstraints:
+        {{- if .Values.topologySpreadConstraints }}
+        {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+        {{- else }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "zero-trust-core.selectorLabels" . | nindent 14 }}
+        {{- end }}
+      affinity:
+        {{- toYaml (.Values.affinity | default dict) | nindent 8 }}
+      nodeSelector:
+        {{- toYaml (.Values.nodeSelector | default dict) | nindent 8 }}
+      tolerations:
+        {{- toYaml (.Values.tolerations | default list) | nindent 8 }}
+
+      volumes:
+        - name: pep-config
+          configMap:
+            name: {{ include "zero-trust-core.fullname" . }}-pep
+            items:
+              - key: pep.yaml
+                path: pep.yaml
+        - name: app-env
+          configMap:
+            name: {{ include "zero-trust-core.fullname" . }}-app
+            items:
+              - key: app.env
+                path: app.env
+        - name: ca-bundle
+          secret:
+            secretName: {{ .Values.secrets.caBundle.name | default (printf "%s-ca" (include "zero-trust-core.fullname" .)) }}
+            optional: false
+        - name: tls
+          secret:
+            secretName: {{ .Values.secrets.tls.name | default (printf "%s-tls" (include "zero-trust-core.fullname" .)) }}
+            optional: false
+        - name: tmp
+          emptyDir: { medium: Memory }
+        {{- if .Values.pdp.enabled }}
+        - name: opa-config
+          configMap:
+            name: {{ include "zero-trust-core.fullname" . }}-opa
+            items:
+              - key: opa-config.yaml
+                path: opa-config.yaml
+        {{- end }}
+        {{- if .Values.vpn.enabled }}
+        - name: vpn-config
+          secret:
+            secretName: {{ .Values.vpn.secretName | default (printf "%s-vpn" (include "zero-trust-core.fullname" .)) }}
+            optional: false
+        {{- end }}
+
+      containers:
+        # ------------------------
+        # PEP (Zero Trust proxy)
+        # ------------------------
+        - name: pep
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          args:
+            - "--config=/etc/zt/pep/pep.yaml"
+            - "--log-json={{ .Values.logging.json | default true }}"
+            - "--log-level={{ .Values.logging.level | default "info" }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.ports.http | default 8080 }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.ports.metrics | default 9464 }}
+              protocol: TCP
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.telemetry.otelEndpoint | default "http://otel-collector.observability.svc.cluster.local:4317" | quote }}
+            - name: JWKS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "zero-trust-core.fullname" . }}-app
+                  key: JWKS_URL
+                  optional: true
+            - name: OPA_DECISION_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "zero-trust-core.fullname" . }}-app
+                  key: OPA_DECISION_URL
+                  optional: true
+          envFrom:
+            - configMapRef:
+                name: {{ include "zero-trust-core.fullname" . }}-app
+          volumeMounts:
+            - name: pep-config
+              mountPath: /etc/zt/pep
+              readOnly: true
+            - name: ca-bundle
+              mountPath: /etc/zt/ca
+              readOnly: true
+            - name: tls
+              mountPath: /etc/zt/tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readinessPath | default "/v1/health/readiness" }}
+              port: {{ .Values.ports.http | default 8080 }}
+              scheme: {{ ternary "HTTPS" "HTTP" (.Values.probes.useTLS | default false) }}
+            initialDelaySeconds: {{ .Values.probes.readinessInitialDelaySeconds | default 5 }}
+            periodSeconds: {{ .Values.probes.readinessPeriodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.probes.readinessTimeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.probes.readinessFailureThreshold | default 3 }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.livenessPath | default "/v1/health/liveness" }}
+              port: {{ .Values.ports.http | default 8080 }}
+              scheme: {{ ternary "HTTPS" "HTTP" (.Values.probes.useTLS | default false) }}
+            initialDelaySeconds: {{ .Values.probes.livenessInitialDelaySeconds | default 10 }}
+            periodSeconds: {{ .Values.probes.livenessPeriodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.probes.livenessTimeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.probes.livenessFailureThreshold | default 3 }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startupPath | default "/v1/health/startup" }}
+              port: {{ .Values.ports.http | default 8080 }}
+              scheme: {{ ternary "HTTPS" "HTTP" (.Values.probes.useTLS | default false) }}
+            failureThreshold: {{ .Values.probes.startupFailureThreshold | default 30 }}
+            periodSeconds: {{ .Values.probes.startupPeriodSeconds | default 5 }}
+          resources:
+            {{- toYaml (.Values.resources.pep | default (dict "requests" (dict "cpu" "100m" "memory" "256Mi") "limits" (dict "cpu" "500m" "memory" "512Mi"))) | nindent 12 }}
+          securityContext:
+            {{- toYaml (.Values.containerSecurityContext | default (dict
+                "runAsNonRoot" true
+                "runAsUser" 10001
+                "runAsGroup" 10001
+                "allowPrivilegeEscalation" false
+                "readOnlyRootFilesystem" true
+                "capabilities" (dict "drop" (list "ALL"))
+              )) | nindent 12 }}
+
+        {{- if .Values.pdp.enabled }}
+        # ------------------------
+        # PDP (OPA sidecar)
+        # ------------------------
+        - name: opa
+          image: "{{ .Values.pdp.image.repository | default "openpolicyagent/opa" }}:{{ .Values.pdp.image.tag | default "latest" }}"
+          imagePullPolicy: {{ .Values.pdp.image.pullPolicy | default "IfNotPresent" }}
+          args:
+            - "run"
+            - "--server"
+            - "--config-file=/etc/zt/opa/opa-config.yaml"
+            {{- if .Values.pdp.extraArgs }}
+            {{- toYaml .Values.pdp.extraArgs | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: opa
+              containerPort: {{ .Values.pdp.port | default 8181 }}
+              protocol: TCP
+          env:
+            {{- if .Values.pdp.bundle.tokenSecretRef }}
+            - name: BUNDLE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "pdp.bundle.tokenSecretRef.name required" .Values.pdp.bundle.tokenSecretRef.name }}
+                  key: {{ .Values.pdp.bundle.tokenSecretRef.key | default "token" }}
+            {{- end }}
+          volumeMounts:
+            - name: opa-config
+              mountPath: /etc/zt/opa
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health?plugins&bundle
+              port: {{ .Values.pdp.port | default 8181 }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.pdp.port | default 8181 }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            {{- toYaml (.Values.resources.opa | default (dict "requests" (dict "cpu" "50m" "memory" "128Mi") "limits" (dict "cpu" "300m" "memory" "256Mi"))) | nindent 12 }}
+          securityContext:
+            {{- toYaml (.Values.containerSecurityContext | default (dict
+                "runAsNonRoot" true
+                "runAsUser" 10001
+                "runAsGroup" 10001
+                "allowPrivilegeEscalation" false
+                "readOnlyRootFilesystem" true
+                "capabilities" (dict "drop" (list "ALL"))
+              )) | nindent 12 }}
+        {{- end }}
+
+        {{- if .Values.vpn.enabled }}
+        # ------------------------
+        # Optional VPN sidecar
+        # ------------------------
+        - name: vpn
+          image: "{{ .Values.vpn.image.repository }}:{{ .Values.vpn.image.tag }}"
+          imagePullPolicy: {{ .Values.vpn.image.pullPolicy | default "IfNotPresent" }}
+          args: {{- toYaml (.Values.vpn.args | default list) | nindent 12 }}
+          volumeMounts:
+            - name: vpn-config
+              mountPath: /etc/vpn
+              readOnly: true
+          securityContext:
+            {{- toYaml (mergeOverwrite (dict
+                "runAsNonRoot" true
+                "allowPrivilegeEscalation" false
+                "capabilities" (dict "add" (list "NET_ADMIN") "drop" (list "ALL"))
+              ) (.Values.vpn.securityContext | default dict)) | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: {{- toYaml (.Values.vpn.readinessCommand | default (list "sh" "-c" "ip link show $(printenv VPN_IFACE || echo tun0) >/dev/null 2>&1")) | nindent 16 }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            {{- toYaml (.Values.resources.vpn | default (dict "requests" (dict "cpu" "20m" "memory" "64Mi") "limits" (dict "cpu" "100m" "memory" "128Mi"))) | nindent 12 }}
+        {{- end }}

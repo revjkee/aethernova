@@ -1,0 +1,235 @@
+# cybersecurity-core/cybersecurity/adversary_emulation/attack_simulator/profiles/windows_enterprise.yaml
+schema_version: "1.0"
+
+profile:
+  id: "windows_enterprise"
+  name: "Windows Enterprise - Benign Adversary Emulation"
+  version: "1.0.0"
+  description: >
+    Безопасная (benign) эмуляция ключевых техник MITRE ATT&CK на Windows
+    для проверки телеметрии и детекций. Действия не наносят ущерба, создают
+    повторяемые события журналов и очищают артефакты.
+  authors:
+    - "Aethernova SecLab"
+  attck_domain: "enterprise"
+  safety_mode: "benign"
+  opsec_guardrails:
+    internet_access: false           # без сетевых загрузок/эксфильтрации
+    persistence_beyond_run: false    # все задания/артефакты удаляются
+    privilege_escalation: false
+    lateral_movement: false
+    remote_execution: false
+  mappings:
+    mitre_techniques:
+      - { id: "T1053.005", name: "Scheduled Task/Job: Scheduled Task" }
+      - { id: "T1047",     name: "Windows Management Instrumentation" }
+      - { id: "T1059",     name: "Command and Scripting Interpreter" }
+      - { id: "T1012",     name: "Query Registry" }
+    frameworks:
+      nist_sp_800_53_rev5:
+        - { id: "AU-2",  name: "Event Logging" }
+        - { id: "AU-12", name: "Audit Record Generation" }
+        - { id: "SI-4",  name: "System Monitoring" }
+        - { id: "AC-2",  name: "Account Management" }
+        - { id: "CM-6",  name: "Configuration Settings" }
+      cis_controls_v8:
+        - { id: "08", name: "Audit Log Management" }
+        - { id: "10", name: "Malware Defenses" }
+        - { id: "12", name: "Network Infrastructure Management" }
+        - { id: "16", name: "Service Provider Management" }
+        - { id: "17", name: "Incident Response Management" }
+
+requirements:
+  os:
+    platforms: ["Windows 10", "Windows 11", "Windows Server 2016", "Windows Server 2019", "Windows Server 2022"]
+  privileges:
+    run_as: "standard_user"  # все процедуры работают без административных прав; если требуется elevation, указано локально
+  audit_policies:
+    - name: "Audit Process Creation (4688)"
+      setting: "Enabled"
+    - name: "Include command line in process creation events"
+      setting: "Enabled"
+    - name: "Microsoft-Windows-TaskScheduler/Operational"
+      setting: "Enabled"
+    - name: "Microsoft-Windows-WMI-Activity/Operational"
+      setting: "Enabled"
+  optional_tools:
+    sysmon:
+      required: false
+      note: "Если Sysmon установлен и сконфигурирован — ожидаются дополнительные события (1, 3)."
+  logging_channels:
+    - { channel: "Security", ids: [4688, 4624] }
+    - { channel: "Microsoft-Windows-TaskScheduler/Operational", ids: [106] }
+    - { channel: "Security", ids: [4698] }  # создание планового задания (если аудит включён)
+    - { channel: "Microsoft-Windows-WMI-Activity/Operational", ids: [5857, 5858, 5859, 5860, 5861] }
+    - { channel: "Microsoft-Windows-Sysmon/Operational", ids: [1, 3], optional: true }
+
+telemetry_expectations:
+  notes: >
+    4688 фиксирует создание процессов и командную строку при включённой политике.
+    4624 фиксирует успешные логоны (используется для контекста, не генерируется каждой процедурой).
+    TaskScheduler Operational 106/Security 4698 фиксируют создание задания.
+    WMI-Activity 5857/5858/5859/5860/5861 фиксируют операции WMI и ошибки запросов.
+    Sysmon 1/3 предоставляют детальную привязку процессов/сетевых подключений (если включено).
+
+variables:
+  now_plus_1min_localtime: "__COMPUTE_AT_RUNTIME__"  # формат HH:MM; вычисляется раннером
+  task_name: "Aethernova_Notepad_Test"
+  benign_marker: "AETHERNOVA_TEST"
+
+procedures:
+
+  - id: "exec_cmd_benign"
+    name: "T1059 - Command Interpreter (cmd.exe) — benign"
+    tactic: ["execution"]
+    technique: { id: "T1059", name: "Command and Scripting Interpreter" }
+    risk: "low"
+    steps:
+      - executor: "cmd"
+        run: 'cmd.exe /c echo %benign_marker%'
+    expected_events:
+      - channel: "Security"
+        event_id: 4688
+        must_contain:
+          - "New Process Name: C:\\Windows\\System32\\cmd.exe"
+          - "Command Line: cmd.exe /c echo %benign_marker%"
+      - channel: "Microsoft-Windows-Sysmon/Operational"
+        event_id: 1
+        optional: true
+        must_contain:
+          - "Image: C:\\Windows\\System32\\cmd.exe"
+          - "CommandLine: cmd.exe /c echo"
+    cleanup: []
+    notes: "Безопасно выводит маркерную строку, генерируя 4688 (+ Sysmon 1 при наличии)."
+
+  - id: "exec_powershell_benign"
+    name: "T1059 - PowerShell — benign"
+    tactic: ["execution"]
+    technique: { id: "T1059", name: "Command and Scripting Interpreter" }
+    risk: "low"
+    steps:
+      - executor: "powershell"
+        run: 'powershell.exe -NoProfile -Command "Write-Output ''%benign_marker%'' | Out-Host"'
+    expected_events:
+      - channel: "Security"
+        event_id: 4688
+        must_contain:
+          - "New Process Name: C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+          - "Command Line: powershell.exe -NoProfile -Command"
+      - channel: "Microsoft-Windows-Sysmon/Operational"
+        event_id: 1
+        optional: true
+        must_contain:
+          - "Image: *\\powershell.exe"
+    cleanup: []
+    notes: "Безопасно печатает маркер; не использует обход ExecutionPolicy."
+
+  - id: "scheduled_task_notepad_once"
+    name: "T1053.005 - Scheduled Task (once, notepad) — benign"
+    tactic: ["execution", "persistence"]
+    technique: { id: "T1053.005", name: "Scheduled Task/Job: Scheduled Task" }
+    risk: "low"
+    prerequisites:
+      elevation_required: false
+      notes: "Стандартный пользователь может создавать задания в контексте своего профиля."
+    steps:
+      - executor: "cmd"
+        run: 'schtasks /create /tn "%task_name%" /tr "notepad.exe" /sc ONCE /st %now_plus_1min_localtime% /rl LIMITED /f'
+      - executor: "cmd"
+        run: 'schtasks /run /tn "%task_name%"'
+    expected_events:
+      - channel: "Microsoft-Windows-TaskScheduler/Operational"
+        event_id: 106
+        must_contain: ["%task_name%"]
+      - channel: "Security"
+        event_id: 4698
+        optional: true
+        must_contain: ["Task Name: \\%task_name%"]
+      - channel: "Security"
+        event_id: 4688
+        must_contain:
+          - "New Process Name: C:\\Windows\\System32\\notepad.exe"
+    cleanup:
+      - executor: "cmd"
+        run: 'schtasks /delete /tn "%task_name%" /f'
+      - executor: "cmd"
+        run: 'taskkill /IM notepad.exe /F'
+    notes: "Создаёт одноразовое задание, запускает notepad, затем удаляет задание и закрывает notepad."
+
+  - id: "wmi_local_query_benign"
+    name: "T1047 - WMI local query — benign"
+    tactic: ["execution", "discovery"]
+    technique: { id: "T1047", name: "Windows Management Instrumentation" }
+    risk: "low"
+    steps:
+      - executor: "powershell"
+        run: 'powershell.exe -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version | Out-Host"'
+    expected_events:
+      - channel: "Microsoft-Windows-WMI-Activity/Operational"
+        event_ids: [5857]   # Operation Started
+      - channel: "Security"
+        event_id: 4688
+        must_contain:
+          - "New Process Name: *\\powershell.exe"
+          - "Command Line: *Get-CimInstance Win32_OperatingSystem*"
+    cleanup: []
+    notes: "Локальный безопасный запрос WMI; не выполняет удалённые команды и не меняет состояние системы."
+
+  - id: "registry_query_benign"
+    name: "T1012 - Query Registry — benign"
+    tactic: ["discovery"]
+    technique: { id: "T1012", name: "Query Registry" }
+    risk: "low"
+    steps:
+      - executor: "cmd"
+        run: 'reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion" /v ProductName'
+    expected_events:
+      - channel: "Security"
+        event_id: 4688
+        must_contain:
+          - "New Process Name: C:\\Windows\\System32\\reg.exe"
+          - "Command Line: reg query *\\CurrentVersion* /v ProductName"
+      - channel: "Microsoft-Windows-Sysmon/Operational"
+        event_id: 1
+        optional: true
+        must_contain:
+          - "Image: C:\\Windows\\System32\\reg.exe"
+    cleanup: []
+    notes: "Только чтение, безопасно."
+
+validation:
+  checklist:
+    - "Появился ли 4688 с корректной командной строкой для каждой процедуры?"
+    - "Для Scheduled Task: зафиксирован ли 106 (TaskScheduler Operational) и/или 4698 (Security) перед запуском notepad?"
+    - "Для WMI: есть ли 5857 (и при ошибках 5858) в WMI-Activity?"
+    - "При наличии Sysmon: присутствуют ли Event ID 1 соответствующие каждому запуску?"
+  thresholds:
+    event_timeout_seconds: 90
+    allow_optional_missing:
+      - "Security:4698"
+      - "Sysmon:*"
+
+rollbacks:
+  on_failure:
+    - executor: "cmd"
+      run: 'schtasks /delete /tn "%task_name%" /f'
+    - executor: "cmd"
+      run: 'taskkill /IM notepad.exe /F'
+
+reporting:
+  artifacts_to_collect:
+    - channel: "Security"
+      ids: [4688, 4698, 4624]
+    - channel: "Microsoft-Windows-TaskScheduler/Operational"
+      ids: [106]
+    - channel: "Microsoft-Windows-WMI-Activity/Operational"
+      ids: [5857, 5858, 5859, 5860, 5861]
+    - channel: "Microsoft-Windows-Sysmon/Operational"
+      ids: [1, 3]
+  fields_of_interest:
+    - "CommandLine"
+    - "ParentProcess"
+    - "User/LogonId"
+    - "TaskName"
+    - "WMI Operation/ResultCode"
+  pii_handling: "exclude_usernames_where_possible"

@@ -1,0 +1,144 @@
+{{-/*
+ledger-core Service template
+Assumes helpers:
+  - {{ include "ledger-core.fullname" . }}
+  - {{ include "ledger-core.labels" . }}
+  - {{ include "ledger-core.selectorLabels" . }}
+*/ -}}
+{{- $fullname := include "ledger-core.fullname" . -}}
+{{- $labels := include "ledger-core.labels" . -}}
+{{- $selector := include "ledger-core.selectorLabels" . -}}
+{{- $svc := .Values.service | default dict -}}
+{{- $type := $svc.type | default "ClusterIP" -}}
+{{- $headless := eq ($svc.headless | default false) true -}}
+{{- $clusterIP := ternary "None" ($svc.clusterIP | default "") $headless -}}
+{{- $annotations := $svc.annotations | default dict -}}
+{{- $ports := $svc.ports | default list -}}
+{{- $sessionAffinity := $svc.sessionAffinity | default "None" -}}
+{{- $sessionAffinityConfig := $svc.sessionAffinityConfig | default dict -}}
+{{- $topologyHints := $svc.topologyAwareHints | default false -}}
+{{- $externalTrafficPolicy := $svc.externalTrafficPolicy | default "" -}}
+{{- $healthCheckNodePort := $svc.healthCheckNodePort | default 0 -}}
+{{- $ipFamilies := $svc.ipFamilies | default list -}}
+{{- $ipFamilyPolicy := $svc.ipFamilyPolicy | default "" -}}
+{{- $publishNotReady := $svc.publishNotReadyAddresses | default false -}}
+{{- $loadBalancerClass := $svc.loadBalancerClass | default "" -}}
+{{- $loadBalancerIP := $svc.loadBalancerIP | default "" -}}
+{{- $sourceRanges := $svc.loadBalancerSourceRanges | default list -}}
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+{{ $labels | nindent 4 }}
+    app.kubernetes.io/component: service
+  annotations:
+    {{- if $annotations }}
+{{ toYaml $annotations | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if $ipFamilies }}
+  ipFamilies:
+{{ toYaml $ipFamilies | nindent 4 }}
+  {{- end }}
+  {{- if $ipFamilyPolicy }}
+  ipFamilyPolicy: {{ $ipFamilyPolicy }}
+  {{- end }}
+  type: {{ $type }}
+  {{- if or $headless $clusterIP }}
+  clusterIP: {{ $clusterIP | quote }}
+  {{- end }}
+  {{- if $publishNotReady }}
+  publishNotReadyAddresses: true
+  {{- end }}
+  {{- if $topologyHints }}
+  internalTrafficPolicy: Local
+  {{- end }}
+  {{- if and (eq $type "LoadBalancer") $loadBalancerClass }}
+  loadBalancerClass: {{ $loadBalancerClass | quote }}
+  {{- end }}
+  {{- if and (eq $type "LoadBalancer") $loadBalancerIP }}
+  loadBalancerIP: {{ $loadBalancerIP | quote }}
+  {{- end }}
+  {{- if and (eq $type "LoadBalancer") $sourceRanges }}
+  loadBalancerSourceRanges:
+{{ toYaml $sourceRanges | nindent 4 }}
+  {{- end }}
+  {{- if and (or (eq $type "LoadBalancer") (eq $type "NodePort")) $externalTrafficPolicy }}
+  externalTrafficPolicy: {{ $externalTrafficPolicy }}
+  {{- end }}
+  {{- if and (eq $type "LoadBalancer") (eq $externalTrafficPolicy "Local") (gt $healthCheckNodePort 0) }}
+  healthCheckNodePort: {{ $healthCheckNodePort }}
+  {{- end }}
+  sessionAffinity: {{ $sessionAffinity }}
+  {{- if and (eq $sessionAffinity "ClientIP") $sessionAffinityConfig }}
+  sessionAffinityConfig:
+{{ toYaml $sessionAffinityConfig | nindent 4 }}
+  {{- end }}
+  ports:
+    {{- $resolved := list -}}
+    {{- if $ports }}
+      {{- range $i, $p := $ports }}
+        {{- /* p: name, port, targetPort, protocol, nodePort?, appProtocol? */ -}}
+    - name: {{ required (printf "service.ports[%d].name is required" $i) $p.name | quote }}
+      port: {{ required (printf "service.ports[%d].port is required" $i) $p.port }}
+      targetPort: {{ default $p.port $p.targetPort }}
+      protocol: {{ default "TCP" $p.protocol }}
+      {{- if $p.appProtocol }}
+      appProtocol: {{ $p.appProtocol | quote }}
+      {{- end }}
+      {{- if and (or (eq $type "LoadBalancer") (eq $type "NodePort")) $p.nodePort }}
+      nodePort: {{ $p.nodePort }}
+      {{- end }}
+        {{- $resolved = append $resolved (dict "name" $p.name "port" $p.port) -}}
+      {{- end }}
+    {{- else }}
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+      appProtocol: http
+    {{- end }}
+  selector:
+{{ $selector | nindent 4 }}
+
+---
+{{- if and (.Values.serviceMonitor.enabled) (hasKey .Capabilities.APIVersions "monitoring.coreos.com/v1") }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ printf "%s-sm" $fullname }}
+  labels:
+{{ $labels | nindent 4 }}
+    app.kubernetes.io/component: servicemonitor
+  {{- with .Values.serviceMonitor.annotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+{{ $labels | nindent 6 }}
+      app.kubernetes.io/component: service
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    {{- $scrape := .Values.serviceMonitor.scrape | default dict -}}
+    - port: {{ $scrape.port | default "metrics" | quote }}
+      path: {{ $scrape.path | default "/metrics" | quote }}
+      interval: {{ $scrape.interval | default "30s" | quote }}
+      scrapeTimeout: {{ $scrape.scrapeTimeout | default "10s" | quote }}
+      scheme: {{ $scrape.scheme | default "http" | quote }}
+      honorLabels: {{ $scrape.honorLabels | default false }}
+      relabelings:
+        {{- with $scrape.relabelings }}
+{{ toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

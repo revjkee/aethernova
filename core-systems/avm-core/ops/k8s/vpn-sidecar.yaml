@@ -1,0 +1,285 @@
+# ============================================
+# ConfigMap: entrypoint для универсального VPN sidecar
+# Запускает команду подъема VPN, проверяет интерфейс, удерживает процесс,
+# корректно завершает туннель по SIGTERM и экспонирует /tmp/ready флаг.
+# Требует: наличия бинарей (wg-quick/openvpn/etc.) внутри образа sidecar.
+# Переменные:
+#   VPN_UP_CMD   - команда запуска (обязательно)
+#   VPN_DOWN_CMD - команда остановки (обязательно)
+#   VPN_IFACE    - имя интерфейса (tun0|wg0), по умолчанию tun0
+# ============================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vpn-sidecar-entrypoint
+  labels:
+    app.kubernetes.io/name: avm-core
+    app.kubernetes.io/component: vpn
+data:
+  entrypoint.sh: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    trap 'on_term' TERM INT
+    : "${VPN_UP_CMD:?VPN_UP_CMD is required}"
+    : "${VPN_DOWN_CMD:?VPN_DOWN_CMD is required}"
+    VPN_IFACE="${VPN_IFACE:-tun0}"
+    READY_FILE="/vpn-ready/ready"
+    LOG() { printf '[%(%Y-%m-%dT%H:%M:%SZ)T] %s\n' -1 "$*" >&2; }
+
+    on_term() {
+      LOG "Stopping VPN via VPN_DOWN_CMD"
+      bash -c "${VPN_DOWN_CMD}" || true
+      rm -f "${READY_FILE}" || true
+      exit 0
+    }
+
+    # Поднимаем VPN
+    LOG "Starting VPN via VPN_UP_CMD"
+    bash -c "${VPN_UP_CMD}"
+
+    # Ожидаем появления интерфейса
+    for i in $(seq 1 120); do
+      if ip link show dev "${VPN_IFACE}" >/dev/null 2>&1; then
+        LOG "VPN iface ${VPN_IFACE} is up"
+        touch "${READY_FILE}"
+        break
+      fi
+      sleep 1
+    done
+
+    if ! ip link show dev "${VPN_IFACE}" >/dev/null 2>&1; then
+      LOG "VPN iface ${VPN_IFACE} did not appear"; exit 1
+    fi
+
+    # Мониторинг интерфейса; при деградации снимаем флаг готовности
+    while true; do
+      if ip link show dev "${VPN_IFACE}" >/dev/null 2>&1; then
+        : # ok
+      else
+        LOG "VPN iface ${VPN_IFACE} lost"; rm -f "${READY_FILE}"
+      fi
+      sleep 5
+    done
+---
+# ==================================================
+# Secret: конфиги и креды VPN (пример заготовок)
+# Заполните stringData актуальными значениями.
+# ==================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vpn-credentials
+  labels:
+    app.kubernetes.io/name: avm-core
+    app.kubernetes.io/component: vpn
+type: Opaque
+stringData:
+  # Для WireGuard:
+  # wg0.conf: |
+  #   [Interface]
+  #   PrivateKey = <REDACTED>
+  #   Address = 10.0.0.2/32
+  #   DNS = 1.1.1.1
+  #   [Peer]
+  #   PublicKey = <REDACTED>
+  #   AllowedIPs = 0.0.0.0/0, ::/0
+  #   Endpoint = <VPN_ENDPOINT_HOST>:51820
+  # Для OpenVPN:
+  # client.ovpn: |
+  #   client
+  #   proto udp
+  #   remote <VPN_ENDPOINT_HOST> 1194
+  #   auth-user-pass /etc/vpn/auth.txt
+  # auth.txt: |
+  #   <username>
+  #   <password>
+---
+# ==================================================
+# NetworkPolicy: egress kill-switch для Pod с VPN
+# Разрешено:
+#  - DNS к kube-dns (укажите IP вашей службы kube-dns)
+#  - трафик к конечной точке VPN (IP/порт)
+# Запрещено: остальной egress (внешняя сеть) для избежания утечек.
+# ==================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: avm-core-vpn-egress
+  labels:
+    app.kubernetes.io/name: avm-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: avm-core
+  policyTypes:
+    - Egress
+  egress:
+    # kube-dns (пример: 10.96.0.10) — замените на реальный ClusterIP
+    - to:
+        - ipBlock:
+            cidr: 10.96.0.10/32   # kube-dns ClusterIP
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Конечная точка VPN — замените IP/порт на реальный
+    - to:
+        - ipBlock:
+            cidr: 198.51.100.42/32   # VPN endpoint IP (пример из RFC 5737)
+      ports:
+        - protocol: UDP
+          port: 51820                 # WireGuard
+        - protocol: TCP
+          port: 1194                  # OpenVPN TCP (если нужно)
+---
+# ==================================================
+# Deployment (пример): приложение + VPN sidecar.
+# Если у вас уже есть Deployment, используйте как ориентир
+# для patchStrategicMerge (добавьте volumes/containers).
+# ==================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: avm-core
+  labels:
+    app.kubernetes.io/name: avm-core
+    app.kubernetes.io/part-of: core-systems
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: avm-core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: avm-core
+        app.kubernetes.io/component: engine
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/vpn: runtime/default
+        container.apparmor.security.beta.kubernetes.io/app: runtime/default
+    spec:
+      # Поднимайте без токена SA по умолчанию
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: vpn-entrypoint
+          configMap:
+            name: vpn-sidecar-entrypoint
+            defaultMode: 0755
+        - name: vpn-creds
+          secret:
+            secretName: vpn-credentials
+        - name: vpn-ready
+          emptyDir: {}
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        - name: tmp
+          emptyDir: {}
+      containers:
+        # ---------------------------
+        # Приложение (пример)
+        # ---------------------------
+        - name: app
+          image: ghcr.io/your-org/avm-core:1.0.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ENV
+              value: prod
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+        # ---------------------------
+        # VPN sidecar (универсальный)
+        # ---------------------------
+        - name: vpn
+          # Требуется образ с bash, iproute2 и вашим VPN‑клиентом (wg-quick или openvpn)
+          image: ghcr.io/your-org/vpn-client:stable
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/entrypoint.d/entrypoint.sh"]
+          env:
+            # Задайте команды запуска/остановки для вашего клиента VPN:
+            # WireGuard (пример):  VPN_UP_CMD="wg-quick up /etc/vpn/wg0.conf"
+            #                     VPN_DOWN_CMD="wg-quick down /etc/vpn/wg0.conf"
+            # OpenVPN  (пример):  VPN_UP_CMD="openvpn --config /etc/vpn/client.ovpn --daemon"
+            #                     VPN_DOWN_CMD="pkill -TERM openvpn"
+            - name: VPN_UP_CMD
+              value: "wg-quick up /etc/vpn/wg0.conf"
+            - name: VPN_DOWN_CMD
+              value: "wg-quick down /etc/vpn/wg0.conf"
+            - name: VPN_IFACE
+              value: "tun0"
+          securityContext:
+            runAsUser: 0               # требуется для NET_ADMIN и /dev/net/tun
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: vpn-entrypoint
+              mountPath: /entrypoint.d
+            - name: vpn-creds
+              mountPath: /etc/vpn
+              readOnly: true
+            - name: vpn-ready
+              mountPath: /vpn-ready
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            exec:
+              command: ["bash", "-ec", 'ip link show dev "${VPN_IFACE:-tun0}" >/dev/null 2>&1 && test -f /vpn-ready/ready' ]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["bash", "-ec", 'ip link show dev "${VPN_IFACE:-tun0}" >/dev/null 2>&1' ]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3

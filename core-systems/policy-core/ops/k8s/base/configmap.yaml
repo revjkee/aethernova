@@ -1,0 +1,245 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: policy-core-config
+  namespace: policy-core
+  labels:
+    app.kubernetes.io/name: policy-core
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/component: pdp
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # Измените checksum при обновлении бандла/схемы — это форсит рестарт подов через аннотирование Deployment.
+    neurocity.io/config-checksum: "sha256:REPLACE_ME"
+data:
+  app.yaml: |
+    # Основная конфигурация PDP (Policy Decision Point)
+    server:
+      http:
+        bind: 0.0.0.0
+        port: 8080
+        request_timeout_ms: 5000
+      grpc:
+        enabled: false
+        port: 9090
+    security:
+      default_deny: true            # Отказ по умолчанию
+      deny_overrides: true          # Любой deny перекрывает allow
+      max_ast_depth: 32
+      eval_time_budget_ms: 20       # Ограничение времени оценки одной решаемой политики
+      allowed_predicates:           # Белый список предикатов движка
+        - eq
+        - ne
+        - gt
+        - ge
+        - lt
+        - le
+        - in
+        - not_in
+        - regex_match
+        - any
+        - all
+        - none
+        - time_between
+        - ip_in_cidr
+        - geo_in
+        - device_risk_below
+        - mfa_required
+    policy:
+      bundle:
+        # Один из вариантов источника бандла:
+        #   type: file + path     — локальный том (ConfigMap/Secret/PVC)
+        #   type: http + url      — удалённый артефакт (например, объект в storage)
+        #   type: oci + ref       — артефакт в OCI-реестре (oras)
+        source:
+          type: file
+          path: /etc/policy-core/bundle
+        # Требовать подписанный бандл (Ed25519/GPG). Публичный ключ монтируется из Secret.
+        require_signature: true
+        public_keys:
+          - /etc/policy-core/keys/policy-pubkey.pem
+        refresh:
+          enabled: true
+          interval_sec: 60
+          jitter_sec: 10
+      schema:
+        path: /etc/policy-core/schemas/policy.schema.json
+      sort_order: "priority_desc,created_at_asc,id_asc"
+    caching:
+      decision_cache:
+        enabled: true
+        ttl_sec: 5
+        max_entries: 50000
+      compiled_policy_cache:
+        enabled: true
+        ttl_sec: 300
+        max_entries: 1024
+    telemetry:
+      logging:
+        config_path: /etc/policy-core/logging.yaml
+      metrics:
+        prometheus:
+          enabled: true
+          bind: 0.0.0.0
+          port: 9092
+          path: /metrics
+      tracing:
+        opentelemetry:
+          enabled: true
+          exporter: otlp
+          endpoint: http://otel-collector.otel:4317
+          service_name: policy-core-pdp
+          sample_ratio: 0.05
+    audit:
+      sink:
+        type: file
+        path: /var/log/policy-core/audit.jsonl
+      fields:
+        include:
+          - ts
+          - trace_id
+          - subject.id
+          - subject.roles
+          - resource.type
+          - action
+          - decision
+          - policy_id
+          - bundle_checksum
+        redact:
+          - subject.attrs.ssn
+          - subject.attrs.token
+    cors:
+      enabled: true
+      allow_origins: ["*"]
+      allow_methods: ["GET","POST","OPTIONS"]
+      allow_headers: ["Authorization","Content-Type","X-Request-ID"]
+      max_age_sec: 600
+
+  logging.yaml: |
+    version: 1
+    disable_existing_loggers: false
+    formatters:
+      json:
+        "()": pythonjsonlogger.jsonlogger.JsonFormatter
+        fmt: "%(asctime)s %(levelname)s %(name)s %(message)s"
+      text:
+        format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+        datefmt: "%Y-%m-%dT%H:%M:%S%z"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: json
+        level: INFO
+        stream: ext://sys.stdout
+      file:
+        class: logging.handlers.RotatingFileHandler
+        formatter: json
+        level: INFO
+        filename: /var/log/policy-core/app.log
+        maxBytes: 5242880
+        backupCount: 3
+        encoding: utf-8
+      audit:
+        class: logging.handlers.RotatingFileHandler
+        formatter: json
+        level: INFO
+        filename: /var/log/policy-core/audit.log
+        maxBytes: 10485760
+        backupCount: 5
+        encoding: utf-8
+    loggers:
+      policy_core:
+        level: INFO
+        handlers: [console, file]
+        propagate: false
+      policy_core.audit:
+        level: INFO
+        handlers: [console, audit]
+        propagate: false
+    root:
+      level: WARNING
+      handlers: [console]
+
+  policy.schema.json: |
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://neurocity/policy.schema.json",
+      "type": "object",
+      "required": ["version","id","effect","resources","actions"],
+      "properties": {
+        "version": { "type": "integer", "minimum": 1 },
+        "id": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "priority": { "type": "integer", "minimum": 0, "default": 0 },
+        "effect": { "enum": ["allow","deny"] },
+        "subjects": {
+          "type": "object",
+          "properties": {
+            "ids": { "type": "array", "items": { "type": "string" } },
+            "roles": { "type": "array", "items": { "type": "string" } },
+            "attrs": { "type": "object", "additionalProperties": true }
+          },
+          "additionalProperties": false
+        },
+        "resources": {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "type": "string", "minLength": 1 },
+            "ids":  { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        },
+        "actions": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
+        "conditions": { "type": "object" },
+        "obligations": { "type": "array", "items": {} },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    }
+
+  bundle.manifest.json: |
+    {
+      "version": 1,
+      "id": "bundle-example",
+      "created_at": "1970-01-01T00:00:00Z",
+      "count": 0,
+      "signature": ""
+    }
+
+  source.oci.yaml: |
+    # Альтернативная декларация источника бандла из OCI-реестра
+    kind: PolicyBundleSource
+    apiVersion: policy.neurocity.io/v1alpha1
+    source:
+      type: oci
+      ref: registry.example.com/policy-core/bundles:1.0.0
+      auth:
+        type: env                       # COSIGN_EXPERIMENTAL=1 / стандартный регистровый логин
+      refresh:
+        interval_sec: 60
+        backoff:
+          initial_ms: 500
+          max_ms: 5000
+          factor: 2.0
+
+  README: |
+    Этот ConfigMap монтируется в контейнер policy-core как:
+      /etc/policy-core/app.yaml
+      /etc/policy-core/logging.yaml
+      /etc/policy-core/schemas/policy.schema.json
+      /etc/policy-core/bundle/manifest.json
+      /etc/policy-core/source.oci.yaml
+
+    Обновление:
+      - измените содержимое и пересоберите checksum в аннотации neurocity.io/config-checksum
+      - примените обновление; Deployment должен иметь стратегию перезапуска по изменению аннотаций
+
+    Безопасность:
+      - публичные ключи для проверки подписи храните в Secret и монтируйте в /etc/policy-core/keys
+      - сам бандл политик может быть в отдельном ConfigMap/Secret/CSI-томе и монтироваться в /etc/policy-core/bundle

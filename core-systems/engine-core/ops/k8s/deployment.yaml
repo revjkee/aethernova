@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engine-core
+  namespace: backend
+  labels:
+    app: engine-core
+    tier: backend
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: engine-core
+  template:
+    metadata:
+      labels:
+        app: engine-core
+        tier: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+        checksum/config: "{{ .Values.configChecksum }}" # Helm/Kustomize support
+    spec:
+      serviceAccountName: engine-core-sa
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext:
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -zv postgres 5432; do echo waiting for db; sleep 2; done']
+      containers:
+        - name: engine-core
+          image: ghcr.io/your-org/engine-core:latest
+          imagePullPolicy: Always
+          command: ["./ops/docker/entrypoint.sh"]
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: engine-core-secrets
+            - configMapRef:
+                name: engine-core-config
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 5
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          volumeMounts:
+            - name: app-logs
+              mountPath: /var/log/engine-core
+              readOnly: false
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: app-logs
+          emptyDir:
+            medium: ""

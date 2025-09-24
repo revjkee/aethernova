@@ -1,0 +1,351 @@
+# k8s-observability/prometheus-stack/values/base.yaml
+# Chart: kube-prometheus-stack (prometheus-community)
+# Профиль: production-grade, безопасные дефолты, без секретов (секреты — через External Secrets/SealedSecrets)
+
+############################################
+# Глобальные метки и селекторы
+############################################
+global:
+  rbac:
+    create: true
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  imagePullSecrets: []         # например: [{ name: regcred }]
+  labels:
+    app.kubernetes.io/part-of: observability
+    observability.aethernova.io/profile: base
+
+############################################
+# Правила по умолчанию (алерты/запросы)
+############################################
+defaultRules:
+  create: true
+  runbookUrl: "https://runbooks.prometheus-operator.dev/"
+  rules:
+    alertmanager: true
+    etcd: true
+    general: true
+    k8s: true
+    kubeApiserver: true
+    kubeApiserverAvailability: true
+    kubeApiserverBurnrate: true
+    kubeApiserverHistogram: true
+    kubeApiserverSlos: true
+    kubeControllerManager: true
+    kubelet: true
+    kubeProxy: true
+    kubeScheduler: true
+    kubeStateMetrics: true
+    network: true
+    node: true
+    nodeExporter: true
+    prometheus: true
+    prometheusOperator: true
+    time: true
+
+############################################
+# Prometheus Operator
+############################################
+prometheusOperator:
+  enabled: true
+  manageCrds: true
+  tls:
+    enabled: true
+  admissionWebhooks:
+    enabled: true
+    patch:
+      enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 200Mi
+    limits:
+      memory: 400Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  kubeletService:
+    enabled: true
+
+############################################
+# Alertmanager
+############################################
+alertmanager:
+  enabled: true
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false
+  persistence:
+    enabled: true
+    type: pvc
+    size: 10Gi
+    storageClass: ""           # унаследовать default, переопределите при необходимости
+  alertmanagerSpec:
+    replicas: 2
+    retention: 120h
+    resources:
+      requests:
+        cpu: 100m
+        memory: 200Mi
+      limits:
+        memory: 512Mi
+    securityContext:
+      runAsNonRoot: true
+      fsGroup: 2000
+      seccompProfile:
+        type: RuntimeDefault
+    podMetadata:
+      labels:
+        app.kubernetes.io/component: alertmanager
+    podAntiAffinity: soft
+    tolerations: []
+    nodeSelector: {}
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+          storageClassName: ""
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ["alertname", "namespace"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+      receiver: "null"
+      routes:
+        - matchers:
+            - severity="critical"
+          receiver: "null"
+          continue: true
+    receivers:
+      - name: "null"
+    inhibit_rules:
+      - source_matchers: ['severity="critical"']
+        target_matchers: ['severity=~"warning|info"']
+        equal: ["alertname", "namespace"]
+
+  networkPolicy:
+    enabled: true
+    allowExternal: false
+
+############################################
+# Prometheus
+############################################
+prometheus:
+  enabled: true
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false
+  prometheusSpec:
+    replicas: 2
+    shards: 1
+    retention: 15d
+    retentionSize: "80%"
+    enableAdminAPI: false
+    walCompression: true
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+    externalLabels:
+      cluster: "main"
+      env: "prod"
+    ruleSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 100Gi
+          storageClassName: ""    # переопределите при необходимости
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        memory: 4Gi
+    securityContext:
+      runAsNonRoot: true
+      fsGroup: 2000
+      seccompProfile:
+        type: RuntimeDefault
+    podMetadata:
+      labels:
+        app.kubernetes.io/component: prometheus
+    podAntiAffinity: hard
+    tolerations: []
+    nodeSelector: {}
+    thanos:
+      create: false              # включайте в overlay (prod/ha) + objectStorageConfig
+    additionalScrapeConfigs: []  # используйте через secretRef в overlay
+  networkPolicy:
+    enabled: true
+    allowExternal: false
+
+############################################
+# Grafana
+############################################
+grafana:
+  enabled: true
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false
+  admin:
+    existingSecret: "grafana-admin"     # создайте секрет отдельно
+    userKey: admin-user
+    passwordKey: admin-password
+  persistence:
+    enabled: true
+    type: pvc
+    size: 20Gi
+    storageClassName: ""
+    accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  env:
+    GF_ANALYTICS_REPORTING_ENABLED: "false"
+    GF_SECURITY_ALLOW_EMBEDDING: "true"
+    GF_AUTH_ANONYMOUS_ENABLED: "false"
+  grafana.ini:
+    security:
+      allow_embedding: true
+      cookie_secure: true
+      cookie_samesite: strict
+    server:
+      root_url: "%(protocol)s://%(domain)s/"
+    auth.anonymous:
+      enabled: false
+    users:
+      viewers_can_edit: false
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      provider:
+        foldersFromFilesStructure: true
+    datasources:
+      enabled: true
+      defaultDatasourceEnabled: true
+      isDefaultDatasource: true
+      uid: prometheus
+      annotations:
+        enabled: true
+  plugins:
+    - grafana-piechart-panel
+    - grafana-worldmap-panel
+  networkPolicy:
+    enabled: true
+    allowExternal: false
+  podSecurityContext:
+    runAsNonRoot: true
+    fsGroup: 472
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+
+############################################
+# kube-state-metrics
+############################################
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 150Mi
+    limits:
+      memory: 300Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+############################################
+# node-exporter
+############################################
+prometheus-node-exporter:
+  hostNetwork: true
+  hostPID: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  tolerations:
+    - operator: "Exists"    # DaemonSet на всех нодах
+  updateStrategy:
+    type: RollingUpdate
+
+############################################
+# Встроенные ServiceMonitors/PodMonitors
+############################################
+kubeApiServer:
+  enabled: true
+kubeControllerManager:
+  enabled: true
+kubeScheduler:
+  enabled: true
+kubeProxy:
+  enabled: true
+kubeEtcd:
+  enabled: true
+kubelet:
+  enabled: true
+
+############################################
+# PodDisruptionBudgets (устойчивость)
+############################################
+alertmanagerPDB:
+  enabled: true
+  minAvailable: 1
+
+prometheusPDB:
+  enabled: true
+  minAvailable: 1
+
+grafana:
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+############################################
+# NetworkPolicies для core-компонентов
+############################################
+networkPolicy:
+  enabled: true
+  allowExternal: false
+
+############################################
+# Дополнительно: метки/аннотации
+############################################
+additionalLabels:
+  observability.aethernova.io/stack: kube-prometheus-stack
+
+additionalAnnotations: {}

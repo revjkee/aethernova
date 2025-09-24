@@ -1,0 +1,166 @@
+// file: policy-core/configs/policies/cel/expressions.cel
+// Входные атрибуты (map-like), ожидаемые движком policy-core:
+//   sub.*  : id, tenants (list<string>), role, clearance, mfa(bool),
+//            device.posture, risk.score (0..100), scopes(list<string>)
+//   res.*  : id, type, owner_tenant, classification, tags.pii(list<string>), legal_hold(bool)
+//   act.*  : name, export.format
+//   env.*  : ip, country, time(ISO8601), network.label, purpose, breakglass.ticket
+//
+// Решение возвращается как map с полями: effect("Permit"|"Deny"),
+// deny_matches, permit_matches, obligations(list<map>), deny_reasons(list<map>).
+
+// ---------- Константы и ранги ----------
+let classification_rank = {
+  "public": 0,
+  "internal": 1,
+  "confidential": 2,
+  "secret": 3
+};
+
+let high_risk_countries = ["CU", "IR", "KP", "SY"];
+let trusted_net_labels  = ["corp", "vpn"];
+let allowed_export_formats = ["csv", "parquet", "jsonl"];
+
+let hour = timestamp(env.time).getHours();
+let business_hours = hour >= 8 && hour < 20;
+
+// ---------- Вспомогательные булевы условия ----------
+let clearance_dominates =
+  classification_rank[sub.clearance] >= classification_rank[res.classification];
+
+let is_tenant_scoped =
+  sub.role == "admin" ||
+  sub.tenants.exists(t, t == res.owner_tenant);
+
+let is_trusted_network =
+  env.network.label in trusted_net_labels;
+// Примечание: при наличии расширений сети можно добавить IP-проверку CIDR.
+
+let non_high_risk_country = !(env.country in high_risk_countries);
+let device_compliant = sub.device.posture == "managed";
+let low_risk_user = sub.risk.score < 80;
+let high_risk_user = !low_risk_user;
+
+let pii_count = size(res.tags.pii);
+
+// MFA: для чувствительных данных требуется либо MFA, либо класс "public"
+let mfa_ok_for_sensitive = (res.classification == "public") || sub.mfa;
+
+// ---------- Политики P0..P10 ----------
+let P0_deny_high_risk =
+  high_risk_user;
+
+let P1_geo_block_sensitive =
+  !is_trusted_network && !non_high_risk_country &&
+  ((res.classification in ["confidential", "secret"]) || (pii_count > 0));
+
+let P2_mfa_sensitive_mutations =
+  (act.name in ["write", "delete"]) &&
+  (res.classification in ["confidential", "secret"]) &&
+  !mfa_ok_for_sensitive;
+
+let P3_allow_read_internal =
+  act.name == "read" &&
+  (res.classification in ["public", "internal"]) &&
+  is_tenant_scoped && device_compliant && low_risk_user;
+
+let P4_allow_read_confidential =
+  act.name == "read" &&
+  res.classification == "confidential" &&
+  clearance_dominates && is_tenant_scoped && device_compliant && low_risk_user;
+
+// Для P4 маскирование требуется, если не admin/dpo/compliance и не владелец
+let P4_mask_needed =
+  P4_allow_read_confidential &&
+  !((sub.role in ["admin", "dpo", "compliance"]) || (sub.id == res.owner_tenant));
+
+let P5_restrict_export_pii =
+  act.name == "export" &&
+  pii_count >= 1 &&
+  (sub.role in ["dpo", "compliance"]) &&
+  env.purpose == "analytics" &&
+  (act.export.format in allowed_export_formats) &&
+  clearance_dominates && is_tenant_scoped;
+
+let P6_training_non_pii =
+  env.purpose == "training" &&
+  act.name == "read" &&
+  pii_count == 0 &&
+  is_tenant_scoped;
+
+let P7_legal_hold_delete_block =
+  act.name == "delete" &&
+  res.legal_hold == true;
+
+let P8_s2s_evaluate =
+  sub.role == "service" &&
+  sub.scopes.exists(s, s == "policy.evaluate") &&
+  act.name == "evaluate" &&
+  is_trusted_network && low_risk_user;
+
+let P9_admin_breakglass =
+  sub.role == "admin" &&
+  env.breakglass.ticket != "" &&
+  low_risk_user;
+
+let P10_business_hours_guard =
+  (act.name in ["write", "approve", "publish"]) &&
+  !business_hours &&
+  !is_trusted_network;
+
+// ---------- Агрегация deny-overrides ----------
+let deny_rules = [
+  {"id":"P0-deny-high-risk",           "m": P0_deny_high_risk,          "reason":{"code":"HIGH_RISK","message":"User risk too high"}},
+  {"id":"P1-geo-block-sensitive",      "m": P1_geo_block_sensitive,     "reason":{"code":"GEO_BLOCK","message":"Access from high-risk country disallowed"}},
+  {"id":"P2-mfa-sensitive-mutations",  "m": P2_mfa_sensitive_mutations, "reason":{"code":"MFA_REQUIRED","message":"MFA required for sensitive mutation"}},
+  {"id":"P7-legal-hold",               "m": P7_legal_hold_delete_block, "reason":{"code":"LEGAL_HOLD","message":"Deletion blocked by legal hold"}},
+  {"id":"P10-business-hours-guard",    "m": P10_business_hours_guard,   "reason":{"code":"OFF_HOURS","message":"Write outside business hours from untrusted network"}}
+];
+
+let permit_rules = [
+  {"id":"P3-allow-read-internal",      "m": P3_allow_read_internal},
+  {"id":"P4-allow-read-confidential",  "m": P4_allow_read_confidential},
+  {"id":"P5-restrict-export-pii",      "m": P5_restrict_export_pii},
+  {"id":"P6-purpose-training-non-pii", "m": P6_training_non_pii},
+  {"id":"P8-service-to-service-eval",  "m": P8_s2s_evaluate},
+  {"id":"P9-admin-breakglass",         "m": P9_admin_breakglass}
+];
+
+// Сработавшие deny/permit
+let deny_matches   = deny_rules.filter(r, r.m).map(r, r.id);
+let deny_reasons   = deny_rules.filter(r, r.m).map(r, r.reason);
+let permit_matches = permit_rules.filter(r, r.m).map(r, r.id);
+
+// Эффект по алгоритму deny-overrides (и deny-by-default при отсутствии матчей)
+let effect = (size(deny_matches) > 0) ? "Deny"
+            : (size(permit_matches) > 0 ? "Permit" : "Deny");
+
+// ---------- Рекомендуемые обязательства (для исполнителя) ----------
+let need_mask_default =
+  P3_allow_read_internal || P4_mask_needed || P5_restrict_export_pii;
+
+let need_redact_pii = P4_mask_needed;   // при P4 для неуполномоченных
+let need_watermark  = P3_allow_read_internal || P4_allow_read_confidential || P5_restrict_export_pii || P6_training_non_pii;
+let need_notify_dlp = P5_restrict_export_pii;
+let need_breakglass = P9_admin_breakglass;
+
+// Формируем obligations как список карт (чтобы исполнитель мог маппить обработчики)
+let obligations = [
+  // Базовый аудит всегда
+  {"kind":"audit","level":"info"}
+]
++ (need_mask_default ? [{"kind":"mask","profile":"default"}] : [])
++ (need_redact_pii   ? [{"kind":"redact","scope":"pii"}]      : [])
++ (need_watermark    ? [{"kind":"watermark","text":"policy-core"}] : [])
++ (need_notify_dlp   ? [{"kind":"notify","channel":"dlp","severity":"high"}] : [])
++ (need_breakglass   ? [{"kind":"annotate","field":"breakglass","ticket":env.breakglass.ticket}] : []);
+
+// ---------- Итоговый объект решения ----------
+{
+  "id": "policy-core.cel.v1",
+  "effect": effect,
+  "deny_matches": deny_matches,
+  "permit_matches": permit_matches,
+  "obligations": obligations,
+  "deny_reasons": deny_reasons
+}

@@ -1,0 +1,165 @@
+# path: omnimind-core/ops/ansible/roles/omnimind-core/tasks/selinux.yml
+---
+# ============================================================
+# SELinux configuration for omnimind-core (industrial-grade)
+# Controls SELinux state, booleans and fcontexts with idempotency.
+#
+# Expected role variables (configure in defaults/main.yml):
+#   omnimind_core_selinux_manage: true
+#   omnimind_core_selinux_state: "enforcing"   # enforcing|permissive|disabled
+#   omnimind_core_selinux_policy: "targeted"
+#   omnimind_core_selinux_auto_reboot: false   # reboot if mode change requires it
+#   omnimind_core_selinux_booleans: []         # list of { name: <bool>, state: "on"/"off", persistent: true }
+#   omnimind_core_selinux_fcontexts: []        # list of { target: "/path(/.*)?", setype: "httpd_sys_rw_content_t", ftype: "a" }
+#   omnimind_core_selinux_restorecon_paths: [] # list of paths for restorecon (deduplicated)
+#
+# Example (in vars):
+#   omnimind_core_selinux_booleans:
+#     - { name: "httpd_can_network_connect", state: "on", persistent: true }
+#     - { name: "container_manage_cgroup", state: "on", persistent: true }
+#   omnimind_core_selinux_fcontexts:
+#     - { target: "/var/lib/omnimind-core(/.*)?", setype: "container_file_t", ftype: "a" }
+#     - { target: "/var/log/omnimind-core(/.*)?",   setype: "var_log_t",        ftype: "a" }
+#   omnimind_core_selinux_restorecon_paths:
+#     - "/var/lib/omnimind-core"
+#     - "/var/log/omnimind-core"
+# ============================================================
+
+- name: "SELinux | Preconditions | manage flag"
+  ansible.builtin.assert:
+    that:
+      - (omnimind_core_selinux_manage | default(true) | bool) == true
+    fail_msg: "SELinux management disabled by omnimind_core_selinux_manage=false"
+    success_msg: "SELinux management enabled"
+  changed_when: false
+  when: omnimind_core_selinux_manage | default(true) | bool
+
+- name: "SELinux | Preconditions | family gating"
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.os_family in ['RedHat', 'Fedora', 'Suse'] or (ansible_facts.selinux is defined)
+    fail_msg: "This taskfile targets SELinux-enabled distros (RHEL/Fedora/SUSE)."
+    success_msg: "SELinux-capable system detected"
+  changed_when: false
+  when: omnimind_core_selinux_manage | default(true) | bool
+
+- name: "SELinux | Validate desired state"
+  ansible.builtin.assert:
+    that:
+      - omnimind_core_selinux_state | default('enforcing') in ['enforcing','permissive','disabled']
+      - omnimind_core_selinux_policy | default('targeted') in ['targeted','mls']
+    fail_msg: "Invalid omnimind_core_selinux_state or omnimind_core_selinux_policy"
+  changed_when: false
+
+# --------- Ensure required tooling (EL/Fedora paths) ---------
+
+- name: "SELinux | Determine python utils package for EL"
+  ansible.builtin.set_fact:
+    _selinux_pyutils_pkg: >-
+      {{ 'policycoreutils-python-utils'
+         if (ansible_facts.os_family == 'RedHat' and (ansible_facts.distribution_major_version | default(8) | int) >= 8)
+         else 'policycoreutils-python' }}
+  when: ansible_facts.os_family == 'RedHat'
+
+- name: "SELinux | Install required packages"
+  ansible.builtin.package:
+    name: >-
+      {{ [
+        'policycoreutils',
+        (_selinux_pyutils_pkg | default('policycoreutils-python-utils')),
+        'libsemanage',
+        'libselinux-utils',
+        'selinux-policy',
+        'selinux-policy-targeted'
+      ] }}
+    state: present
+  when:
+    - omnimind_core_selinux_manage | default(true) | bool
+    - ansible_facts.os_family in ['RedHat','Fedora']
+
+# --------- Apply SELinux mode (idempotent) ---------
+
+- name: "SELinux | Apply state and policy"
+  ansible.posix.selinux:
+    policy: "{{ omnimind_core_selinux_policy | default('targeted') }}"
+    state:  "{{ omnimind_core_selinux_state  | default('enforcing') }}"
+  register: _selinux_mode
+  when: omnimind_core_selinux_manage | default(true) | bool
+
+- name: "SELinux | Reboot if required by mode change"
+  ansible.builtin.reboot:
+    msg: "Rebooting to apply SELinux mode change (managed by omnimind-core role)."
+    reboot_timeout: 900
+    connect_timeout: 30
+    pre_reboot_delay: 5
+    post_reboot_delay: 15
+    test_command: "getenforce"
+  when:
+    - omnimind_core_selinux_manage | default(true) | bool
+    - _selinux_mode is defined
+    - (_selinux_mode.reboot_required | default(false)) | bool
+    - omnimind_core_selinux_auto_reboot | default(false) | bool
+
+# --------- Apply SELinux booleans ---------
+
+- name: "SELinux | Apply sebooleans (persistent)"
+  ansible.posix.seboolean:
+    name: "{{ item.name }}"
+    state: "{{ item.state | default('on') }}"
+    persistent: "{{ item.persistent | default(true) | bool }}"
+  loop: "{{ omnimind_core_selinux_booleans | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - omnimind_core_selinux_manage | default(true) | bool
+    - (omnimind_core_selinux_booleans | default([])) | length > 0
+
+# --------- Register persistent fcontexts ---------
+
+- name: "SELinux | Register fcontext rules (sefcontext)"
+  ansible.posix.sefcontext:
+    target: "{{ item.target }}"
+    setype: "{{ item.setype }}"
+    ftype: "{{ item.ftype | default('a') }}"
+    state: present
+  loop: "{{ omnimind_core_selinux_fcontexts | default([]) }}"
+  loop_control:
+    label: "{{ item.target }} -> {{ item.setype }}"
+  when:
+    - omnimind_core_selinux_manage | default(true) | bool
+    - (omnimind_core_selinux_fcontexts | default([])) | length > 0
+
+# --------- Restore contexts deterministically ---------
+
+- name: "SELinux | Build unique restorecon path list"
+  ansible.builtin.set_fact:
+    _restorecon_paths: "{{ (omnimind_core_selinux_restorecon_paths | default([])) | unique | list }}"
+  when:
+    - omnimind_core_selinux_manage | default(true) | bool
+
+- name: "SELinux | restorecon paths (recursive, verbose on change)"
+  ansible.builtin.command:
+    cmd: "restorecon -ir {{ item }}"
+  register: _restorecon_out
+  changed_when: "_restorecon_out.stdout is search('^restorecon') or _restorecon_out.rc == 0 and (_restorecon_out.stdout | length) > 0"
+  failed_when: "_restorecon_out.rc not in [0]"
+  loop: "{{ _restorecon_paths | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - omnimind_core_selinux_manage | default(true) | bool
+    - (_restorecon_paths | default([])) | length > 0
+
+# --------- Report (debug, optional) ---------
+
+- name: "SELinux | Summary"
+  ansible.builtin.debug:
+    msg:
+      state_applied: "{{ omnimind_core_selinux_state | default('enforcing') }}"
+      policy: "{{ omnimind_core_selinux_policy | default('targeted') }}"
+      reboot_required: "{{ _selinux_mode.reboot_required | default(false) }}"
+      booleans_count: "{{ (omnimind_core_selinux_booleans | default([])) | length }}"
+      fcontexts_count: "{{ (omnimind_core_selinux_fcontexts | default([])) | length }}"
+      restorecon_paths_count: "{{ (_restorecon_paths | default([])) | length }}"
+  changed_when: false
+  when: omnimind_core_selinux_manage | default(true) | bool

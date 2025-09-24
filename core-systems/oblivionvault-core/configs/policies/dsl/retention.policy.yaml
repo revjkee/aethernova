@@ -1,0 +1,400 @@
+apiVersion: policies.oblivionvault.aethernova.io/v1
+kind: RetentionPolicyDSL
+metadata:
+  name: retention-dsl
+  owner: platform-security-core
+  labels:
+    project: oblivionvault-core
+    module: data-governance
+    managed-by: gitops
+  annotations:
+    description: "Промышленная DSL для политик хранения/очистки с безопасными гард-правилами."
+    change-control: "PR + Security review"
+    compliance.refs: "GDPR, ISO 27001, SOC2, PCI-DSS (если применимо)"
+
+spec:
+  dsl:
+    name: "retention"
+    version: "1.0.0"
+    semantics:
+      evalOrder:
+        - resolve.env
+        - expand.includes
+        - expand.macros
+        - validate.schema
+        - compute.overrides
+        - enforce.safeguards
+        - plan.actions
+        - render.backends
+      precedence: ["rule", "policySet", "environment", "global"]
+      safetyGuards:
+        - name: deny-when-legal-hold
+          condition: "ctx.legalHold.active == true"
+          reason: "Legal hold is active"
+        - name: deny-dryrun-in-prod
+          condition: "ctx.env == 'prod' and ctx.flags.dryRun == true"
+          reason: "Dry-run forbidden in prod"
+        - name: deny-global-disabled
+          condition: "ctx.flags.enabled == false"
+          reason: "Retention engine disabled"
+      limits:
+        maxDeletePerRun:
+          loki: "500Gi"
+          elasticsearch: "2Ti"
+          s3: "5Ti"
+          clickhouse: "1Ti"
+        maxIndexDropPerRun:
+          elasticsearch: 2
+          clickhouse: 0
+    types:
+      Duration: "regex:^(\\d+)(s|m|h|d|w|M|y)$"
+      Size: "regex:^(\\d+)(Ki|Mi|Gi|Ti)$"
+      Cron: "regex:^(@(yearly|monthly|weekly|daily|hourly)|((\\d+|\\*)\\s+){4}(\\d+|\\*))$"
+      LabelKey: "regex:^[a-zA-Z_][a-zA-Z0-9_:-]{0,62}$"
+      LabelVal: "regex:^[^\\n]{0,256}$"
+      Env: { enum: ["prod", "staging", "dev"] }
+    operators:
+      logical: ["and","or","not"]
+      compare: ["==","!=",">",">=","<","<=","in","contains","matches"]
+    functions:
+      - name: now
+        signature: "now() -> timestamp"
+      - name: age
+        signature: "age(timestamp) -> Duration"
+      - name: size_bytes
+        signature: "size_bytes(Size) -> number"
+      - name: env
+        signature: "env() -> Env"
+      - name: has_tag
+        signature: "has_tag(resource, tag: string) -> bool"
+      - name: label
+        signature: "label(resource, key: LabelKey) -> LabelVal"
+
+  globals:
+    flags:
+      enabled: true
+      dryRun: false
+    defaults:
+      rpo: "15m"
+      rto: "30m"
+      softDeleteGrace: "72h"
+      piiTiers:
+        - { tag: "PII_LOW",  ttl: "90d",  purge: "tombstone" }
+        - { tag: "PII_MED",  ttl: "30d",  purge: "redact" }
+        - { tag: "PII_HIGH", ttl: "14d",  purge: "shred" }
+    approval:
+      requireChangeTicket: true
+      approvers: ["secops@oblivionvault.local", "dpo@oblivionvault.local"]
+      minApprovals: 2
+    audit:
+      sink: { type: "loki", target: "loki://audit-retention" }
+      includeDryRun: true
+    timezone: "Europe/Stockholm"
+
+  environments:
+    - name: prod
+      constraints:
+        minReplicaBackups: 7
+        forbidPurgeOnIncident: true
+      overrides:
+        rpo: "5m"
+        rto: "15m"
+        softDeleteGrace: "120h"
+        approval:
+          minApprovals: 2
+    - name: staging
+      constraints: { minReplicaBackups: 3 }
+      overrides:
+        rpo: "15m"
+        rto: "30m"
+        approval:
+          minApprovals: 1
+    - name: dev
+      constraints: {}
+      overrides:
+        rpo: "30m"
+        rto: "60m"
+        approval:
+          requireChangeTicket: false
+          minApprovals: 0
+
+  library:
+    includes: []  # внешние policy-файлы при необходимости
+    macros:
+      - name: ttl_by_label
+        params: ["labelKey","labelVal","ttl"]
+        expand:
+          match:
+            all:
+              - eq: ["${labelKey}", "${labelVal}"]
+          action:
+            ttl: "${ttl}"
+      - name: sec_stream_longterm
+        params: ["ttl","compactionGi"]
+        expand:
+          action:
+            ttl: "${ttl}"
+            loki:
+              compaction:
+                enabled: true
+                max_target_bytes: "${compactionGi}Gi"
+
+    presets:
+      - name: pii_tier_rules
+        rules:
+          - name: redact-pii-med
+            where: { any: [ { tag: "PII_MED" } ] }
+            action: { ttl: "30d", purge: { strategy: "redact", columns: ["email","phone","address"] } }
+          - name: shred-pii-high
+            where: { any: [ { tag: "PII_HIGH" } ] }
+            action: { ttl: "14d", purge: { strategy: "shred" } }
+
+  policySets:
+    - name: observability-defaults
+      description: "Базовые правила для метрик/логов/трейсов"
+      rules:
+        - name: metrics-default
+          target: { kind: "prometheus.metrics" }
+          match: { any: [ { label: { key: "workspace", value: "oblivionvault-core" } } ] }
+          action:
+            ttl: "30d"
+            prometheus:
+              wal:
+                max_age: "48h"
+                max_size: "15Gi"
+              remote_write:
+                lts: { type: "thanos", bucket: "obv-metrics-lts", ttl: "400d" }
+
+        - name: logs-app
+          target: { kind: "loki.stream" }
+          match: { any: [ { label: { key: "namespace", value: "oblivionvault" } } ] }
+          action:
+            ttl: "14d"
+            loki:
+              compaction: { enabled: true, max_target_bytes: "2Gi" }
+
+        - name: logs-sec
+          target: { kind: "loki.stream" }
+          match: { any: [ { label: { key: "sec", value: "true" } } ] }
+          use: { macro: "sec_stream_longterm", args: { ttl: "365d", compactionGi: 10 } }
+
+        - name: traces-default
+          target: { kind: "tempo.traces" }
+          match: { any: [ { label: { key: "service", value: "*" } } ] }
+          action:
+            ttl: "7d"
+            tempo:
+              tail_sampling:
+                error_spans: { percent: 100, min_ttl: "30d" }
+                p95_latency: { percentile_ms: 1000, sample_percent: 100, min_ttl: "14d" }
+
+    - name: data-platform-defaults
+      description: "Хранилища и очереди"
+      rules:
+        - name: es-default-logs
+          target: { kind: "elasticsearch.index" }
+          match: { any: [ { index: "logs-*" } ] }
+          action:
+            elasticsearch:
+              ilm:
+                hot:  { rollover: { max_age: "1d", max_size: "50gb" } }
+                warm: { min_age: "7d",  forcemerge: { max_num_segments: 1 } }
+                cold: { min_age: "30d", freeze: true }
+                delete: { min_age: "90d" }
+
+        - name: es-sec
+          target: { kind: "elasticsearch.index" }
+          match: { any: [ { index: "sec-*" } ] }
+          action:
+            elasticsearch:
+              ilm:
+                hot:  { rollover: { max_age: "1d", max_size: "30gb" } }
+                cold: { min_age: "180d", migrate: { tier: "cold" } }
+                delete: { min_age: "365d" }
+
+        - name: ch-ledger
+          target: { kind: "clickhouse.table", db: "ov_ledger", table: "tx_events" }
+          action:
+            clickhouse:
+              ttl: "event_time + INTERVAL 365 DAY DELETE"
+              moves:
+                - { to: "ssd", when: "age(event_time) < INTERVAL 30 DAY" }
+                - { to: "hdd", when: "age(event_time) >= INTERVAL 30 DAY" }
+
+        - name: pg-audit-events
+          target: { kind: "postgres.table", db: "oblivion_vault", schema: "audit", table: "events" }
+          action:
+            postgres:
+              soft_delete: { column: "deleted_at", grace: "120h" }
+              hard_delete: { where: "deleted_at IS NOT NULL AND now() - deleted_at > interval '120 hours'" }
+              partitioning:
+                mode: "time"
+                by: "created_at"
+                interval: "1 month"
+                keep_partitions: 24
+
+        - name: s3-backups
+          target: { kind: "s3.bucket", bucket: "obv-app-backups" }
+          action:
+            s3:
+              encryption: { kmsKeyAlias: "alias/obv-backups" }
+              lifecycle:
+                - id: "daily-backups"
+                  filter: { prefix: "daily/" }
+                  expiration: { days: 30 }
+                  transitions:
+                    - { days: 7,  storageClass: "STANDARD_IA" }
+                    - { days: 21, storageClass: "GLACIER_IR" }
+                - id: "weekly-backups"
+                  filter: { prefix: "weekly/" }
+                  expiration: { days: 180 }
+                  transitions:
+                    - { days: 14, storageClass: "GLACIER_IR" }
+                    - { days: 60, storageClass: "DEEP_ARCHIVE" }
+
+        - name: kafka-ledger-events
+          target: { kind: "kafka.topic", topic: "ov.ledger.events" }
+          action:
+            kafka:
+              retention: { time: "14d", size: "200Gi", cleanupPolicy: "delete" }
+
+  rules:
+    # Дополнительные точечные правила
+    - name: metrics-ledger-extended
+      target: { kind: "prometheus.metrics" }
+      match: { any: [ { label: { key: "job", value: "ledger-bridge" } } ] }
+      action: { ttl: "90d" }
+
+    - name: traces-ledger-30d
+      target: { kind: "tempo.traces" }
+      match: { any: [ { label: { key: "service", value: "ledger-bridge" } } ] }
+      action: { ttl: "30d" }
+
+    - name: pii-presets
+      use: { preset: "pii_tier_rules" }
+
+  bindings:
+    - name: prod-binding
+      environment: "prod"
+      apply:
+        - policySet: "observability-defaults"
+        - policySet: "data-platform-defaults"
+        - rule: "metrics-ledger-extended"
+        - rule: "traces-ledger-30d"
+        - rule: "pii-presets"
+
+    - name: staging-binding
+      environment: "staging"
+      inheritFrom: "prod-binding"
+      overrides:
+        - target: { kind: "loki.stream", name: "logs-app" }
+          action:
+            ttl: "7d"
+        - target: { kind: "prometheus.metrics", name: "metrics-default" }
+          action:
+            ttl: "14d"
+
+    - name: dev-binding
+      environment: "dev"
+      inheritFrom: "staging-binding"
+      overrides:
+        - target: { kind: "kafka.topic", topic: "ov.ledger.events" }
+          action:
+            kafka: { retention: { time: "3d", size: "20Gi", cleanupPolicy: "delete" } }
+        - target: { kind: "postgres.table", db: "oblivion_vault", schema: "audit", table: "events" }
+          action:
+            postgres:
+              soft_delete: { column: "deleted_at", grace: "24h" }
+              hard_delete: { where: "deleted_at IS NOT NULL AND now() - deleted_at > interval '24 hours'" }
+
+  generators:
+    loki:
+      map:
+        ttl: ".action.ttl"
+        compaction: ".action.loki.compaction"
+    prometheus:
+      map:
+        ttl: ".action.ttl"
+        wal: ".action.prometheus.wal"
+        remote_write: ".action.prometheus.remote_write"
+    tempo:
+      map:
+        ttl: ".action.ttl"
+        tail_sampling: ".action.tempo.tail_sampling"
+    elasticsearch:
+      map:
+        ilm: ".action.elasticsearch.ilm"
+    clickhouse:
+      map:
+        ttl: ".action.clickhouse.ttl"
+        moves: ".action.clickhouse.moves"
+    postgres:
+      map:
+        soft_delete: ".action.postgres.soft_delete"
+        hard_delete: ".action.postgres.hard_delete"
+        partitioning: ".action.postgres.partitioning"
+    s3:
+      map:
+        lifecycle: ".action.s3.lifecycle"
+        encryption: ".action.s3.encryption"
+    kafka:
+      map:
+        retention: ".action.kafka.retention"
+
+  schedules:
+    maintenanceWindows:
+      - name: nightly
+        cron: "@daily"
+      - name: weekend-heavy
+        cron: "0 3 * * 6"
+    backpressure:
+      maxConcurrentJobs: 5
+      queueDepthThreshold: 1000
+
+  tests:
+    - name: dev-logs-shorter
+      input:
+        env: "dev"
+        resource:
+          kind: "loki.stream"
+          labels: { namespace: "oblivionvault" }
+      expect:
+        ttl: "7d"
+
+    - name: prod-sec-logs-long
+      input:
+        env: "prod"
+        resource:
+          kind: "loki.stream"
+          labels: { sec: "true" }
+      expect:
+        ttl: "365d"
+        loki:
+          compaction:
+            enabled: true
+            max_target_bytes: "10Gi"
+
+    - name: prod-legal-hold-deny
+      input:
+        env: "prod"
+        ctx:
+          legalHold: { active: true }
+        resource:
+          kind: "elasticsearch.index"
+          index: "logs-2025.08.20"
+      expect:
+        deniedBy: "Legal hold is active"
+
+    - name: staging-prom-metrics-ttl
+      input:
+        env: "staging"
+        resource:
+          kind: "prometheus.metrics"
+          labels: { workspace: "oblivionvault-core" }
+      expect:
+        ttl: "14d"
+
+  schemaHints:
+    # Подсказки для валидатора/линтера, не обязательны
+    requiredRuleFields: ["name","target"]
+    allowUnknownBackendKeys: false

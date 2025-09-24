@@ -1,0 +1,227 @@
+# ledger-core/ops/otel/collector-config.yaml
+# OpenTelemetry Collector — production-grade конфигурация.
+
+receivers:
+  # OTLP приёмник для приложений (traces/metrics/logs)
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # tls (опционально)
+        # tls:
+        #   cert_file: /etc/otel/certs/tls.crt
+        #   key_file: /etc/otel/certs/tls.key
+      http:
+        endpoint: 0.0.0.0:4318
+  # Метрики хоста (для DaemonSet сценария)
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu: {}
+      load: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      network: {}
+      process: {}
+  # kubelet cAdvisor (ресурсные метрики подов/контейнеров)
+  kubeletstats:
+    collection_interval: 30s
+    auth_type: serviceAccount
+    endpoint: ${KUBELET_ENDPOINT:unix:///var/run/containerd/containerd.sock}
+    metric_groups: [container, pod, node]
+  # Сбор логов контейнеров (DaemonSet)
+  filelog:
+    include:
+      - /var/log/containers/*.log
+    start_at: beginning
+    operators:
+      - type: container
+      - type: move
+        from: attributes.stream
+        to: attributes["log.iostream"]
+      - type: move
+        from: attributes["k8s.pod.name"]
+        to: resource["k8s.pod.name"]
+      - type: move
+        from: attributes["k8s.container.name"]
+        to: resource["k8s.container.name"]
+      - type: severity_parser
+        parse_from: body
+        preserve_to: attributes["log.severity.raw"]
+
+processors:
+  batch:
+    send_batch_size: 8192
+    timeout: 5s
+  memory_limiter:
+    check_interval: 2s
+    # Лимиты динамически через env (должны быть <= ресурсных лимитов Pod)
+    limit_mib: ${OTEL_MEM_LIMIT_MIB:1024}
+    spike_limit_mib: ${OTEL_MEM_SPIKE_MIB:256}
+  resource:
+    attributes:
+      - key: service.namespace
+        from_attribute: k8s.namespace.name
+        action: upsert
+      - key: service.instance.id
+        from_attribute: k8s.pod.uid
+        action: upsert
+      - key: deployment.environment
+        value: ${DEPLOY_ENV:prod}
+        action: upsert
+  attributes/sanitize:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: db.statement.parameters
+        action: delete
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.namespace.name
+        - k8s.node.name
+        - k8s.pod.start_time
+        - k8s.container.name
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+    filter:
+      node_from_env_var: KUBE_NODE_NAME
+  # Tail sampling для контроля объёма и релевантности трейсов
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 2000
+    policies:
+      - name: error-status
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: high-latency
+        type: latency
+        latency:
+          threshold_ms: ${TRACE_SAMPLING_LATENCY_MS:500}
+      - name: services-priority
+        type: probabilistic
+        probabilistic:
+          hash_seed: 17
+          sampling_percentage: ${TRACE_SAMPLING_PERCENT:10}
+          attribute_source: trace
+  # Агрегация span->metrics
+  spanmetrics:
+    metrics_exporter: prometheus
+    histogram:
+      explicit_buckets: [1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s]
+    dimensions:
+      - name: http.method
+      - name: http.status_code
+      - name: rpc.system
+      - name: rpc.service
+      - name: rpc.method
+    namespace: otel_spanmetrics
+  transform/logs_redaction:
+    log_statements:
+      - context: log
+        statements:
+          - replace_pattern(body, `(?i)password\s*=\s*[^&\s]+`, "password=<redacted>")
+          - replace_pattern(body, `(?i)token\s*=\s*[A-Za-z0-9\.\-_]+`, "token=<redacted>")
+
+exporters:
+  # Основной OTLP экспортер (например, Tempo/Jaeger/Any OTLP)
+  otlp:
+    endpoint: ${OTLP_ENDPOINT:otel-collector.observability.svc.cluster.local:4317}
+    tls:
+      insecure: ${OTLP_INSECURE:false}
+      ca_file: ${OTLP_CA_FILE:}
+    headers:
+      x-otlp-tenant: ${OTLP_TENANT:default}
+    sending_queue:
+      enabled: true
+      num_consumers: 8
+      queue_size: 32768
+    retry_on_failure:
+      enabled: true
+      initial_interval: 100ms
+      max_interval: 5s
+      max_elapsed_time: 1m
+  # Prometheus pull endpoint для метрик (экспортёр внутри коллектора)
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: ledger_core
+  # Prometheus Remote Write (альтернатива)
+  prometheusremotewrite:
+    endpoint: ${PRW_ENDPOINT:}
+    tls:
+      insecure: ${PRW_INSECURE:false}
+    headers:
+      X-Scope-OrgID: ${PRW_TENANT:}
+  # Loki для логов (опционально)
+  loki:
+    endpoint: ${LOKI_ENDPOINT:http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push}
+    tls:
+      insecure: ${LOKI_INSECURE:true}
+    labels:
+      resource:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.container.name
+        - service.name
+      attributes:
+        - log.iostream
+        - http.method
+        - http.status_code
+  # Debug‑экспортёр (для отладки в dev)
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+connectors:
+  spanmetrics: {}   # коннектор для преобразования spans -> metrics
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+  # Встроенный мониторинг самого коллектора (Prometheus)
+  prometheus:
+    endpoint: 0.0.0.0:8888
+    namespace: otelcol
+
+service:
+  telemetry:
+    logs:
+      level: ${OTELCOL_LOG_LEVEL:info}
+    metrics:
+      address: 0.0.0.0:8888
+  extensions: [health_check, pprof, zpages, prometheus]
+
+  # Две отдельные конвейерные линии для прод‑сценария:
+  # 1) traces: ingest -> k8s enrich -> sampling -> batch -> export
+  # 2) metrics: otlp + host/kubelet + spanmetrics -> batch -> export
+  # 3) logs: container logs -> redact -> k8s enrich -> batch -> export
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, attributes/sanitize, tail_sampling, batch]
+      exporters: [otlp, debug]
+    traces/spanmetrics:
+      receivers: [otlp]
+      processors: [spanmetrics]
+      exporters: [prometheus]
+    metrics:
+      receivers: [otlp, hostmetrics, kubeletstats, spanmetrics]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp, filelog]
+      processors: [logs_redaction, k8sattributes, batch]
+      exporters: [loki, debug]

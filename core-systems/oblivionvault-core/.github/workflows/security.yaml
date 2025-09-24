@@ -1,0 +1,222 @@
+# oblivionvault-core/.github/workflows/security.yaml
+name: Security CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  pull_request:
+    branches: [ "**" ]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  schedule:
+    - cron: "17 3 * * 1"   # еженедельно по понедельникам
+  workflow_dispatch: {}
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+
+env:
+  TRIVY_TIMEOUT: 10m
+  IMAGE_TAG: ovcore:${{ github.sha }}
+
+jobs:
+  # ---------------- CodeQL (SAST, поддерживаемые языки) ----------------
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ "javascript", "python", "go" ]
+    if: |
+      (matrix.language == 'python' && hashFiles('**/*.py') != '') ||
+      (matrix.language == 'javascript' && (hashFiles('**/*.js','**/*.ts') != '')) ||
+      (matrix.language == 'go' && hashFiles('**/*.go') != '')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # ---------------- Semgrep (доп. SAST, SARIF) ----------------
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Semgrep scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          generateSarif: "1"
+          auditOn: push
+          config: >-
+            p/ci
+        env:
+          SEMGREP_ENABLE_VERSION_CHECK: "0"
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+  # ---------------- Gitleaks (секреты, SARIF) ----------------
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # полная история для поиска секретов в diff
+
+      - name: Run gitleaks
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          args: >-
+            detect
+            --no-git
+            --redact
+            --verbose
+            --report-format sarif
+            --report-path gitleaks.sarif
+        continue-on-error: true
+
+      - name: Upload Gitleaks SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+
+  # ---------------- Trivy FS (зависимости/конфиги, SARIF) ----------------
+  trivy-fs:
+    name: Trivy FS scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          format: sarif
+          output: trivy-fs.sarif
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH,MEDIUM
+          scanners: vuln,secret,config
+          timeout: ${{ env.TRIVY_TIMEOUT }}
+        continue-on-error: true
+
+      - name: Upload Trivy FS SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+  # ---------------- Сборка образа (условно) и Trivy image ----------------
+  image-scan:
+    name: Trivy image scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: [ trivy-fs ]
+    if: hashFiles('**/Dockerfile') != ''
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image (best-effort)
+        run: |
+          docker build -t "${IMAGE_TAG}" .
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        continue-on-error: true
+
+      - name: Trivy image scan
+        if: always()
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_TAG }}
+          format: sarif
+          output: trivy-image.sarif
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          timeout: ${{ env.TRIVY_TIMEOUT }}
+        continue-on-error: true
+
+      - name: Upload Trivy image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+  # ---------------- SBOM (SPDX) ----------------
+  sbom:
+    name: SBOM (SPDX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom-oblivionvault-core.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: sbom-oblivionvault-core.spdx.json
+          if-no-files-found: error
+          retention-days: 7

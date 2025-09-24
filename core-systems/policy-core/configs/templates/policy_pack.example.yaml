@@ -1,0 +1,425 @@
+# =============================================================================
+# policy_pack.example.yaml — Industrial template for policy-core
+# =============================================================================
+apiVersion: policy.neurocity.io/v1
+kind: PolicyPack
+metadata:
+  name: policy-core-pack
+  displayName: "Policy Core Pack (example)"
+  description: "Пример промышленного policy-пакета для RBAC/ABAC/RBA (risk-based)."
+  # Семантическая версия пакета (для миграций и согласования контрактов)
+  version: 1.0.0
+  # Совместимость с рантаймом/движком
+  compatibility:
+    engine:
+      type: rego            # rego|cel|wasm
+      minVersion: "0.55.0"  # версия OPA/движка
+    runtime:
+      minVersion: "1.2.0"
+      maxVersion: "2.x"
+  owners:
+    - team: policy
+      email: security@example.com
+  annotations:
+    repo: "https://example.com/org/policy-core"
+    ticket: "SEC-12345"
+
+signing:
+  # Настройки подписи артефакта пакета для цепочки поставок (supply chain)
+  enabled: true
+  provider: cosign           # cosign|pgp|kms
+  keyRef: "ref:secrets/cosign.key"
+  attestations:
+    - type: provenance
+      predicateType: slsa    # slsa|custom
+      source: "ci"
+  integrity:
+    checksum:
+      algo: sha256
+      expected: "<FILL_ME>"  # будет заполнено пайплайном
+
+schema:
+  # Схема валидирует inputs/outputs политик и pack-документ (jsonschema)
+  url: "https://config.neurocity/policy-core/schema/policy-pack-v1.json"
+  strict: true
+
+defaults:
+  tenantMode: single          # single|multi
+  decision:
+    denyOnError: true
+    timeoutMs: 800
+  i18n:
+    defaultLang: en
+  # Базовые ключи кэша частичной оценки
+  partialEval:
+    enabled: true
+    cacheTTL: 300s
+
+sources:
+  # Декларация источников данных/словарей для политик.
+  # Каждому источнику даём стабильный id и контракт схемы.
+  - id: roles
+    kind: embedded            # embedded|http|s3|kafka|db
+    format: json
+    schemaRef: "#/definitions/Roles"
+    data:
+      admin:
+        permissions:
+          "*": ["*"]
+      analyst:
+        permissions:
+          document: ["read", "search"]
+          policy: ["read"]
+      approver:
+        permissions:
+          document: ["approve", "read"]
+  - id: classification
+    kind: embedded
+    format: json
+    schemaRef: "#/definitions/Classification"
+    data:
+      public: 0
+      internal: 1
+      confidential: 2
+      restricted: 3
+  - id: networks
+    kind: embedded
+    format: json
+    schemaRef: "#/definitions/Networks"
+    data:
+      allow: ["10.0.0.0/8", "192.168.0.0/16"]
+      deny:  ["203.0.113.0/24"]
+  - id: timeWindows
+    kind: embedded
+    format: json
+    data:
+      restricted_actions:
+        delete: { start: 0, end: 6 }
+  - id: pii
+    kind: embedded
+    format: json
+    data:
+      consent_scopes:
+        read:  "pii_read"
+        write: "pii_write"
+
+entrypoints:
+  # Логические точки входа движка и их подписи I/O.
+  - name: policy/allow
+    description: "Основное решение — позволить/запретить."
+    language: rego
+    inputSchemaRef: "#/definitions/AuthZInput"
+    outputSchemaRef: "#/definitions/AllowOutput"
+    file: "rego/authz.rego"
+    exportedRule: "allow"
+  - name: policy/deny
+    language: rego
+    inputSchemaRef: "#/definitions/AuthZInput"
+    outputSchemaRef: "#/definitions/DenyOutput"
+    file: "rego/authz.rego"
+    exportedRule: "deny"
+  - name: policy/reasons
+    language: rego
+    inputSchemaRef: "#/definitions/AuthZInput"
+    outputSchemaRef: "#/definitions/ReasonsOutput"
+    file: "rego/authz.rego"
+    exportedRule: "reasons"
+  - name: policy/effective_permissions
+    language: rego
+    inputSchemaRef: "#/definitions/AuthZInput"
+    outputSchemaRef: "#/definitions/PermissionsOutput"
+    file: "rego/authz.rego"
+    exportedRule: "effective_permissions"
+
+overrides:
+  # Точечные переопределения для окружений/тенантов/каналов:
+  # Могут применяться на этапе сборки пакета или во время деплоя.
+  environments:
+    dev:
+      decision:
+        timeoutMs: 1200
+      partialEval:
+        cacheTTL: 0s
+    stage:
+      decision:
+        timeoutMs: 900
+    prod:
+      decision:
+        timeoutMs: 600
+  tenants:
+    # Пример мульти-тенантных исключений
+    acme:
+      sources:
+        - id: networks
+          data:
+            allow: ["10.10.0.0/16"]
+    globex:
+      entrypoints:
+        - name: policy/allow
+          # Напрямую запрещаем delete глобально
+          patches:
+            - op: add
+              path: "/constraints/denyActions"
+              value: ["delete"]
+  featureFlags:
+    # Включение новых правил через фичефлаги
+    new_policy_pipeline: false
+    async_eval: false
+
+constraints:
+  # Общие ограничения для всех политик (используются в шаблоне Rego как data.authz.*)
+  # Этот раздел будет материализован в data.authz.* при сборке.
+  data:
+    authz:
+      roles: ${sources.roles}
+      classification: ${sources.classification}
+      networks: ${sources.networks}
+      time_windows: ${sources.timeWindows}
+      pii: ${sources.pii}
+
+rollout:
+  # Стратегии выката версий политик
+  channels:
+    - name: canary
+      description: "Канареечный канал для 5% трафика."
+      match:
+        percentage: 5
+        by: user.sub            # ключ шардирования
+    - name: stable
+      description: "Стабильный канал для 95% трафика."
+      match:
+        percentage: 95
+  promotions:
+    autoPromote: true
+    successCriteria:
+      window: 30m
+      maxErrorRate: 0.01
+      maxLatencyP95Ms: 700
+  killSwitches:
+    disablePolicyReload: false
+
+validation:
+  # Статическая и динамическая валидация пакета до деплоя
+  static:
+    lint:
+      rego:
+        failOn:
+          - unsafe_vars
+          - unused_rules
+    schema:
+      failOnUnknownKeys: true
+  dynamic:
+    dryRun:
+      enabled: true
+      samples:
+        - file: "tests/fixtures/allow_read.json"
+        - file: "tests/fixtures/deny_delete.json"
+      expect:
+        coverageMin: 0.8
+        denyReasonsAllowlist:
+          - "RBAC_DENY"
+          - "TENANT_MISMATCH"
+          - "ABAC_DENY"
+          - "CLASSIFICATION_TOO_LOW"
+          - "PII_CONSENT_REQUIRED"
+          - "RISK_POLICY_BLOCK"
+          - "NETWORK_NOT_ALLOWED"
+          - "ACTION_FORBIDDEN_AT_THIS_TIME"
+          - "QUOTA_EXCEEDED"
+
+observability:
+  # Карты i18n-ключей причин и их уровни важности (для алертов/логов)
+  reasons:
+    RBAC_DENY:                  { severity: warn,  i18n: "authz.rbac_denied" }
+    TENANT_MISMATCH:            { severity: error, i18n: "authz.tenant_mismatch" }
+    ABAC_DENY:                  { severity: warn,  i18n: "authz.abac_denied" }
+    CLASSIFICATION_TOO_LOW:     { severity: error, i18n: "authz.classification_low" }
+    PII_CONSENT_REQUIRED:       { severity: warn,  i18n: "authz.pii_consent_required" }
+    RISK_POLICY_BLOCK:          { severity: error, i18n: "authz.risk_block" }
+    NETWORK_NOT_ALLOWED:        { severity: error, i18n: "authz.network_not_allowed" }
+    ACTION_FORBIDDEN_AT_THIS_TIME: { severity: warn, i18n: "authz.forbidden_time" }
+    QUOTA_EXCEEDED:             { severity: warn,  i18n: "authz.quota_exceeded" }
+  metrics:
+    enabled: true
+    labels:
+      pack_version: "${metadata.version}"
+      pack_name: "${metadata.name}"
+
+tests:
+  # Декларативные сценарии тестирования (исполняются рантаймом или CI)
+  - name: allow_analyst_read_internal
+    description: "Аналитик читает документ internal в своём отделе."
+    inputFile: "tests/fixtures/allow_read.json"
+    expect:
+      entrypoint: "policy/allow"
+      value: true
+  - name: deny_delete_at_night
+    description: "Удаление ночью запрещено."
+    input:
+      tenant: acme
+      user:
+        id: u1
+        roles: ["analyst"]
+        attrs: { dept: "sales", clearance: "internal", mfa: true, geo: "EU" }
+        scopes: []
+        consents: []
+      resource:
+        type: document
+        id: doc-42
+        tenant: acme
+        owner: u2
+        labels: { classification: internal, pii: false, dept: sales }
+      action: delete
+      env: { ip: "10.1.2.3", weekday: "Mon", hour: 2, risk: "low" }
+      quota: { minute_requests: 1, minute_limit: 100 }
+    expect:
+      entrypoint: "policy/allow"
+      value: false
+      denyContainsAny:
+        - "ACTION_FORBIDDEN_AT_THIS_TIME"
+  - name: deny_pii_without_consent
+    description: "Чтение PII без согласия отклоняется."
+    input:
+      tenant: acme
+      user:
+        id: u1
+        roles: ["analyst"]
+        attrs: { dept: "sales", clearance: "internal", mfa: true, geo: "EU" }
+        scopes: []
+        consents: []         # нет consent
+      resource:
+        type: document
+        id: doc-43
+        tenant: acme
+        owner: u2
+        labels: { classification: internal, pii: true, dept: sales }
+      action: read
+      env: { ip: "10.1.2.3", weekday: "Mon", hour: 11, risk: "low" }
+      quota: { minute_requests: 1, minute_limit: 100 }
+    expect:
+      entrypoint: "policy/allow"
+      value: false
+      denyContainsAll:
+        - "PII_CONSENT_REQUIRED"
+
+migrations:
+  # Эволюция правил между версиями пакетов
+  from: ">=0.9.0"
+  to: "1.0.0"
+  steps:
+    - id: rename-reason-key
+      description: "Переименование i18n ключа для RBAC."
+      changes:
+        reasons:
+          RBAC_DENY: { i18n: "authz.rbac_denied" }
+    - id: reduce-timeout
+      description: "Уменьшить decision timeout до 600ms в prod."
+      target: overrides.environments.prod.decision.timeoutMs
+      newValue: 600
+
+security:
+  # Жёсткие ограничения безопасности для пакета
+  sandbox:
+    wasm:
+      allowedImports: ["env.now", "env.random"]  # пример
+  forbid:
+    networkCallsFromPolicy: true
+  audit:
+    logInputs: true
+    logDecisions: true
+    redact:
+      - "user.token"
+      - "input.pii.*"
+
+definitions:
+  # ----- JSON Schema фрагменты для ссылок в entrypoints -----
+  AuthZInput:
+    type: object
+    required: [tenant, user, resource, action, env]
+    properties:
+      tenant: { type: string, minLength: 1 }
+      user:
+        type: object
+        required: [id, roles, attrs]
+        properties:
+          id: { type: string }
+          roles: { type: array, items: { type: string }, minItems: 1 }
+          attrs:
+            type: object
+            properties:
+              dept: { type: string }
+              clearance: { type: string, enum: [public, internal, confidential, restricted] }
+              mfa: { type: boolean }
+              geo: { type: string }
+          scopes: { type: array, items: { type: string } }
+          consents: { type: array, items: { type: string } }
+      resource:
+        type: object
+        required: [type, id, tenant, labels]
+        properties:
+          type: { type: string }
+          id:   { type: string }
+          tenant: { type: string }
+          owner: { type: string }
+          labels:
+            type: object
+            properties:
+              classification: { type: string }
+              pii: { type: boolean }
+              dept: { type: string }
+      action: { type: string, enum: [read, write, delete, approve, search] }
+      env:
+        type: object
+        required: [ip, hour, risk]
+        properties:
+          ip:   { type: string }
+          weekday: { type: string }
+          hour: { type: integer, minimum: 0, maximum: 23 }
+          risk: { type: string, enum: [low, medium, high] }
+      quota:
+        type: object
+        properties:
+          minute_requests: { type: integer, minimum: 0 }
+          minute_limit:    { type: integer, minimum: 1 }
+
+  AllowOutput:
+    type: boolean
+
+  DenyOutput:
+    type: array
+    items: { type: string }
+
+  ReasonsOutput:
+    type: array
+    items:
+      type: object
+      required: [code, i18n_key]
+      properties:
+        code: { type: string }
+        i18n_key: { type: string }
+        details: { type: object }
+
+  PermissionsOutput:
+    type: array
+    items: { type: string }
+
+  Roles:
+    type: object
+    additionalProperties:
+      type: object
+      properties:
+        permissions:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
+
+  Classification:
+    type: object
+    additionalProperties: { type: integer, minimum: 0, maximum: 10 }
+
+  Networks:
+    type: object
+    properties:
+      allow: { type: array, items: { type: string } }
+      deny:  { type: array, items: { type: string } }

@@ -1,0 +1,100 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: security-core
+  # namespace: monitoring             # Рекомендуется задавать через overlay
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/part-of: core-systems
+    app.kubernetes.io/component: observability
+    monitoring: "true"
+spec:
+  jobLabel: app.kubernetes.io/name
+
+  # Какие неймспейсы сканировать. В базе лучше не указывать, а задать в overlay.
+  # namespaceSelector:
+  #   matchNames: ["security-core-namespace"]
+
+  # Выбор Service по меткам (должен совпадать с метками целевого Service)
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: security-core
+      app.kubernetes.io/part-of: core-systems
+      app.kubernetes.io/component: api
+
+  # Перенос меток в таргеты Prometheus (service → target)
+  targetLabels:
+    - app.kubernetes.io/name
+    - app.kubernetes.io/part-of
+    - app.kubernetes.io/component
+    - app.kubernetes.io/version
+
+  # Перенос pod-меток в таргеты (pod → target), требует совпадения селектора Service → Pod
+  podTargetLabels:
+    - security-tier
+    - workload-class
+
+  sampleLimit: 50000                  # Ограничение семплов на таргет за интервал
+  targetLimit: 1000                   # Ограничение числа таргетов
+  labelLimit: 65                      # Ограничение количества лейблов
+  labelNameLengthLimit: 512
+  labelValueLengthLimit: 2048
+
+  endpoints:
+    - port: http-metrics              # Имя порта в Service.spec.ports[].name
+      scheme: http                    # Или https при включенном TLS
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: false
+      honorTimestamps: true
+      followRedirects: true
+
+      # Аутентификация: Bearer token из секрета (опционально, оставить, если требуется)
+      # bearerTokenSecret:
+      #   name: security-core-monitoring-token
+      #   key: token
+
+      # TLS (mTLS/CA) при использовании scheme: https
+      # tlsConfig:
+      #   caFile: /etc/prometheus/secrets/security-core-ca/ca.crt
+      #   certFile: /etc/prometheus/secrets/security-core-client/tls.crt
+      #   keyFile: /etc/prometheus/secrets/security-core-client/tls.key
+      #   insecureSkipVerify: false
+      #   serverName: security-core.internal
+
+      # Базовые relabeling для нормализации и снижения кардинальности
+      relabelings:
+        # Перенос имени узла в явный лейбл
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: kubernetes_node
+          action: replace
+
+        # Установка user‑friendly job на основе метки сервиса
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_name]
+          targetLabel: job
+          action: replace
+          regex: "(.+)"
+          replacement: "$1"
+
+        # Удаление шумовых служебных лейблов
+        - action: labeldrop
+          regex: "(controller_revision_hash|pod_template_hash|endpoint|service_port|prometheus)"
+
+      # Снижение кардинальности метрик
+      metricRelabelings:
+        # Отбрасываем крайне болтливые go_* метрики, если они не нужны в SLO
+        - sourceLabels: [__name__]
+          regex: "go_(memstats_.*|gc_.*)"
+          action: drop
+        # Отбрасываем quantile‑ряда summary, если SLA на них не строится
+        - sourceLabels: [quantile]
+          regex: ".+"
+          action: drop
+        # Переименуем label instance в target_instance, чтобы избежать конфликтов
+        - sourceLabels: [instance]
+          targetLabel: target_instance
+          action: replace
+
+      # Прокси при необходимости
+      # proxyUrl: http://prometheus-proxy.monitoring.svc.cluster.local:3128

@@ -1,0 +1,153 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: security-core-prod
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/name: security-core
+  app.kubernetes.io/instance: security-core-prod
+  app.kubernetes.io/part-of: core-systems
+  app.kubernetes.io/component: security-core
+  app.kubernetes.io/environment: prod
+
+commonAnnotations:
+  security.neurocity.dev/hardening-level: "s3"
+  kubernetes.io/description: "Production overlay for security-core"
+
+images:
+  - name: ghcr.io/neurocity/security-core
+    newName: ghcr.io/neurocity/security-core
+    newTag: "1.8.0"
+    # digest имеет приоритет над тегом; укажите продовый дайджест:
+    # digest: "sha256:REPLACE_WITH_PROD_DIGEST"
+
+replicas:
+  - name: security-core
+    count: 6
+
+patches:
+  # Harden и операционные параметры Pod/Deployment
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: security-core
+    patch: |-
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          fsGroup: 10001
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/automountServiceAccountToken
+        value: false
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: ENV
+            value: prod
+      - op: add
+        path: /spec/strategy
+        value:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 25%
+            maxSurge: 25%
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+      - op: add
+        path: /spec/template/spec/containers/0/startupProbe
+        value:
+          httpGet:
+            path: /startupz
+            port: 8080
+          failureThreshold: 30
+          periodSeconds: 5
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: security-core
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: security-core
+                  topologyKey: kubernetes.io/hostname
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - name: tmp
+            emptyDir: {}
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - name: tmp
+            mountPath: /tmp
+
+  # Продовые границы HPA: согласованы со стартовыми репликами
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: security-core
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 6
+      - op: replace
+        path: /spec/maxReplicas
+        value: 60

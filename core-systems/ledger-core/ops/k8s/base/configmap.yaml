@@ -1,0 +1,173 @@
+# ledger-core/ops/k8s/base/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ledger-core-config
+  namespace: default
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/part-of: ledger-core
+    app.kubernetes.io/component: service
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "1.0.0"
+    tier: backend
+  annotations:
+    # При использовании авто‑релоуда конфигов через sidecar/операторы добавьте нужные аннотации в оверлеях.
+    # Примеры (закомментированы, чтобы база была нейтральной):
+    # reloader.stakater.com/match: "true"
+    # configmap.reloader.stakater.com/reload: "ledger-core-config"
+immutable: true
+data:
+  # Основной конфигурационный файл приложения.
+  # Перекрывайте значения в оверлеях (staging/prod) патчами Kustomize.
+  application.yaml: |
+    server:
+      host: 0.0.0.0
+      port: 8080
+      # Заголовки и таймауты на уровне приложения
+      requestTimeoutMs: 10000
+      idleTimeoutMs: 60000
+      maxRequestBytes: 10485760  # 10 MiB
+
+    security:
+      # Безопасные дефолты; секреты задаются через Secret/ENV, а не в ConfigMap
+      cors:
+        enabled: true
+        allowedOrigins: ["*"]   # Задайте белый список в оверлеях (prod не должен быть "*")
+        allowedMethods: ["GET","POST","PUT","DELETE","OPTIONS"]
+        allowedHeaders: ["*"]
+      csrf:
+        enabled: false
+      httpHeaders:
+        # Базовые secure‑заголовки
+        frameOptions: "DENY"
+        contentTypeOptions: "nosniff"
+        xssProtection: "0"
+        referrerPolicy: "no-referrer"
+        hsts:
+          enabled: true
+          maxAgeSeconds: 31536000
+          includeSubdomains: true
+          preload: false
+
+    database:
+      driver: "postgresql"
+      host: "ledger-postgres"
+      port: 5432
+      dbname: "ledger"
+      # user/password берутся из Secret через ENV; здесь задаются только нефиденциальные параметры
+      pool:
+        min: 2
+        max: 16
+        maxLifetimeSec: 1800
+        connectionTimeoutMs: 3000
+        idleTimeoutSec: 300
+      migration:
+        enabled: true
+        # Стратегия: baseline → migrate; при необходимости переопределите в оверлеях
+        baselineOnMigrate: true
+
+    cache:
+      # Пример: Redis как кэш/лейер для rate‑limit/сессий
+      enabled: true
+      host: "ledger-redis"
+      port: 6379
+      db: 0
+      # password через Secret/ENV
+      tls: false
+      defaultTtlSec: 300
+
+    messaging:
+      # Пример брокера событий; подмените под свой стек (Kafka/NATS/RabbitMQ)
+      type: "kafka"
+      kafka:
+        brokers: ["ledger-kafka:9092"]
+        clientId: "ledger-core"
+        acks: "all"
+        compressionType: "lz4"
+        # auth через Secret/ENV
+        topics:
+          audit: "ledger.audit.v1"
+          events: "ledger.events.v1"
+          dlt: "ledger.dlt.v1"
+        producer:
+          lingerMs: 5
+          batchSizeBytes: 131072
+          retries: 5
+        consumer:
+          groupId: "ledger-core"
+          autoOffsetReset: "latest"
+          sessionTimeoutMs: 10000
+          maxPollRecords: 500
+
+    logging:
+      level: "INFO"     # DEBUG/INFO/WARN/ERROR
+      json: true
+      # Разделение по подсистемам
+      levels:
+        sqlalchemy: "WARN"
+        aiohttp: "WARN"
+        uvicorn.error: "INFO"
+        uvicorn.access: "WARN"
+      sampling:
+        enabled: true
+        initial: 5
+        thereafter: 100
+      redact:
+        enabled: true
+        # ключи, которые подлежат маскированию в логах
+        keys: ["password","token","authorization","api_key","secret"]
+
+    observability:
+      metrics:
+        enabled: true
+        path: "/metrics"
+        port: 9090
+      tracing:
+        enabled: true
+        # OTLP endpoint указывается через ENV (например, OTEL_EXPORTER_OTLP_ENDPOINT)
+        sampler: "parentbased_traceidratio"
+        ratio: 0.1
+      profiling:
+        enabled: false
+      health:
+        livenessPath: "/health/live"
+        readinessPath: "/health/ready"
+
+    limits:
+      # Лимиты на уровне приложения (дополняют k8s Requests/Limits и Ingress)
+      rateLimit:
+        enabled: true
+        requestsPerSecond: 100.0
+        burst: 200
+        key: "ip"
+      payload:
+        maxJsonDepth: 64
+        maxArrayLength: 50000
+
+    features:
+      # Включаем флаги детерминированно в разных окружениях
+      dlpScanner: true
+      experimentalApis: false
+      writeAheadLog: true
+
+    api:
+      basePath: "/api"
+      pagination:
+        defaultLimit: 50
+        maxLimit: 500
+      timeouts:
+        upstreamMs: 8000
+
+    # Карта переменных окружения, ожидаемых приложением.
+    # Используйте envFrom (ConfigMap+Secret) в Deployment, чтобы подмешать их в процесс.
+  env.example: |
+    # Пример ENV (не секреты). Секреты — только из Secret!
+    APP_ENV=dev
+    LOG_LEVEL=INFO
+    OTEL_SERVICE_NAME=ledger-core
+    METRICS_PORT=9090
+    # DATABASE_*, REDIS_*, KAFKA_* берутся из Secret/ENV в оверлеях
+
+  # Версию схемы конфигурации держите рядом, чтобы контролировать совместимость на деплое.
+  config.schema.version: "1"

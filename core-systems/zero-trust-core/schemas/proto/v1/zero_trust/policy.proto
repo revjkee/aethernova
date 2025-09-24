@@ -1,0 +1,504 @@
+// zero-trust-core/schemas/proto/v1/zero_trust/policy.proto
+syntax = "proto3";
+
+package zerotrust.v1;
+
+option go_package = "github.com/aethernova/zero-trust-core/gen/go/zerotrust/v1;zerotrustv1";
+option java_package = "io.aethernova.zerotrust.v1";
+option java_multiple_files = true;
+option csharp_namespace = "Aethernova.ZeroTrust.V1";
+option php_namespace = "Aethernova\\ZeroTrust\\V1";
+option ruby_package = "Aethernova::ZeroTrust::V1";
+option objc_class_prefix = "AZT";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/type/expr.proto";
+
+// =====================
+// БАЗОВЫЕ ENUM
+// =====================
+
+enum Effect {
+  EFFECT_UNSPECIFIED = 0;
+  EFFECT_ALLOW = 1;
+  EFFECT_DENY = 2;
+}
+
+enum PolicyMode {
+  POLICY_MODE_UNSPECIFIED = 0;
+  POLICY_MODE_ENFORCE = 1;
+  POLICY_MODE_MONITOR = 2; // только логирование, без блокировки
+}
+
+enum L4Protocol {
+  L4_PROTOCOL_UNSPECIFIED = 0;
+  L4_PROTOCOL_ANY = 1;
+  L4_PROTOCOL_TCP = 2;
+  L4_PROTOCOL_UDP = 3;
+}
+
+enum L7Protocol {
+  L7_PROTOCOL_UNSPECIFIED = 0;
+  L7_PROTOCOL_ANY = 1;
+  L7_PROTOCOL_HTTP = 2;
+  L7_PROTOCOL_GRPC = 3;
+  L7_PROTOCOL_KAFKA = 4;
+  L7_PROTOCOL_POSTGRES = 5;
+  L7_PROTOCOL_MYSQL = 6;
+  L7_PROTOCOL_REDIS = 7;
+}
+
+enum MfaRequirement {
+  MFA_REQUIREMENT_UNSPECIFIED = 0;
+  MFA_REQUIRED = 1;
+  MFA_NOT_REQUIRED = 2;
+}
+
+enum DevicePosture {
+  DEVICE_POSTURE_UNSPECIFIED = 0;
+  DEVICE_POSTURE_COMPLIANT = 1;
+  DEVICE_POSTURE_NONCOMPLIANT = 2;
+}
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  DECISION_ALLOW = 1;
+  DECISION_DENY = 2;
+}
+
+// =====================
+// ОБЩИЕ УТИЛИТЫ
+// =====================
+
+message Labels {
+  map<string, string> items = 1;
+}
+
+message KeyValues {
+  map<string, string> items = 1;
+}
+
+// Упрощённый label selector (как в k8s)
+message LabelSelector {
+  map<string, string> match_labels = 1; // точные совпадения
+  repeated MatchExpression match_expressions = 2; // более сложные условия
+}
+
+message MatchExpression {
+  string key = 1;
+  Operator operator = 2;
+  repeated string values = 3;
+
+  enum Operator {
+    OPERATOR_UNSPECIFIED = 0;
+    IN = 1;
+    NOT_IN = 2;
+    EXISTS = 3;
+    DOES_NOT_EXIST = 4;
+    EQUALS = 5;
+    NOT_EQUALS = 6;
+    REGEX_MATCH = 7;
+    REGEX_NOT_MATCH = 8;
+    GT = 9;
+    GTE = 10;
+    LT = 11;
+    LTE = 12;
+  }
+}
+
+// =====================
+// СЕЛЕКТОРЫ И ИДЕНТИЧНОСТИ
+// =====================
+
+// Идентичности: пользователь/сервис/группа/роль
+message IdentitySelector {
+  reserved 8, 9;
+  // Пользователь
+  message UserSelector {
+    string id = 1;                // "u:alice" (внутренний ID)
+    string email = 2;             // опционально
+    repeated string groups = 3;   // групповые ID
+    repeated string roles = 4;    // логические роли
+    string principal_regex = 5;   // regex по principal
+  }
+  // Сервис (машинная идентичность)
+  message ServiceSelector {
+    // Kubernetes сервис-аккаунт
+    string k8s_namespace = 1;
+    string k8s_service_account = 2;
+    // SPIFFE
+    string spiffe_id = 3;         // spiffe://trust-domain/path
+    // Workload label matching
+    LabelSelector labels = 4;
+  }
+
+  oneof kind {
+    UserSelector user = 1;
+    ServiceSelector service = 2;
+    string any = 3; // любая идентичность (значение игнорируется)
+  }
+
+  Labels labels = 6;              // дополнительные метки селектора
+}
+
+// Ресурс/ворклоад: k8s/vm/spiffe/атрибуты
+message ResourceSelector {
+  reserved 10, 11;
+
+  message K8sSelector {
+    string cluster = 1;
+    string namespace = 2;
+    string service_account = 3;
+    LabelSelector labels = 4;
+    string name = 5;              // конкретный объект (deployment/statefulset/pod)
+  }
+
+  message VmSelector {
+    string project = 1;
+    string zone = 2;
+    map<string, string> tags = 3; // метки/теги VM/BM
+  }
+
+  message SpiffeSelector {
+    string id = 1;                // spiffe://...
+    string trust_domain = 2;      // опционально
+    string path = 3;              // опционально
+  }
+
+  message AttributeSelector {
+    map<string, google.protobuf.Value> attributes = 1; // произвольные кей/вал
+  }
+
+  oneof kind {
+    K8sSelector k8s = 1;
+    VmSelector vm = 2;
+    SpiffeSelector spiffe = 3;
+    AttributeSelector attr = 4;
+    string any = 5; // любые ворклоады/ресурсы
+  }
+
+  Labels labels = 6;
+}
+
+// =====================
+// КОНТЕКСТ И УСЛОВИЯ
+// =====================
+
+message DeviceContext {
+  bool compliant = 1;
+  bool attested = 2;
+  string posture = 3; // произвольная строка ("cis_level1", "edr_ok")
+  string os = 4;
+  string os_version = 5;
+}
+
+message NetworkContext {
+  string src_ip_cidr = 1;    // опционально одно значение
+  string dst_ip_cidr = 2;
+  repeated string src_ip_cidrs = 3;
+  repeated string dst_ip_cidrs = 4;
+  repeated int64 src_asns = 5;
+  repeated string geo_countries = 6; // ISO3166-1 alpha-2
+  bool tls_client_presented = 7;
+}
+
+message RiskContext {
+  int32 score = 1;           // 0..100
+  string reason = 2;
+}
+
+message TimeCondition {
+  google.protobuf.Timestamp not_before = 1;
+  google.protobuf.Timestamp not_after = 2;
+  // Человекочитаемые окна, напр.: "mon-fri 08:00-20:00", "sat 01:00-03:00"
+  repeated string schedules = 3;
+}
+
+message SubjectCondition {
+  string principal_regex = 1;
+  repeated string roles_any_of = 2;
+  repeated string groups_any_of = 3;
+}
+
+message DeviceCondition {
+  MfaRequirement mfa = 1;
+  DevicePosture min_posture = 2;
+  bool attested = 3;
+}
+
+message RiskCondition {
+  int32 max_score = 1; // трафик допустим при score <= max_score
+}
+
+message NetworkCondition {
+  NetworkContext network = 1;
+}
+
+// Консолидированные условия с возможностью расширить через CEL
+message Conditions {
+  TimeCondition time = 1;
+  DeviceCondition device = 2;
+  RiskCondition risk = 3;
+  SubjectCondition subject = 4;
+  NetworkCondition network = 5;
+
+  // Дополнительные выражения CEL (true/false), см. google.type.Expr
+  repeated google.type.Expr cel = 20;
+
+  // Произвольный контекст — попадёт в движок/логирование
+  map<string, google.protobuf.Value> extra = 30;
+}
+
+// =====================
+// L4/L7/TLS/EGRESS ОГРАНИЧЕНИЯ
+// =====================
+
+message TlsConstraint {
+  bool enforce = 1;                   // требовать mTLS
+  string min_version = 2;             // "TLS1.2" / "TLS1.3"
+  repeated string cipher_suites = 3;  // OpenSSL/IANA имена
+  bool client_auth_required = 4;      // требовать клиентский сертификат
+  string spiffe_trust_bundle = 5;     // ссылка/URI на bundle
+  string ca_bundle_ref = 6;           // внутр. ссылка на CA bundle
+}
+
+message L4Constraint {
+  repeated L4Protocol protocols = 1;
+  repeated uint32 ports = 2;
+}
+
+message HttpHeaderMatch {
+  string name = 1;
+  string value_regex = 2;
+}
+
+message HttpConstraint {
+  repeated string methods = 1;         // GET/POST/PUT/...
+  repeated string path_regexes = 2;    // PCRE2/RE2 в зависимости от движка
+  repeated HttpHeaderMatch headers = 3;
+}
+
+message GrpcConstraint {
+  repeated string full_methods = 1;    // "pkg.Service/Method" (regex допустим)
+}
+
+message KafkaConstraint {
+  repeated string topics = 1;
+  repeated string consumer_groups = 2;
+}
+
+message L7Constraint {
+  L7Protocol protocol = 1;
+
+  oneof details {
+    HttpConstraint http = 10;
+    GrpcConstraint grpc = 11;
+    KafkaConstraint kafka = 12;
+    google.protobuf.Struct generic = 50; // для иных L7 протоколов
+  }
+}
+
+message EgressConstraint {
+  bool via_proxy = 1;                 // вынуждать трафик через корпоративный прокси
+  repeated string allow_fqdn = 2;     // список разрешённых FQDN
+  repeated string allow_sni = 3;      // allowlist по SNI
+  repeated string dns_resolvers = 4;  // допустимые резолверы
+}
+
+// =====================
+// ПРАВИЛА, ИСКЛЮЧЕНИЯ, ОБЯЗАННОСТИ
+// =====================
+
+message Obligation {
+  // Напр.: "log", "watermark", "mask:PAN", "route:proxy"
+  string kind = 1;
+  google.protobuf.Struct params = 2;
+}
+
+message TrafficSelector {
+  // Источник/назначение можно задать как идентичностью, так и ворклоадом
+  repeated IdentitySelector identities = 1;
+  repeated ResourceSelector workloads = 2;
+  LabelSelector labels = 3; // дополнительная фильтрация (например, зоны)
+}
+
+message Rule {
+  string id = 1;
+  string description = 2;
+  Effect effect = 3;                         // allow/deny
+  TrafficSelector source = 4;
+  TrafficSelector destination = 5;
+  L4Constraint l4 = 6;
+  repeated L7Constraint l7 = 7;
+  TlsConstraint tls = 8;
+  EgressConstraint egress = 9;
+  Conditions conditions = 10;
+  repeated Obligation obligations = 11;
+
+  // Время жизни/план работ — для staged rollout/дезактивации
+  google.protobuf.Timestamp not_before = 20;
+  google.protobuf.Timestamp not_after = 21;
+
+  Labels labels = 30;
+}
+
+message Exception {
+  string id = 1;
+  string justification = 2;                   // обязательная причина
+  string approved_by = 3;
+  google.protobuf.Timestamp expires_at = 4;   // обязательный срок действия
+  // Что именно исключается/разрешается
+  Effect effect = 5;
+  TrafficSelector scope_source = 6;
+  TrafficSelector scope_destination = 7;
+  L4Constraint l4 = 8;
+  repeated L7Constraint l7 = 9;
+  Conditions conditions = 10;
+  repeated Obligation obligations = 11;
+}
+
+// =====================
+// ПОЛИТИКА И БАНДЛ
+// =====================
+
+message Policy {
+  string name = 1;
+  string tenant_id = 2;
+  string description = 3;
+  PolicyMode mode = 4;             // enforce/monitor
+  Labels labels = 5;
+
+  // Версионирование/метаданные
+  string etag = 10;
+  string revision = 11;
+  google.protobuf.Timestamp create_time = 12;
+  google.protobuf.Timestamp update_time = 13;
+
+  // Правила, deny‑блоки и исключения
+  repeated Rule rules = 20;
+  repeated Rule denies = 21;        // явные запреты (приоритет выше allow)
+  repeated Exception exceptions = 22;
+
+  // Глобальные ограничения по умолчанию (на уровне политики)
+  TlsConstraint default_tls = 30;
+  EgressConstraint default_egress = 31;
+
+  // Валидация/компиляция
+  message Validation {
+    bool fail_on_unused_selectors = 1;
+    bool fail_on_shadowed_rules = 2;
+    bool fail_on_unknown_services = 3;
+  }
+  Validation validation = 40;
+
+  // Целевые движки принудительного применения (мэппинг)
+  repeated string compile_targets = 41; // "istio.authorizationPolicy", "cilium.networkPolicy", "cloud.securityGroup"
+
+  // Доп. параметры
+  google.protobuf.Struct extensions = 50;
+}
+
+message PolicyBundle {
+  string tenant_id = 1;
+  string name = 2; // логическое имя бандла (набор политик)
+  string etag = 3;
+  string revision = 4;
+  Labels labels = 5;
+
+  repeated Policy items = 10;
+
+  google.protobuf.Timestamp create_time = 20;
+  google.protobuf.Timestamp update_time = 21;
+}
+
+// =====================
+// EVALUATION API МОДЕЛИ
+// =====================
+
+message Subject {
+  // Унифицированный субъект для запроса на оценку
+  string principal = 1; // "u:alice" / "svc:web-frontend"
+  repeated string groups = 2;
+  repeated string roles = 3;
+  // Привязка сервисной идентичности
+  string spiffe_id = 4;
+  string k8s_namespace = 5;
+  string k8s_service_account = 6;
+  Labels labels = 7;
+  google.protobuf.Struct attributes = 8;
+}
+
+message Resource {
+  string type = 1; // "api","db","secret","blob","document","workload"
+  string id = 2;   // ресурсный ID (URI/ARN/имя)
+  Labels labels = 3;
+  google.protobuf.Struct attributes = 4;
+}
+
+message EvaluationContext {
+  google.protobuf.Timestamp ts = 1;
+  MfaRequirement mfa = 2;
+  DeviceContext device = 3;
+  NetworkContext network = 4;
+  RiskContext risk = 5;
+  google.protobuf.Struct env = 10; // произвольные переменные окружения
+}
+
+message EvaluationRequest {
+  string tenant_id = 1;
+  string action = 2;               // логическое действие (например, "invoke", "read", "connect")
+  Subject subject = 3;
+  Resource resource = 4;
+  EvaluationContext context = 5;
+
+  // Запрашиваемое поведение PDP
+  bool include_explanation = 10;
+  bool include_obligations = 11;
+
+  // Ограничение времени/ресурсов оценки
+  google.protobuf.Duration timeout = 20;
+}
+
+message Explanation {
+  string policy_name = 1;
+  string rule_id = 2;
+  Effect effect = 3;
+  // Краткая причина/диагноз
+  string reason = 4;
+  // Какие условия сработали
+  repeated string matched_conditions = 5;
+  // Дамп конкретных матчей (например, путь/метод)
+  google.protobuf.Struct evidence = 6;
+}
+
+message EvaluationResult {
+  Decision decision = 1;
+  repeated Obligation obligations = 2;
+  Explanation explanation = 3;
+  string bundle_etag = 4;
+  string policy_revision = 5;
+}
+
+// =====================
+// СЕРВИСНЫЕ СООБЩЕНИЯ ДЛЯ ВНУТРЕННЕГО API (опционально)
+// =====================
+
+message CompileRequest {
+  PolicyBundle bundle = 1;
+}
+
+message CompileResult {
+  // Компилированные артефакты для целей (например, YAML Istio/Cilium)
+  repeated CompiledArtifact artifacts = 1;
+  // Предупреждения/ошибки валидации
+  repeated string warnings = 2;
+}
+
+message CompiledArtifact {
+  string target = 1;   // "istio.authorizationPolicy", ...
+  string format = 2;   // "yaml","json","hcl"
+  bytes payload = 3;   // байтовое содержимое
+  Labels metadata = 4; // дополнительные метки
+}

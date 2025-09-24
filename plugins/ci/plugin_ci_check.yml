@@ -1,0 +1,100 @@
+name: Plugin Integrity and Compliance Check
+
+on:
+  pull_request:
+    paths:
+      - 'plugins/**'
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+env:
+  PYTHON_VERSION: '3.11'
+  REQUIRED_SCHEMA: 'plugins/schemas/plugin_schema.json'
+
+jobs:
+  plugin-lint-validate:
+    runs-on: ubuntu-latest
+    name: Static Checks and Metadata Validation
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install jsonschema cryptography pytest
+
+      - name: Detect modified plugins
+        id: detect_plugins
+        run: |
+          echo "PLUGINS=$(git diff --name-only origin/main | grep 'plugins/' | grep -E 'plugin\.py$' | xargs)" >> $GITHUB_ENV
+
+      - name: Validate plugin schemas
+        run: |
+          for plugin_file in $PLUGINS; do
+            echo "Validating schema: $plugin_file"
+            python scripts/validate_plugin.py --schema $REQUIRED_SCHEMA --plugin $plugin_file
+          done
+
+  plugin-security-check:
+    runs-on: ubuntu-latest
+    name: Signature and ZK-Proof Verification
+    needs: plugin-lint-validate
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install crypto dependencies
+        run: |
+          pip install cryptography pyzk jsonschema
+
+      - name: Verify Plugin Signatures
+        run: |
+          for plugin_file in $PLUGINS; do
+            echo "Verifying signature for $plugin_file"
+            python scripts/verify_signature.py $plugin_file
+          done
+
+      - name: Run Zero-Knowledge Proof Check (if required)
+        run: |
+          for plugin_file in $PLUGINS; do
+            if grep -q 'zk_required.*true' $plugin_file; then
+              echo "Running zkSNARK proof check on $plugin_file"
+              python scripts/verify_zk_proof.py $plugin_file
+            fi
+          done
+
+  plugin-runtime-tests:
+    runs-on: ubuntu-latest
+    name: Runtime Plugin Tests
+    needs: plugin-security-check
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run Plugin Tests
+        run: |
+          pytest plugins/tests/

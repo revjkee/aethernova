@@ -1,0 +1,362 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer без префикса v (например: 1.4.0)"
+        required: true
+      prerelease:
+        description: "Отметить как pre-release"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write          # для создания релиза и загрузки ассетов
+  id-token: write          # для OIDC (cosign, provenance)
+  packages: write          # публикация в GHCR
+  actions: read
+  attestations: write
+
+env:
+  APP_NAME: zero-trust-core
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  NODE_OPTIONS: --max-old-space-size=4096
+  PYTHONUNBUFFERED: "1"
+  TZ: Europe/Stockholm
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare version and notes
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      created_tag: ${{ steps.tag.outputs.created }}
+      release_body: ${{ steps.notes.outputs.release_body }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VER="${{ github.event.inputs.version }}"
+            [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.-]+)?$ ]] || { echo "Invalid SemVer"; exit 1; }
+            TAG="v${VER}"
+            IS_PRE="${{ github.event.inputs.prerelease == 'true' && 'true' || 'false' }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            VER="${TAG#v}"
+            IS_PRE="$( [[ "$TAG" =~ - ]] && echo true || echo false )"
+          fi
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$IS_PRE" >> $GITHUB_OUTPUT
+
+      - name: Create tag (dispatch only)
+        id: tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          echo "created=true" >> $GITHUB_OUTPUT
+
+      - name: Generate Release Notes
+        id: notes
+        uses: release-drafter/release-drafter@v6
+        with:
+          config-name: release-drafter.yml
+          disable-autolabeler: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Test suite
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements*.txt') }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          if [ -f "requirements-dev.txt" ]; then pip install -r requirements-dev.txt; fi
+
+      - name: Lint & Typecheck
+        run: |
+          pip install ruff mypy
+          ruff check .
+          mypy --ignore-missing-imports .
+
+      - name: Unit tests
+        run: |
+          pip install pytest pytest-cov
+          pytest -q --maxfail=1 --disable-warnings --cov=.
+
+  build:
+    name: Build artifacts
+    needs: [prepare, test]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target:
+          - linux-amd64
+          - linux-arm64
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel/sdist
+        run: |
+          pip install build
+          python -m build
+          mkdir -p dist.upload
+          cp dist/* dist.upload/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist.upload/*
+          retention-days: 14
+
+  sbom:
+    name: Generate SBOM
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: CycloneDX Python SBOM
+        run: |
+          pipx install cyclonedx-bom
+          cyclonedx-py -e -o sbom-python.json || cyclonedx-bom -o sbom-generic.json
+          # если нет python‑метаданных, создадим generic SBOM
+          test -f sbom-python.json && cp sbom-python.json sbom.json || mv sbom-generic.json sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+          retention-days: 60
+
+  container:
+    name: Build and push OCI image
+    needs: [prepare, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            APP_VERSION=${{ env.VERSION }}
+
+      - name: Export image digest
+        id: img
+        run: |
+          DIGEST="$(crane digest $REGISTRY/${IMAGE_NAME}:${TAG} 2>/dev/null || true)"
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          TAG: ${{ env.TAG }}
+        shell: bash
+
+  scan:
+    name: Trivy scan (image + fs)
+    needs: [container, sbom]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: .
+
+      - name: Trivy FS scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          vuln-type: os,library
+
+      - name: Trivy Image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.tag }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+  sign-and-attest:
+    name: Cosign sign + SLSA provenance
+    needs: [container, sbom, scan, prepare]
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: write
+      packages: write
+      attestations: write
+    env:
+      IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign image (keyless OIDC)
+        run: |
+          cosign sign --yes "${IMAGE}"
+          cosign attach sbom --sbom sbom:application/vnd.cyclonedx+json --sbom-file sbom.json "${IMAGE}" || true
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        # SBOM скачиваем из артефактов
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: .
+
+      - name: Attest provenance (SLSA v1.0)
+        uses: slsa-framework/slsa-github-generator/.github/actions/generator@v2.0.0
+        with:
+          provenance-name: provenance.intoto.jsonl
+          upload-assets: true
+
+  github-release:
+    name: Create GitHub Release
+    needs: [prepare, build, container, sign-and-attest]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: .
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > ../checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Release ${{ needs.prepare.outputs.tag }}
+          body: ${{ needs.prepare.outputs.release_body }}
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' }}
+          files: |
+            dist/*
+            checksums.txt
+            sbom.json
+
+  notify:
+    name: Notify
+    needs: [github-release]
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - name: Summary
+        run: |
+          echo "Release: ${{ needs.prepare.outputs.tag }}"
+          echo "Prerelease: ${{ needs.prepare.outputs.is_prerelease }}"
+          echo "Status: ${{ job.status }}"

@@ -1,0 +1,369 @@
+{{- /*
+PrometheusRule for policy-core (industrial-grade)
+
+Values (excerpt):
+alerts:
+  enabled: true
+  releaseLabel: ""                 # если используете kube-prometheus-stack: имя релиза Prometheus
+  namespaceSelector: {}            # matchNames override через Helm Release namespace по умолчанию
+  severity:
+    page: critical
+    ticket: warning
+    info: info
+  slo:
+    enabled: true
+    service: "policy-core"
+    targetAvailability: 99.9
+    window: "28d"
+    latencyBuckets:
+      slo_seconds: 0.5             # SLO latency threshold
+      window: "5m"
+  thresholds:
+    errorRate:
+      window: "5m"
+      warn: 0.01                   # 1%
+      crit: 0.05                   # 5%
+    availability:
+      window: "5m"
+      warn: 0.995
+      crit: 0.990
+    latency:
+      window: "5m"
+      warn: 0.2
+      crit: 0.5
+    saturation:
+      cpuWarn: 0.8
+      cpuCrit: 0.95
+      memWarn: 0.85
+      memCrit: 0.95
+  durations:
+    short: "2m"
+    medium: "5m"
+    long: "15m"
+runbookBaseURL: "https://runbooks.example.com/policy-core"
+dashboardURL: "https://grafana.example.com/d/policy-core"
+labels:
+  common: {}
+annotations:
+  common: {}
+*/ -}}
+{{- if and .Values.alerts .Values.alerts.enabled }}
+{{- $name := include "policy-core.fullname" . | default (printf "%s-%s" .Release.Name "policy-core") -}}
+{{- $svc := (default "policy-core" .Values.alerts.slo.service) -}}
+{{- $dur := .Values.alerts.durations | default (dict "short" "2m" "medium" "5m" "long" "15m") -}}
+{{- $sev := .Values.alerts.severity | default (dict "page" "critical" "ticket" "warning" "info" "info") -}}
+{{- $thr := .Values.alerts.thresholds | default dict -}}
+{{- $err := (default (dict "window" "5m" "warn" 0.01 "crit" 0.05) $thr.errorRate) -}}
+{{- $lat := (default (dict "window" "5m" "warn" 0.2 "crit" 0.5) $thr.latency) -}}
+{{- $avl := (default (dict "window" "5m" "warn" 0.995 "crit" 0.990) $thr.availability) -}}
+{{- $sat := (default (dict "cpuWarn" 0.8 "cpuCrit" 0.95 "memWarn" 0.85 "memCrit" 0.95) $thr.saturation) -}}
+{{- $slo := .Values.alerts.slo | default (dict "enabled" true "service" $svc "targetAvailability" 99.9 "window" "28d" "latencyBuckets" (dict "slo_seconds" 0.5 "window" "5m")) -}}
+{{- $rb := .Values.runbookBaseURL | default "" -}}
+{{- $db := .Values.dashboardURL | default "" -}}
+{{- $labelsCommon := .Values.labels.common | default dict -}}
+{{- $annCommon := .Values.annotations.common | default dict -}}
+{{- $release := .Values.alerts.releaseLabel | default "" -}}
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $name }}-rules
+  labels:
+    app.kubernetes.io/name: {{ include "policy-core.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: policy
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    {{- if $release }}
+    release: {{ $release }}
+    {{- end }}
+    {{- with $labelsCommon }}
+{{ toYaml . | indent 4 }}
+    {{- end }}
+  annotations:
+    {{- with $annCommon }}
+{{ toYaml . | indent 4 }}
+    {{- end }}
+    # checksum для перезапуска правил при изменении значимых thresholds/slo (best-effort)
+    checksum/alerts: {{ sha256sum (printf "%v%v%v%v%v%v%v%v" $thr $slo $dur $sev $rb $db $labelsCommon $annCommon) | quote }}
+spec:
+  groups:
+    # ------------------------------
+    # Availability / Uptime rules
+    # ------------------------------
+    - name: policy-core.availability
+      interval: 30s
+      rules:
+        - alert: PolicyCoreExporterDown
+          expr: |
+            max_over_time(up{job="{{ $svc }}",app_kubernetes_io_name="{{ include "policy-core.name" . }}"}[{{ $dur.short }}]) == 0
+          for: {{ $dur.short }}
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "Exporter down for {{ $svc }}"
+            description: "No 'up==1' for {{ $svc }} during {{ $dur.short }}. Instance might be down or unreachable."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "exporter_down" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+            dashboard: {{ if $db }}{{ $db | quote }}{{ else }}"{{ $db }}"{{ end }}
+
+        - alert: PolicyCoreLowAvailabilityWarn
+          expr: |
+            (sum(rate(http_requests_total{job="{{ $svc }}",code!~"2.."}[{{ $avl.window }}])) /
+             clamp_min(sum(rate(http_requests_total{job="{{ $svc }}"}[{{ $avl.window }}])), 1))
+            > (1 - {{ $avl.warn }})
+          for: {{ $dur.medium }}
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "Availability below warning threshold"
+            description: "Availability fell below {{ mul $avl.warn 100.0 }}% over {{ $avl.window }} for {{ $svc }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "availability" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+            dashboard: {{ if $db }}{{ $db | quote }}{{ else }}"{{ $db }}"{{ end }}
+
+        - alert: PolicyCoreLowAvailabilityPage
+          expr: |
+            (sum(rate(http_requests_total{job="{{ $svc }}",code!~"2.."}[{{ $avl.window }}])) /
+             clamp_min(sum(rate(http_requests_total{job="{{ $svc }}"}[{{ $avl.window }}])), 1))
+            > (1 - {{ $avl.crit }})
+          for: {{ $dur.medium }}
+          labels:
+            severity: {{ $sev.page | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "Availability below paging threshold"
+            description: "Availability fell below {{ mul $avl.crit 100.0 }}% over {{ $avl.window }} for {{ $svc }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "availability" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+            dashboard: {{ if $db }}{{ $db | quote }}{{ else }}"{{ $db }}"{{ end }}
+
+    # ------------------------------
+    # Error rate rules
+    # ------------------------------
+    - name: policy-core.errors
+      interval: 30s
+      rules:
+        - record: policy_core:http_error_rate:ratio
+          expr: |
+            sum(rate(http_requests_total{job="{{ $svc }}",code=~"(5..|4..)"}[{{ $err.window }}])) /
+            clamp_min(sum(rate(http_requests_total{job="{{ $svc }}"}[{{ $err.window }}])), 1)
+
+        - alert: PolicyCoreHighErrorRateWarn
+          expr: policy_core:http_error_rate:ratio > {{ $err.warn }}
+          for: {{ $dur.medium }}
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "Elevated error rate"
+            description: "Error rate > {{ mul $err.warn 100.0 }}% over {{ $err.window }} for {{ $svc }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "error_rate" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+        - alert: PolicyCoreHighErrorRatePage
+          expr: policy_core:http_error_rate:ratio > {{ $err.crit }}
+          for: {{ $dur.short }}
+          labels:
+            severity: {{ $sev.page | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "High error rate (paging)"
+            description: "Error rate > {{ mul $err.crit 100.0 }}% over {{ $err.window }} for {{ $svc }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "error_rate" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+    # ------------------------------
+    # Latency rules (histogram buckets)
+    # ------------------------------
+    - name: policy-core.latency
+      interval: 30s
+      rules:
+        - record: policy_core:latency_slo:ratio
+          expr: |
+            (
+              sum(rate(http_request_duration_seconds_bucket{job="{{ $svc }}",le="{{ $slo.latencyBuckets.slo_seconds }}"}[{{ $lat.window }}]))
+              /
+              clamp_min(sum(rate(http_request_duration_seconds_count{job="{{ $svc }}"}[{{ $lat.window }}])), 1)
+            )
+        - alert: PolicyCoreLatencySLODegradationWarn
+          expr: (1 - policy_core:latency_slo:ratio) > {{ $lat.warn }}
+          for: {{ $dur.medium }}
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "Latency SLO degradation (warn)"
+            description: "Share of requests exceeding {{ $slo.latencyBuckets.slo_seconds }}s > {{ mul $lat.warn 100.0 }}% over {{ $lat.window }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "latency" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+        - alert: PolicyCoreLatencySLODegradationPage
+          expr: (1 - policy_core:latency_slo:ratio) > {{ $lat.crit }}
+          for: {{ $dur.short }}
+          labels:
+            severity: {{ $sev.page | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "Latency SLO degradation (page)"
+            description: "Share of requests exceeding {{ $slo.latencyBuckets.slo_seconds }}s > {{ mul $lat.crit 100.0 }}% over {{ $lat.window }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "latency" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+    # ------------------------------
+    # Saturation (resource pressure)
+    # ------------------------------
+    - name: policy-core.saturation
+      interval: 30s
+      rules:
+        - alert: PolicyCoreHighCPUWarn
+          expr: |
+            sum(rate(container_cpu_usage_seconds_total{container!="",pod=~".*{{ $svc }}.*"}[5m]))
+            /
+            clamp_min(sum(kube_pod_container_resource_limits{resource="cpu",pod=~".*{{ $svc }}.*"}), 1)
+            > {{ $sat.cpuWarn }}
+          for: {{ $dur.medium }}
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "CPU usage near limit (warn)"
+            description: "CPU usage ratio > {{ mul $sat.cpuWarn 100.0 }}% for {{ $svc }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "saturation_cpu" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+        - alert: PolicyCoreHighCPUCrit
+          expr: |
+            sum(rate(container_cpu_usage_seconds_total{container!="",pod=~".*{{ $svc }}.*"}[5m]))
+            /
+            clamp_min(sum(kube_pod_container_resource_limits{resource="cpu",pod=~".*{{ $svc }}.*"}), 1)
+            > {{ $sat.cpuCrit }}
+          for: {{ $dur.short }}
+          labels:
+            severity: {{ $sev.page | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "CPU usage near limit (crit)"
+            description: "CPU usage ratio > {{ mul $sat.cpuCrit 100.0 }}% for {{ $svc }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "saturation_cpu" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+        - alert: PolicyCoreHighMemoryWarn
+          expr: |
+            sum(container_memory_working_set_bytes{container!="",pod=~".*{{ $svc }}.*"})
+            /
+            clamp_min(sum(kube_pod_container_resource_limits{resource="memory",pod=~".*{{ $svc }}.*"}), 1)
+            > {{ $sat.memWarn }}
+          for: {{ $dur.medium }}
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "Memory usage near limit (warn)"
+            description: "Memory usage ratio > {{ mul $sat.memWarn 100.0 }}% for {{ $svc }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "saturation_mem" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+        - alert: PolicyCoreHighMemoryCrit
+          expr: |
+            sum(container_memory_working_set_bytes{container!="",pod=~".*{{ $svc }}.*"})
+            /
+            clamp_min(sum(kube_pod_container_resource_limits{resource="memory",pod=~".*{{ $svc }}.*"}), 1)
+            > {{ $sat.memCrit }}
+          for: {{ $dur.short }}
+          labels:
+            severity: {{ $sev.page | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "Memory usage near limit (crit)"
+            description: "Memory usage ratio > {{ mul $sat.memCrit 100.0 }}% for {{ $svc }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "saturation_mem" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+    # ------------------------------
+    # SLO burn-rate (optional)
+    # ------------------------------
+    {{- if and $slo.enabled $slo.targetAvailability }}
+    - name: policy-core.slo
+      interval: 30s
+      rules:
+        # Ошибки как прокси недоступности
+        - record: policy_core:slo_error_ratio
+          expr: |
+            sum(rate(http_requests_total{job="{{ $svc }}",code!~"2.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total{job="{{ $svc }}"}[5m])), 1)
+
+        # Быстрый и медленный окна для burn-rate
+        - record: policy_core:slo_burnrate_fast
+          expr: |
+            ( sum(rate(http_requests_total{job="{{ $svc }}",code!~"2.."}[5m])) /
+              clamp_min(sum(rate(http_requests_total{job="{{ $svc }}"}[5m])), 1) )
+            /
+            (1 - {{ div (sub 100.0 $slo.targetAvailability) 100.0 }})
+        - record: policy_core:slo_burnrate_slow
+          expr: |
+            ( sum(rate(http_requests_total{job="{{ $svc }}",code!~"2.."}[1h])) /
+              clamp_min(sum(rate(http_requests_total{job="{{ $svc }}"}[1h])), 1) )
+            /
+            (1 - {{ div (sub 100.0 $slo.targetAvailability) 100.0 }})
+
+        - alert: PolicyCoreSLOBurnFast
+          expr: policy_core:slo_burnrate_fast > 1
+          for: {{ $dur.short }}
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "SLO burn (fast)"
+            description: "Fast-window SLO burn-rate > 1 — consuming error budget too quickly."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "slo_burn" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+        - alert: PolicyCoreSLOBurnSustained
+          expr: (policy_core:slo_burnrate_fast > 1) and (policy_core:slo_burnrate_slow > 1)
+          for: {{ $dur.medium }}
+          labels:
+            severity: {{ $sev.page | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "SLO burn (sustained)"
+            description: "Sustained SLO burn in both fast and slow windows — paging."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "slo_burn" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+    {{- end }}
+
+    # ------------------------------
+    # Scrape / Metrics hygiene
+    # ------------------------------
+    - name: policy-core.metrics-hygiene
+      interval: 1m
+      rules:
+        - alert: PolicyCoreNoRecentScrapes
+          expr: |
+            (time() - max(timestamp(up{job="{{ $svc }}"}) )) > 300
+          for: {{ $dur.medium }}
+          labels:
+            severity: {{ $sev.info | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "No recent scrapes"
+            description: "No fresh samples for {{ $svc }} in >5 minutes; check ServiceMonitor/targets."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "scrape_issues" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+
+        - alert: PolicyCoreHighCardinalityLabels
+          expr: |
+            topk(1, count by(__name__) (http_request_duration_seconds_bucket{job="{{ $svc }}"}) ) > 1000000
+          for: {{ $dur.medium }}
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            team: "policy"
+            service: "{{ $svc }}"
+          annotations:
+            summary: "Potential high cardinality"
+            description: "Unusually high series count in histogram; verify label dimensions for {{ $svc }}."
+            runbook_url: {{ if $rb }}{{ printf "%s/%s" $rb "cardinality" | quote }}{{ else }}"{{ $rb }}"{{ end }}
+{{- end }}

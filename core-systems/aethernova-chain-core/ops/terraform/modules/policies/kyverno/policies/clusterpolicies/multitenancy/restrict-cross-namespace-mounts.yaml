@@ -1,0 +1,122 @@
+# aethernova-chain-core/ops/terraform/modules/policies/kyverno/policies/clusterpolicies/multitenancy/restrict-cross-namespace-mounts.yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-cross-namespace-mounts
+  annotations:
+    policies.kyverno.io/title: Restrict Cross-Namespace Mounts
+    policies.kyverno.io/category: Multitenancy, Storage Security
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >
+      Deny Pods that reference Secrets, ConfigMaps, or PVCs not present in the
+      same Namespace as the Pod. This makes Kubernetes' same-namespace requirements
+      explicit at admission time and improves error transparency for multi-tenant clusters.
+      Sources: Kubernetes docs (Secrets/ConfigMaps/Projected Volumes/PVC), Kyverno docs (apiCall/foreach).
+  labels:
+    app.kubernetes.io/managed-by: kyverno
+    app.kubernetes.io/part-of: aethernova-chain-core
+    app.kubernetes.io/component: policies
+    policy.aethernova.io/tier: strict
+spec:
+  background: true
+  validationFailureAction: Enforce
+  rules:
+    # 1) PVC must exist in the same namespace as the Pod
+    - name: ensure-pvc-exists-in-pod-namespace
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      context:
+        - name: pvcObj
+          apiCall:
+            # urlPath evaluated per 'foreach' element below; placeholder overwritten there
+            urlPath: "/api"  # dummy, will be replaced by foreach.context
+      validate:
+        message: >-
+          PersistentVolumeClaim '{{ element.persistentVolumeClaim.claimName }}' must exist
+          in Namespace '{{ request.namespace }}'. Cross-namespace PVC usage is not allowed.
+        foreach:
+          - list: "request.object.spec.volumes[?persistentVolumeClaim]"
+            context:
+              - name: pvcObj
+                apiCall:
+                  urlPath: "/api/v1/namespaces/{{ request.namespace }}/persistentvolumeclaims/{{ element.persistentVolumeClaim.claimName }}"
+            deny:
+              conditions:
+                any:
+                  # Deny when API call returned no object (PVC not found in this namespace)
+                  - key: "{{ pvcObj.kind || 'NotFound' }}"
+                    operator: Equals
+                    value: "NotFound"
+
+    # 2) Secret sources used via projected volumes must exist in the same namespace
+    - name: ensure-secrets-exist-in-pod-namespace
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: >-
+          Secret '{{ element.secret.name }}' referenced by projected volume must exist
+          in Namespace '{{ request.namespace }}'. Cross-namespace Secret mounts are disallowed.
+        foreach:
+          - list: "request.object.spec.volumes[?projected].projected.sources[?secret]"
+            context:
+              - name: secretObj
+                apiCall:
+                  urlPath: "/api/v1/namespaces/{{ request.namespace }}/secrets/{{ element.secret.name }}"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ secretObj.kind || 'NotFound' }}"
+                    operator: Equals
+                    value: "NotFound"
+
+    # 3) ConfigMap sources used via projected volumes must exist in the same namespace
+    - name: ensure-configmaps-exist-in-pod-namespace
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: >-
+          ConfigMap '{{ element.configMap.name }}' referenced by projected volume must exist
+          in Namespace '{{ request.namespace }}'. Cross-namespace ConfigMap mounts are disallowed.
+        foreach:
+          - list: "request.object.spec.volumes[?projected].projected.sources[?configMap]"
+            context:
+              - name: cmObj
+                apiCall:
+                  urlPath: "/api/v1/namespaces/{{ request.namespace }}/configmaps/{{ element.configMap.name }}"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ cmObj.kind || 'NotFound' }}"
+                    operator: Equals
+                    value: "NotFound"
+
+    # 4) Optional hardening: explicitly forbid any attempt to specify an out-of-namespace reference
+    #    (defense-in-depth; most fields don't even support a 'namespace' key in Pod volumes)
+    - name: forbid-explicit-namespace-fields-in-volume-sources
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: >-
+          Volume sources must not specify a foreign Namespace. Remove any 'namespace' fields
+          from Secret/ConfigMap/PVC references.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.volumes[?secret && secret.namespace] | length(@) }}"
+                operator: GreaterThan
+                value: 0
+              - key: "{{ request.object.spec.volumes[?configMap && configMap.namespace] | length(@) }}"
+                operator: GreaterThan
+                value: 0
+              - key: "{{ request.object.spec.volumes[?persistentVolumeClaim && persistentVolumeClaim.namespace] | length(@) }}"
+                operator: GreaterThan
+                value: 0

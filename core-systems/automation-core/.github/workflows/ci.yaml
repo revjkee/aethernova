@@ -1,0 +1,359 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'site/**'
+      - 'assets/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'site/**'
+      - 'assets/**'
+
+# Отменяем старые запуски на ту же ветку
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Минимально необходимые разрешения
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  POETRY_VERSION: "1.8.3"
+  POETRY_VIRTUALENVS_IN_PROJECT: "true"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lint:
+    name: Lint (ruff + pre-commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Cache Poetry and venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pypoetry
+            ~/.cache/pip
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}-py312
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install deps (dev)
+        run: |
+          poetry install --no-interaction --sync
+
+      - name: Ruff check
+        run: |
+          poetry run ruff --version
+          poetry run ruff format --check .
+          poetry run ruff check --output-format=github .
+
+      - name: Pre-commit (all hooks)
+        if: ${{ hashFiles('.pre-commit-config.yaml') != '' }}
+        run: |
+          poetry run pre-commit install
+          poetry run pre-commit run --all-files
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ lint ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Cache Poetry and venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pypoetry
+            ~/.cache/pip
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}-py312
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install deps (dev)
+        run: poetry install --no-interaction --sync
+
+      - name: Mypy
+        run: |
+          poetry run mypy --version
+          poetry run mypy src/automation_core
+
+  unit:
+    name: Unit tests (Py ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [ typecheck ]
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [ '3.10', '3.11', '3.12' ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: System deps (lxml, psycopg2, etc.)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libxml2-dev libxslt1-dev libpq-dev protobuf-compiler
+
+      - name: Install Poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Cache Poetry and venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pypoetry
+            ~/.cache/pip
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}-py${{ matrix.python }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install deps (dev)
+        run: poetry install --no-interaction --sync
+
+      - name: (Optional) Generate protobuf stubs
+        if: ${{ hashFiles('proto/**/*.proto') != '' && hashFiles('scripts/gen_proto.sh') != '' }}
+        run: poetry run bash scripts/gen_proto.sh
+
+      - name: Pytest unit with coverage
+        run: |
+          poetry run pytest -q tests/unit \
+            --maxfail=1 --disable-warnings \
+            --cov=src/automation_core --cov-report=xml
+
+      - name: Upload coverage xml
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit-py${{ matrix.python }}
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  integration:
+    name: Integration tests (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: [ unit ]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        ports: [ '5432:5432' ]
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: automation
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    env:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/automation
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpq-dev
+
+      - name: Install Poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Cache Poetry and venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pypoetry
+            ~/.cache/pip
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}-py312
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install deps (dev)
+        run: poetry install --no-interaction --sync
+
+      - name: Run integration tests
+        run: |
+          poetry run pytest -q tests/integration \
+            --maxfail=1 --disable-warnings \
+            --cov=src/automation_core --cov-append --cov-report=xml
+
+      - name: Upload coverage xml
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-integration
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  e2e:
+    name: E2E tests (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: [ integration ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Cache Poetry and venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pypoetry
+            ~/.cache/pip
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}-py312
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install deps (dev)
+        run: poetry install --no-interaction --sync
+
+      - name: Install Playwright browsers (if used)
+        run: |
+          if poetry run python -c "import importlib; import sys; sys.exit(0 if importlib.util.find_spec('playwright') else 1)"; then
+            poetry run playwright install --with-deps
+          else
+            echo "Playwright not in deps, skipping browsers install"
+          fi
+
+      - name: Run E2E tests (xvfb)
+        run: |
+          if [ -d "tests/e2e" ]; then
+            xvfb-run -a poetry run pytest -q tests/e2e --maxfail=1 --disable-warnings
+          else
+            echo "No tests/e2e found. Skipping."
+          fi
+
+  build-package:
+    name: Build package (sdist/wheel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ e2e ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+
+      - name: Cache Poetry and venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pypoetry
+            ~/.cache/pip
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}-py312
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install deps (no dev)
+        run: poetry install --no-interaction --only main
+
+      - name: Build
+        run: poetry build
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          retention-days: 7
+
+  # Опционально: объединение покрытий и/или загрузка в Codecov (если публичный репо)
+  coverage-merge:
+    name: Merge coverage
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [ unit, integration ]
+    steps:
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: coverage-artifacts
+
+      - name: Merge XMLs
+        run: |
+          python - <<'PY'
+          import glob, xml.etree.ElementTree as ET, shutil, os
+          files = glob.glob("coverage-artifacts/**/coverage.xml", recursive=True)
+          if not files:
+              print("No coverage files found")
+              raise SystemExit(0)
+          # на практике лучше использовать coverage combine; простой fallback:
+          shutil.copy(files[0], "coverage-merged.xml")
+          print("Merged base:", files[0])
+          # Примечание: для корректного merge используйте `coverage combine` в одном окружении.
+          PY
+
+      - name: Upload merged coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-merged
+          path: coverage-merged.xml
+          if-no-files-found: ignore
+          retention-days: 7

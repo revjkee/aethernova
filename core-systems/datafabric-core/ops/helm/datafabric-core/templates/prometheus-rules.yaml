@@ -1,0 +1,212 @@
+{{- /*
+  datafabric-core/templates/prometheus-rules.yaml
+
+  values.yaml (фрагмент):
+  prometheusRule:
+    enabled: true
+    namespace: ""                         # по умолчанию .Release.Namespace
+    additionalLabels: { release: prom-operator }
+    annotations: { runbook_url: https://runbooks.example.com/datafabric-core }
+    selector:
+      job: datafabric-core                # лейбл job в метриках приложения
+      namespace: ""                       # если пусто, то .Release.Namespace
+      service: ""                         # опционально: service лейбл
+    thresholds:
+      latencyP99: 0.25                    # секунды
+      errorRate: 0.02                     # 2% ошибок
+      restarts5m: 3
+      cpuSaturation: 0.9                  # доля
+      memRSSLimitPct: 0.9                 # доля от limits
+      goroutinesMax: 200000               # пример для Go
+      redisLatencyMs: 50
+      kafkaLagCritical: 10000
+    groupsOverride: []                    # если задано — полностью заменяет стандартные группы
+*/ -}}
+
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "datafabric-core.fullname" . }}
+  namespace: {{ default .Release.Namespace .Values.prometheusRule.namespace }}
+  labels:
+    {{- include "datafabric-core.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.prometheusRule.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.prometheusRule.groupsOverride }}
+  groups:
+    {{- toYaml .Values.prometheusRule.groupsOverride | nindent 4 }}
+  {{- else }}
+  groups:
+    - name: datafabric-core.availability
+      rules:
+        - alert: DatafabricCoreDown
+          expr: |
+            absent(up{job="{{ .Values.prometheusRule.selector.job }}", namespace="{{ default .Release.Namespace .Values.prometheusRule.selector.namespace }}"} == 1)
+          for: 2m
+          labels:
+            severity: critical
+            service: {{ default (include "datafabric-core.fullname" .) .Values.prometheusRule.selector.service | quote }}
+          annotations:
+            summary: "Сервис недоступен"
+            description: "Нет целевых метрик up==1 для job={{ .Values.prometheusRule.selector.job }}."
+            {{- with .Values.prometheusRule.annotations.runbook_url }}
+            runbook_url: {{ . | quote }}
+            {{- end }}
+
+        - alert: DatafabricCorePodNotReady
+          expr: |
+            sum by (pod) (
+              max_over_time(
+                kube_pod_status_ready{condition="true", namespace="{{ default .Release.Namespace .Values.prometheusRule.selector.namespace }}"}[5m]
+              )
+            * on(pod) group_left
+              label_replace(
+                kube_pod_labels{label_app_kubernetes_io_name="{{ include "datafabric-core.name" . }}", namespace="{{ default .Release.Namespace .Values.prometheusRule.selector.namespace }}"},
+                "pod","$1","pod","(.*)")
+            ) == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod не готов"
+            description: "Pod(ы) приложения не в состоянии Ready более 5 минут."
+
+    - name: datafabric-core.latency-and-errors
+      rules:
+        - record: job:datafabric_core:p99_latency_seconds
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(app_request_duration_seconds_bucket{job="{{ .Values.prometheusRule.selector.job }}"}[5m]))
+            )
+        - alert: DatafabricCoreHighLatencyP99
+          expr: |
+            job:datafabric_core:p99_latency_seconds
+              > {{ .Values.prometheusRule.thresholds.latencyP99 | default 0.25 }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Высокая задержка p99"
+            description: "p99 > {{ .Values.prometheusRule.thresholds.latencyP99 | default 0.25 }}s в течение 10m."
+        - record: job:datafabric_core:error_rate
+          expr: |
+            sum(rate(app_requests_total{job="{{ .Values.prometheusRule.selector.job }}",status=~"5.."}[5m]))
+            /
+            sum(rate(app_requests_total{job="{{ .Values.prometheusRule.selector.job }}"}[5m]))
+        - alert: DatafabricCoreHighErrorRate
+          expr: |
+            job:datafabric_core:error_rate
+              > {{ .Values.prometheusRule.thresholds.errorRate | default 0.02 }}
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Рост доли ошибок"
+            description: "Доля 5xx > {{ .Values.prometheusRule.thresholds.errorRate | default 0.02 }} за последние 10m."
+
+    - name: datafabric-core.stability
+      rules:
+        - alert: DatafabricCoreCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{
+              namespace="{{ default .Release.Namespace .Values.prometheusRule.selector.namespace }}",
+              container="{{ include "datafabric-core.name" . }}"
+            }[5m]) > {{ .Values.prometheusRule.thresholds.restarts5m | default 3 }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Частые рестарты контейнера"
+            description: "Количество рестартов > {{ .Values.prometheusRule.thresholds.restarts5m | default 3 }} за 5 минут."
+
+        - alert: DatafabricCoreCPUSaturation
+          expr: |
+            sum(rate(container_cpu_usage_seconds_total{
+              namespace="{{ default .Release.Namespace .Values.prometheusRule.selector.namespace }}",
+              image!="", container!="POD", pod=~"{{ include "datafabric-core.fullname" . }}-.*"
+            }[5m]))
+            /
+            sum(kube_pod_container_resource_limits{resource="cpu",
+              namespace="{{ default .Release.Namespace .Values.prometheusRule.selector.namespace }}",
+              pod=~"{{ include "datafabric-core.fullname" . }}-.*"}) > {{ .Values.prometheusRule.thresholds.cpuSaturation | default 0.9 }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CPU близко к лимиту"
+            description: "Средняя загрузка CPU > {{ .Values.prometheusRule.thresholds.cpuSaturation | default 0.9 }} от лимита 10 минут."
+
+        - alert: DatafabricCoreMemoryPressure
+          expr: |
+            sum(container_memory_working_set_bytes{
+              namespace="{{ default .Release.Namespace .Values.prometheusRule.selector.namespace }}",
+              image!="", container!="POD", pod=~"{{ include "datafabric-core.fullname" . }}-.*"
+            })
+            /
+            sum(kube_pod_container_resource_limits{resource="memory",
+              namespace="{{ default .Release.Namespace .Values.prometheusRule.selector.namespace }}",
+              pod=~"{{ include "datafabric-core.fullname" . }}-.*"}) > {{ .Values.prometheusRule.thresholds.memRSSLimitPct | default 0.9 }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Память близко к лимиту"
+            description: "Рабочий набор памяти > {{ .Values.prometheusRule.thresholds.memRSSLimitPct | default 0.9 }} от лимита."
+
+    - name: datafabric-core.runtime
+      rules:
+        - alert: DatafabricCoreHighGCPause
+          expr: |
+            rate(go_gc_duration_seconds_sum{job="{{ .Values.prometheusRule.selector.job }}"}[5m])
+            /
+            rate(go_gc_duration_seconds_count{job="{{ .Values.prometheusRule.selector.job }}"}[5m]) > 0.05
+          for: 10m
+          labels:
+            severity: info
+          annotations:
+            summary: "Увеличение пауз GC"
+            description: "Средняя пауза GC > 50ms за 10m."
+        - alert: DatafabricCoreTooManyGoroutines
+          expr: |
+            go_goroutines{job="{{ .Values.prometheusRule.selector.job }}"}
+              > {{ .Values.prometheusRule.thresholds.goroutinesMax | default 200000 }}
+          for: 5m
+          labels:
+            severity: info
+          annotations:
+            summary: "Число горутин высоко"
+            description: "go_goroutines превышает допустимое значение."
+
+    - name: datafabric-core.dependencies
+      rules:
+        - alert: DatafabricCoreRedisLatencyHigh
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(app_redis_latency_seconds_bucket{job="{{ .Values.prometheusRule.selector.job }}"}[5m]))
+            ) * 1000 > {{ .Values.prometheusRule.thresholds.redisLatencyMs | default 50 }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Высокая задержка Redis"
+            description: "Redis p99 > {{ .Values.prometheusRule.thresholds.redisLatencyMs | default 50 }}ms."
+
+        - alert: DatafabricCoreKafkaLagCritical
+          expr: |
+            sum by (topic) (kafka_consumergroup_lag{namespace="{{ default .Release.Namespace .Values.prometheusRule.selector.namespace }}"})
+              > {{ .Values.prometheusRule.thresholds.kafkaLagCritical | default 10000 }}
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Критичный лаг Kafka"
+            description: "Суммарный lag по топику превышает заданный порог."
+  {{- end }}
+{{- end }}

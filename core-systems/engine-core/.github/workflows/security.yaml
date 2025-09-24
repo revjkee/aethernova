@@ -1,0 +1,89 @@
+name: Security Audit Pipeline
+
+on:
+  push:
+    branches: [main, release/**]
+  pull_request:
+    branches: [main, release/**]
+  schedule:
+    - cron: '0 3 * * 1'  # еженедельный аудит по понедельникам
+  workflow_dispatch:
+
+jobs:
+  security-audit:
+    name: Static Code & Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Scan Python dependencies (OSV + PyUp DB)
+        uses: pyupio/safety-action@v2
+        with:
+          scan_type: 'poetry'
+          fail_on_severity: 'high'
+
+      - name: Run Bandit static security scanner
+        uses: tj-actions/bandit@v4
+        with:
+          targets: "src"
+          options: "-r -ll -ii"
+
+      - name: Generate SBOM with CycloneDX
+        run: |
+          poetry export -f requirements.txt --without-hashes | cyclonedx-py -i - -o sbom.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.json
+
+      - name: Trivy scan for vulnerabilities in code & config
+        uses: aquasecurity/trivy-action@0.16.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Secret scanning with Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: .gitleaks.toml
+
+      - name: SLSA provenance attestation
+        uses: slsa-framework/slsa-github-generator@v1.5.0
+        with:
+          artifact-path: sbom.json
+
+      - name: Sigstore signing
+        uses: sigstore/gh-action-sigstore-python@v2
+        with:
+          inputs: sbom.json
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            bandit_report.json
+            trivy_report.txt
+            sbom.json

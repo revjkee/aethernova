@@ -1,0 +1,298 @@
+{{- /*
+mythos-core/ops/helm/mythos-core/templates/prometheus-rules.yaml
+
+Параметры (пример values.yaml):
+prometheus:
+  rules:
+    enabled: true
+    namespace: ""                     # по умолчанию .Release.Namespace
+    labels:
+      team: "sre"
+    annotations:
+      grafana_dashboard: "https://grafana.example.com/d/abc123/mythos"
+    runbookBaseURL: "https://runbooks.example.com/mythos-core"
+    severity:
+      page: "critical"
+      ticket: "warning"
+      notice: "info"
+    selector: 'namespace="{{ .Release.Namespace }}", job="kubernetes-pods", app="mythos-core", component="api"'
+    kubeSelector: 'namespace="{{ .Release.Namespace }}", label_app_kubernetes_io_name="mythos-core", label_app_kubernetes_io_component="api"'
+    httpRequestsMetric: 'http_requests_total'                       # альтернативы: http_server_requests_seconds_count
+    httpDurationBucketMetric: 'http_request_duration_seconds_bucket' # альтернативы: http_server_requests_seconds_bucket
+    slo:
+      errorRate5m: 0.05
+      errorRate30m: 0.01
+      p95_ms: 500
+      p99_ms: 1000
+    availability:
+      notReadyMinutes: 10
+    container:
+      restartBurst5m: 3
+      memSaturation: 0.90
+      cpuThrottle: 0.2
+    hpa:
+      name: "mythos-core-api"
+      scaleMaxedMinutes: 10
+      utilizationHeadroom: 1.10
+*/ -}}
+{{- if .Values.prometheus.rules.enabled }}
+
+{{- /* Локальные переменные/дефолты */ -}}
+{{- $ns := (default .Release.Namespace .Values.prometheus.rules.namespace) -}}
+{{- $labels := (default dict .Values.prometheus.rules.labels) -}}
+{{- $ann := (default dict .Values.prometheus.rules.annotations) -}}
+{{- $runbook := (default "" .Values.prometheus.rules.runbookBaseURL) -}}
+{{- $sev := (merge (dict "page" "critical" "ticket" "warning" "notice" "info") (default dict .Values.prometheus.rules.severity)) -}}
+{{- $selector := (default (printf "namespace=\"%s\", job=\"kubernetes-pods\", app=\"mythos-core\", component=\"api\"" $ns) .Values.prometheus.rules.selector) -}}
+{{- $kubeSel := (default (printf "namespace=\"%s\", label_app_kubernetes_io_name=\"mythos-core\", label_app_kubernetes_io_component=\"api\"" $ns) .Values.prometheus.rules.kubeSelector) -}}
+{{- $mReq := (default "http_requests_total" .Values.prometheus.rules.httpRequestsMetric) -}}
+{{- $mDur := (default "http_request_duration_seconds_bucket" .Values.prometheus.rules.httpDurationBucketMetric) -}}
+{{- $slo := (merge (dict "errorRate5m" 0.05 "errorRate30m" 0.01 "p95_ms" 500 "p99_ms" 1000) (default dict .Values.prometheus.rules.slo)) -}}
+{{- $avail := (merge (dict "notReadyMinutes" 10) (default dict .Values.prometheus.rules.availability)) -}}
+{{- $ctr := (merge (dict "restartBurst5m" 3 "memSaturation" 0.90 "cpuThrottle" 0.2) (default dict .Values.prometheus.rules.container)) -}}
+{{- $hpa := (merge (dict "name" "mythos-core-api" "scaleMaxedMinutes" 10 "utilizationHeadroom" 1.10) (default dict .Values.prometheus.rules.hpa)) -}}
+{{- $fullname := printf "%s-%s" .Release.Name "mythos-core" | trunc 63 | trimSuffix "-" -}}
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ printf "%s-prometheus-rules" $fullname | quote }}
+  namespace: {{ $ns | quote }}
+  labels:
+    app.kubernetes.io/name: mythos-core
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service | default "Helm" }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | default .Chart.Version | quote }}
+    app.kubernetes.io/component: "api"
+    app.kubernetes.io/part-of: "mythos-core"
+    {{- range $k, $v := $labels }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+spec:
+  groups:
+
+    # -------------------- SLO / HTTP --------------------
+    - name: mythos-core.http.slo
+      interval: 30s
+      rules:
+        # Записываемые правила для квантилей латентности (p95/p99)
+        - record: job:http_request_duration_ms:p95
+          expr: |
+            1000 *
+            histogram_quantile(0.95,
+              sum by (le) (rate({{ $mDur }}{ {{ tpl $selector . }} }[5m]))
+            )
+        - record: job:http_request_duration_ms:p99
+          expr: |
+            1000 *
+            histogram_quantile(0.99,
+              sum by (le) (rate({{ $mDur }}{ {{ tpl $selector . }} }[5m]))
+            )
+
+        # Доля 5xx за 5 минут (page)
+        - alert: MythosHighErrorRate5m
+          expr: |
+            (
+              sum(rate({{ $mReq }}{ {{ tpl $selector . }}, status=~"5.."}[5m]))
+              /
+              sum(rate({{ $mReq }}{ {{ tpl $selector . }} }[5m]))
+            ) > {{ $slo.errorRate5m }}
+          for: 5m
+          labels:
+            severity: {{ $sev.page | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "Высокая доля 5xx за 5м (> {{ $slo.errorRate5m }})"
+            description: "Доля 5xx за 5 минут превысила порог SLO."
+            runbook_url: {{ printf "%s/%s" $runbook "http-error-rate" | quote }}
+
+        # Доля 5xx за 30 минут (ticket)
+        - alert: MythosElevatedErrorRate30m
+          expr: |
+            (
+              sum(rate({{ $mReq }}{ {{ tpl $selector . }}, status=~"5.."}[30m]))
+              /
+              sum(rate({{ $mReq }}{ {{ tpl $selector . }} }[30m]))
+            ) > {{ $slo.errorRate30m }}
+          for: 10m
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "Повышенная доля 5xx за 30м (> {{ $slo.errorRate30m }})"
+            description: "Тренд ошибок HTTP повышен в течение 30 минут."
+            runbook_url: {{ printf "%s/%s" $runbook "http-error-rate" | quote }}
+
+        # P95 > порога
+        - alert: MythosHighLatencyP95
+          expr: job:http_request_duration_ms:p95 > {{ $slo.p95_ms }}
+          for: 10m
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "Высокая латентность P95 (> {{ $slo.p95_ms }}ms)"
+            description: "Квантиль P95 времени ответа стабильно выше SLO."
+            runbook_url: {{ printf "%s/%s" $runbook "latency" | quote }}
+
+        # P99 > порога (paging)
+        - alert: MythosHighLatencyP99
+          expr: job:http_request_duration_ms:p99 > {{ $slo.p99_ms }}
+          for: 5m
+          labels:
+            severity: {{ $sev.page | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "Критическая латентность P99 (> {{ $slo.p99_ms }}ms)"
+            description: "Квантиль P99 времени ответа критически высока."
+            runbook_url: {{ printf "%s/%s" $runbook "latency" | quote }}
+
+        # Нет трафика (в рабочие часы может означать инцидент)
+        - alert: MythosNoTraffic
+          expr: sum(rate({{ $mReq }}{ {{ tpl $selector . }} }[10m])) == 0
+          for: 15m
+          labels:
+            severity: {{ $sev.notice | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "Отсутствует входящий трафик"
+            description: "За 10 минут не зафиксировано запросов. Проверьте Ingress/DNS."
+            runbook_url: {{ printf "%s/%s" $runbook "no-traffic" | quote }}
+
+    # -------------------- POD / CONTAINER HEALTH --------------------
+    - name: mythos-core.k8s.runtime
+      interval: 30s
+      rules:
+        # Всплеск рестартов за 5 минут
+        - alert: MythosContainerRestartBurst
+          expr: |
+            increase(kube_pod_container_status_restarts_total{ {{ tpl $kubeSel . }} }[5m]) > {{ $ctr.restartBurst5m }}
+          for: 5m
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "Всплеск рестартов контейнера"
+            description: "Количество рестартов > {{ $ctr.restartBurst5m }} за 5 минут."
+            runbook_url: {{ printf "%s/%s" $runbook "restarts" | quote }}
+
+        # CrashLoopBackOff
+        - alert: MythosCrashLooping
+          expr: |
+            max by (pod) (kube_pod_container_status_waiting_reason{ {{ tpl $kubeSel . }}, reason="CrashLoopBackOff" }) == 1
+          for: 10m
+          labels:
+            severity: {{ $sev.page | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "CrashLoopBackOff у контейнера"
+            description: "Контейнер в состоянии CrashLoopBackOff более 10 минут."
+            runbook_url: {{ printf "%s/%s" $runbook "crashloop" | quote }}
+
+        # Перегрев памяти (отношение working_set к лимиту)
+        - alert: MythosMemorySaturation
+          expr: |
+            max by (pod) (
+              container_memory_working_set_bytes{ {{ printf "namespace=\"%s\"" $ns }}, container!="", image!="" }
+              /
+              container_spec_memory_limit_bytes{ {{ printf "namespace=\"%s\"" $ns }}, container!="", image!="" }
+            ) > {{ $ctr.memSaturation }}
+          for: 10m
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "Saturation по памяти (> {{ mul $ctr.memSaturation 100 }}%)"
+            description: "Рабочий набор памяти стабильно близок к лимиту."
+            runbook_url: {{ printf "%s/%s" $runbook "memory" | quote }}
+
+        # Высокий CPU throttling
+        - alert: MythosCPUThrottlingHigh
+          expr: |
+            max by (pod) (
+              rate(container_cpu_cfs_throttled_periods_total{ {{ printf "namespace=\"%s\"" $ns }}, container!="", image!="" }[5m])
+              /
+              rate(container_cpu_cfs_periods_total{ {{ printf "namespace=\"%s\"" $ns }}, container!="", image!="" }[5m])
+            ) > {{ $ctr.cpuThrottle }}
+          for: 10m
+          labels:
+            severity: {{ $sev.notice | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "Высокая доля CPU throttling (> {{ mul $ctr.cpuThrottle 100 }}%)"
+            description: "Контейнер ограничивается по CPU; проверьте requests/limits/HPA."
+            runbook_url: {{ printf "%s/%s" $runbook "cpu-throttling" | quote }}
+
+        # Pod не готов длительно
+        - alert: MythosPodNotReady
+          expr: |
+            min by (pod) (kube_pod_status_ready{ {{ tpl $kubeSel . }}, condition="true" }) == 0
+          for: {{ printf "%dm" (int $avail.notReadyMinutes) }}
+          labels:
+            severity: {{ $sev.page | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "Pod не готов > {{ $avail.notReadyMinutes }} минут"
+            description: "Проверить readiness/liveness, зависимости и события pod."
+            runbook_url: {{ printf "%s/%s" $runbook "pod-not-ready" | quote }}
+
+    # -------------------- HPA / CAPACITY --------------------
+    - name: mythos-core.capacity.hpa
+      interval: 30s
+      rules:
+        # Достигнут максимум реплик, и при этом utilization выше целевого (headroom)
+        - alert: MythosHPAReplicasMaxedOut
+          expr: |
+            (
+              kube_hpa_status_current_replicas{namespace="{{ $ns }}", hpa="{{ $hpa.name }}"}
+                == on(namespace, hpa)
+              kube_hpa_spec_max_replicas{namespace="{{ $ns }}", hpa="{{ $hpa.name }}"}
+            )
+            and
+            (
+              kube_hpa_status_current_metrics_target{namespace="{{ $ns }}", hpa="{{ $hpa.name }}", metric_name=~"cpu|memory"}
+                * {{ $hpa.utilizationHeadroom }}
+              <
+              kube_hpa_status_current_metrics_value{namespace="{{ $ns }}", hpa="{{ $hpa.name }}", metric_name=~"cpu|memory"}
+            )
+          for: {{ printf "%dm" (int $hpa.scaleMaxedMinutes) }}
+          labels:
+            severity: {{ $sev.ticket | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "HPA упёрся в maxReplicas и не покрывает нагрузку"
+            description: "Рассмотрите увеличение maxReplicas или вертикальный скейлинг."
+            runbook_url: {{ printf "%s/%s" $runbook "hpa-maxed" | quote }}
+
+        # HPA не масштабирует вниз из-за стабилизации слишком долго
+        - alert: MythosHPANoScaleDown
+          expr: |
+            (
+              kube_hpa_status_condition{namespace="{{ $ns }}", hpa="{{ $hpa.name }}", condition="AbleToScale", status="true"} == 1
+            )
+            and
+            (
+              (time() - kube_hpa_status_last_scale_time{namespace="{{ $ns }}", hpa="{{ $hpa.name }}"}) > (15 * 60)
+            )
+          for: 30m
+          labels:
+            severity: {{ $sev.notice | quote }}
+            service: "mythos-core"
+            component: "api"
+          annotations:
+            summary: "HPA давно не масштабировался вниз"
+            description: "Проверьте stabilization window и метрики; потенциальное переразмеривание."
+            runbook_url: {{ printf "%s/%s" $runbook "hpa-stuck" | quote }}
+
+{{- end }}

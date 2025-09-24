@@ -1,0 +1,289 @@
+# cybersecurity-core/configs/crypto.yaml
+apiVersion: crypto.aethernova.dev/v1
+kind: CryptoPolicy
+metadata:
+  name: cybersecurity-core
+  environment: prod
+  revision: 1
+  updatedAt: "2025-09-02T00:00:00Z"
+  annotations:
+    owner: Aethernova
+    managedBy: Terraform/GitOps
+    changeControl: "All deviations require Security CAB approval"
+
+spec:
+  compliance:
+    fips140_3: true                    # Включить FIPS-совместимые профили
+    allow_non_fips_in_dev: false       # Разрешать Ed25519/ChaCha20 только вне prod
+    crypto_agility: true               # Разрешить безопасную миграцию алгоритмов через версии
+
+  rng:
+    source: system                      # getrandom()/CryptGenRandom()/dev/urandom
+    drbg:
+      enabled: true
+      type: Hash_DRBG
+      hash: sha256
+      prediction_resistance: true
+    health_checks:
+      continuous_rng_test: true
+      min_entropy_bits_per_byte: 7.5
+
+  kms:                                  # Централизованное управление ключами
+    defaultProvider: aws-kms            # aws-kms | gcp-kms | azure-keyvault | soft-hsm | file
+    providers:
+      aws-kms:
+        region: eu-north-1
+        keyPolicyManaged: true
+        enforceKeyRotation: true
+      gcp-kms: {}
+      azure-keyvault: {}
+      soft-hsm:
+        pkcs11Module: /usr/lib/softhsm/libsofthsm2.so
+        slotLabel: AETHERNOVA
+    keyMaterial:
+      storage: "never-extractable"      # Запрещает экспорт закрытых ключей
+      backup:
+        enabled: true
+        method: quorum                   # M-of-N при доступе к бэкапам
+        quorum:
+          m: 2
+          n: 5
+
+  keys:                                 # Каталог ключей по назначению
+    data_at_rest:
+      id: "arn:aws:kms:eu-north-1:111122223333:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+      usage: encrypt-decrypt
+      algorithm: aes-256-gcm
+      rotationDays: 90
+      cacheTtl: 300s
+      exportable: false
+    tls_server:
+      id: "managed:pki/server"
+      usage: tls-server-auth
+      algorithm: ecdsa-p256              # В FIPS — ECDSA P-256; RSA-2048 как fallback
+      rsa_fallback_bits: 2048
+      rotationDays: 60
+      renewBefore: 720h                  # 30d
+    tls_client:
+      id: "managed:pki/client"
+      usage: tls-client-auth
+      algorithm: ecdsa-p256
+      rotationDays: 60
+    jwt_signing:
+      id: "managed:jose/jwkset"
+      usage: sign-verify
+      algorithm: es256                   # Только ES256 в prod
+      rotationDays: 45
+      kidStrategy: datetime
+    log_signing:
+      id: "managed:ed25519/internal"     # Вне внешнего периметра (для цепочек аудита)
+      usage: sign-verify
+      algorithm: ed25519
+      rotationDays: 180
+      allowOnlyInternal: true
+    code_signing:
+      id: "managed:cosign/keyless"       # Sigstore keyless (OIDC), без сохранения приватного ключа
+      usage: sign-verify
+      algorithm: fulcio-rekor
+      policy:
+        requireSlsaProvenance: true
+
+  policies:
+    symmetric:
+      default: aes-256-gcm
+      allowed: [ aes-256-gcm, chacha20-poly1305 ]
+      min_key_size_bits: 256
+      aad_required: true
+    hashing:
+      default: sha-256
+      allowed: [ sha-256, sha-384, sha-512 ]
+      disallowed: [ md5, sha-1, ripemd160 ]
+    mac:
+      hmac:
+        default: hmac-sha256
+        min_tag_bits: 128
+        truncate_to_bits: 256
+    signatures:
+      default: ecdsa-p256
+      allowed:
+        - ecdsa-p256
+        - ecdsa-p384
+        - rsa-pss-2048
+      allow_ed25519_when_not_fips: false
+    kdf:
+      argon2id:
+        enabled: true
+        # Профиль для prod (≈ интерактивный логин)
+        time_cost: 3
+        memory_kib: 262144      # 256 MiB
+        parallelism: 1
+        salt_len: 16
+        hash_len: 32
+        ad: ""
+      pbkdf2:
+        enabled: true
+        prf: hmac-sha256
+        iterations_min: 210000   # OWASP/modern baseline
+        salt_len: 16
+        hash_len: 32
+      scrypt:
+        enabled: false           # По умолчанию отключен в пользу Argon2id
+    password_policy:
+      min_length: 12
+      require_classes: [ upper, lower, digit, symbol ]
+      max_age_days: 0            # 0 = без принудительной смены по времени
+      lockout_threshold: 10
+      lockout_window: 15m
+      reuse_prevention: 5
+
+  tls:
+    min_version: "1.3"
+    allow_tls12_fallback: true
+    # Список шифров применяется только к TLS 1.2
+    tls12_cipher_suites:
+      # FIPS-совместимые наборы
+      - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+      - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+      - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+      - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    curves:
+      prefer: [ x25519, secp256r1 ]
+      fips_only: [ secp256r1, secp384r1 ]
+    prefer_server_ciphers: true
+    session_tickets:
+      enabled: true
+      rotation_hours: 24
+      limit: 2
+    stapling:
+      ocsp:
+        enabled: true
+        must_staple: true
+        timeout: 2s
+    hsts:
+      enabled: true
+      max_age: 31536000
+      include_subdomains: true
+      preload: false
+    mtls:
+      internal_services_required: true
+      external_clients_required: false
+      client_ca_bundle_ref: "secret://pki/client/ca-bundle"
+      verify_depth: 2
+    cert_issuance:
+      backend: acme-kms-pki              # acme-kms-pki | private-ca
+      renew_before: 720h
+      subject:
+        org: "Aethernova"
+        country: "SE"
+      san:
+        require_dns: true
+        require_min_entries: 1
+    pinning:
+      spki_pins:
+        enabled: true
+        pins:
+          - base64: "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        enforce_for_internal_clients: true
+
+  jose_jwt:
+    issuer: "https://auth.aethernova.dev"
+    audiences:
+      - "cybersecurity-core"
+    clock_skew_leeway: 30s
+    allowed_algs: [ ES256 ]
+    disallowed_algs: [ none, HS256, RS256 ]  # запрет симметричных и устаревших в этом контексте
+    access_token_ttl: 15m
+    refresh_token_ttl: 30d
+    require_jti: true
+    replay_protection:
+      enabled: true
+      store: "redis://redis.internal:6379/5"
+      ttl: 16m
+    key_set:
+      source: jwks
+      jwks_uri: "https://auth.aethernova.dev/.well-known/jwks.json"
+      cache_ttl: 10m
+      require_kid: true
+    claims_validation:
+      required: [ sub, aud, iss, exp, iat ]
+      custom:
+        env: prod
+
+  ssh:
+    server_policy:
+      kex: [ curve25519-sha256, curve25519-sha256@libssh.org, ecdh-sha2-nistp256 ]
+      hostkeys:
+        - type: ecdsa-sha2-nistp256
+        - type: ssh-ed25519   # допускается для совместимости, не FIPS
+      macs: [ hmac-sha2-256, hmac-sha2-512 ]
+      ciphers: [ chacha20-poly1305@openssh.com, aes256-gcm@openssh.com, aes128-gcm@openssh.com ]
+      login_banner: "Authorized access only"
+      root_login: "prohibit-password"
+    client_policy:
+      strict_host_key_checking: true
+      revocation_lists:
+        - "https://pki.aethernova.dev/ssh/crl.pem"
+
+  secrets_management:
+    envelope_encryption:
+      kek_ref: "kms:arn:aws:kms:eu-north-1:111122223333:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+      dek_alg: aes-256-gcm
+      aad_context: "aethernova/cybersecurity-core"
+    storage:
+      provider: sops
+      sops:
+        recipients:
+          age:
+            - "age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          pgp:
+            - "FINGERPRINT:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        encryption:
+          default: aes-256-gcm
+          mac: hmac-sha256
+    rotation:
+      secrets_days: 90
+      credentials_days: 45
+      stagger_jitter: "10%"
+
+  logging_integrity:
+    strategy: "hash-chain+hmac"
+    hmac_key_ref: "managed:hmac/logs"
+    hash_function: sha-256
+    anchoring:
+      enabled: true
+      cadence: 1h
+      target: "rekor://rekor.sigstore.dev"
+    export:
+      format: jsonl
+      compress: true
+
+  code_signing:
+    cosign:
+      keyless: true
+      require_tlog: true
+      attestations:
+        slsa_level: 3
+        sbom_required: true
+        sbom_format: spdx-json
+
+  zeroization:
+    enabled: true
+    method: "libsodium_secure_memzero"
+    apply_to:
+      - private_key_buffers
+      - session_keys
+      - password_hash_intermediates
+
+  side_channel_mitigations:
+    constant_time_compare: true
+    blind_rsa_decrypt: true
+    disable_remote_timing: true
+
+  enforcement:
+    fail_on_policy_violation: true
+    audit_only_in: [ "dev", "staging" ]
+    report_channel: "siem://security-events"
+
+  versioning:
+    policy_version: "2025.09"
+    next_review_before: "2026-09-01T00:00:00Z"

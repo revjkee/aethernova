@@ -1,0 +1,268 @@
+# ledger-core/ops/configs/policies/signing_policies.yaml
+# ======================================================================
+# (A) KYVERNO — строгая проверка подписи и аттестаций cosign + базовые запреты
+# Требует установленный Kyverno v1.10+.
+# ======================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ledger-forbid-latest-and-require-digest
+  annotations:
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/description: >-
+      Запрет тега :latest и требование закрепления образов по digest для пространств с label environment=prod.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: forbid-latest
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "Do not use ':latest' tag in production."
+        pattern:
+          spec:
+            template:
+              spec:
+                containers:
+                  - image: "!*:latest"
+                =(initContainers):
+                  - image: "!*:latest"
+    - name: require-digest
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "Images must be pinned by digest (…@sha256:<64-hex>)."
+        foreach:
+          - list: "request.object.spec.template.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: ".*@sha256:[0-9a-f]{64}$"
+          - list: "request.object.spec.template.spec.initContainers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: ".*@sha256:[0-9a-f]{64}$"
+---
+apiVersion: kyverno.io/v2
+kind: ClusterPolicy
+metadata:
+  name: ledger-verify-images-and-attestations
+  annotations:
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/description: >-
+      Верификация cosign-подписи образов, разрешённые реестры, Rekor CT, требование SBOM и SLSA/Provenance
+      аттестаций для приложений с label environment=prod.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: verify-ledger-core-images
+      match:
+        any:
+          - resources:
+              kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector: { matchLabels: { environment: prod } }
+      verifyImages:
+        - imageReferences:
+            - "PLACEHOLDER_REG1/ledger-core-api@sha256:*"
+            - "PLACEHOLDER_REG1/ledger-core-worker@sha256:*"
+            - "PLACEHOLDER_REG1/ledger-core-migrations@sha256:*"
+          mutateDigest: false
+          failureAction: Enforce
+          repository: ""   # оставьте пустым при использовании полных references
+          attestors:
+            # 1) Проверка через публичный ключ cosign (offline)
+            - entries:
+                - keys:
+                    publicKeys: |
+                      -----BEGIN PUBLIC KEY-----
+                      PLACEHOLDER_COSIGN_PUBKEY
+                      -----END PUBLIC KEY-----
+            # 2) Дополнительно — проверка через Rekor (CT лог) для тех же ключей
+            - entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subject: "repo:PLACEHOLDER_GH_ORG/PLACEHOLDER_REPO:ref:refs/tags/v.*"
+                  rekor:
+                    url: "https://rekor.sigstore.dev"
+          attestations:
+            # Требуем SBOM (SPDX или CycloneDX) — минимум один из типов
+            - predicateType: "https://spdx.dev/Document"
+              verifier:
+                entries:
+                  - keys:
+                      publicKeys: |
+                        -----BEGIN PUBLIC KEY-----
+                        PLACEHOLDER_COSIGN_PUBKEY
+                        -----END PUBLIC KEY-----
+              conditions:
+                all:
+                  - key: "{{ regex_match('^SPDX-2\\..*$', string(predicate.SPDXID)) }}"
+                    operator: Equals
+                    value: "true"
+            - predicateType: "https://cyclonedx.org/bom"
+              verifier:
+                entries:
+                  - keys:
+                      publicKeys: |
+                        -----BEGIN PUBLIC KEY-----
+                        PLACEHOLDER_COSIGN_PUBKEY
+                        -----END PUBLIC KEY-----
+              conditions:
+                all:
+                  - key: "{{ predicate.metadata.component.name }}"
+                    operator: Equals
+                    value: "ledger-core"
+            # Требуем SLSA/Provenance (in‑toto)
+            - predicateType: "https://slsa.dev/provenance/v1"
+              verifier:
+                entries:
+                  - keyless:
+                      issuer: "https://token.actions.githubusercontent.com"
+                      subject: "repo:PLACEHOLDER_GH_ORG/PLACEHOLDER_REPO:ref:refs/heads/main"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+              conditions:
+                all:
+                  - key: "{{ predicate.buildDefinition.builder.id }}"
+                    operator: Equals
+                    value: "https://github.com/PLACEHOLDER_GH_ORG/PLACEHOLDER_REPO/.github/workflows/release.yml@refs/heads/main"
+        - imageReferences:
+            # Разрешённые сторонние образы — только из доверенных реестров и с подписью
+            - "PLACEHOLDER_REG2/library/nginx@sha256:*"
+            - "PLACEHOLDER_REG2/library/postgres@sha256:*"
+          failureAction: Enforce
+          attestors:
+            - entries:
+                - keyless:
+                    issuer: "https://accounts.google.com"
+                    subject: "MAIL_OR_SUBJECT_OF_VENDOR"
+                  rekor:
+                    url: "https://rekor.sigstore.dev"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ledger-allowlist-registries
+  annotations:
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/description: "Жёсткий allowlist OCI‑реестров для production."
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: only-approved-registries
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "Images must come from approved registries (PLACEHOLDER_REG1/REG2)."
+        foreach:
+          - list: "request.object.spec.template.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: "^(PLACEHOLDER_REG1|PLACEHOLDER_REG2)\\/.*@sha256:[0-9a-f]{64}$"
+          - list: "request.object.spec.template.spec.initContainers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: "^(PLACEHOLDER_REG1|PLACEHOLDER_REG2)\\/.*@sha256:[0-9a-f]{64}$"
+
+# ======================================================================
+# (B) SIGSTORE POLICY CONTROLLER — альтернативный (или доп.) путь
+# Требует установленный sigstore/policy‑controller.
+# ======================================================================
+---
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: ledger-enforce-signed
+  annotations:
+    description: >-
+      Политика Sigstore: разрешать только образы, подписанные ключом cosign
+      И/ИЛИ построенные под удостоверением OIDC GitHub Actions (keyless) с записью в Rekor.
+spec:
+  mode: enforce
+  images:
+    - glob: "PLACEHOLDER_REG1/ledger-core-*"
+    - glob: "PLACEHOLDER_REG2/library/*"
+  authorities:
+    # A1: Подпись известным публичным ключом (офлайн)
+    - key:
+        data: |
+          -----BEGIN PUBLIC KEY-----
+          PLACEHOLDER_COSIGN_PUBKEY
+          -----END PUBLIC KEY-----
+      ctlog:
+        url: https://rekor.sigstore.dev
+    # A2: Keyless/OIDC GitHub — идентичности строителя (issuer+subject regexp)
+    - keyless:
+        identities:
+          - issuer: https://token.actions.githubusercontent.com
+            subjectRegExp: "^repo:PLACEHOLDER_GH_ORG/PLACEHOLDER_REPO:ref:refs/(heads/main|tags/v.+)$"
+      ctlog:
+        url: https://rekor.sigstore.dev
+  # Требуем аттестации SBOM и SLSA; каждое правило — «должно существовать»
+  attestations:
+    - name: sbom-spdx-or-cdx
+      predicateType: https://spdx.dev/Document
+    - name: slsa-provenance
+      predicateType: https://slsa.dev/provenance/v1
+
+# ======================================================================
+# (C) KYVERNO — оговорки/исключения на уровне namespace (опционально)
+# ======================================================================
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ledger-signing-exceptions
+  annotations:
+    policies.kyverno.io/category: Exceptions
+    policies.kyverno.io/description: "Явные исключения (напр., миграционные джобы) — по метке waive-signing=true."
+spec:
+  validationFailureAction: Audit    # фиксируем, но не блокируем (для точечных waive)
+  background: true
+  rules:
+    - name: waive-signing-if-labeled
+      match:
+        any:
+          - resources:
+              kinds: ["Job","CronJob"]
+              selector:
+                matchExpressions:
+                  - key: waive-signing
+                    operator: In
+                    values: ["true"]
+      preconditions:
+        any:
+          - key: "{{ request.operation }}"
+            operator: In
+            value: ["CREATE","UPDATE"]
+      validate:
+        message: "Signing policy waived for this workload (audited)."
+        deny:
+          conditions:
+            any:
+              - key: "false"
+                operator: Equals
+                value: "true"

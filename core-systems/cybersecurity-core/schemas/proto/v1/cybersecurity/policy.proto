@@ -1,0 +1,337 @@
+syntax = "proto3";
+
+package aethernova.cybersecurity.v1;
+
+option go_package = "github.com/aethernova/cybersecurity-core/gen/go/cybersecurity/v1;cybersecurityv1";
+option java_multiple_files = true;
+option java_package = "io.aethernova.cybersecurity.v1";
+option csharp_namespace = "Aethernova.Cybersecurity.V1";
+option objc_class_prefix = "ANCS";
+option php_namespace = "Aethernova\\Cybersecurity\\V1";
+option ruby_package = "Aethernova::Cybersecurity::V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// ------------------------------- Enums ----------------------------------------
+
+enum PolicyLanguage {
+  POLICY_LANGUAGE_UNSPECIFIED = 0;
+  POLICY_LANGUAGE_REGO = 1;        // OPA/Rego source
+  POLICY_LANGUAGE_CEL = 2;         // CEL expressions
+  POLICY_LANGUAGE_KYVERNO = 3;     // Kyverno YAML
+  POLICY_LANGUAGE_GATEKEEPER = 4;  // Gatekeeper ConstraintTemplate YAML
+  POLICY_LANGUAGE_YAML = 5;        // Generic YAML (e.g., Kubernetes manifests)
+  POLICY_LANGUAGE_WASM = 6;        // Precompiled WASM policy
+}
+
+enum PolicyEngine {
+  POLICY_ENGINE_UNSPECIFIED = 0;
+  POLICY_ENGINE_OPA = 1;           // OPA/Conftest family
+  POLICY_ENGINE_KYVERNO = 2;
+  POLICY_ENGINE_GATEKEEPER = 3;
+  POLICY_ENGINE_CUSTOM = 4;        // External/custom engine
+}
+
+enum EnforcementAction {
+  ENFORCEMENT_ACTION_UNSPECIFIED = 0;
+  ENFORCEMENT_ACTION_ADVISORY = 1; // Informational
+  ENFORCEMENT_ACTION_WARN = 2;     // Warning (non-blocking)
+  ENFORCEMENT_ACTION_AUDIT = 3;    // Audit-only
+  ENFORCEMENT_ACTION_DENY = 4;     // Block request
+  ENFORCEMENT_ACTION_MUTATE = 5;   // Mutate (where applicable)
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO = 1;
+  SEVERITY_LOW = 2;
+  SEVERITY_MEDIUM = 3;
+  SEVERITY_HIGH = 4;
+  SEVERITY_CRITICAL = 5;
+}
+
+// ------------------------------- Core Types -----------------------------------
+
+message Hash {
+  // Example: "sha256"
+  string algo = 1;
+  // Hex-encoded digest
+  string hex = 2;
+}
+
+message Signature {
+  string type = 1;                            // e.g., "cosign", "pgp"
+  bytes signature = 2;                        // raw/signature payload
+  string key_id = 3;                          // key identifier/thumbprint
+  string verifier_hint = 4;                   // optional verifier name/ref
+  Hash payload_hash = 5;                      // hash of signed payload
+  map<string, string> metadata = 6;           // additional attestation data
+  google.protobuf.Timestamp signed_at = 7;
+}
+
+message Dependency {
+  string name = 1;                            // dependency name
+  string version = 2;                         // semver
+  string source_uri = 3;                      // OCI/Git/HTTP
+  Hash hash = 4;                              // integrity
+}
+
+// Kubernetes selectors
+message LabelSelectorRequirement {
+  string key = 1;
+  // Operators: In, NotIn, Exists, DoesNotExist
+  string operator = 2;
+  repeated string values = 3;
+}
+
+message LabelSelector {
+  map<string, string> match_labels = 1;
+  repeated LabelSelectorRequirement match_expressions = 2;
+}
+
+// Target definitions
+message KubernetesTarget {
+  string api_group = 1;                       // "" for core
+  string api_version = 2;                     // e.g., "v1"
+  string kind = 3;                            // e.g., "Pod"
+  repeated string namespaces = 4;             // "*" means all
+  repeated LabelSelector selectors = 5;       // object label selectors
+}
+
+message OPATarget {
+  string package = 1;                         // e.g., "kubernetes.admission"
+  string rule = 2;                            // entrypoint rule name
+  repeated string input_fields = 3;           // expected input fields
+}
+
+message Target {
+  oneof kind {
+    KubernetesTarget kubernetes = 1;
+    OPATarget opa = 2;
+    string generic = 3;                       // free-form target identifier
+  }
+}
+
+// Parameter schema (JSON Schema) for policy parameters
+message ParameterSchema {
+  string name = 1;
+  google.protobuf.Struct json_schema = 2;     // JSON Schema Draft (object form)
+  google.protobuf.Struct default_value = 3;
+  bool required = 4;
+}
+
+// Policy metadata & status
+message PolicyMeta {
+  string name = 1;                            // policy short name (unique within project)
+  string version = 2;                         // semver for policy content
+  string description = 3;
+  string project = 4;                         // logical grouping/project
+  string environment = 5;                     // prod/staging/dev/etc.
+  string owner = 6;                           // owner/team
+  map<string, string> labels = 7;
+  map<string, string> annotations = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  string etag = 11;                           // for optimistic concurrency
+}
+
+message PolicyStatus {
+  bool active = 1;
+  bool deprecated = 2;
+  string deprecation_note = 3;
+  repeated string errors = 4;
+  repeated string warnings = 5;
+  string last_applied_revision = 6;           // SCM/OCI digest or git sha
+}
+
+// Policy specification
+message PolicySpec {
+  PolicyLanguage language = 1;
+  PolicyEngine engine = 2;
+
+  // Exactly one content source must be provided.
+  oneof source {
+    string rego = 10;                         // Rego module(s) concatenated
+    string cel = 11;                          // CEL expression(s)
+    string kyverno_yaml = 12;                 // Kyverno policy YAML
+    string gatekeeper_template_yaml = 13;     // ConstraintTemplate YAML
+    string oci_bundle_ref = 14;               // OCI reference to bundle
+    bytes wasm_module = 15;                   // WASM binary
+  }
+
+  // For engines that need entrypoints, e.g., OPA package.rule
+  string entrypoint = 20;
+
+  // Where policy applies
+  repeated Target targets = 21;
+
+  // Default severity and action (can be overridden by params)
+  Severity default_severity = 22;
+  EnforcementAction default_action = 23;
+
+  // Parameters schema and dependencies
+  repeated ParameterSchema parameter_schemas = 24;
+  repeated Dependency dependencies = 25;
+
+  // Integrity
+  Hash content_hash = 26;
+
+  // Reserved for future flags (e.g., multi-tenancy scopes)
+  reserved 27 to 29;
+}
+
+// Primary Policy object
+message Policy {
+  // Resource name, e.g., "policies/{uuid}" or "projects/{id}/policies/{name}@{version}"
+  string id = 1;
+
+  PolicyMeta meta = 2;
+  PolicySpec spec = 3;
+
+  // Optional signatures/attestations
+  repeated Signature signatures = 4;
+
+  PolicyStatus status = 5;
+
+  // Reserved numbers for forward-compat
+  reserved 6 to 9;
+}
+
+// Bundle of policies (atomic publish unit)
+message PolicyBundle {
+  string id = 1;
+  string name = 2;
+  string version = 3;                         // semver for the bundle
+  map<string, string> labels = 4;
+  map<string, string> annotations = 5;
+  repeated Policy policies = 6;
+  google.protobuf.Timestamp created_at = 7;
+  Hash content_hash = 8;
+}
+
+// ----------------------------- Evaluation Types -------------------------------
+
+message ResourceRef {
+  string uid = 1;
+  string api_group = 2;
+  string api_version = 3;
+  string kind = 4;
+  string namespace = 5;
+  string name = 6;
+
+  // Full object for admission/offline checks (optional)
+  google.protobuf.Struct object = 10;
+}
+
+message UserInfo {
+  string username = 1;
+  repeated string groups = 2;
+  map<string, string> extras = 3;             // e.g., cert attributes
+}
+
+message PolicyContext {
+  Target target = 1;
+  ResourceRef resource = 2;
+  UserInfo user_info = 3;
+  map<string, string> tenant = 4;             // e.g., org/project/env
+  map<string, string> attributes = 5;         // arbitrary request attributes
+}
+
+message Violation {
+  string code = 1;                             // machine-readable code
+  string message = 2;                          // human-readable message
+  google.protobuf.Struct details = 3;          // arbitrary data (evidence)
+  ResourceRef resource = 4;
+  Severity severity = 5;
+  EnforcementAction suggested_action = 6;
+}
+
+message Decision {
+  string policy_id = 1;
+  string policy_name = 2;
+  EnforcementAction action = 3;               // effective action
+  Severity severity = 4;                      // effective severity
+  bool violated = 5;
+  repeated Violation violations = 6;
+  map<string, string> metadata = 7;           // engine-specific info
+  google.protobuf.Duration eval_duration = 8;
+}
+
+message EvaluationRequest {
+  string request_id = 1;
+  PolicyContext context = 2;
+
+  // Evaluate provided policies OR referenced by IDs (server-resolved)
+  repeated Policy policies = 3;
+  repeated string policy_ids = 4;
+
+  // Raw input for policy evaluation (OPA/CEL, etc.)
+  google.protobuf.Struct input = 5;
+
+  bool dry_run = 6;
+  google.protobuf.Timestamp timestamp = 7;
+  map<string, string> attributes = 8;
+}
+
+message EvaluationResponse {
+  string request_id = 1;
+  repeated Decision decisions = 2;
+  int32 policy_count = 3;
+  int32 violated_count = 4;
+  google.protobuf.Duration duration = 5;
+}
+
+// ----------------------------- Validation & CRUD ------------------------------
+
+message ValidateResponse {
+  bool valid = 1;
+  repeated string errors = 2;
+  repeated string warnings = 3;
+}
+
+message GetPolicyRequest {
+  string id = 1;                               // policy resource name
+}
+
+message ListPoliciesRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  map<string, string> filter_labels = 3;       // exact-match labels
+  string query = 4;                             // free-text query
+}
+
+message ListPoliciesResponse {
+  repeated Policy policies = 1;
+  string next_page_token = 2;
+  int32 total_size = 3;
+}
+
+message DeletePolicyRequest {
+  string id = 1;
+  string etag = 2;                              // for concurrency control
+}
+
+message DeletePolicyResponse {}
+
+message PushPolicyRequest {
+  Policy policy = 1;
+  bool overwrite = 2;                           // allow replacing if etag matches
+}
+
+message PushPolicyResponse {
+  Policy policy = 1;                            // persisted/normalized version
+}
+
+// ------------------------------- Service API ----------------------------------
+
+service PolicyService {
+  rpc Validate(Policy) returns (ValidateResponse);
+  rpc Evaluate(EvaluationRequest) returns (EvaluationResponse);
+
+  rpc PushPolicy(PushPolicyRequest) returns (PushPolicyResponse);
+  rpc GetPolicy(GetPolicyRequest) returns (Policy);
+  rpc ListPolicies(ListPoliciesRequest) returns (ListPoliciesResponse);
+  rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse);
+}

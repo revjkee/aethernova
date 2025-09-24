@@ -1,0 +1,314 @@
+version: 1
+policy_id: anti_cheat.core
+description: >
+  Единая политика анти‑чит/анти‑фрод для engine-core. Совмещает сигналы клиента и сервера,
+  детекторы правил + ML, риск-скоринг и управляемые меры воздействия (sanctions).
+
+app:
+  env: ${APP_ENV:production}
+  service: engine-core
+  clock_skew_tolerance_sec: 60
+
+# -----------------------------
+# 1) Источники сигналов
+# -----------------------------
+signals:
+  client_attestation:
+    required: true
+    providers:
+      - name: device_integrity
+        fields: [bootloader_locked, device_rooted, emulator, debug_build, developer_mode]
+      - name: runtime_integrity
+        fields: [hook_framework_detected, mem_patch_detected, ptrace_attached, code_injection]
+      - name: app_attest
+        fields: [bundle_hash, signing_cert_spki, app_version, integrity_token_valid]
+    signature:
+      algs: [Ed25519, ES256]
+      max_age_sec: 300
+  device_fingerprint:
+    required: true
+    stability_days_target: 30
+    fields: [hw_model, os_version, timezone, locale, screen, ip_subnet, user_agent_hash, webgl_hash]
+    collision_threshold_pct: 90
+  network:
+    collect: [ip, asn, cidr, country, city, proxy_type, vpn, tor, hosting_asn]
+    ip_reputation_enabled: true
+  behavior:
+    events_required: true
+    streams:
+      - name: auth
+        fields: [action, success, mfa, latency_ms]
+      - name: gameplay
+        fields: [action, delta_t_ms, coords, input_entropy, velocity, accel]
+      - name: economy
+        fields: [action, amount, asset, price, balance_before, balance_after]
+      - name: social
+        fields: [action, target_id]
+    sampling:
+      default_pct: 100
+  server_metrics:
+    include: [rps_per_user, error_401_rate, tx_per_min, unique_ips_24h, orders_per_5m]
+  web:
+    anti_bot_provider: turnstile
+    secret_env: BOT_CHALLENGE_SECRET
+    challenge_on_paths: ["/auth/*","/mint/*","/api/v1/economy/*"]
+
+# -----------------------------
+# 2) Модель риска и пороги
+# -----------------------------
+risk:
+  score_range: [0, 100]
+  buckets:
+    clean:   { range: [0, 24] }
+    watch:   { range: [25, 49] }
+    suspect: { range: [50, 74] }
+    fraud:   { range: [75, 100] }
+  actions_by_bucket:
+    clean:   [allow]
+    watch:   [allow, shadow_log]
+    suspect: [step_up_auth, rate_limit_soft, shadow_ban_content]
+    fraud:   [block_hard, freeze_economy, require_attestation_renew]
+  decay:
+    half_life_hours: 72           # естественное снижение риска при чистом поведении
+
+# -----------------------------
+# 3) Детекторы (правила)
+# -----------------------------
+detectors:
+  emulator_use:
+    weight: 25
+    when: "signals.client_attestation.emulator == true"
+  root_jailbreak:
+    weight: 20
+    when: "signals.client_attestation.device_rooted == true or signals.client_attestation.debug_build == true"
+  hook_framework:
+    weight: 30
+    when: "signals.client_attestation.hook_framework_detected == true or signals.client_attestation.code_injection == true"
+  runtime_tamper:
+    weight: 20
+    when: "signals.client_attestation.mem_patch_detected == true or signals.client_attestation.ptrace_attached == true"
+  vpn_tor_hosting:
+    weight: 10
+    when: "signals.network.proxy_type in ['vpn','tor'] or signals.network.hosting_asn == true"
+  impossible_travel:
+    weight: 20
+    when: "geo_speed_kmh(signals.network) > 900 and time_delta_min(auth.prev_login_at, now()) < 30"
+  multi_account_farm:
+    weight: 20
+    when: "metrics.unique_accounts_on_fp_24h > 5 or metrics.unique_fp_on_account_24h > 5"
+  input_nonhuman:
+    weight: 25
+    when: "metrics.input_entropy_5m < 0.2 or metrics.reaction_time_std_ms < 20"
+  speedhack_physics:
+    weight: 25
+    when: "metrics.velocity_sigma > 6 or metrics.teleport_events_5m > 2"
+  economy_anomaly:
+    weight: 20
+    when: "metrics.tx_out_in_ratio_1h > 10 or metrics.balance_jump_sigma > 5"
+  api_abuse:
+    weight: 15
+    when: "metrics.rps_per_user > limits.api_user_rps_hard or metrics.error_401_rate > 0.3"
+  referral_abuse:
+    weight: 10
+    when: "metrics.referrals_24h > 10 and metrics.new_devices_24h < 2"
+
+limits:
+  api_user_rps_soft: 10
+  api_user_rps_hard: 30
+  economy_tx_per_min_soft: 20
+  economy_tx_per_min_hard: 60
+
+# -----------------------------
+# 4) Модель ML (дополняет правила)
+# -----------------------------
+ml_model:
+  enabled: true
+  name: anti_cheat_gbdt_v3
+  input_features:
+    - "ip_rep_score"            # 0..1
+    - "fp_stability_days"
+    - "events_per_min"
+    - "entropy_keystroke"
+    - "delta_balance_sigma"
+    - "geo_velocity_kmh"
+    - "device_integrity_score"
+    - "mfa_usage_ratio_30d"
+  threshold_suspect: 0.65
+  threshold_fraud: 0.85
+  fallback_on_error: true
+  retrain:
+    cadence_days: 14
+    drift_monitoring: true
+    min_auc: 0.85
+
+# -----------------------------
+# 5) Агрегация риска
+# -----------------------------
+scoring:
+  combine:
+    method: weighted_max            # max с бонусом за совпадения
+    bonus_if_multiple_triggers: 10  # добавка, если ≥2 детекторов сработали
+  caps:
+    max_rule_contrib: 70
+    max_ml_contrib: 40
+  mitigations:
+    negative_signals:
+      - "mfa_verified_recent"       # снижает 5
+      - "device_stable_30d"         # снижает 5
+  formulas:
+    mfa_verified_recent: "event_since('auth.mfa_success', 14d) == true ? -5 : 0"
+    device_stable_30d: "signals.device_fingerprint.stability_days >= 30 ? -5 : 0"
+
+# -----------------------------
+# 6) Реакции (санкции)
+# -----------------------------
+sanctions:
+  step_up_auth:
+    actions:
+      - type: require_mfa
+      - type: captcha_strong
+  rate_limit_soft:
+    actions:
+      - type: rate_limit
+        bucket: user_soft
+        params: { rps: 5, burst: 10 }
+  shadow_ban_content:
+    actions:
+      - type: shadow_flag
+        scope: ["chat_post","review_post","social_invite"]
+  freeze_economy:
+    actions:
+      - type: hold_transactions
+        duration_sec: 86400
+        allowlist_paths: ["/withdraw/cancel","/support/appeal"]
+  block_hard:
+    actions:
+      - type: deny_requests
+        http_status: 429
+        duration_sec: 7200
+  require_attestation_renew:
+    actions:
+      - type: invalidate_attestation
+      - type: request_app_attest_renew
+
+# -----------------------------
+# 7) Исключения и доверенные контуры
+# -----------------------------
+trust:
+  staff_allow:
+    ip_cidrs: ["10.0.0.0/8","192.168.0.0/16"]
+    roles: ["admin","security_admin","auditor"]
+    max_bucket: watch
+  partners:
+    fp_allow_list: []      # список отпечатков устройств партнёров для демо/QA
+  feature_flags:
+    disable_emulator_rule_envs: ["development","staging"]
+
+# -----------------------------
+# 8) Апелляции и разбан
+# -----------------------------
+appeals:
+  enabled: true
+  window_days: 30
+  channels: ["inapp","email"]
+  sla_hours: 72
+  evidence_required:
+    - "id_proof_optional"
+    - "device_logs_attest"
+  review:
+    reviewers_min: 2
+    quorum: 2
+    auto_unfreeze_if_no_response_hours: 72
+
+# -----------------------------
+# 9) Приватность и хранение данных
+# -----------------------------
+privacy:
+  pii_redaction:
+    enabled: true
+    fields: ["email","phone","ip","token"]
+  retention:
+    raw_events_days: 30
+    aggregates_days: 365
+    appeals_artifacts_days: 365
+  export_controls:
+    allow_user_export: true
+    require_dpa_for_partners: true
+
+# -----------------------------
+# 10) Аудит и телеметрия
+# -----------------------------
+auditing:
+  enabled: true
+  redact_pii_fields: true
+  log_events:
+    - detector_triggered
+    - bucket_changed
+    - sanction_applied
+    - appeal_opened
+    - appeal_resolved
+  fields:
+    - subject.user_id
+    - subject.role
+    - device.fp_hash
+    - ip
+    - geo.country
+    - risk.score
+    - bucket
+    - sanctions
+    - request_id
+telemetry:
+  otlp_endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://otel-collector:4318}
+  metrics:
+    - "anti_cheat_risk_score"
+    - "sanctions_applied_total"
+    - "appeals_opened_total"
+    - "detector_triggered_total"
+  alerts:
+    fraud_bucket_rate_pct:
+      warn: 2
+      crit: 5
+
+# -----------------------------
+# 11) Интеграция с другими политиками
+# -----------------------------
+integration:
+  security_policy_ref: "configs/security.yaml"
+  economy_policy_ref:  "configs/policies/economy.yaml"
+  acl_world_policy_ref:"configs/policies/acl.world.yaml"
+  rate_limit_redis_env: RATE_LIMIT_REDIS_DSN
+
+# -----------------------------
+# 12) Тест‑вектора (канареечные проверки)
+# -----------------------------
+test_vectors:
+  - name: emulator_detect
+    input:
+      signals.client_attestation.emulator: true
+    expect:
+      min_bucket: suspect
+      sanction_contains: ["step_up_auth"]
+  - name: impossible_travel
+    input:
+      geo_prev: { country: "SE", ts: "2025-08-12T10:00:00Z" }
+      geo_now:  { country: "US", ts: "2025-08-12T10:20:00Z" }
+    expect:
+      min_bucket: suspect
+  - name: hook_framework_block
+    input:
+      signals.client_attestation.hook_framework_detected: true
+    expect:
+      min_bucket: fraud
+      sanction_contains: ["block_hard"]
+
+# -----------------------------
+# 13) Документация операционного контура
+# -----------------------------
+runbook:
+  sev1:
+    actions: ["enable_global_captcha","raise_buckets_all:+10","pause_economy_buy","notify_sec_ops"]
+  sev2:
+    actions: ["enable_captcha_on:/auth/*,/mint/*","tighten_rate_limits:+50%","notify_ops"]
+  contacts:
+    email: ["sec-duty@example.com","fraud@example.com"]
+    pagerduty: "anti-cheat-primary"

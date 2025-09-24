@@ -1,0 +1,167 @@
+{{- /*
+  Industrial-grade ConfigMap for security-core.
+  Features:
+    - Stable fullname calculation without helpers.
+    - Common Kubernetes labels for traceability.
+    - Checksums over Values.config and chart-embedded policy/config files.
+    - Optional template rendering (tpl) for inline and file-based content.
+    - Support for data and binaryData via Values.config.extraFiles.
+    - Compatible with Stakater Reloader via annotation.
+*/ -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- $name = trunc 63 $name | trimSuffix "-" -}}
+{{- $fullname := default (printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-") .Values.fullnameOverride -}}
+{{- $ns := .Release.Namespace -}}
+
+{{- /* Build concatenated payload for policy checksum */ -}}
+{{- $polConcat := "" -}}
+{{- range $path, $f := .Files.Glob "policies/**" }}
+  {{- $polConcat = printf "%s%s" $polConcat ($f.AsString) -}}
+{{- end -}}
+{{- $policiesSum := sha256sum $polConcat -}}
+
+{{- /* Build concatenated payload for extra config files checksum */ -}}
+{{- $cfgFilesConcat := "" -}}
+{{- range $path, $f := .Files.Glob "config/**" }}
+  {{- $cfgFilesConcat = printf "%s%s" $cfgFilesConcat ($f.AsString) -}}
+{{- end -}}
+{{- $cfgFilesSum := sha256sum $cfgFilesConcat -}}
+
+{{- /* Values-based config checksum */ -}}
+{{- $valuesCfgSum := sha256sum (toYaml .Values.config | default "") -}}
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-config" $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.Version | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: core-systems
+    app.kubernetes.io/component: security-core
+    security.neurocity.io/tier: "critical"
+    helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
+    {{- with .Values.globalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    # Any change in these checksums forces Pods to roll using checksum annotations in Pod template.
+    config.checksum/values: {{ $valuesCfgSum | quote }}
+    config.checksum/files: {{ $cfgFilesSum | quote }}
+    config.checksum/policies: {{ $policiesSum | quote }}
+    reloader.stakater.com/match: "true"
+    {{- with .Values.extraAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+data:
+  # -----------------------------
+  # Inline application config
+  # -----------------------------
+  {{- if .Values.config.app }}
+  app.yaml: |
+    {{- if .Values.config.enableTpl }}
+    {{- tpl (toYaml .Values.config.app) . | nindent 4 }}
+    {{- else }}
+    {{- toYaml .Values.config.app | nindent 4 }}
+    {{- end }}
+  {{- end }}
+
+  {{- if .Values.config.logging }}
+  logging.yaml: |
+    {{- if .Values.config.enableTpl }}
+    {{- tpl (toYaml .Values.config.logging) . | nindent 4 }}
+    {{- else }}
+    {{- toYaml .Values.config.logging | nindent 4 }}
+    {{- end }}
+  {{- end }}
+
+  {{- if .Values.config.policy }}
+  policy.yaml: |
+    {{- if .Values.config.enableTpl }}
+    {{- tpl (toYaml .Values.config.policy) . | nindent 4 }}
+    {{- else }}
+    {{- toYaml .Values.config.policy | nindent 4 }}
+    {{- end }}
+  {{- end }}
+
+  # -----------------------------
+  # Embedded chart configs (config/**)
+  # Every file under chart's config/** becomes a key in ConfigMap.
+  # Supports tpl rendering when config.enableTpl=true.
+  # -----------------------------
+  {{- $enableTpl := .Values.config.enableTpl | default false -}}
+  {{- range $path, $f := .Files.Glob "config/**" }}
+  {{ base $path }}: |
+    {{- if $enableTpl }}
+    {{- tpl ($f.AsString) $ | nindent 4 }}
+    {{- else }}
+    {{- $f.AsString | nindent 4 }}
+    {{- end }}
+  {{- end }}
+
+  # -----------------------------
+  # Embedded OPA/Rego policies (policies/**)
+  # -----------------------------
+  {{- if or (.Values.policies.enabled) (gt (len (.Files.Glob "policies/**")) 0) }}
+  {{- if .Values.policies.header }}
+  policies-header.txt: |
+    {{- if $enableTpl }}
+    {{- tpl .Values.policies.header $ | nindent 4 }}
+    {{- else }}
+    {{- .Values.policies.header | nindent 4 }}
+    {{- end }}
+  {{- end }}
+  {{- range $path, $f := .Files.Glob "policies/**" }}
+  {{ base $path }}: |
+    {{- if $enableTpl }}
+    {{- tpl ($f.AsString) $ | nindent 4 }}
+    {{- else }}
+    {{- $f.AsString | nindent 4 }}
+    {{- end }}
+  {{- end }}
+  {{- range $i, $p := .Values.policies.inline }}
+  {{- if and $p.name $p.content }}
+  {{ $p.name }}: |
+    {{- if or $p.tpl $enableTpl }}
+    {{- tpl $p.content $ | nindent 4 }}
+    {{- else }}
+    {{- $p.content | nindent 4 }}
+    {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+
+  # -----------------------------
+  # Extra inline files from values (textual)
+  # Values.config.extraFiles[].name, .content, .tpl
+  # -----------------------------
+  {{- range $i, $f := .Values.config.extraFiles }}
+  {{- if and (not $f.binary) $f.name $f.content }}
+  {{ $f.name }}: |
+    {{- if or $f.tpl $enableTpl }}
+    {{- tpl $f.content $ | nindent 4 }}
+    {{- else }}
+    {{- $f.content | nindent 4 }}
+    {{- end }}
+  {{- end }}
+  {{- end }}
+
+{{- /* Optional binaryData for base64 payloads */ -}}
+{{- $hasBinary := false -}}
+{{- range $i, $f := .Values.config.extraFiles -}}
+  {{- if and $f.binary $f.name $f.content -}}
+    {{- $hasBinary = true -}}
+  {{- end -}}
+{{- end -}}
+{{- if $hasBinary }}
+binaryData:
+  {{- range $i, $f := .Values.config.extraFiles }}
+  {{- if and $f.binary $f.name $f.content }}
+  {{ $f.name }}: {{ $f.content | quote }}
+  {{- end }}
+  {{- end }}
+{{- end }}

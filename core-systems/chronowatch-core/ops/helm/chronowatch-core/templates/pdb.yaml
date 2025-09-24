@@ -1,0 +1,102 @@
+{{- /*
+  ChronoWatch Core — PodDisruptionBudget(s)
+  policy/v1, совместим с K8s >=1.25.
+  Генерирует PDB для компонентов: api, worker, scheduler.
+  Управление через:
+    .Values.pdb.enabled: true|false
+    .Values.pdb.mode: "minAvailable"|"maxUnavailable"
+    .Values.pdb.defaults.minAvailable: "50%" (или число)
+    .Values.pdb.defaults.maxUnavailable: "25%" (или число)
+    .Values.pdb.unhealthyPodEvictionPolicy: "IfHealthyBudget"|"AlwaysAllow" (опц.)
+    .Values.pdb.annotations: { ... } — общие аннотации
+    .Values.pdb.components.api|worker|scheduler:
+        mode, minAvailable, maxUnavailable, annotations — для override компонента
+  Компонент создаёт PDB только если replicaCount > 1.
+*/ -}}
+
+{{- if (default true .Values.pdb.enabled) -}}
+{{- $name := include "chronowatch-core.name" . | default "chronowatch-core" -}}
+{{- $fullname := include "chronowatch-core.fullname" . | default (printf "%s-%s" .Release.Name $name) -}}
+{{- $labels := include "chronowatch-core.labels" . | default dict -}}
+{{- $pdb := .Values.pdb | default dict -}}
+
+{{- /* Список компонентов с их репликами и включенностью */ -}}
+{{- $apiEnabled      := dig "api" "enabled" true .Values -}}
+{{- $apiReplicas     := dig "api" "replicaCount" 2 .Values -}}
+{{- $workerEnabled   := dig "worker" "enabled" true .Values -}}
+{{- $workerReplicas  := dig "worker" "replicaCount" 2 .Values -}}
+{{- $schedEnabled    := dig "scheduler" "enabled" true .Values -}}
+{{- $schedReplicas   := dig "scheduler" "replicaCount" 1 .Values -}}
+
+{{- $components := list
+    (dict "name" "api"      "enabled" $apiEnabled     "replicas" $apiReplicas)
+    (dict "name" "worker"   "enabled" $workerEnabled  "replicas" $workerReplicas)
+    (dict "name" "scheduler" "enabled" $schedEnabled  "replicas" $schedReplicas)
+-}}
+
+{{- range $i, $c := $components }}
+{{- if and $c.enabled (gt (int $c.replicas) 1) }}
+
+{{- /* Определяем режим и значение для компонента */ -}}
+{{- $compCfg := (index ($pdb.components | default dict) $c.name) | default dict -}}
+{{- $mode := default (default "minAvailable" $pdb.mode) $compCfg.mode -}}
+
+{{- /* Автодефолты: для >=3 реплик — 66% minAvailable, для =2 — 50% */
+    Можно переопределить через defaults или per-component. */ -}}
+{{- $autoMin := (ternary "66%" "50%" (ge (int $c.replicas) 3)) -}}
+{{- $minDefault := default $autoMin (dig "defaults" "minAvailable" $autoMin $pdb) -}}
+{{- $maxDefault := default "25%" (dig "defaults" "maxUnavailable" "25%" $pdb) -}}
+{{- $minVal := default $minDefault $compCfg.minAvailable -}}
+{{- $maxVal := default $maxDefault $compCfg.maxUnavailable -}}
+
+{{- /* Аннотации: общие + компонентные */ -}}
+{{- $annGlobal := $pdb.annotations | default dict -}}
+{{- $annComp := $compCfg.annotations | default dict -}}
+{{- $annotations := merge (deepCopy $annGlobal) (deepCopy $annComp) -}}
+
+{{- /* Политика эвикшена нездоровых подов (опционально) */ -}}
+{{- $unhealthy := default "" $pdb.unhealthyPodEvictionPolicy -}}
+{{- if hasKey $compCfg "unhealthyPodEvictionPolicy" }}
+{{-   $unhealthy = $compCfg.unhealthyPodEvictionPolicy -}}
+{{- end -}}
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ printf "%s-%s-pdb" $fullname $c.name | trunc 63 | trimSuffix "-" }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ $name }}
+    app.kubernetes.io/component: {{ $c.name }}
+    {{- if $labels }}
+    {{- /* Дополнительные метки из helpers (если есть) */ -}}
+    {{- toYaml (fromYaml (printf "%s" $labels)) | nindent 4 }}
+    {{- end }}
+  annotations:
+    # Рекомендуется поддерживать runbook и SLO owner
+    runbook.url: "https://docs.neurocity.ai/chronowatch/runbooks/{{ $c.name }}"
+    slo.owner: "team-chronowatch-sre"
+    {{- if $annotations }}
+    {{- toYaml $annotations | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: {{ $c.name }}
+  {{- if eq $mode "maxUnavailable" }}
+  maxUnavailable: {{ $maxVal | quote }}
+  {{- else }}
+  minAvailable: {{ $minVal | quote }}
+  {{- end }}
+  {{- if $unhealthy }}
+  unhealthyPodEvictionPolicy: {{ $unhealthy | quote }}
+  {{- end }}
+
+{{- end }}
+{{- end }}
+{{- end }}

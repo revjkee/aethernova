@@ -1,0 +1,174 @@
+{{- /*
+HorizontalPodAutoscaler for security-core
+Features:
+- API negotiation: autoscaling/v2 preferred, fallback to v2beta2/v2beta1
+- Resource metrics (CPU/Memory) + arbitrary custom metrics (External/Pods/Object)
+- Behavior (scaleUp/scaleDown) with policies and stabilization windows (v2+)
+- Strict labels/annotations via helpers and values
+- Safe defaults; all optional blocks are guarded by conditions
+*/ -}}
+{{- if .Values.hpa.enabled }}
+
+{{- $hasV2 := .Capabilities.APIVersions.Has "autoscaling/v2" -}}
+{{- $hasV2b2 := .Capabilities.APIVersions.Has "autoscaling/v2beta2" -}}
+{{- $api := ternary "autoscaling/v2" (ternary "autoscaling/v2beta2" "autoscaling/v2beta1" $hasV2b2) $hasV2 -}}
+
+apiVersion: {{ $api }}
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "security-core.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "security-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: security
+    app.kubernetes.io/part-of: neurocity
+  {{- if .Values.hpa.annotations }}
+  annotations:
+    {{- toYaml .Values.hpa.annotations | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: {{ default "apps/v1" .Values.hpa.targetApiVersion }}
+    kind: {{ default "Deployment" .Values.hpa.targetKind }}
+    name: {{ default (include "security-core.fullname" .) .Values.hpa.targetName }}
+  minReplicas: {{ default 2 .Values.hpa.minReplicas }}
+  maxReplicas: {{ default 10 .Values.hpa.maxReplicas }}
+  {{- /*
+    Metrics section:
+    - CPU/Memory via simple flags for convenience
+    - Additional .Values.hpa.metrics for advanced scenarios (External/Pods/Object/Resource)
+  */}}
+  {{- $metrics := list -}}
+  {{- if hasKey .Values.hpa "targetCPUUtilizationPercentage" }}
+    {{- $m := dict "type" "Resource" "resource" (dict "name" "cpu" "target" (dict "type" "Utilization" "averageUtilization" .Values.hpa.targetCPUUtilizationPercentage)) -}}
+    {{- $metrics = append $metrics $m -}}
+  {{- end }}
+  {{- if hasKey .Values.hpa "targetMemoryUtilizationPercentage" }}
+    {{- $m := dict "type" "Resource" "resource" (dict "name" "memory" "target" (dict "type" "Utilization" "averageUtilization" .Values.hpa.targetMemoryUtilizationPercentage)) -}}
+    {{- $metrics = append $metrics $m -}}
+  {{- end }}
+  {{- if .Values.hpa.metrics }}
+    {{- $metrics = concat $metrics .Values.hpa.metrics -}}
+  {{- end }}
+  {{- if $metrics | len | gt 0 }}
+  metrics:
+    {{- /* Render metrics depending on API (v2/v2beta2/v2beta1 share mostly same structure for these fields) */}}
+    {{- range $metrics }}
+    - type: {{ .type }}
+      {{- if eq .type "Resource" }}
+      resource:
+        name: {{ .resource.name }}
+        {{- if or (eq $api "autoscaling/v2") (eq $api "autoscaling/v2beta2") }}
+        target:
+          type: {{ default "Utilization" .resource.target.type }}
+          {{- if hasKey .resource.target "averageUtilization" }}
+          averageUtilization: {{ .resource.target.averageUtilization }}
+          {{- end }}
+          {{- if hasKey .resource.target "averageValue" }}
+          averageValue: {{ .resource.target.averageValue }}
+          {{- end }}
+          {{- if hasKey .resource.target "value" }}
+          value: {{ .resource.target.value }}
+          {{- end }}
+        {{- else }}
+        targetAverageUtilization: {{ default 70 .resource.target.averageUtilization }}
+        {{- end }}
+      {{- else if eq .type "External" }}
+      external:
+        metric:
+          name: {{ .external.metric.name }}
+          {{- if .external.metric.selector }}
+          selector:
+            matchLabels:
+              {{- toYaml .external.metric.selector | nindent 14 }}
+          {{- end }}
+        {{- if or (eq $api "autoscaling/v2") (eq $api "autoscaling/v2beta2") }}
+        target:
+          type: {{ .target.type }}
+          {{- if hasKey .target "averageValue" }}
+          averageValue: {{ .target.averageValue }}
+          {{- end }}
+          {{- if hasKey .target "value" }}
+          value: {{ .target.value }}
+          {{- end }}
+          {{- if hasKey .target "averageUtilization" }}
+          averageUtilization: {{ .target.averageUtilization }}
+          {{- end }}
+        {{- else }}
+        targetAverageValue: {{ required "external.target.averageValue required for v2beta1" .target.averageValue }}
+        {{- end }}
+      {{- else if eq .type "Pods" }}
+      pods:
+        metric:
+          name: {{ .pods.metric.name }}
+          {{- if .pods.metric.selector }}
+          selector:
+            matchLabels:
+              {{- toYaml .pods.metric.selector | nindent 14 }}
+          {{- end }}
+        {{- if or (eq $api "autoscaling/v2") (eq $api "autoscaling/v2beta2") }}
+        target:
+          type: {{ .target.type }}
+          {{- if hasKey .target "averageValue" }}
+          averageValue: {{ .target.averageValue }}
+          {{- end }}
+        {{- else }}
+        targetAverageValue: {{ required "pods.target.averageValue required for v2beta1" .target.averageValue }}
+        {{- end }}
+      {{- else if eq .type "Object" }}
+      object:
+        describedObject:
+          apiVersion: {{ .object.describedObject.apiVersion }}
+          kind: {{ .object.describedObject.kind }}
+          name: {{ .object.describedObject.name }}
+        metric:
+          name: {{ .object.metric.name }}
+          {{- if .object.metric.selector }}
+          selector:
+            matchLabels:
+              {{- toYaml .object.metric.selector | nindent 14 }}
+          {{- end }}
+        {{- if or (eq $api "autoscaling/v2") (eq $api "autoscaling/v2beta2") }}
+        target:
+          type: {{ .target.type }}
+          {{- if hasKey .target "value" }}
+          value: {{ .target.value }}
+          {{- end }}
+          {{- if hasKey .target "averageValue" }}
+          averageValue: {{ .target.averageValue }}
+          {{- end }}
+        {{- else }}
+        targetValue: {{ required "object.target.value required for v2beta1" .target.value }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+
+  {{- /* behavior only for autoscaling/v2 and v2beta2 */}}
+  {{- if and (or (eq $api "autoscaling/v2") (eq $api "autoscaling/v2beta2")) .Values.hpa.behavior }}
+  behavior:
+    {{- if .Values.hpa.behavior.scaleUp }}
+    scaleUp:
+      stabilizationWindowSeconds: {{ default 0 .Values.hpa.behavior.scaleUp.stabilizationWindowSeconds }}
+      {{- if .Values.hpa.behavior.scaleUp.policies }}
+      policies:
+        {{- /* Example item:
+              - type: Percent
+                value: 100
+                periodSeconds: 60
+            */}}
+        {{- toYaml .Values.hpa.behavior.scaleUp.policies | nindent 8 }}
+      {{- end }}
+      selectPolicy: {{ default "Max" .Values.hpa.behavior.scaleUp.selectPolicy }}
+    {{- end }}
+    {{- if .Values.hpa.behavior.scaleDown }}
+    scaleDown:
+      stabilizationWindowSeconds: {{ default 300 .Values.hpa.behavior.scaleDown.stabilizationWindowSeconds }}
+      {{- if .Values.hpa.behavior.scaleDown.policies }}
+      policies:
+        {{- toYaml .Values.hpa.behavior.scaleDown.policies | nindent 8 }}
+      {{- end }}
+      selectPolicy: {{ default "Max" .Values.hpa.behavior.scaleDown.selectPolicy }}
+    {{- end }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,257 @@
+// zero-trust-core/configs/policies/cedar/schema.cedarschema
+// Zero Trust — промышленная схема Cedar (люди, сервисы, ресурсы, контекст, действия)
+
+namespace ZeroTrustCore {
+
+  // ---------- Общие типы (context/record aliases) ----------
+  // Временной/сетевой/устройственный/рисковый контекст для решений ZT
+  type DeviceCtx = {
+    compliant: Bool,
+    attested?: Bool,
+    posture?: String,          // например "cis_level1", "edr_ok"
+    os?: String,               // "windows", "linux", "macos", "ios", "android"
+    os_version?: String
+  };
+
+  type NetworkCtx = {
+    src_ip: __cedar::ipaddr,
+    dst_ip?: __cedar::ipaddr,
+    src_asn?: Long,
+    geo?: String,              // ISO3166-1 alpha-2 или иная метка
+    tls_client_presented?: Bool
+  };
+
+  type RiskCtx = {
+    score: Long,               // 0..100
+    reason?: String
+  };
+
+  type ZTContext = {
+    ts?: Long,                 // epoch millis
+    mfa?: Bool,
+    device?: DeviceCtx,
+    network?: NetworkCtx,
+    risk?: RiskCtx,
+    // произвольные дополнительные ключи допускаются через entity tags/атрибуты ресурса/принципала
+  };
+
+  // Общий owner/labels блок для ряда ресурсов
+  type OwnerBlock = {
+    tenant: Tenant,
+    ownerGroup?: Group,
+    owners?: Set<User>
+  };
+
+  type Classification = {
+    level: String,             // "public","internal","restricted","secret"
+    pii?: Bool,
+    pci?: Bool,
+    hipaa?: Bool
+  };
+
+  // ---------- Базовые сущности (тенант, окружения) ----------
+  entity Tenant;                // арендатор/организация
+  @doc("Имя окружения используется в ресурсах/ворклоадах")
+  entity Environment enum ["dev","stage","prod","sandbox"];
+
+  // ---------- Идентичности (principals) ----------
+  // Пользователь может состоять в группах и принадлежать тенанту
+  entity User in [Group, Tenant] = {
+    email?: String,
+    displayName?: String,
+    assignedRoles?: Set<Role>,
+    deviceTrustMin?: String     // требуемый уровень posture для критичных действий
+  } tags String;
+
+  // Сервисная идентичность (для машин/подов/джобов)
+  entity Service in [Tenant] = {
+    spiffe?: String,            // spiffe://<trust-domain>/<path>
+    namespace?: String,         // k8s namespace
+    serviceAccount?: String,    // k8s sa
+    workload?: Workload
+  } tags String;
+
+  // Группы (иерархичны)
+  entity Group in [Group, Tenant] = {
+    description?: String
+  } tags String;
+
+  // Роли (логические; могут назначаться пользователям/группам)
+  entity Role in [Tenant] = {
+    description?: String,
+    implies?: Set<Role>         // граф наследования ролей
+  } tags String;
+
+  // Устройство (для привязки доверия/позы)
+  entity Device in [Tenant] = {
+    owner?: User,
+    serial?: String,
+    platform?: String,
+    compliant: Bool,
+    attested?: Bool
+  } tags String;
+
+  // Исполняемая единица (поды/ВМ/функции)
+  entity Workload in [Tenant, Environment] = {
+    kind?: String,              // "k8s_pod","vm","lambda","job"
+    cluster?: String,
+    namespace?: String,
+    serviceAccount?: String,
+    spiffe?: String
+  } tags String;
+
+  // ---------- Ресурсы ----------
+  entity Api in [Tenant, Environment] = {
+    owner: OwnerBlock,
+    version?: String,
+    classification?: Classification,
+    allowedPaths?: Set<String>
+  } tags String;
+
+  entity Database in [Tenant, Environment] = {
+    owner: OwnerBlock,
+    engine?: String,            // "postgres","mysql","dynamo","mongodb"
+    classification?: Classification,
+    encrypted?: Bool
+  } tags String;
+
+  entity Secret in [Tenant, Environment] = {
+    owner: OwnerBlock,
+    classification?: Classification,
+    rotationDays?: Long
+  } tags String;
+
+  entity Queue in [Tenant, Environment] = {
+    owner: OwnerBlock,
+    classification?: Classification
+  } tags String;
+
+  entity Topic in [Tenant, Environment] = {
+    owner: OwnerBlock,
+    classification?: Classification
+  } tags String;
+
+  entity Blob in [Tenant, Environment] = {
+    owner: OwnerBlock,
+    classification?: Classification,
+    bucket?: String,
+    prefix?: String
+  } tags String;
+
+  entity Certificate in [Tenant, Environment] = {
+    owner: OwnerBlock,
+    san?: Set<String>,
+    purpose?: String            // "mtls_server","mtls_client","code_sign"
+  } tags String;
+
+  entity Document in [Tenant, Environment] = {
+    owner: OwnerBlock,
+    classification?: Classification
+  } tags String;
+
+  // ---------- Действия (Action entities + группы) ----------
+  // Группы действий (иерархия). Их можно использовать в политике как Action::"Group".
+  action "Read";                // группа чтения
+  action "Write";               // группа записи/модификации
+  action "Admin";               // админские операции
+  action "Network";             // сетевые соединения/вызовы
+  action "Crypto";              // крипто‑операции (ключи/сертификаты)
+  action "Messaging";           // очереди/топики
+  action "Storage";             // блобы/документы
+
+  // --- Универсальные действия над API/сервисами
+  action "connect" in ["Network"] appliesTo {
+    principal: [User, Service],
+    resource: [Api, Workload],
+    context: ZTContext
+  };
+
+  action "invoke" in ["Network","Read","Write"] appliesTo {
+    principal: [User, Service],
+    resource: Api,
+    context: ZTContext
+  };
+
+  // --- CRUD над данными
+  action "read" in ["Read"] appliesTo {
+    principal: [User, Service],
+    resource: [Api, Database, Secret, Blob, Document],
+    context: ZTContext
+  };
+
+  action "write" in ["Write"] appliesTo {
+    principal: [User, Service],
+    resource: [Api, Database, Secret, Blob, Document],
+    context: ZTContext
+  };
+
+  action "delete" in ["Write","Admin"] appliesTo {
+    principal: [User, Service],
+    resource: [Api, Database, Secret, Blob, Document],
+    context: ZTContext
+  };
+
+  action "list" in ["Read"] appliesTo {
+    principal: [User, Service],
+    resource: [Api, Database, Blob, Document, Queue, Topic],
+    context: ZTContext
+  };
+
+  // --- Секреты/крипто
+  action "readSecret" in ["Read","Crypto"] appliesTo {
+    principal: [User, Service],
+    resource: Secret,
+    context: ZTContext
+  };
+
+  action "writeSecret" in ["Write","Crypto"] appliesTo {
+    principal: [User, Service],
+    resource: Secret,
+    context: ZTContext
+  };
+
+  action "rotateKey" in ["Admin","Crypto"] appliesTo {
+    principal: [User, Service],
+    resource: [Secret, Certificate],
+    context: ZTContext
+  };
+
+  // --- Очереди/топики
+  action "publish" in ["Messaging","Write"] appliesTo {
+    principal: [User, Service],
+    resource: [Queue, Topic],
+    context: ZTContext
+  };
+
+  action "consume" in ["Messaging","Read"] appliesTo {
+    principal: [User, Service],
+    resource: [Queue, Topic],
+    context: ZTContext
+  };
+
+  // --- Хранилища/доки
+  action "upload" in ["Storage","Write"] appliesTo {
+    principal: [User, Service],
+    resource: Blob,
+    context: ZTContext
+  };
+
+  action "download" in ["Storage","Read"] appliesTo {
+    principal: [User, Service],
+    resource: Blob,
+    context: ZTContext
+  };
+
+  // --- Администрирование
+  action "approve" in ["Admin"] appliesTo {
+    principal: [User],
+    resource: [Secret, Certificate, Document, Database],
+    context: ZTContext
+  };
+
+  action "impersonate" in ["Admin"] appliesTo {
+    principal: [User],
+    resource: [User, Service],
+    context: ZTContext
+  };
+}

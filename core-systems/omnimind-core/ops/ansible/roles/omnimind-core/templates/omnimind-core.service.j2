@@ -1,0 +1,158 @@
+# Managed by Ansible (omnimind-core)
+# Template: omnimind-core.service.j2
+# Назначение: безопасный и промышленный unit-файл systemd для Omnimind Core
+
+[Unit]
+Description={{ omnimind_description | default("Omnimind Core Service") }}
+Documentation={{ omnimind_docs_url | default("https://internal.docs/omnimind-core") }}
+After=network-online.target
+Wants=network-online.target
+{% if omnimind_socket_activation | default(false) %}
+Requires={{ omnimind_service_name | default("omnimind-core") }}.socket
+{% endif %}
+
+# Опционально: ждем БД/кэш (если используется отдельный unit-таргет)
+{% if omnimind_require_targets is defined and omnimind_require_targets %}
+{% for t in omnimind_require_targets %}
+After={{ t }}
+Wants={{ t }}
+{% endfor %}
+{% endif %}
+
+[Service]
+# Тип: simple (по умолчанию) либо notify при наличии sd_notify в приложении
+Type={{ omnimind_service_type | default("simple") }}
+
+# Пользователь и группа (можно включить DynamicUser вместо статического)
+{% if omnimind_dynamic_user | default(false) %}
+DynamicUser=yes
+{% else %}
+User={{ omnimind_user | default("omni") }}
+Group={{ omnimind_group | default("omni") }}
+{% endif %}
+
+# Рабочий каталог приложения
+WorkingDirectory={{ omnimind_workdir | default("/opt/omnimind-core") }}
+
+# Каталоги состояния/кэша/логов, создаются с нужными правами (systemd >= 235)
+RuntimeDirectory={{ omnimind_runtime_dir | default("omnimind") }}
+RuntimeDirectoryMode={{ omnimind_runtime_mode | default("0750") }}
+StateDirectory={{ omnimind_state_dir | default("omnimind") }}
+StateDirectoryMode={{ omnimind_state_mode | default("0750") }}
+CacheDirectory={{ omnimind_cache_dir | default("omnimind") }}
+CacheDirectoryMode={{ omnimind_cache_mode | default("0750") }}
+LogsDirectory={{ omnimind_logs_dir | default("omnimind") }}
+LogsDirectoryMode={{ omnimind_logs_mode | default("0750") }}
+
+# Файл окружения и inline переменные
+{% if omnimind_env_file | default("") %}
+EnvironmentFile={{ omnimind_env_file }}
+{% endif %}
+{% if omnimind_environment is defined and omnimind_environment %}
+{% for k, v in omnimind_environment.items() %}
+Environment="{{ k }}={{ v }}"
+{% endfor %}
+{% endif %}
+
+# Дополнительные FD/variables для socket-активации
+{% if omnimind_socket_activation | default(false) %}
+# При socket-активации приложение должно слушать $LISTEN_FDS (sd_listen_fds)
+{% endif %}
+
+# Подготовительные шаги: миграции, healthcheck, прогрев
+{% if omnimind_execstart_pre is defined and omnimind_execstart_pre %}
+{% for cmd in omnimind_execstart_pre %}
+ExecStartPre={{ cmd }}
+{% endfor %}
+{% endif %}
+
+# Основная команда запуска (ASGI/WSGI/CLI), логируем в journald
+# Примеры:
+#   uvicorn omnimind_core.app:app --host 0.0.0.0 --port 8000 --workers 3
+#   gunicorn omnimind_core.wsgi:app -b 0.0.0.0:8000 -w 3 -k uvicorn.workers.UvicornWorker
+ExecStart={{ omnimind_execstart | default("/usr/local/bin/uvicorn omnimind_core.app:app --host 0.0.0.0 --port 8000 --workers 3") }}
+
+# Перезагрузка (например, для gunicorn: HUP)
+{% if omnimind_execreload | default("") %}
+ExecReload={{ omnimind_execreload }}
+{% else %}
+ExecReload=/bin/kill -HUP $MAINPID
+{% endif %}
+
+# Корректное завершение
+TimeoutStartSec={{ omnimind_timeout_start | default("30s") }}
+TimeoutStopSec={{ omnimind_timeout_stop | default("30s") }}
+KillMode=mixed
+KillSignal=SIGTERM
+Restart=always
+RestartSec={{ omnimind_restart_sec | default("3s") }}
+StartLimitIntervalSec={{ omnimind_start_limit_window | default("60s") }}
+StartLimitBurst={{ omnimind_start_limit_burst | default(10) }}
+
+# Вывод логов
+StandardOutput=journal
+StandardError=journal
+# При желании можно ограничить размер journal через настройки journald.
+
+# Ограничения ресурсов (примерные безопасные дефолты)
+# ulimit'ы
+LimitNOFILE={{ omnimind_limit_nofile | default(65536) }}
+LimitNPROC={{ omnimind_limit_nproc | default(16384) }}
+# Память и CPU
+{% if omnimind_memory_max | default("") %}MemoryMax={{ omnimind_memory_max }}{% endif %}
+{% if omnimind_memory_high | default("") %}MemoryHigh={{ omnimind_memory_high }}{% endif %}
+{% if omnimind_cpu_quota | default("") %}CPUQuota={{ omnimind_cpu_quota }}{% endif %}
+# OOM
+{% if omnimind_oom_score_adj | default("") %}OOMScoreAdjust={{ omnimind_oom_score_adj }}{% else %}OOMScoreAdjust=0{% endif %}
+
+# Безопасность и sandboxing (hardening)
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+IPAddressDeny=any
+{% if omnimind_network_outbound | default(false) %}
+# Разрешаем исходящие подключения при необходимости (например, к БД)
+IPAddressAllow={{ omnimind_network_outbound_cidr | default("0.0.0.0/0 ::/0") }}
+{% endif %}
+# Системные вызовы: разумный фильтр (может потребовать корректировок под вашу среду)
+SystemCallFilter=@system-service @pkey @chown @signal
+SystemCallErrorNumber=EPERM
+
+# Капибилити: по умолчанию все запрещаем
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Read/write каталоги внутри sandbox
+ReadWritePaths={{ omnimind_rw_paths | default("/var/lib/omnimind /var/cache/omnimind /var/log/omnimind /run/omnimind") }}
+
+# NotifyAccess для Type=notify
+{% if (omnimind_service_type | default("simple")) == "notify" %}
+NotifyAccess=all
+{% endif %}
+
+# Параметры для запуска под selinux/apparmor (опционально)
+{% if omnimind_selinux_context | default("") %}SELinuxContext={{ omnimind_selinux_context }}{% endif %}
+{% if omnimind_apparmor_profile | default("") %}AppArmorProfile={{ omnimind_apparmor_profile }}{% endif %}
+
+# Дополнительно: импорт переменных из каталогов окружения
+{% if omnimind_environment_directories is defined and omnimind_environment_directories %}
+{% for d in omnimind_environment_directories %}
+EnvironmentFile=-{{ d }}/*
+{% endfor %}
+{% endif %}
+
+[Install]
+WantedBy=multi-user.target
+{% if omnimind_socket_activation | default(false) %}
+Also={{ omnimind_service_name | default("omnimind-core") }}.socket
+{% endif %}

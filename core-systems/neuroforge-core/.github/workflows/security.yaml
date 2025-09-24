@@ -1,0 +1,250 @@
+name: Security Suite
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "17 3 * * *"  # ежедневный ночной прогон (UTC)
+  workflow_dispatch: {}
+
+# Минимальные права по умолчанию
+permissions:
+  contents: read
+
+concurrency:
+  group: security-suite-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  PYTHONWARNINGS: default
+  # Unverified: при необходимости подставьте каталог проекта
+  PY_SRC_DIR: neuroforge_core
+
+jobs:
+  codeql:
+    name: CodeQL (SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ "python" ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: +security-and-quality
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project (if needed)
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install . || true; fi
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+
+  bandit:
+    name: Bandit (Python SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install bandit
+        run: pip install bandit==1.7.9
+      - name: Run bandit
+        run: |
+          TARGET="${PY_SRC_DIR:-.}"
+          bandit -r "$TARGET" -f sarif -o bandit.sarif || true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+
+  pip_audit:
+    name: pip-audit (Python deps SCA)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install pip-audit
+        run: pip install pip-audit==2.7.3
+      - name: Audit requirements files
+        run: |
+          set -e
+          found=0
+          for f in requirements.txt requirements-prod.txt requirements.lock; do
+            if [ -f "$f" ]; then
+              found=1
+              pip-audit -r "$f" -f sarif -o "pip-audit-${f//\//_}.sarif" || true
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            # Скан установленных дистрибутивов как fallback
+            pip-audit -f sarif -o pip-audit-env.sarif || true
+          fi
+      - name: Upload SARIFs
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .
+        continue-on-error: true
+
+  trivy_fs:
+    name: Trivy (FS vuln+config+secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy FS scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scanners: "vuln,secret,config"
+          ignore-unfixed: true
+          format: sarif
+          output: trivy.sarif
+          severity: "CRITICAL,HIGH,MEDIUM"
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+  checkov_iac:
+    name: Checkov (IaC misconfig)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          quiet: true
+          output_format: sarif
+          output_file_path: checkov.sarif
+          soft_fail: true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+
+  gitleaks:
+    name: Gitleaks (Secret scanning)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz \
+          | tar -xz gitleaks
+          ./gitleaks detect --no-git --report-format sarif --report-path gitleaks.sarif || true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+
+  sbom_grype:
+    name: SBOM (Syft) + Grype (SCA by SBOM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM (CycloneDX JSON)
+        uses: anchore/sbom-action@v0.16.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Scan SBOM with Grype
+        uses: anchore/scan-action@v3
+        with:
+          sbom: sbom.cdx.json
+          fail-build: false
+          severity-cutoff: medium
+          output-format: sarif
+          output-file: grype.sarif
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: grype.sarif
+
+  ossf_scorecard:
+    name: OSSF Scorecard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: false
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif

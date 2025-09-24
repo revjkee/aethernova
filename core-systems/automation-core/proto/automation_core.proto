@@ -1,0 +1,389 @@
+// automation-core/proto/automation_core.proto
+syntax = "proto3";
+
+package aethernova.automation.v1;
+
+// Production options for common language toolchains.
+option optimize_for = SPEED;
+option cc_enable_arenas = true;
+option java_multiple_files = true;
+option java_package = "ai.aethernova.automation.v1";
+option java_outer_classname = "AutomationCoreProto";
+option csharp_namespace = "Aethernova.Automation.V1";
+option go_package = "github.com/aethernova/automation-core/gen/go/aethernova/automation/v1;automationv1";
+option php_namespace = "Aethernova\\Automation\\V1";
+option objc_class_prefix = "ANAC";
+
+import "google/protobuf/timestamp.proto";   // Well-known: time points
+import "google/protobuf/duration.proto";    // Well-known: durations
+import "google/protobuf/field_mask.proto";  // Well-known: update masks
+import "google/protobuf/struct.proto";      // Well-known: arbitrary structured data
+import "google/protobuf/empty.proto";
+import "google/longrunning/operations.proto"; // AIP-151 long-running operations
+import "google/rpc/status.proto";             // Canonical error model
+
+// -----------------------------------------------------------------------------
+// Resource model
+// -----------------------------------------------------------------------------
+
+// Automation represents a scheduled task definition (idempotent orchestration unit).
+message Automation {
+  // Resource name: "automations/{automation_id}"
+  string name = 1;
+
+  // Server-generated stable identifier (e.g., UUIDv4).
+  string uid = 2;
+
+  // Human-readable display name.
+  string display_name = 3;
+
+  // Free-form description.
+  string description = 4;
+
+  // Whether scheduler is allowed to run this automation.
+  bool enabled = 5;
+
+  // Schedule specification (one of: cron, rrule, interval, at).
+  Schedule schedule = 6;
+
+  // Job to execute when triggered.
+  Job job = 7;
+
+  // User-defined labels for search/routing.
+  map<string, string> labels = 8;
+
+  // Optimistic concurrency control per AIP-154.
+  // Must be echoed on Update/Delete to avoid lost updates.
+  string etag = 9;
+
+  // Audit fields.
+  google.protobuf.Timestamp create_time = 10;
+  google.protobuf.Timestamp update_time = 11;
+  string create_user = 12;
+  string update_user = 13;
+
+  // Optional tags for grouping/reporting.
+  repeated string tags = 14;
+
+  // Execution priority hint for the scheduler.
+  Priority priority = 15;
+}
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_NORMAL = 2;
+  PRIORITY_HIGH = 3;
+  PRIORITY_CRITICAL = 4;
+}
+
+// A concrete execution attempt (usually produced by RunAutomation).
+message Execution {
+  // Resource name: "automations/{automation_id}/executions/{execution_id}"
+  string name = 1;
+
+  // Back-reference to the automation name.
+  string automation = 2;
+
+  // Stable execution UID (e.g., UUIDv7).
+  string uid = 3;
+
+  // State machine for the execution lifecycle.
+  State state = 4;
+
+  // Attempt number (1-based).
+  int32 attempt = 5;
+
+  // Timing.
+  google.protobuf.Timestamp start_time = 6;
+  google.protobuf.Timestamp end_time = 7;
+  google.protobuf.Duration runtime = 8;
+
+  // Terminal error if failed/cancelled/timed out (google.rpc.Status).
+  google.rpc.Status error = 9;
+
+  // Structured output of the job, if any (producer-defined schema).
+  google.protobuf.Struct output = 10;
+
+  // Labels propagated from Automation and/or Run request.
+  map<string, string> labels = 11;
+
+  // Concurrency token for updates on the execution resource.
+  string etag = 12;
+}
+
+enum State {
+  STATE_UNSPECIFIED = 0;
+  STATE_QUEUED = 1;
+  STATE_RUNNING = 2;
+  STATE_SUCCEEDED = 3;
+  STATE_FAILED = 4;
+  STATE_CANCELLED = 5;
+  STATE_TIMED_OUT = 6;
+}
+
+// -----------------------------------------------------------------------------
+// Scheduling
+// -----------------------------------------------------------------------------
+
+message Schedule {
+  // IANA time zone name, e.g. "Europe/Stockholm". If empty, UTC is assumed.
+  string timezone = 1;
+
+  // Optional enable/disable window for schedule.
+  google.protobuf.Timestamp start_time = 2;
+  google.protobuf.Timestamp end_time = 3;
+
+  // Optional jitter to spread executions, applied to each firing.
+  google.protobuf.Duration jitter = 4;
+
+  // Optional grace period to consider a missed run still valid.
+  google.protobuf.Duration grace = 5;
+
+  // Only one schedule spec is allowed.
+  oneof spec {
+    CronSchedule cron = 10;        // Cron expression (implementation-defined)
+    RRuleSchedule rrule = 11;      // RFC 5545 RRULE string
+    IntervalSchedule interval = 12;// Fixed interval schedule
+    AtSchedule at = 13;            // One or more exact timestamps
+  }
+}
+
+// Cron-style schedule. Note: cron syntax varies by implementation.
+// Expression should be validated by the server implementation.
+message CronSchedule {
+  // Example: "0 */15 * * * *" (six-field cron, including seconds).
+  string expression = 1;
+}
+
+// RFC 5545 recurrence rule schedule (e.g., "RRULE:FREQ=DAILY;INTERVAL=1").
+message RRuleSchedule {
+  string rrule = 1; // As defined by iCalendar RRULE grammar (RFC 5545).
+}
+
+// Fixed-interval schedule with an optional anchor time.
+message IntervalSchedule {
+  // Interval between runs (e.g., "3600s" for hourly).
+  google.protobuf.Duration every = 1;
+
+  // Optional anchor (first) time; if unset, server chooses start.
+  google.protobuf.Timestamp anchor_time = 2;
+}
+
+// Fire at specific absolute instants (UTC).
+message AtSchedule {
+  repeated google.protobuf.Timestamp times = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Job specification
+// -----------------------------------------------------------------------------
+
+message Job {
+  // One concrete action type.
+  oneof action {
+    HttpAction http = 1;
+    CommandAction command = 2;
+    WebhookAction webhook = 3;
+  }
+
+  // Common execution controls.
+  google.protobuf.Duration timeout = 10;   // Hard timeout
+  RetryPolicy retry = 11;                   // Backoff policy
+  bool idempotent = 12;                     // Hints safe retries
+}
+
+// Simple HTTP request.
+message HttpAction {
+  string url = 1;
+  string method = 2; // "GET", "POST", ...
+  repeated Header headers = 3;
+  bytes body = 4;
+}
+
+message Header {
+  string key = 1;
+  string value = 2;
+}
+
+// Execute a local or containerized command.
+message CommandAction {
+  string executable = 1;            // e.g., "/usr/bin/python3"
+  repeated string args = 2;
+  map<string, string> env = 3;
+  string working_dir = 4;
+
+  // Optional container image to run the command (OCI/ Docker reference).
+  string container_image = 10;
+}
+
+// Alias of HttpAction; may include signing/verification in implementation.
+message WebhookAction {
+  string url = 1;
+  string method = 2;
+  repeated Header headers = 3;
+  bytes body = 4;
+}
+
+// Exponential backoff retry policy.
+message RetryPolicy {
+  int32 max_attempts = 1;                      // 0 or 1 = no retries
+  google.protobuf.Duration initial_backoff = 2;// default: 1s
+  double backoff_multiplier = 3;               // default: 2.0
+  google.protobuf.Duration max_backoff = 4;    // cap for backoff
+}
+
+// -----------------------------------------------------------------------------
+// Requests & responses — follow AIP for pagination/filtering/ordering/idempotency
+// -----------------------------------------------------------------------------
+
+message CreateAutomationRequest {
+  // Optional client-chosen ID (segment of resource name "automations/{id}").
+  string automation_id = 1;
+
+  // The automation to create. Server ignores output-only fields.
+  Automation automation = 2;
+
+  // Idempotency token per AIP-155. Up to 36 ASCII chars recommended.
+  string request_id = 3;
+
+  // If true, validate only and do not persist.
+  bool validate_only = 4;
+}
+
+message GetAutomationRequest {
+  string name = 1; // "automations/{automation_id}"
+}
+
+message ListAutomationsRequest {
+  // Pagination per AIP-158.
+  int32 page_size = 1;         // server may cap
+  string page_token = 2;
+
+  // Filtering per AIP-160 (implementation-defined grammar, typically CEL-like).
+  string filter = 3;
+
+  // Ordering per AIP-161, e.g., "create_time desc, display_name".
+  string order_by = 4;
+}
+
+message ListAutomationsResponse {
+  repeated Automation automations = 1; // plural first field per AIP-158 rules
+  string next_page_token = 2;
+}
+
+message UpdateAutomationRequest {
+  // The automation with updated fields; resource name must be set.
+  Automation automation = 1;
+
+  // Fields to update (AIP-161).
+  google.protobuf.FieldMask update_mask = 2;
+
+  // Optimistic concurrency token (AIP-154).
+  string etag = 3;
+
+  // Idempotency token (AIP-155).
+  string request_id = 4;
+
+  // If true, validate only and do not persist.
+  bool validate_only = 5;
+
+  // Allow creating the resource if missing (upsert semantics).
+  bool allow_missing = 6;
+}
+
+message DeleteAutomationRequest {
+  string name = 1;   // "automations/{automation_id}"
+  string etag = 2;   // AIP-154 concurrency check
+  string request_id = 3; // AIP-155 idempotency
+  bool force = 4;    // If true, also deletes child executions.
+}
+
+message PauseAutomationRequest {
+  string name = 1;
+  string etag = 2;
+  string request_id = 3;
+}
+
+message ResumeAutomationRequest {
+  string name = 1;
+  string etag = 2;
+  string request_id = 3;
+}
+
+message RunAutomationRequest {
+  string name = 1; // "automations/{automation_id}"
+
+  // Optional structured inputs available to the job/template.
+  google.protobuf.Struct inputs = 2;
+
+  // Labels to override/augment for this run.
+  map<string, string> labels = 3;
+
+  // Idempotency token; identical Run with same token should not duplicate work.
+  string request_id = 4;
+
+  // Validate-only dry-run.
+  bool validate_only = 5;
+}
+
+message ListExecutionsRequest {
+  // Parent: "automations/{automation_id}"
+  string parent = 1;
+
+  int32 page_size = 2;    // AIP-158
+  string page_token = 3;  // AIP-158
+  string filter = 4;      // AIP-160
+  string order_by = 5;    // AIP-161
+}
+
+message ListExecutionsResponse {
+  repeated Execution executions = 1;
+  string next_page_token = 2;
+}
+
+message GetExecutionRequest {
+  string name = 1; // "automations/{automation_id}/executions/{execution_id}"
+}
+
+message CancelExecutionRequest {
+  string name = 1;
+  string request_id = 2;
+}
+
+// Metadata for long-running RunAutomation operation.
+message RunMetadata {
+  string automation = 1; // resource name
+  string execution = 2;  // resource name (may be set when created)
+  int32 attempt = 3;
+  google.protobuf.Timestamp create_time = 4;
+}
+
+// -----------------------------------------------------------------------------
+// Service
+// -----------------------------------------------------------------------------
+
+service AutomationCore {
+  // CRUD
+  rpc CreateAutomation(CreateAutomationRequest) returns (Automation);
+  rpc GetAutomation(GetAutomationRequest) returns (Automation);
+  rpc ListAutomations(ListAutomationsRequest) returns (ListAutomationsResponse);
+  rpc UpdateAutomation(UpdateAutomationRequest) returns (Automation);
+  rpc DeleteAutomation(DeleteAutomationRequest) returns (google.protobuf.Empty);
+
+  // State control
+  rpc PauseAutomation(PauseAutomationRequest) returns (Automation);
+  rpc ResumeAutomation(ResumeAutomationRequest) returns (Automation);
+
+  // Execution management
+  rpc RunAutomation(RunAutomationRequest) returns (google.longrunning.Operation) {
+    // Per AIP-151, declare response/metadata types for LRO.
+    option (google.longrunning.operation_info) = {
+      response_type: "aethernova.automation.v1.Execution"
+      metadata_type: "aethernova.automation.v1.RunMetadata"
+    };
+  }
+  rpc ListExecutions(ListExecutionsRequest) returns (ListExecutionsResponse);
+  rpc GetExecution(GetExecutionRequest) returns (Execution);
+  rpc CancelExecution(CancelExecutionRequest) returns (google.protobuf.Empty);
+}

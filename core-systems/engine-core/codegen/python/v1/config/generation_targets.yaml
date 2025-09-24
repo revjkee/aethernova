@@ -1,0 +1,211 @@
+# Aethernova Engine | Codegen v1
+# Маппинг: входные .proto → выходные артефакты + флаги генерации
+
+version: 1
+schema: "aethernova.codegen.generation-targets/1.0"
+
+meta:
+  project: "engine-core"
+  owner: "Aethernova Platform Team"
+  contact: "platform@aethernova.example"
+  updated_at: "2025-08-12T12:00:00Z"
+  description: >
+    Конфигурация генерации артефактов по целям. Используется совместно с proto_paths.yaml.
+    Все пути могут содержать окружение и шаблоны (${VARS}), см. proto_paths.yaml/env.
+
+# Переменные окружения, доступные для подстановки
+env:
+  REPO_ROOT: "${REPO_ROOT:-.}"
+  SCHEMAS_ROOT: "${SCHEMAS_ROOT:-${REPO_ROOT}/engine-core/schemas/proto}"
+  OUT_ROOT: "${OUT_ROOT:-${REPO_ROOT}/engine-core/codegen/python/v1/generated}"
+  AUTOGEN_DIR: "${AUTOGEN_DIR:-_autogen}"
+
+# Глобальные ограничения/настройки генерации
+settings:
+  reproducible: true                 # детерминированная генерация
+  strip_timestamps: true             # вычищать нестабильные временные метки
+  parallelism: 4                     # максимум параллельных задач генерации
+  max_cmd_length: 32760              # для Windows
+  fail_fast: true
+  color: auto
+  # Политики на уровне всего набора
+  policies:
+    forbid_unknown_includes: true
+    verify_checksums: true
+    plugin_allowlist:
+      - "grpc_python_out"
+      - "mypy_protobuf"
+    plugin_blocklist:
+      - "protoc-gen-custom-unsafe"
+
+# Якоря с дефолтами для переиспользования
+defaults:
+  &python_defaults
+  tool: "python -m grpc_tools.protoc"
+  includes:
+    - "${SCHEMAS_ROOT}"
+    - "${REPO_ROOT}"
+  options:
+    optimize_for: "SPEED"
+  outputs:
+    python_out: "${OUT_ROOT}/${AUTOGEN_DIR}"
+    grpc_python_out: "${OUT_ROOT}/${AUTOGEN_DIR}"
+  plugins:
+    - name: "grpc_python_out"
+      required: true
+    # при наличии mypy-protobuf раскомментируйте и добавьте в outputs.mypy_out
+    # - name: "mypy_protobuf"
+    #   required: false
+  integrity:
+    algorithm: "sha256"
+    manifest: "${OUT_ROOT}/${AUTOGEN_DIR}/__genstamp__.json"
+  cache:
+    enabled: true
+    dir: "${REPO_ROOT}/.cache/proto"
+    key_salt: "codegen-api:1.0.0"
+
+# Профили сборки: выбирают набор целей + флаги
+profiles:
+  dev:
+    description: "Локальная разработка: допускаем предупреждения, включаем lint basic"
+    targets: ["python.engine.network", "python.common.error", "python.economy.all"]
+    flags:
+      fail_on_warn: false
+      experimental_allow_unstable: true
+      lint_ruleset: "basic"
+  ci:
+    description: "CI: строгая сборка, все модули"
+    targets: ["python.engine.*", "python.common.*", "python.economy.*"]
+    flags:
+      fail_on_warn: true
+      experimental_allow_unstable: false
+      lint_ruleset: "strict"
+  release:
+    description: "Release: заморозка импортов и версий, строгие проверки"
+    targets: ["python.engine.*", "python.common.*", "python.economy.*"]
+    flags:
+      fail_on_warn: true
+      experimental_allow_unstable: false
+      lint_ruleset: "strict"
+      freeze_imports: true
+
+# Цели генерации.
+# Ключи организованы по языку/платформе, затем по модулю и конкретной цели.
+targets:
+
+  python:
+
+    # ---------- ENGINE ----------
+    engine:
+
+      network:
+        <<: *python_defaults
+        description: "engine/v1/engine/network.proto → Python pb2 + gRPC stubs"
+        sources:
+          - "${SCHEMAS_ROOT}/v1/engine/network.proto"
+        include_overrides: []          # при необходимости добавить внешние -I
+        exclude: []                    # маски исключений
+        out_files:
+          - "engine/network_pb2.py"
+          - "engine/network_pb2_grpc.py"
+        # Дополнительные флаги/опции генерации
+        args: []
+        labels: ["public", "engine", "network"]
+        depends_on: []                 # явные зависимости (если есть)
+        integrity:
+          extra_inputs: []             # дополнительный вклад в хэш (версии плагинов и т.п.)
+
+      all:
+        <<: *python_defaults
+        description: "Все публичные протосхемы engine/"
+        sources:
+          - "${SCHEMAS_ROOT}/v1/engine/**/*.proto"
+        exclude:
+          - "**/*_internal.proto"
+        out_files: auto                # auto — выводим все pb2/pb2_grpc по найденным источникам
+        args: []
+        labels: ["public", "engine", "all"]
+
+    # ---------- COMMON ----------
+    common:
+
+      error:
+        <<: *python_defaults
+        description: "common/v1/common/error/error.proto → Python pb2 + gRPC stubs"
+        sources:
+          - "${SCHEMAS_ROOT}/v1/common/error/error.proto"
+        out_files:
+          - "common/error/error_pb2.py"
+          - "common/error/error_pb2_grpc.py"
+        labels: ["public", "common", "error"]
+
+      all:
+        <<: *python_defaults
+        description: "Все публичные протосхемы common/"
+        sources:
+          - "${SCHEMAS_ROOT}/v1/common/**/*.proto"
+        exclude: []
+        out_files: auto
+        labels: ["public", "common", "all"]
+
+    # ---------- ECONOMY ----------
+    economy:
+
+      all:
+        <<: *python_defaults
+        description: "Все протосхемы economy/ (internal)"
+        sources:
+          - "${SCHEMAS_ROOT}/v1/economy/**/*.proto"
+        exclude: []
+        out_files: auto
+        labels: ["internal", "economy", "all"]
+
+# Правила резолвинга wildcard-целей (например, python.engine.*)
+wildcard:
+  expand:
+    "python.engine.*": ["python.engine.network", "python.engine.all"]
+    "python.common.*": ["python.common.error", "python.common.all"]
+    "python.economy.*": ["python.economy.all"]
+
+# Линт и верификация перед запуском генерации
+lint:
+  enabled: true
+  tools:
+    - name: "buf"
+      mode: "if-available"          # if-available | required | off
+      ruleset_from_profile: true
+      config_file: "${REPO_ROOT}/buf.yaml"
+  sanity_checks:
+    unique_sources: true             # запрет дубликатов в sources
+    existing_files: true             # проверка, что все sources существуют
+    allowed_import_roots_from_proto_paths: true
+
+# Постпроцессоры (необязательные)
+postprocess:
+  strip_whitespace: true
+  normalize_imports: true
+  fix_namespace_inits:
+    enabled: true
+    ensure_dunder_init: true
+
+# Исключения по артефактам (если нужно скрыть некоторые файлы из out_files:auto)
+excludes:
+  files: []
+  patterns:
+    - "**/__pycache__/**"
+
+# Отчетность/логирование
+reporting:
+  verbose: true
+  print_cmdline: true
+  timings: true
+  emit_files: true
+  sbom:
+    enabled: true
+    file: "${OUT_ROOT}/${AUTOGEN_DIR}/SBOM.CODEGEN.txt"
+
+# Примеры команд верхнеуровневого инструмента (для документации)
+examples:
+  dev: "python -m engine_core.codegen.pytool --profile dev"
+  ci: "python -m engine_core.codegen.pytool --profile ci --verify"
+  release: "python -m engine_core.codegen.pytool --profile release --freeze"

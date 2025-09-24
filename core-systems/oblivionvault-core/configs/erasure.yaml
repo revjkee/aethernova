@@ -1,0 +1,340 @@
+apiVersion: oblivionvault.aethernova/v1
+kind: ErasurePolicySet
+metadata:
+  name: oblivionvault-erasure
+  labels:
+    system: oblivionvault-core
+    component: data-lifecycle
+    compliance: "true"
+
+# Глобальные дефолты через якорь
+defaults: &defaults
+  timezone: "UTC"
+  dryRun: false                      # В prod — всегда false
+  twoPersonRule:
+    enabled: true
+    quorum: 2
+    approvers:
+      # Идентификаторы групп/ролей из вашей IAM/SSO
+      - name: "SecurityOfficers"
+        provider: "oidc"
+      - name: "DataStewards"
+        provider: "oidc"
+  changeWindows:
+    allow:
+      - cron: "0 22 * * 5,6"        # Ночи пятницы/субботы 22:00 UTC
+        description: "Weekend change window"
+    freeze:
+      - cron: "0 0 20 12 *"         # 20 декабря
+        description: "Year-end freeze"
+  guardrails:
+    requireTag: "allow-erasure=true"   # Без этого тега операция будет заблокирована
+    blockIf:
+      legalHold: true                  # Блокировать при legal hold
+    minDataAgeDays: 7                  # Минимальный возраст данных для удаления
+    maxScopeObjects: 1000000           # Ограничение масштаба операции
+  verification:
+    mode:
+      - "key_state"                    # Проверка состояния KMS-ключей
+      - "sample_readback"              # Сэмпловая попытка чтения после операции
+    sampleReadback:
+      percentage: 0.5                  # 0.5% файлов/записей
+      maxSamples: 5000
+    maxVerificationTime: "2h"
+  rateLimits:
+    globalOpsPerMinute: 500
+    perTargetOpsPerMinute: 120
+    backoff:
+      initial: "2s"
+      max: "2m"
+      jitter: true
+  metrics:
+    prometheus:
+      enabled: true
+      endpoint: "/metrics"
+      listen: "0.0.0.0:9090"
+  audit:
+    sinks:
+      - type: "loki"
+        url: "http://loki.observability.svc:3100"
+      - type: "s3"
+        bucket: "ov-audit-logs"
+        prefix: "erasure/"
+        region: "eu-central-1"
+      - type: "cwlogs"
+        group: "/ov/erasure"
+        region: "eu-central-1"
+    redactSecrets: true
+    includeDiffs: true
+  notifications:
+    channels:
+      - type: "slack"
+        webhookSecretRef: "slack-ov-webhook"
+        room: "#ov-erasure"
+      - type: "email"
+        smtpProfile: "corp-smtp"
+        to:
+          - "secops@example.com"
+          - "dpo@example.com"
+  kms:
+    defaultKeyArn: "arn:aws:kms:eu-central-1:111111111111:key/REPLACE_ME"
+    # Позволенные сервисы для kms:ViaService (если применяется crypto-shred по объектным ключам)
+    viaService:
+      - "s3.eu-central-1.amazonaws.com"
+      - "logs.eu-central-1.amazonaws.com"
+
+profiles:
+  prod:
+    <<: *defaults
+    timezone: "Europe/Stockholm"
+    dryRun: false
+  stage:
+    <<: *defaults
+    dryRun: true
+    rateLimits:
+      globalOpsPerMinute: 200
+  dev:
+    <<: *defaults
+    dryRun: true
+    twoPersonRule:
+      enabled: false
+    guardrails:
+      requireTag: "allow-erasure=true"
+      blockIf:
+        legalHold: true
+      minDataAgeDays: 1
+    rateLimits:
+      globalOpsPerMinute: 50
+
+# Определение коннекторов к целевым системам
+targets:
+  s3:
+    - name: "logs-archive"
+      type: "aws"
+      region: "eu-central-1"
+      bucket: "ov-logs-archive"
+      prefix: ""
+      kmsKeyArn: "arn:aws:kms:eu-central-1:111111111111:key/REPLACE_ME"
+      accountId: "111111111111"
+      accessRef: "aws-ov-irsa"           # Ссылка на профиль доступа/роль
+    - name: "backups"
+      type: "aws"
+      region: "eu-central-1"
+      bucket: "ov-db-backups"
+      prefix: ""
+      kmsKeyArn: "arn:aws:kms:eu-central-1:111111111111:key/REPLACE_ME"
+      accountId: "111111111111"
+      accessRef: "aws-ov-irsa"
+  posix:
+    - name: "media-store"
+      rootPath: "/mnt/ov/media"
+      mount: "ext4"
+      fsync: true
+  rdbms:
+    postgres:
+      - name: "ov-pg"
+        dsnSecretRef: "pg-ov-dsn"        # secret c DSN/паролями
+        safeVacuum: true
+    clickhouse:
+      - name: "ov-ch"
+        dsnSecretRef: "ch-ov-dsn"
+        dropDetached: true
+  kafka:
+    - name: "ov-stream"
+      brokersSecretRef: "kafka-brokers"
+      saslSecretRef: "kafka-sasl"
+      tlsSecretRef: "kafka-tls"
+
+# Методы стирания
+methods:
+  crypto_shred:
+    description: "Криптографическое стирание: уничтожение доступа к ключам шифрования (DEK/KEK)."
+    keyActions:
+      disableBeforeDelete: true
+      scheduleDeletionDays: 30          # 7..30; защищенное окно на откат
+      revokeGrants: true
+      removeAliases: false              # опционально
+    data:
+      envelopeEncryption: true          # если данные зашифрованы объектными DEK
+      revokeViaService: true            # ограничить kms:ViaService
+  overwrite:
+    description: "Логическое переписывание данных на POSIX/FUSE."
+    passes:
+      - pattern: "random"
+      - pattern: "0x00"
+      - pattern: "0xFF"
+    blockSize: "4MiB"
+    fsyncAfter: true
+    trimIfSupported: true
+  anonymize:
+    description: "Де-идентификация в RDBMS вместо удаления (GDPR Art. 17(1) исключения)."
+    transformers:
+      email: "hash(salt=env:ANON_SALT, algo=sha256)"
+      name: "mask(left=1, fill=*)"
+      phone: "null"
+      ip: "truncate(/24)"
+  drop_partitions:
+    description: "Удаление секций в ClickHouse c последующим очистителем."
+    cleaner:
+      dropDetached: true
+      freezeBeforeDrop: false
+
+# Политики: что, когда, как удаляем
+policies:
+  - id: "backup-expiry-90d"
+    description: "Удаление бэкапов старше 90 дней из S3."
+    profile: "prod"
+    selectors:
+      target: "s3.backups"
+      match:
+        prefix: ""
+        olderThan: "90d"
+    method: "crypto_shred"
+    schedule:
+      cron: "0 3 * * *"                 # каждый день 03:00
+    approvals:
+      require: true
+      justification: "Routine backup expiry"
+    guardrails:
+      labels:
+        - key: "allow-erasure"
+          anyOf: ["true","yes","1"]
+    verification:
+      mode: ["sample_readback"]
+      sampleReadback:
+        percentage: 0.2
+        maxSamples: 1000
+    limits:
+      maxOps: 200000
+      maxDuration: "4h"
+    notifications:
+      onStart: ["slack"]
+      onSuccess: ["slack"]
+      onFailure: ["slack","email"]
+    audit:
+      includeManifest: true
+
+  - id: "gdpr-subject-erase"
+    description: "Удаление данных субъекта (PII) по subject_id с prefer=anonymize для RDBMS и crypto_shred для blob."
+    profile: "prod"
+    input:
+      required:
+        - subject_id
+      schema:
+        subject_id: "string"
+    pipeline:
+      - stage: "db-anonymize"
+        selector:
+          target: "rdbms.postgres.ov-pg"
+          tables:
+            - name: "users"
+              where: "subject_id = :subject_id"
+              columns:
+                email: "email"
+                full_name: "name"
+                phone: "phone"
+            - name: "events"
+              where: "subject_id = :subject_id"
+              columns:
+                ip: "ip"
+        method: "anonymize"
+      - stage: "blob-crypto-shred"
+        selector:
+          target: "s3.logs-archive"
+          match:
+            prefix: "subjects/:subject_id/"
+        method: "crypto_shred"
+    schedule:
+      manualOnly: true
+    approvals:
+      require: true
+      justification: "Data subject request"
+    guardrails:
+      legalHoldBypass: false
+    verification:
+      mode: ["sample_readback"]
+      sampleReadback:
+        percentage: 1.0
+        maxSamples: 100
+    notifications:
+      onSuccess: ["slack","email"]
+
+  - id: "incident-purge"
+    description: "Инцидентное экстренное стирание конкретного префикса медиаданных на POSIX с тройным переписыванием."
+    profile: "prod"
+    selectors:
+      target: "posix.media-store"
+      match:
+        glob: "/mnt/ov/media/incidents/CASE-*/**"
+    method: "overwrite"
+    schedule:
+      manualOnly: true
+    approvals:
+      require: true
+      quorum: 2
+      approversOverride:
+        - name: "CISO"
+          provider: "oidc"
+        - name: "HeadOfLegal"
+          provider: "oidc"
+    limits:
+      maxDuration: "6h"
+      maxOps: 500000
+    verification:
+      mode: ["sample_readback"]
+      sampleReadback:
+        percentage: 0.2
+        maxSamples: 500
+    notifications:
+      onStart: ["slack"]
+      onFailure: ["slack","email"]
+
+  - id: "clickhouse-partition-drop-30d"
+    description: "Удаление секций ClickHouse старше 30 дней."
+    profile: "prod"
+    selectors:
+      target: "rdbms.clickhouse.ov-ch"
+      match:
+        database: "ov_metrics"
+        table: "events"
+        where: "toDate(ts) < today() - 30"
+    method: "drop_partitions"
+    schedule:
+      cron: "30 2 * * *"                # ежедневно 02:30
+    approvals:
+      require: true
+    verification:
+      mode: ["key_state"]               # верификация на уровне управляющих ключей не требуется; формальная отметка
+    notifications:
+      onSuccess: ["slack"]
+
+  - id: "kafka-compaction"
+    description: "Принудительное уменьшение истории в Kafka‑топиках по инцидентам (ретеншн до 24h)."
+    profile: "stage"
+    selectors:
+      target: "kafka.ov-stream"
+      topics:
+        - "ov-events"
+        - "ov-audit"
+    method: "crypto_shred"              # логическая очистка через переинициализацию ключей/секретов клиента и политик ретеншна
+    schedule:
+      manualOnly: true
+    approvals:
+      require: true
+    notifications:
+      onStart: ["slack"]
+      onSuccess: ["slack"]
+
+# Тестовые/примерные политики для dev
+examples:
+  - id: "dev-s3-dryrun"
+    description: "Примерная политика S3 в dev (только dryRun)."
+    profile: "dev"
+    selectors:
+      target: "s3.logs-archive"
+      match:
+        prefix: "test/"
+        olderThan: "3d"
+    method: "crypto_shred"
+    schedule:
+      cron: "*/30 * * * *"

@@ -1,0 +1,381 @@
+apiVersion: oblivionvault.io/v1
+kind: ArchiveProfile
+metadata:
+  name: example-archive-profiles
+  env: prod
+  cluster: oblivionvault-prod
+  labels:
+    app.kubernetes.io/managed-by: gitops
+    app.kubernetes.io/part-of: oblivionvault-core
+    env: prod
+
+x-defaults:
+  storage: &storage_defaults
+    redundancy:
+      cross_region_replication: true
+      min_copies: 2
+      max_copies: 3
+    checksum:
+      algorithm: "SHA-256"
+      verify_on_write: true
+      scheduled_reverify_cron: "0 3 * * 0"  # weekly re-verify
+    compression:
+      algorithm: "zstd"
+      level: 12
+    deduplication:
+      enabled: true
+      scope: "cluster"  # file, bucket, tenant, cluster
+    encryption:
+      at_rest:
+        keyset_ref: "data-envelope"  # ссылочный ключ из configs/keys.yaml
+        algorithm: "AES-256-GCM"
+      in_transit:
+        tls_min_version: "1.2"
+    immutability:
+      enabled: true
+      mode: "WORM"      # WORM, Governance
+      retention_lock_days: 90
+    legal_hold:
+      supported: true
+      default_state: "disabled"
+    access:
+      allowed_callers:
+        - ns/oblivionvault/jobs:sa/archiver
+        - ns/oblivionvault/dr:sa/restore-runner
+      approval:
+        dual_control: true
+        m_out_of_n: "2/3"
+        custodians:
+          - user: security-lead@oblivionvault.io
+          - user: compliance@oblivionvault.io
+          - user: sre-lead@oblivionvault.io
+    audit:
+      otlp:
+        endpoint: "otel-gateway.observability.svc.cluster.local:4317"
+        protocol: "grpc"
+      log_fields:
+        - dataset
+        - profile
+        - requester
+        - approval_ref
+        - checksum
+        - storage_target
+  lifecycle: &lifecycle_defaults
+    retention:
+      min_days: 365
+      max_days: 3650
+      delete_after_expiry: false
+      purge_grace_days: 30
+    deletion_workflow:
+      requires_approvals: true
+      approvers:
+        - user: dpo@oblivionvault.io
+        - user: legal@oblivionvault.io
+      block_if_legal_hold: true
+    retrieval:
+      expected_tiers:
+        - "Instant"
+        - "Expedited"
+        - "Bulk"
+      default_tier: "Bulk"
+      max_thaw_hours: 12
+    restore_testing:
+      drill_enabled: true
+      drill_frequency_cron: "15 2 1 * *"  # monthly
+      sample_rate_percent: 2
+      success_slo_percent: 99.0
+      max_rto_minutes: 180
+      max_rpo_minutes: 60
+  budgeting: &budget_defaults
+    monthly_cap_usd: 1500
+    alerting_threshold_percent: 80
+    early_deletion_penalties_ok: false
+    notify:
+      channels:
+        - pagerduty: "oblivionvault-storage"
+        - email: "finops@oblivionvault.io"
+  indexing: &indexing_defaults
+    catalog:
+      enabled: true
+      persist_manifest: true
+      manifest_format: "json"  # json, parquet
+      manifest_bucket: "s3://ov-prod-catalog"
+    content_hash:
+      algo: "BLAKE3"    # быстрее для больших архивов
+      store_with_object: true
+    metadata:
+      include:
+        - filename
+        - path
+        - size_bytes
+        - content_type
+        - created_at
+        - last_modified_at
+        - owner
+        - tags
+  compliance: &compliance_defaults
+    standards:
+      - iso27001
+      - soc2
+      - hipaa_optional
+      - gdpr
+    data_categories:
+      - pii
+      - financial
+      - telemetry
+    pii_tokenization:
+      enabled: true
+      scheme: "FF3-1-AES-256"
+      keyset_ref: "pii-tokenization"
+      scope_fields:
+        - national_id
+        - phone
+        - email
+    export_controls:
+      eu_residency_required: true
+      restricted_regions:
+        - "RU"
+        - "KP"
+        - "IR"
+
+# Провайдеры хранилищ (без секретов, только декларации и параметры классов)
+storageProviders:
+  - name: aws-deep-archive
+    type: aws-s3
+    bucket: "ov-prod-deep-archive"
+    region: "eu-north-1"
+    class: "GLACIER_DEEP_ARCHIVE"
+    object_lock:
+      enabled: true
+      mode: "COMPLIANCE"
+      default_retention_days: 365
+    kms:
+      keyset_ref: "backup-velero"
+    network:
+      vpc_endpoints_required: true
+  - name: azure-archive
+    type: azure-blob
+    container: "ov-prod-archive"
+    account: "ovprodstorage"
+    tier: "Archive"
+    immutability:
+      policy: "TimeBasedRetention"
+      days: 365
+  - name: gcs-coldline
+    type: gcs
+    bucket: "ov-prod-coldline"
+    location: "eu"
+    storage_class: "COLDLINE"
+  - name: onprem-minio-worm
+    type: minio
+    endpoint: "https://minio.storage.svc.cluster.local:9000"
+    bucket: "ov-prod-worm"
+    worm:
+      enabled: true
+      retention_days: 180
+    tls:
+      verify: true
+
+# Профили архивирования
+profiles:
+  # Профиль для холодного логирования и телеметрии
+  - name: cold-logs
+    description: "Архивация системных и приложенческих логов для длительного хранения и расследований"
+    dataset:
+      match:
+        include_globs:
+          - "/var/log/**/*.log"
+          - "s3://ov-prod-logs/**"
+        exclude_globs:
+          - "**/*.tmp"
+          - "**/debug/**"
+      classification: "telemetry"
+      max_object_size_mb: 512
+      tags:
+        - "observability"
+        - "forensics"
+    storage:
+      <<: *storage_defaults
+      targets:
+        - provider_ref: "aws-deep-archive"
+          selection:
+            prefix: "logs/"
+            transition:
+              after_days: 30
+        - provider_ref: "onprem-minio-worm"
+          selection:
+            prefix: "logs-local/"
+            transition:
+              after_days: 0
+      immutability:
+        enabled: true
+        mode: "WORM"
+        retention_lock_days: 120
+    lifecycle:
+      <<: *lifecycle_defaults
+      retention:
+        min_days: 730
+        max_days: 1825
+        delete_after_expiry: true
+        purge_grace_days: 14
+      retrieval:
+        default_tier: "Bulk"
+        max_thaw_hours: 24
+    budgeting:
+      <<: *budget_defaults
+      monthly_cap_usd: 900
+    indexing:
+      <<: *indexing_defaults
+      catalog:
+        enabled: true
+        persist_manifest: true
+        manifest_format: "parquet"
+        manifest_bucket: "s3://ov-prod-catalog/logs"
+    compliance:
+      <<: *compliance_defaults
+      data_categories:
+        - telemetry
+
+  # Профиль для юридически значимых артефактов и доказательств
+  - name: legal-evidence
+    description: "Архив цифровых доказательств, экспорт чатов аудита, снапшотов, отчетов проверки"
+    dataset:
+      match:
+        include_globs:
+          - "s3://ov-prod-evidence/**"
+          - "/evidence/**"
+      classification: "legal"
+      max_object_size_mb: 2048
+      tags:
+        - "legal"
+        - "audit"
+        - "chain-of-custody"
+    storage:
+      <<: *storage_defaults
+      redundancy:
+        cross_region_replication: true
+        min_copies: 3
+        max_copies: 3
+      targets:
+        - provider_ref: "azure-archive"
+          selection:
+            prefix: "evidence/primary/"
+            transition:
+              after_days: 0
+        - provider_ref: "gcs-coldline"
+          selection:
+            prefix: "evidence/secondary/"
+            transition:
+              after_days: 0
+      immutability:
+        enabled: true
+        mode: "WORM"
+        retention_lock_days: 365
+      legal_hold:
+        supported: true
+        default_state: "enabled"
+    lifecycle:
+      <<: *lifecycle_defaults
+      retention:
+        min_days: 2555     # 7 лет
+        max_days: 3650
+        delete_after_expiry: false
+      deletion_workflow:
+        requires_approvals: true
+        approvers:
+          - user: dpo@oblivionvault.io
+          - user: legal@oblivionvault.io
+          - user: ciso@oblivionvault.io
+        block_if_legal_hold: true
+      retrieval:
+        default_tier: "Expedited"
+        max_thaw_hours: 6
+      restore_testing:
+        drill_enabled: true
+        drill_frequency_cron: "0 4 1,15 * *"  # дважды в месяц
+        sample_rate_percent: 5
+        success_slo_percent: 99.5
+        max_rto_minutes: 60
+        max_rpo_minutes: 15
+    budgeting:
+      <<: *budget_defaults
+      monthly_cap_usd: 2500
+      early_deletion_penalties_ok: false
+    indexing:
+      <<: *indexing_defaults
+      content_hash:
+        algo: "SHA-256"
+        store_with_object: true
+      metadata:
+        include:
+          - filename
+          - size_bytes
+          - created_at
+          - custodian
+          - chain_of_custody_id
+          - digital_signature
+    compliance:
+      <<: *compliance_defaults
+      standards:
+        - iso27001
+        - soc2
+        - gdpr
+      export_controls:
+        eu_residency_required: true
+
+# Политики уведомлений и аномалий
+notifications:
+  events:
+    - type: "archive_success"
+      channels:
+        - email: "sre@oblivionvault.io"
+    - type: "archive_failure"
+      channels:
+        - pagerduty: "oblivionvault-incidents"
+        - email: "security@oblivionvault.io"
+    - type: "restore_success"
+      channels:
+        - email: "dr@oblivionvault.io"
+    - type: "restore_failure"
+      channels:
+        - pagerduty: "oblivionvault-incidents"
+        - email: "dr@oblivionvault.io"
+
+anomalyDetection:
+  enabled: true
+  rules:
+    - name: unusual-deletion-rate
+      description: "Удалений больше обычного"
+      window: "24h"
+      threshold_percent_over_baseline: 200
+    - name: checksum-mismatch
+      description: "Несовпадение контрольных сумм при re-verify"
+      window: "1h"
+      threshold_count: 1
+
+approvalsDirectory:
+  system: "gitops"
+  repo: "git@code.oblivionvault.io:platform/archive-approvals.git"
+  branch: "main"
+  path: "changes/"
+  require_signed_commits: true
+
+validation:
+  required_fields:
+    - profiles[*].storage.targets[*].provider_ref
+    - profiles[*].lifecycle.retention.min_days
+    - profiles[*].storage.encryption.at_rest.keyset_ref
+  deny_if:
+    - profiles[*].storage.immutability.enabled == false and profiles[*].dataset.classification in ["legal"]
+  lint:
+    allowed_algorithms:
+      - AES-256-GCM
+      - RSA-3072
+      - Ed25519
+      - BLAKE3
+      - SHA-256
+
+notes:
+  - Этот файл является шаблоном. Секреты, учетные данные и реальные ключи не включаются.
+  - keyset_ref должны ссылаться на действующие ключи в configs/keys.yaml.
+  - Проверьте ограничения провайдеров на ранние удаления и тарифы восстановления перед включением purge.

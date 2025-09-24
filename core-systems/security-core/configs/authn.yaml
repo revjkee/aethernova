@@ -1,0 +1,385 @@
+# ================================
+# security-core :: authn.yaml
+# Схема аутентификации и сессий (prod-grade)
+# ================================
+version: 1
+schema: "security-core/authn/1.0"
+
+meta:
+  service: "security-core"
+  environment: "prod"            # prod | stage | dev | test
+  issuer: "https://auth.neurocity.example"
+  audience:
+    - "https://api.neurocity.example"
+    - "security-core"
+  clock_skew_leeway_sec: 60
+
+secrets:
+  # Значения берутся из переменных окружения/Secret Manager/ Vault и т.п.
+  # Конфиг не содержит секретов в открытом виде.
+  argon2_pepper_env: "AUTHN_PEPPER"
+  redis_url_env: "AUTHN_REDIS_URL"
+  postgres_url_env: "AUTHN_DATABASE_URL"
+  kms_key_alias: "alias/security-core-auth"
+  jwks_primary_kid_env: "AUTHN_JWKS_PRIMARY_KID"
+  jwks_hsm_slot_env: "AUTHN_HSM_SLOT"      # при использовании HSM
+  oidc_google_client_id_env: "OIDC_GOOGLE_CLIENT_ID"
+  oidc_google_client_secret_env: "OIDC_GOOGLE_CLIENT_SECRET"
+  oidc_github_client_id_env: "OIDC_GITHUB_CLIENT_ID"
+  oidc_github_client_secret_env: "OIDC_GITHUB_CLIENT_SECRET"
+  saml_sp_private_key_env: "SAML_SP_PRIVATE_KEY_PEM"
+
+tenancy:
+  mode: "multi"                   # single | multi
+  default_tenant: "public"
+  resolver:
+    from_hostname_suffix: ".neurocity.example"   # tenant=left(hostname)
+    from_jwt_claim: "tenant"
+  isolation:
+    user_store: "schema-per-tenant" # или "row-level-security"
+    session_store: "namespace-per-tenant"
+
+identity_providers:
+  local:
+    enabled: true
+    username_format: "email"      # email | phone | username
+    password_hash:
+      algorithm: "argon2id"
+      parameters:
+        time_cost: 3
+        memory_cost_kib: 65536
+        parallelism: 1
+        salt_len: 16
+        hash_len: 32
+    password_policy:
+      min_length: 12
+      require:
+        lower: true
+        upper: true
+        digit: true
+        symbol: true
+      denylist:
+        enabled: true
+        source: "file://configs/password_denylist.txt"
+      rotation_days: 365
+      history: 5
+    account_lockout:
+      threshold: 10
+      window: "10m"
+      lockout_duration: "30m"
+      progressive_backoff: true
+  oidc:
+    enabled: true
+    providers:
+      - name: "google"
+        issuer: "https://accounts.google.com"
+        client_id_env: "{{ secrets.oidc_google_client_id_env }}"
+        client_secret_env: "{{ secrets.oidc_google_client_secret_env }}"
+        scopes: ["openid","email","profile"]
+        pkce: "S256_required"
+        nonce_required: true
+        max_age_sec: 3600
+        prompt: "consent"
+        claim_mapping:
+          sub: "subject"
+          email: "email"
+          email_verified: "email_verified"
+          hd: "tenant_hint"
+        allowed_audiences: []
+        trust:
+          jwks_cache_ttl: "1h"
+          http_timeout: "3s"
+      - name: "github"
+        issuer: "https://github.com/login/oauth"   # OAuth2; при неполном OIDC используйте userinfo
+        client_id_env: "{{ secrets.oidc_github_client_id_env }}"
+        client_secret_env: "{{ secrets.oidc_github_client_secret_env }}"
+        scopes: ["read:user","user:email"]
+        pkce: "S256_required"
+        nonce_required: true
+        claim_mapping:
+          id: "subject"
+          email: "email"
+        trust:
+          jwks_cache_ttl: "1h"
+          http_timeout: "3s"
+  saml:
+    enabled: false
+    sp_entity_id: "{{ meta.issuer }}/saml/sp"
+    acs_url: "{{ meta.issuer }}/saml/acs"
+    nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+    idp_metadata_url: "https://idp.example.com/metadata"
+    signing:
+      private_key_env: "{{ secrets.saml_sp_private_key_env }}"
+      want_assertion_signed: true
+      want_response_signed: true
+    claim_mapping:
+      "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress": "email"
+      "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier": "subject"
+
+mfa:
+  default: "optional"             # required | optional | disabled
+  required_for_roles: ["admin","security","ops"]
+  methods:
+    totp:
+      enabled: true
+      issuer: "NeuroCity Security Core"
+      period_sec: 30
+      digits: 6
+      drift_steps: 1
+      secret_len: 32
+      algo: "SHA1"
+      bootstrap_recovery_codes: 8
+    webauthn:
+      enabled: true
+      rp_id: "auth.neurocity.example"
+      rp_name: "NeuroCity Auth"
+      origins:
+        - "https://auth.neurocity.example"
+        - "https://console.neurocity.example"
+      attestation: "none"
+      user_verification: "required"
+      timeout_ms: 60000
+      algorithms: ["-7","-257"]   # ES256, RS256 COSE
+    sms:
+      enabled: false              # по умолчанию отключено (риск перехвата)
+  step_up:
+    enabled: true
+    triggers:
+      high_risk_login: true
+      privileged_action: true
+      policy_change: true
+
+risk_engine:
+  ip_reputation:
+    enabled: true
+    denylist_source: "file://configs/ip_denylist.txt"
+  velocity_rules:
+    login_per_ip_per_minute: 20
+    login_per_account_per_minute: 10
+  geo_anomaly:
+    enabled: true
+    impossible_travel_threshold_km: 1500
+  device_fingerprint:
+    enabled: true
+    binding_required_for_roles: ["admin","security"]
+
+sessions:
+  store:
+    type: "redis"
+    redis_url_env: "{{ secrets.redis_url_env }}"
+    namespace: "sc:sessions"
+    tls_required: true
+  cookie:
+    name: "sc_session"
+    same_site: "Lax"              # для admin‑панели можно "Strict"
+    secure: true
+    http_only: true
+    domain: ".neurocity.example"
+    path: "/"
+  ttl:
+    access_token: "10m"
+    refresh_token: "30d"
+    absolute_session_lifetime: "30d"
+    idle_timeout: "30m"
+  refresh_rotation:
+    enabled: true
+    mode: "rotate-and-revoke-previous"
+    reuse_detect_lockout_min: 5
+
+jwt:
+  signing:
+    algorithm: "RS256"            # рекомендуется EdDSA при поддержке клиентов
+    kid: "{{ secrets.jwks_primary_kid_env }}"
+    source:                       # источник закрытого ключа
+      type: "kms"                 # kms | hsm | file | env | jwks-remote
+      kms:
+        key_alias: "{{ secrets.kms_key_alias }}"
+        region: "eu-central-1"
+      hsm:
+        enabled: false
+        slot_env: "{{ secrets.jwks_hsm_slot_env }}"
+      file:
+        path: "file://keys/jwt_signing_key.pem"
+      env:
+        key_env: "AUTHN_JWT_SIGNING_KEY_PEM"
+      jwks-remote:
+        url: "https://keys.neurocity.example/jwks.json"
+        cache_ttl: "1h"
+  claims:
+    issuer: "{{ meta.issuer }}"
+    audience: "{{ meta.audience }}"
+    include:
+      - "sub"
+      - "jti"
+      - "iat"
+      - "nbf"
+      - "exp"
+      - "tenant"
+      - "roles"
+      - "scopes"
+    jti_uniqueness_ttl: "32d"
+    max_ttl: "15m"
+    leeway_sec: 60
+  encryption:
+    jwe_enabled: false
+  key_rotation:
+    schedule_cron: "0 3 * * 0"    # еженедельно по воскресеньям 03:00
+    overlap_ttl: "14d"            # период, когда старый ключ остаётся в JWKS (verify‑only)
+  jwks_publish:
+    enabled: true
+    path: "/.well-known/jwks.json"
+    cache_headers:
+      max_age_sec: 3600
+
+token_introspection:
+  enabled: true
+  endpoint: "/oauth/introspect"
+  auth:
+    method: "mtls"                # mtls | basic
+    trusted_client_cas: ["file://configs/ca/client_ca.pem"]
+  cache_positive_ttl: "1m"
+  cache_negative_ttl: "10s"
+
+token_revocation:
+  enabled: true
+  endpoint: "/oauth/revoke"
+  storage:
+    type: "redis"
+    namespace: "sc:revoked"
+  jti_index_ttl: "32d"
+
+cors:
+  enabled: true
+  allowed_origins:
+    - "https://console.neurocity.example"
+    - "https://app.neurocity.example"
+  allowed_methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+  allowed_headers: ["Authorization","Content-Type","X-Request-ID","X-CSRF-Token"]
+  allow_credentials: true
+  max_age_sec: 600
+
+csrf:
+  enabled: true
+  mode: "double-submit-cookie"
+  header_name: "X-CSRF-Token"
+  cookie_name: "sc_csrf"
+  same_site: "Strict"
+  secure: true
+
+network_policies:
+  allowed_redirect_urls:
+    - "https://console.neurocity.example/callback"
+    - "https://app.neurocity.example/callback"
+  ip_allowlist: []
+  ip_denylist:
+    from_file: "file://configs/ip_denylist.txt"
+
+rbac:
+  model: "role-based"
+  roles:
+    admin:
+      description: "Full administrative access"
+      permissions: ["*"]
+      mfa_required: true
+    security:
+      description: "Security operations"
+      permissions:
+        - "keys:read"
+        - "audit:read"
+        - "policy:update"
+      mfa_required: true
+    ops:
+      description: "Operational access"
+      permissions:
+        - "service:read"
+        - "service:restart"
+    user:
+      description: "Default end-user"
+      permissions:
+        - "self:read"
+        - "self:update"
+  attribute_rules:                  # опционально, ABAC правила через OPA
+    enabled: true
+    opa_bundle: "file://policies/rbac_bundle.tar.gz"
+
+service_accounts:
+  enabled: true
+  audiences: ["security-core","internal"]
+  token_ttl: "1h"
+  issuance:
+    restricted_to_namespaces: ["security-core","core-systems"]
+    allowed_scopes:
+      - "service:read"
+      - "service:metrics"
+  auth:
+    method: "jwt"
+    verification:
+      sources:
+        - "jwks"                   # внутренний JWKS security-core
+        - "k8s-serviceaccount"     # верификация SA токенов кластера
+
+rates_limits:
+  login:
+    per_ip_per_min: 20
+    per_identity_per_min: 10
+    burst: 20
+  totp_verify_per_min: 30
+  password_reset_per_hour: 5
+  token_exchange_per_min: 60
+
+observability:
+  logging:
+    level: "INFO"
+    format: "json"
+    context_fields: ["request_id","trace_id","tenant","subject"]
+    pii_redaction:
+      enabled: true
+      fields: ["email","phone","ip"]
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+      additional_labels:
+        component: "authn"
+        tier: "critical"
+  tracing:
+    otlp:
+      enabled: true
+      endpoint: "http://otel-collector.observability:4317"
+      sample_ratio: 0.1
+
+privacy_compliance:
+  gdpr:
+    data_subject_rights: ["access","erase","export"]
+    retention_days:
+      auth_logs: 365
+      sessions: 45
+      revoked_tokens: 45
+    consent_required_for_analytics: true
+  data_encryption_at_rest:
+    kms_key_alias: "{{ secrets.kms_key_alias }}"
+    algorithm: "AES256-GCM"
+  export_controls:
+    block_countries: []            # ISO‑коды, при необходимости
+
+admin_console:
+  enabled: true
+  base_url: "https://console.neurocity.example/security-core"
+  access:
+    allowed_roles: ["admin","security"]
+    ip_allowlist: []
+
+failsafe:
+  offline_mode:
+    enabled: true
+    allow_cached_jwks_verify: true
+    max_stale_jwks: "24h"
+  emergency_admins:
+    # E‑ID, которым разрешён вход при инциденте (требует MFA)
+    subjects: []
+    require_ticket_ref: true
+
+dangerous_features:
+  magic_links: false
+  auto_social_signup: false
+  password_autofill_seed: false

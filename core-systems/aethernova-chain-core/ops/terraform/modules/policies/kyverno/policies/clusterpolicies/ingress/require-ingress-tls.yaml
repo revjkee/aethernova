@@ -1,0 +1,131 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-ingress-tls
+  labels:
+    app.kubernetes.io/name: kyverno
+    app.kubernetes.io/part-of: ingress-security
+    app.kubernetes.io/component: tls-enforcement
+  annotations:
+    policies.kyverno.io/title: Require Ingress TLS
+    policies.kyverno.io/category: Network Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Ingress
+    policies.kyverno.io/description: >-
+      Enforce TLS on all Ingress resources. Require spec.tls[], forbid disabling HTTPS redirects on NGINX,
+      require kubernetes.io/ingress.allow-http: "false" on GKE/GCE, and enforce Traefik TLS annotation.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    # 1) Требуем наличие spec.tls[] (в любом контроллере)
+    - name: require-spec-tls-array
+      match:
+        any:
+          - resources:
+              kinds: ["Ingress"]
+      validate:
+        message: "Ingress must enable TLS: spec.tls[] is required."
+        pattern:
+          spec:
+            tls:
+              - {}  # наличие хотя бы одного элемента
+
+    # 2) GKE/GCE: обязательно отключить HTTP (только HTTPS)
+    - name: gke-disallow-http
+      match:
+        any:
+          - resources:
+              kinds: ["Ingress"]
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.ingressClassName || request.object.metadata.annotations.\"kubernetes.io/ingress.class\" || '' }}"
+            operator: In
+            value:
+              - "gce"
+      validate:
+        message: "GKE/GCE Ingress must set kubernetes.io/ingress.allow-http: \"false\"."
+        pattern:
+          metadata:
+            annotations:
+              kubernetes.io/ingress.allow-http: "false"
+
+    # 3) NGINX: запрещаем отключать HTTPS редирект (ssl-redirect=false)
+    - name: nginx-ssl-redirect-not-disabled
+      match:
+        any:
+          - resources:
+              kinds: ["Ingress"]
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.ingressClassName || request.object.metadata.annotations.\"kubernetes.io/ingress.class\" || '' }}"
+            operator: In
+            value:
+              - "nginx"
+      validate:
+        message: "NGINX Ingress must not disable HTTPS redirect (ssl-redirect must not be \"false\")."
+        deny:
+          conditions:
+            all:
+              - key: "{{ request.object.metadata.annotations.\"nginx.ingress.kubernetes.io/ssl-redirect\" || '' }}"
+                operator: Equals
+                value: "false"
+
+    # 4) Traefik: включаем TLS на уровне роутера
+    - name: traefik-require-router-tls
+      match:
+        any:
+          - resources:
+              kinds: ["Ingress"]
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.ingressClassName || request.object.metadata.annotations.\"kubernetes.io/ingress.class\" || '' }}"
+            operator: In
+            value:
+              - "traefik"
+      validate:
+        message: "Traefik Ingress must enable TLS via traefik.ingress.kubernetes.io/router.tls: \"true\"."
+        pattern:
+          metadata:
+            annotations:
+              traefik.ingress.kubernetes.io/router.tls: "true"
+---
+# Отдельная политика: соответствие host в rules и в tls.hosts (во избежание несоответствия сертификата)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ingress-host-match-tls-strict
+  labels:
+    app.kubernetes.io/name: kyverno
+    app.kubernetes.io/part-of: ingress-security
+    app.kubernetes.io/component: tls-host-consistency
+  annotations:
+    policies.kyverno.io/title: Ingress Host Match TLS
+    policies.kyverno.io/category: Network Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Ingress
+    policies.kyverno.io/description: >-
+      Ensure that each host in spec.rules[].host is also present in spec.tls[].hosts[].
+spec:
+  validationFailureAction: Enforce
+  # Используем запросный контекст; в audit-проходе (background) request.* недоступен — отключаем.
+  background: false
+  rules:
+    - name: host-match-tls
+      match:
+        any:
+          - resources:
+              kinds: ["Ingress"]
+      preconditions:
+        all:
+          - key: "{{request.operation || 'BACKGROUND'}}"
+            operator: AnyIn
+            value: ["CREATE","UPDATE"]
+      validate:
+        message: "The host(s) in spec.rules[].host must also be listed in spec.tls[].hosts[]."
+        deny:
+          conditions:
+            all:
+              - key: "{{ (request.object.spec.rules[].host || `[]`) | sort(@) }}"
+                operator: AnyNotIn
+                value: "{{ (request.object.spec.tls[].hosts[] || `[]`) | sort(@) }}"

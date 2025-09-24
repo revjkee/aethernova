@@ -1,0 +1,592 @@
+apiVersion: compliance.aethernova.io/v1
+kind: ComplianceProgram
+metadata:
+  name: cybersecurity-core-compliance
+  labels:
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/component: governance
+    compliance.aethernova.io/schema: "1.0.0"
+
+spec:
+  organization:
+    name: Aethernova
+    contacts:
+      ciso: ciso@aethernova.local
+      dpo: dpo@aethernova.local
+      soc: soc@aethernova.local
+    jurisdictions:
+      - EU
+      - US
+      - Worldwide
+    business_units:
+      - platform
+      - product
+      - operations
+
+  scope:
+    systems:
+      - name: k8s-prod
+        type: kubernetes
+        env: prod
+        clusters:
+          - name: prod-eu
+            region: eu-central
+      - name: k8s-staging
+        type: kubernetes
+        env: staging
+      - name: ci-cd
+        type: pipeline
+        tools: [github-actions, argo, jenkins]
+    assets:
+      repositories:
+        - name: cybersecurity-core
+          criticality: high
+        - name: platform-security-core
+          criticality: high
+      data_stores:
+        - name: vault
+          type: secrets
+          criticality: high
+        - name: redis-cache
+          type: cache
+          criticality: medium
+
+  dataClassification:
+    categories:
+      - id: public
+        name: Public
+        retention: P0D
+        encryption_at_rest: false
+        encryption_in_transit: true
+      - id: internal
+        name: Internal
+        retention: P2Y
+        encryption_at_rest: true
+        encryption_in_transit: true
+      - id: confidential
+        name: Confidential
+        retention: P5Y
+        encryption_at_rest: true
+        encryption_in_transit: true
+        dlp_required: true
+      - id: restricted
+        name: Restricted
+        retention: P7Y
+        encryption_at_rest: true
+        encryption_in_transit: true
+        dlp_required: true
+        mfa_required: true
+
+  # Глобальные определения (якоря для переиспользования)
+  definitions:
+    severities: &severities
+      critical: {score: 4, description: "Немедленное устранение, риск для бизнеса/безопасности"}
+      high:     {score: 3, description: "Угроза высокой значимости"}
+      medium:   {score: 2, description: "Значимый риск"}
+      low:      {score: 1, description: "Минорное отклонение"}
+    sla: &default_sla
+      detection:
+        critical: PT1H
+        high: PT4H
+        medium: PT24H
+        low: PT48H
+      remediation:
+        critical: P3D
+        high: P7D
+        medium: P30D
+        low: P90D
+    evidence_policy: &evidence_policy
+      retention: P3Y
+      storage:
+        s3_bucket: "compliance-artifacts"
+        path_prefix: "cybersecurity-core"
+      integrity:
+        hashing: sha256
+        attestations: in-toto
+    automation_common: &automation_common
+      ci_gates:
+        conftest:
+          policy_packages:
+            - path: policies/rego
+              package: compliance
+          on_events: [pull_request, push, release]
+        checkov:
+          directories: ["terraform/", "ops/terraform/"]
+        terrascan:
+          directories: ["terraform/"]
+        semgrep:
+          config: "p/ci"
+        gitleaks:
+          fail_on_leak: true
+      cluster_jobs:
+        trivy:
+          schedule: "0 2 * * *"
+          targets: ["images", "filesystems"]
+        kube_bench:
+          schedule: "0 3 * * *"
+        kube_hunter:
+          schedule: "0 4 * * *"
+      sbom:
+        tools: [syft]
+        schedule: "0 1 * * *"
+        output_format: spdx-json
+      provenance:
+        slsa_level: "L3"
+        generator: "github-actions-provenance"
+
+  frameworks:
+    - id: ISO-27001-2022
+      name: ISO/IEC 27001:2022
+      mappings:
+        A.5.1: [AC-01, GOV-01]
+        A.8.3: [CRYPTO-01]
+        A.8.16: [LOG-01]
+        A.8.20: [VULN-01]
+        A.8.21: [PATCH-01]
+        A.8.28: [IR-01]
+        A.5.23: [BCP-01]
+        A.5.29: [SCM-01]
+    - id: SOC2-TSC
+      name: AICPA SOC 2 TSC
+      mappings:
+        CC6.1: [AC-01]
+        CC7.1: [LOG-01, DETECT-01]
+        CC7.2: [VULN-01, PATCH-01]
+        CC8.1: [SCM-01, SBOM-01]
+    - id: NIST-800-53r5
+      name: NIST SP 800-53 Rev.5
+      mappings:
+        AC-2: [AC-01]
+        AU-2: [LOG-01]
+        IR-4: [IR-01]
+        RA-5: [VULN-01]
+        SI-2: [PATCH-01]
+    - id: CIS-K8S-1.26
+      name: CIS Kubernetes Benchmark v1.26
+      mappings:
+        "1.1.*": [K8S-BASELINE]
+        "5.*":   [K8S-NETPOL, K8S-PSP]
+    - id: GDPR
+      name: EU GDPR
+      mappings:
+        "Art.25": [PRIV-01]
+        "Art.30": [PRIV-REC-01]
+        "Art.32": [CRYPTO-01, AC-01, IR-01]
+
+  owners:
+    families:
+      AC: {role: "Head of IAM", email: iam@aethernova.local}
+      LOG: {role: "Head of Observability", email: obs@aethernova.local}
+      IR: {role: "Head of Incident Response", email: ir@aethernova.local}
+      GOV: {role: "GRC Lead", email: grc@aethernova.local}
+      PRIV: {role: "DPO", email: dpo@aethernova.local}
+      SCM: {role: "Supply Chain Sec Lead", email: scm@aethernova.local}
+      K8S: {role: "Platform Lead", email: platform@aethernova.local}
+
+  controls:
+    - id: GOV-01
+      title: Инвентаризация и границы программы
+      family: GOV
+      policy_refs:
+        - path: policies/governance/program.md
+      implementation:
+        - CMDB для систем в scope (label-driven discovery)
+        - Тегирование критичности и владельцев
+      verification:
+        automated:
+          - type: conftest
+            package: "compliance.governance"
+            target: "repositories/*"
+            cadence: "on_every_pr"
+        manual:
+          - type: review
+            cadence: "quarterly"
+      evidence:
+        required:
+          - cmdb_export.json
+          - owners_matrix.csv
+        <<: *evidence_policy
+      sla: *default_sla
+      metrics:
+        - name: coverage.assets_in_cmdb
+          target: ">= 0.98"
+
+    - id: AC-01
+      title: Управление доступом и минимальные привилегии
+      family: AC
+      policy_refs:
+        - path: policies/access/iam.md
+        - path: policies/access/kubernetes-rbac.md
+      implementation:
+        - SSO + MFA для всех админских доступов
+        - Kubernetes RBAC, запрет wildcard в ClusterRole
+        - Разделение сред, запрет прямых доступов в prod
+      verification:
+        automated:
+          - type: conftest
+            package: "compliance.rbac"
+            target: "ops/k8s/**"
+            rule: "deny_wildcards"
+            cadence: "on_every_pr"
+          - type: checkov
+            target: "ops/terraform/**"
+            cadence: "on_every_pr"
+        manual:
+          - type: access-review
+            cadence: "quarterly"
+      evidence:
+        required:
+          - access_reviews/*.pdf
+          - rbac_dump.yaml
+        <<: *evidence_policy
+      sla: *default_sla
+      metrics:
+        - name: rbac.wildcards
+          target: "== 0"
+
+    - id: LOG-01
+      title: Журналирование и наблюдаемость
+      family: LOG
+      policy_refs:
+        - path: policies/logging/standard.md
+      implementation:
+        - Централизованный сбор логов (OTel)
+        - Нормализация в ECS
+        - Хранение ≥ 365 дней для prod
+      verification:
+        automated:
+          - type: semgrep
+            target: "services/**"
+            rulepack: "logging-required"
+            cadence: "on_every_pr"
+          - type: cluster-job
+            tool: kube-bench
+            cadence: "daily"
+        manual:
+          - type: retention-check
+            cadence: "quarterly"
+      evidence:
+        required:
+          - siem/retention-config.json
+          - dashboards/*.json
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: VULN-01
+      title: Управление уязвимостями
+      family: SI
+      policy_refs:
+        - path: policies/vuln-management.md
+      implementation:
+        - Trivy для образов и файлов
+        - Регулярные сканы контейнеров в кластере
+        - Создание тикетов на критические CVE автоматически
+      verification:
+        automated:
+          - type: trivy
+            target: "containers"
+            cadence: "daily"
+            fail_on_severity: ["CRITICAL","HIGH"]
+          - type: semgrep
+            target: "repositories/**"
+            rulepack: "security-audit"
+            cadence: "on_every_pr"
+      evidence:
+        required:
+          - scan_reports/trivy/*.json
+          - tickets/jira/vuln/*.csv
+        <<: *evidence_policy
+      sla: *default_sla
+      metrics:
+        - name: vuln.time_to_fix_critical
+          target: "<= P3D"
+
+    - id: PATCH-01
+      title: Патч-менеджмент
+      family: SI
+      policy_refs:
+        - path: policies/patching.md
+      implementation:
+        - Обновления базовых образов еженедельно
+        - Renovate/Dependabot для зависимостей
+      verification:
+        automated:
+          - type: pipeline-policy
+            gate: "disallow_outdated_base_images"
+            cadence: "on_every_pr"
+      evidence:
+        required:
+          - renovate/reports/*.json
+          - base-image-changelogs/*.md
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: IR-01
+      title: Реагирование на инциденты
+      family: IR
+      policy_refs:
+        - path: policies/incident-response.md
+      implementation:
+        - Runbook, ролевые обязанности, каналы оповещения
+        - Табличные учения 2 раза в год
+      verification:
+        automated:
+          - type: siem-rule-tests
+            target: "detection-rules/**"
+            cadence: "weekly"
+        manual:
+          - type: tabletop-exercise
+            cadence: "semiannual"
+      evidence:
+        required:
+          - postmortems/*.md
+          - pagerduty/reports/*.csv
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: K8S-BASELINE
+      title: Базовая безопасность Kubernetes
+      family: K8S
+      policy_refs:
+        - path: policies/kubernetes/baseline.md
+      implementation:
+        - Seccomp RuntimeDefault, readOnlyRootFilesystem
+        - Drop ALL capabilities, NetworkPolicy deny-by-default
+      verification:
+        automated:
+          - type: conftest
+            package: "compliance.k8s.baseline"
+            target: "ops/k8s/**"
+            cadence: "on_every_pr"
+          - type: kube-bench
+            cadence: "weekly"
+      evidence:
+        required:
+          - kube-bench/reports/*.json
+          - admission/audit-logs/*.json
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: K8S-NETPOL
+      title: Сегментация сети и egress-контроль
+      family: K8S
+      policy_refs:
+        - path: policies/kubernetes/network.md
+      implementation:
+        - Default deny, явные allow-листы
+        - Контроль egress через egress-gateway
+      verification:
+        automated:
+          - type: conftest
+            package: "compliance.k8s.netpol"
+            target: "ops/k8s/**"
+            cadence: "on_every_pr"
+      evidence:
+        required:
+          - netpol/coverage-report.json
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: CRYPTO-01
+      title: Криптография и управление ключами
+      family: SC
+      policy_refs:
+        - path: policies/crypto/kms.md
+      implementation:
+        - TLS 1.2+, запрет слабых шифров
+        - Управление секретами через Vault
+      verification:
+        automated:
+          - type: semgrep
+            target: "services/**"
+            rulepack: "crypto-best-practices"
+            cadence: "on_every_pr"
+      evidence:
+        required:
+          - vault/policies/*.hcl
+          - tls/config/*.yaml
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: SCM-01
+      title: Supply Chain Security и аттестации
+      family: SCM
+      policy_refs:
+        - path: policies/supply-chain.md
+      implementation:
+        - SBOM для всех артефактов, подписи контейнеров
+        - SLSA L3, in-toto аттестации
+      verification:
+        automated:
+          - type: sbom-verify
+            tool: syft
+            cadence: "on_every_build"
+          - type: signature-verify
+            tool: cosign
+            cadence: "on_every_release"
+      evidence:
+        required:
+          - sbom/*.spdx.json
+          - attestations/*.jsonl
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: PRIV-01
+      title: Privacy by Design
+      family: PRIV
+      policy_refs:
+        - path: policies/privacy/pbd.md
+      implementation:
+        - DPIA для новых фич
+        - Минимизация и псевдонимизация персональных данных
+      verification:
+        manual:
+          - type: dpia-review
+            cadence: "on_change"
+      evidence:
+        required:
+          - dpia/*.pdf
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: PRIV-REC-01
+      title: Реестр операций с персональными данными
+      family: PRIV
+      policy_refs:
+        - path: policies/privacy/records.md
+      implementation:
+        - Актуальный реестр Art.30
+      verification:
+        manual:
+          - type: audit
+            cadence: "annual"
+      evidence:
+        required:
+          - records_of_processing/*.xlsx
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: BCP-01
+      title: Непрерывность бизнеса и DR
+      family: GOV
+      policy_refs:
+        - path: policies/bcp-dr.md
+      implementation:
+        - RTO/RPO цели, тесты восстановления раз в год
+      verification:
+        manual:
+          - type: dr-test
+            cadence: "annual"
+      evidence:
+        required:
+          - dr/test-reports/*.pdf
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: SBOM-01
+      title: Генерация и контроль SBOM
+      family: SCM
+      policy_refs:
+        - path: policies/sbom.md
+      implementation:
+        - Автоматическая генерация SBOM по всем сборкам
+      verification:
+        automated:
+          - type: sbom-verify
+            tool: syft
+            cadence: "on_every_build"
+      evidence:
+        required:
+          - sbom/*.spdx.json
+        <<: *evidence_policy
+      sla: *default_sla
+
+    - id: DETECT-01
+      title: Выявление аномалий и оповещение
+      family: LOG
+      policy_refs:
+        - path: policies/detection-engineering.md
+      implementation:
+        - Правила корреляции в SIEM, сторожевые дашборды
+      verification:
+        automated:
+          - type: siem-rule-tests
+            cadence: "weekly"
+      evidence:
+        required:
+          - siem/rules/*.yml
+          - siem/tests/*.yml
+        <<: *evidence_policy
+      sla: *default_sla
+
+  exceptions:
+    process:
+      approvers: [CISO, GRC Lead]
+      max_duration: P90D
+      review_cadence: "monthly"
+    register:
+      - id: EXC-001
+        control_id: AC-01
+        justification: "Техническое ограничение поставщика"
+        temporary_compensating_controls:
+          - "Запросы доступа логируются и мониторятся"
+        owner: iam@aethernova.local
+        status: "approved"
+        valid_until: "2025-12-31"
+
+  risks:
+    methodology: ISO-31000
+    appetite:
+      residual: "medium"
+    register:
+      - id: RISK-001
+        title: "Компрометация образа контейнера"
+        severity: *severities
+        inherent: high
+        treatment: reduce
+        controls: [SCM-01, SBOM-01, VULN-01]
+        owner: scm@aethernova.local
+        review_date: "2025-11-01"
+
+  audits:
+    internal:
+      cadence: "semiannual"
+      scope: ["controls", "evidence", "exceptions", "risks"]
+    external:
+      cadence: "annual"
+      standards: ["ISO-27001-2022", "SOC2-TSC"]
+    sampling:
+      method: random
+      size_pct: 10
+
+  automation:
+    <<: *automation_common
+    evidence_collection:
+      on_ci_success:
+        - path: "reports/**"
+          upload: true
+      scheduled:
+        - schedule: "0 0 * * 1"
+          collect:
+            - "scan_reports/**"
+            - "dashboards/**"
+    reporting:
+      formats: ["html", "pdf", "json"]
+      recipients:
+        - grc@aethernova.local
+        - ciso@aethernova.local
+
+  integrations:
+    siem:
+      type: opensearch
+      index_prefix: "sec-logs"
+    ticketing:
+      system: jira
+      project_key: SEC
+    secrets:
+      vault:
+        mount: "kv/security"
+        policies: ["compliance-read", "ci-writer"]
+    paging:
+      system: pagerduty
+      service: "security-oncall"

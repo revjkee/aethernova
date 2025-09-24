@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop, release/**, hotfix/**, feature/** ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  PYTHONUTF8: "1"
+  POETRY_VIRTUALENVS_IN_PROJECT: "true"
+  POETRY_NO_INTERACTION: "1"
+
+jobs:
+  lint-type-test:
+    name: Lint/Type/Test (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [ "3.10", "3.11", "3.12" ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: "pip"
+
+      - name: Install Poetry via pipx
+        uses: pipxproject/action-pipx@v1
+        with:
+          packages: poetry==1.8.3
+
+      - name: Configure Poetry
+        run: |
+          poetry --version
+          poetry config virtualenvs.in-project true
+
+      - name: Cache .venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: v1-venv-${{ runner.os }}-py${{ matrix.python }}-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            v1-venv-${{ runner.os }}-py${{ matrix.python }}-
+            v1-venv-${{ runner.os }}-
+
+      - name: Cache Poetry package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: v1-poetry-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            v1-poetry-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: |
+          poetry install --no-root --sync
+          # Optional dev tools may be in extras; tolerate absence
+          poetry run python -c "import sys; print(sys.version)"
+
+      - name: Ruff (lint)
+        run: |
+          if poetry run python -c "import importlib; importlib.import_module('ruff')" 2>/dev/null; then
+            poetry run ruff check . --output-format=github
+          else
+            echo "Ruff not declared; skipping lint."; exit 0
+          fi
+
+      - name: Mypy (type check)
+        run: |
+          if [ -f "mypy.ini" ] || [ -f "pyproject.toml" ]; then
+            if poetry run python -c "import importlib; importlib.import_module('mypy')" 2>/dev/null; then
+              poetry run mypy .
+            else
+              echo "mypy not declared; skipping type check."
+            fi
+          fi
+
+      - name: Pytest (unit/integration) with coverage
+        env:
+          PYTEST_ADDOPTS: "-q"
+        run: |
+          if poetry run python -c "import importlib; importlib.import_module('pytest')" 2>/dev/null; then
+            poetry run pytest \
+              --maxfail=1 \
+              --disable-warnings \
+              --durations=10 \
+              --cov=./ \
+              --cov-report=xml:coverage.xml \
+              --junitxml=pytest-results.xml
+          else
+            echo "pytest not declared; skipping tests."
+          fi
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-py${{ matrix.python }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            coverage.xml
+            pytest-results.xml
+            .coverage
+            .pytest_cache/**
+
+      - name: Security scan — bandit (SAST)
+        run: |
+          if poetry run python -c "import importlib; importlib.import_module('bandit')" 2>/dev/null; then
+            poetry run bandit -q -r . -x tests,engine/tests -f txt -o bandit.txt || true
+          fi
+
+      - name: Security scan — safety (vuln DB)
+        run: |
+          if poetry run python -c "import importlib; importlib.import_module('safety')" 2>/dev/null; then
+            poetry run safety check --full-report --output text || true
+          fi
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-py${{ matrix.python }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            bandit.txt
+
+  build:
+    name: Build sdist/wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ lint-type-test ]
+    if: ${{ always() && !cancelled() && needs.lint-type-test.result != 'failure' }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Poetry via pipx
+        uses: pipxproject/action-pipx@v1
+        with:
+          packages: poetry==1.8.3
+
+      - name: Configure Poetry
+        run: poetry config virtualenvs.in-project true
+
+      - name: Cache .venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: v1-venv-build-${{ runner.os }}-py312-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install deps (no dev)
+        run: poetry install --no-root --only main --sync
+
+      - name: Build distributions
+        run: |
+          poetry build
+          ls -lah dist
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          retention-days: 14
+
+  release:
+    name: Release (tag)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [ build ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

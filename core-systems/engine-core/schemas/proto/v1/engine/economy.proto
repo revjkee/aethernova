@@ -1,0 +1,525 @@
+// SPDX-License-Identifier: Apache-2.0
+// engine-core/schemas/proto/v1/engine/economy.proto
+//
+// Промышленный API экономического контура:
+//  - Каталог активов и торговых инструментов
+//  - Балансы (available/locked/pending/liabilities)
+//  - Переводы с идемпотентностью и комиссионной матрицей
+//  - Ордерный движок: market/limit, time-in-force, частичные исполнения
+//  - Котировки/оценки/конвертация (preview)
+//  - Стейкинг/награды
+//  - Платёжные/бухгалтерские события (ledger) и потоковое наблюдение
+//  - Маппинг ошибок через engine.v1.error.Error
+//
+// Требует: common.proto, error.proto
+
+syntax = "proto3";
+
+package engine.v1.engine;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "engine-core/schemas/proto/v1/common.proto";
+import "engine-core/schemas/proto/v1/error.proto";
+
+option go_package          = "github.com/yourorg/engine-core/gen/proto/engine/v1/engine;enginev1";
+option java_package        = "com.yourorg.engine.v1.engine";
+option java_multiple_files = true;
+option csharp_namespace    = "YourOrg.Engine.V1.Engine";
+option objc_class_prefix   = "ENG";
+option php_namespace       = "YourOrg\\Engine\\V1\\Engine";
+
+// -----------------------------
+// Справочники и базовые типы
+// -----------------------------
+
+// Вид актива.
+enum AssetKind {
+  ASSET_KIND_UNSPECIFIED = 0;
+  FIAT = 1;         // ISO‑4217 (USD, EUR, SEK)
+  CRYPTO = 2;       // layer1 coin (ETH, BTC)
+  TOKEN = 3;        // токены L2/ERC‑20 и пр.
+  DERIVATIVE = 4;   // производные, в т.ч. LP‑доли
+}
+
+// Идентификатор актива.
+message AssetId {
+  string code = 1;           // "USD","USDC","REVA","ETH"
+  AssetKind kind = 2;
+  // Для on‑chain активов полезно указать сеть.
+  string chain = 3;          // "ethereum","polygon","solana","offchain"
+  string contract = 4;       // адрес контракта для TOKEN (если применимо)
+  reserved 5 to 10;
+}
+
+// Описание актива.
+message Asset {
+  AssetId id = 1;
+  string name = 2;           // человекочитаемое имя
+  uint32 display_scale = 3;  // число знаков (USD=2, USDC=6, REVA=18)
+  bool transferrable = 4;
+  bool stakeable = 5;
+  bool quote_enabled = 6;
+  reserved 7 to 10;
+}
+
+// Торговый инструмент (пара base/quote).
+message Instrument {
+  string symbol = 1;       // "REVA/USD", "ETH/USDC"
+  AssetId base = 2;
+  AssetId quote = 3;
+  // Лоты и шаги цены/количества.
+  string qty_step = 4;     // Decimal в виде строки, напр. "0.0001"
+  string price_step = 5;   // Decimal в виде строки
+  // Лимиты
+  string min_qty = 6;
+  string min_notional = 7;
+  bool enabled = 8;
+  reserved 9 to 20;
+}
+
+// Направление сделки.
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  BUY = 1;
+  SELL = 2;
+}
+
+// Тип ордера.
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  MARKET = 1;
+  LIMIT = 2;
+}
+
+// Политика времени жизни.
+enum TimeInForce {
+  TIF_UNSPECIFIED = 0;
+  GTC = 1;   // Good-Till-Cancel
+  IOC = 2;   // Immediate-Or-Cancel
+  FOK = 3;   // Fill-Or-Kill
+  DAY = 4;   // истекает в конце торгового дня
+}
+
+// Статус ордера.
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  NEW = 1;
+  PARTIALLY_FILLED = 2;
+  FILLED = 3;
+  CANCELED = 4;
+  REJECTED = 5;
+  EXPIRED = 6;
+}
+
+// Причины отклонения.
+enum RejectReason {
+  REJECT_REASON_UNSPECIFIED = 0;
+  INSUFFICIENT_FUNDS = 1;
+  PRICE_OUT_OF_BOUNDS = 2;
+  RISK_LIMIT = 3;
+  POLICY_BLOCK = 4;     // economy/anti‑cheat/ACL политика
+  INTERNAL_ERROR = 5;
+}
+
+// -----------------------------
+// Балансы и комиссии
+// -----------------------------
+
+// Баланс по активу.
+message Balance {
+  AssetId asset = 1;
+  engine.v1.common.Money available = 2;
+  engine.v1.common.Money locked = 3;
+  engine.v1.common.Money pending = 4;
+  engine.v1.common.Money liabilities = 5;   // отрицательные обязательства
+  reserved 6 to 10;
+}
+
+// Строка комиссии.
+message FeeLine {
+  string name = 1;                          // "maker", "taker", "withdrawal"
+  engine.v1.common.Money amount = 2;
+  string basis = 3;                          // "bps:10", "flat"
+  reserved 4 to 10;
+}
+
+// Расчет комиссий/стоимости операции.
+message FeeBreakdown {
+  repeated FeeLine lines = 1;
+  engine.v1.common.Money total = 2;
+  reserved 3 to 10;
+}
+
+// -----------------------------
+// Переводы (кошелёк/кошелёк, ввод/вывод)
+// -----------------------------
+
+message TransferRequest {
+  // Кому/от кого — в терминах субъектов внутри системы.
+  engine.v1.common.ResourceRef from = 1;   // напр. "engine.wallet", id=...
+  engine.v1.common.ResourceRef to = 2;
+  AssetId asset = 3;
+  engine.v1.common.Money amount = 4;
+  string reference = 5;                    // внешний референс/метка
+  string idempotency_key = 6;              // <=128 ASCII
+  // Дополнительно: атрибуты (например, memo/инвойс).
+  map<string, string> attributes = 7;
+  reserved 8 to 10;
+}
+
+message TransferResponse {
+  engine.v1.common.Id transfer_id = 1;
+  FeeBreakdown fees = 2;
+  // Итого к списанию с источника (amount + fees исходящие)
+  engine.v1.common.Money total_debit = 3;
+  google.protobuf.Timestamp executed_at = 4;
+  // Ошибки доменных политик/лимитов — через типизированный контейнер
+  engine.v1.error.Error error = 5;
+  reserved 6 to 10;
+}
+
+// -----------------------------
+// Ордеры и сделки
+// -----------------------------
+
+message Order {
+  engine.v1.common.Id order_id = 1;
+  string symbol = 2;                      // инструмент
+  Side side = 3;
+  OrderType type = 4;
+  TimeInForce tif = 5;
+  // Кол‑во и цена в Decimal‑строках для точности UI/сериализации.
+  string quantity = 6;                    // желаемое количество base
+  string price = 7;                       // для LIMIT
+  string client_order_id = 8;             // внешний ID клиента (<= 64 ASCII)
+  OrderStatus status = 9;
+  // Итоги исполнения
+  string executed_qty = 10;
+  engine.v1.common.Money executed_notional = 11; // в quote
+  FeeBreakdown fees = 12;
+  RejectReason reject_reason = 13;
+  // Временные метки
+  google.protobuf.Timestamp created_at = 14;
+  google.protobuf.Timestamp updated_at = 15;
+  reserved 16 to 30;
+}
+
+message CreateOrderRequest {
+  string symbol = 1;
+  Side side = 2;
+  OrderType type = 3;
+  TimeInForce tif = 4;
+  string quantity = 5;                    // обязательна для MARKET buy как notional? см. policy
+  string price = 6;                       // обязательна для LIMIT
+  string client_order_id = 7;
+  string idempotency_key = 8;
+  // Полезно для UI‑подтверждения рисков
+  bool post_only = 9;                     // отклонить, если пересекается (maker only)
+  reserved 10 to 20;
+}
+
+message CreateOrderResponse {
+  Order order = 1;
+  engine.v1.error.Error error = 2;        // при REJECTED/ошибках валидации
+}
+
+message CancelOrderRequest {
+  engine.v1.common.Id order_id = 1;
+  string client_order_id = 2;             // альтернативный ключ
+}
+
+message CancelOrderResponse {
+  Order order = 1;                         // итоговый статус (CANCELED/FILLED/REJECTED)
+  engine.v1.error.Error error = 2;
+}
+
+message GetOrderRequest {
+  engine.v1.common.Id order_id = 1;
+  string client_order_id = 2;             // альтернативный ключ
+}
+
+message GetOrderResponse {
+  Order order = 1;
+}
+
+message ListOrdersRequest {
+  string symbol = 1;
+  OrderStatus status = 2;
+  // Пагинация (cursor‑based)
+  string cursor = 3;
+  uint32 page_size = 4;                   // 1..1000
+  string order_by = 5;                    // "created_at","updated_at"
+  engine.v1.common.SortDirection direction = 6;
+}
+
+message ListOrdersResponse {
+  repeated Order orders = 1;
+  string next_cursor = 2;
+}
+
+// Событие исполнения (fill).
+message TradeFill {
+  engine.v1.common.Id trade_id = 1;
+  engine.v1.common.Id order_id = 2;
+  string symbol = 3;
+  Side side = 4;
+  string price = 5;                       // Decimal строка
+  string qty = 6;                         // Decimal строка (base)
+  engine.v1.common.Money notional = 7;    // в quote
+  FeeBreakdown fees = 8;
+  google.protobuf.Timestamp executed_at = 9;
+  reserved 10 to 20;
+}
+
+// -----------------------------
+// Котировки, конвертация, оценки
+// -----------------------------
+
+// Котировка для инструмента.
+message Quote {
+  string symbol = 1;
+  // Лучшая цена/объем по сторонам
+  string bid_price = 2;
+  string bid_qty = 3;
+  string ask_price = 4;
+  string ask_qty = 5;
+  // TWAP/VWAP и справочные курсы
+  string mid_price = 6;
+  google.protobuf.Timestamp as_of = 7;
+  reserved 8 to 20;
+}
+
+message GetQuoteRequest {
+  string symbol = 1;
+}
+
+message GetQuoteResponse {
+  Quote quote = 1;
+  engine.v1.error.Error error = 2;
+}
+
+// Предпросчет конвертации/торга (без исполнения).
+message ConvertPreviewRequest {
+  AssetId from_asset = 1;
+  AssetId to_asset = 2;
+  engine.v1.common.Money amount_in = 3;   // сколько отдаём
+  // Ограничения пользователя: max slippage и прочее.
+  uint32 max_slippage_bps = 4;            // 1bps=0.01%
+}
+
+message ConvertPreviewResponse {
+  engine.v1.common.Money amount_out = 1;
+  string effective_price = 2;             // Decimal
+  FeeBreakdown fees = 3;
+  uint32 realized_slippage_bps = 4;
+  engine.v1.error.Error error = 5;
+}
+
+// -----------------------------
+// Портфель
+// -----------------------------
+
+message GetBalanceRequest {
+  engine.v1.common.ResourceRef owner = 1; // чья учетная запись/кошелёк
+  AssetId asset = 2;                       // опционально: конкретный актив
+}
+
+message GetBalanceResponse {
+  repeated Balance balances = 1;
+}
+
+message GetPortfolioRequest {
+  engine.v1.common.ResourceRef owner = 1;
+}
+
+message GetPortfolioResponse {
+  repeated Balance balances = 1;
+  engine.v1.common.Money portfolio_value_base = 2; // в базовой валюте (например, USD)
+  reserved 3 to 10;
+}
+
+// -----------------------------
+// Стейкинг
+// -----------------------------
+
+message StakingInfo {
+  AssetId asset = 1;                 // какой актив можно стейкать
+  string apr_pct = 2;                // Decimal строка, напр. "12.0"
+  engine.v1.common.Money min_amount = 3;
+  bool auto_compound = 4;
+  reserved 5 to 10;
+}
+
+message GetStakingInfoRequest {
+  AssetId asset = 1;
+}
+
+message GetStakingInfoResponse {
+  StakingInfo info = 1;
+}
+
+message StakeRequest {
+  engine.v1.common.ResourceRef owner = 1;
+  AssetId asset = 2;
+  engine.v1.common.Money amount = 3;
+  string idempotency_key = 4;
+}
+
+message StakeResponse {
+  engine.v1.common.Id stake_id = 1;
+  engine.v1.error.Error error = 2;
+}
+
+message UnstakeRequest {
+  engine.v1.common.ResourceRef owner = 1;
+  engine.v1.common.Id stake_id = 2;
+  engine.v1.common.Money amount = 3; // можно частично
+}
+
+message UnstakeResponse {
+  engine.v1.error.Error error = 1;
+}
+
+message ClaimRewardsRequest {
+  engine.v1.common.ResourceRef owner = 1;
+  AssetId reward_asset = 2;           // в каком активе выдать награды
+}
+
+message ClaimRewardsResponse {
+  engine.v1.common.Money amount = 1;
+  engine.v1.error.Error error = 2;
+}
+
+// -----------------------------
+// Бухгалтерские события (Ledger)
+// -----------------------------
+
+enum LedgerEventType {
+  LEDGER_EVENT_TYPE_UNSPECIFIED = 0;
+  CREDIT = 1;
+  DEBIT = 2;
+  FEE = 3;
+  TRADE = 4;
+  TRANSFER = 5;
+  STAKE = 6;
+  UNSTAKE = 7;
+  REWARD = 8;
+  MINT = 9;
+  BURN = 10;
+  BUYBACK = 11;
+}
+
+message LedgerEvent {
+  engine.v1.common.Id event_id = 1;
+  LedgerEventType type = 2;
+  engine.v1.common.ResourceRef owner = 3;
+  AssetId asset = 4;
+  engine.v1.common.Money amount = 5;            // знак по типу события
+  FeeBreakdown fees = 6;
+  map<string, string> attributes = 7;           // tx hash, venue, note и т.п.
+  google.protobuf.Timestamp occurred_at = 8;
+  // Корреляция
+  engine.v1.common.Id related_order_id = 9;
+  engine.v1.common.Id related_transfer_id = 10;
+  reserved 11 to 20;
+}
+
+message StreamLedgerRequest {
+  engine.v1.common.ResourceRef owner = 1;
+  google.protobuf.Timestamp since = 2;  // от времени (опционально)
+  string cursor = 3;                     // либо курсор
+  uint32 batch = 4;                      // размер батча в потоке
+}
+
+message StreamLedgerResponse {
+  repeated LedgerEvent events = 1;       // сервер может слать чанки
+  string next_cursor = 2;                 // для возобновления
+}
+
+// -----------------------------
+// Сервис
+// -----------------------------
+
+service EconomyService {
+  // Активы/инструменты
+  rpc GetAsset(AssetId) returns (Asset);
+  rpc ListAssets(google.protobuf.Empty) returns (ListAssetsResponse);
+  rpc GetInstrument(GetInstrumentRequest) returns (Instrument);
+  rpc ListInstruments(google.protobuf.Empty) returns (ListInstrumentsResponse);
+
+  // Портфель/балансы
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  rpc GetPortfolio(GetPortfolioRequest) returns (GetPortfolioResponse);
+
+  // Переводы
+  rpc Transfer(TransferRequest) returns (TransferResponse);
+
+  // Ордерный контур
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+
+  // Котировки/оценки
+  rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
+  rpc ConvertPreview(ConvertPreviewRequest) returns (ConvertPreviewResponse);
+
+  // Стейкинг
+  rpc GetStakingInfo(GetStakingInfoRequest) returns (GetStakingInfoResponse);
+  rpc Stake(StakeRequest) returns (StakeResponse);
+  rpc Unstake(UnstakeRequest) returns (UnstakeResponse);
+  rpc ClaimRewards(ClaimRewardsRequest) returns (ClaimRewardsResponse);
+
+  // Ledger поток
+  rpc StreamLedger(StreamLedgerRequest) returns (stream StreamLedgerResponse);
+
+  // Здоровье
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message ListAssetsResponse {
+  repeated Asset assets = 1;
+}
+
+message GetInstrumentRequest {
+  string symbol = 1;
+}
+
+message ListInstrumentsResponse {
+  repeated Instrument instruments = 1;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool ready = 1;
+  string version = 2;
+  google.protobuf.Timestamp now = 3;
+}
+
+// -----------------------------
+// Контракты/инварианты для реализации
+// -----------------------------
+//
+// 1) Money и Decimal:
+//    * Все суммы выражаются через engine.v1.common.Money (units+nanos).
+//    * Поля цен/количеств в ордерах — Decimal‑строки; сервер обязан нормализовать под step.
+// 2) Идемпотентность:
+//    * Transfer.idempotency_key и CreateOrder.idempotency_key стабилизируют ответ >= 24ч.
+// 3) Балансы:
+//    * available + pending + locked - liabilities >= 0 (инвариант по счету).
+//    * При размещении ордера блокируется соответствующая часть средств.
+// 4) Комиссии/лимиты:
+//    * FeeBreakdown.total обязан равняться сумме FeeLine.
+//    * Отказы по лимитам/политикам — через engine.v1.error.Error с кодами
+//      RESOURCE_EXHAUSTED / POLICY_VIOLATION / ECONOMY_REJECTED и деталями.
+// 5) Ордеры:
+//    * MARKET BUY: допускается quantity как notional в quote (политика должна быть зафиксирована).
+//    * TIF=IOC/FOK — не создают длительно живущих блокировок при неисполнении.
+// 6) Котировки/preview:
+//    * ConvertPreview — без побочных эффектов; не гарантирует будущую цену.
+// 7) Ledger:
+//    * События неизменяемы; порядок нестрогий, но внутри одного owner желательно монотоничный.
+// 8) Эволюция:
+//    * Поля помеченные reserved не переиспользовать; клиенты игнорируют незнакомые поля.

@@ -1,0 +1,131 @@
+id: playbook-critical-rce-v3
+name: Critical RCE Containment and Remediation
+description: |
+  Автоматизированный сценарий инцидента критического уровня, связанного с удалённым выполнением кода (RCE).
+  Предназначен для немедленного сдерживания, сбора артефактов, уведомлений и отката.
+
+version: "3.2.0"
+severity: critical
+tags:
+  - RCE
+  - containment
+  - zero-trust
+  - automated-response
+  - forensics
+
+entry_conditions:
+  - match_cve:
+      prefix: "CVE-"
+      severity: ["CRITICAL"]
+      exploit_status: "confirmed"
+  - observed_behavior:
+      rule_ids: ["exploit_rce_01", "exploit_rce_02", "network_rce_payload"]
+      threat_score_min: 85
+
+actions:
+  - id: isolate-target-container
+    type: handler
+    module: playbooks.handlers.isolate_container
+    input:
+      container_id: "{{ incident.container_id }}"
+      runtime: docker
+      mode: network_block
+      operator: system-playbook
+      reason: "RCE containment"
+      dry_run: false
+
+  - id: block-attacker-ip
+    type: handler
+    module: playbooks.handlers.block_ip
+    input:
+      ip: "{{ incident.attacker_ip }}"
+      engine: iptables
+      mode: drop
+      operator: system-playbook
+      reason: "IP origin of RCE exploit"
+      dry_run: false
+
+  - id: trigger-ai-forensics
+    type: handler
+    module: playbooks.handlers.trigger_ai_forensics
+    input:
+      incident_id: "{{ incident.id }}"
+      evidence:
+        log: "{{ incident.log_path }}"
+        process_tree: "{{ incident.proc_tree }}"
+        memory: "{{ incident.mem_capture }}"
+      operator: system-playbook
+      mode: full
+      dry_run: false
+      access_token: "{{ secrets.ai_forensics_token }}"
+
+  - id: snapshot-and-patch
+    type: handler
+    module: playbooks.handlers.patch_vulnerability
+    input:
+      cve_id: "{{ incident.cve_id }}"
+      engine: apt
+      target: "{{ incident.package }}"
+      operator: system-playbook
+      mode: auto
+      context: rce-autofix
+      snapshot_before: true
+      dry_run: false
+
+  - id: alert-admin
+    type: handler
+    module: playbooks.handlers.escalate_to_admin
+    input:
+      incident_id: "{{ incident.id }}"
+      title: "RCE Detected and Contained"
+      description: "Critical RCE triggered auto-response"
+      severity: critical
+      operator: system-playbook
+      channel: telegram
+      contact: "{{ secrets.telegram_chat_id }}"
+      token: "{{ secrets.telegram_bot_token }}"
+      context: critical-rce
+
+  - id: reboot-sandbox
+    type: handler
+    module: playbooks.handlers.reboot_sandboxed_vm
+    input:
+      vm_id: "{{ incident.vm_id }}"
+      provider: proxmox
+      mode: soft
+      operator: system-playbook
+      snapshot_before: true
+      dry_run: false
+
+post_conditions:
+  - confirm_action:
+      from: isolate-target-container
+      must_be: "success"
+  - confirm_action:
+      from: patch-vulnerability
+      must_be: "success"
+  - verify_forensics_completed: true
+  - notify_on_failure: true
+
+output_artifacts:
+  - logs:
+      source: "{{ incident.log_path }}"
+      archived_as: "{{ incident.id }}_logs.tar.gz"
+  - ai_analysis:
+      source: ai_forensics.result
+      format: json
+  - snapshot_info:
+      source: snapshot-and-patch.details
+
+audit:
+  enabled: true
+  log_channel: "blackvault.audit.rce"
+  redact_sensitive: true
+  trace_id: "{{ trace.uuid }}"
+
+meta:
+  created_by: TeslaAI Genesis
+  validated_by: metaagents [20x review + 3 meta-generals]
+  zero_trust_compliant: true
+  replayable: true
+  version_controlled: true

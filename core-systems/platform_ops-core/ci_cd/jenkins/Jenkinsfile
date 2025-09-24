@@ -1,0 +1,121 @@
+pipeline {
+    agent any
+
+    environment {
+        LANG = 'en_US.UTF-8'
+        // Секреты и креденшелы из Jenkins Credentials
+        GIT_CREDENTIALS_ID = 'git-credentials'
+        DOCKERHUB_CREDENTIALS_ID = 'dockerhub-credentials'
+        SLACK_WEBHOOK_URL = credentials('slack-webhook-url')
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        url: 'git@github.com:your-org/your-repo.git',
+                        credentialsId: env.GIT_CREDENTIALS_ID
+                    ]]
+                ])
+            }
+        }
+
+        stage('Setup') {
+            steps {
+                script {
+                    // Настройка окружения
+                    sh 'python3 -m venv .venv'
+                    sh '.venv/bin/pip install --upgrade pip'
+                    sh '.venv/bin/pip install -r requirements.txt'
+                }
+            }
+        }
+
+        stage('Lint & Type Check') {
+            steps {
+                sh '.venv/bin/flake8 .'
+                sh '.venv/bin/mypy .'
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '.venv/bin/pytest --cov=./ --cov-report=xml'
+            }
+            post {
+                always {
+                    junit '**/test-results.xml'
+                    publishCoverage adapters: [coberturaAdapter('coverage.xml')]
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                sh '''
+                .venv/bin/pip install bandit
+                .venv/bin/bandit -r . -lll -f xml -o bandit-report.xml
+                '''
+                publishHTML(target: [
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: '.',
+                    reportFiles: 'bandit-report.xml',
+                    reportName: 'Bandit Security Report'
+                ])
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    docker.withRegistry('https://index.docker.io/v1/', env.DOCKERHUB_CREDENTIALS_ID) {
+                        def image = docker.build("yourorg/yourimage:${env.BUILD_NUMBER}")
+                        image.push()
+                        image.push('latest')
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            steps {
+                sh './deploy_scripts/deploy_staging.sh'
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                slackSend(
+                    channel: '#ci-cd',
+                    color: 'good',
+                    message: "Build #${env.BUILD_NUMBER} succeeded: ${env.JOB_NAME} (<${env.BUILD_URL}|Open>)"
+                )
+            }
+        }
+        failure {
+            script {
+                slackSend(
+                    channel: '#ci-cd',
+                    color: 'danger',
+                    message: "Build #${env.BUILD_NUMBER} failed: ${env.JOB_NAME} (<${env.BUILD_URL}|Open>)"
+                )
+            }
+        }
+        cleanup {
+            cleanWs()
+        }
+    }
+}

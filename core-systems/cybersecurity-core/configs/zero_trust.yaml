@@ -1,0 +1,448 @@
+schema_version: "1.4"
+kind: ZeroTrustConfig
+metadata:
+  name: cybersecurity-core-zero-trust
+  revision: "2025.09.02"
+  owners:
+    - team: platform-security-core
+    - team: anon-core
+    - team: observability-core
+  tags:
+    project: cybersecurity-core
+    environment: multi
+    managed_by: terraform|ansible|helm
+
+globals:
+  enforcement_mode: enforce        # enforce | monitor
+  default_deny: true               # стратегия "deny-by-default"
+  trusted_time_source: "ntp.pool.org"
+  jwt_clock_skew_seconds: 30
+  # Контуры PDP/PEP
+  decision_points:
+    pdp:
+      type: opa
+      endpoints:
+        - "http://opa.platform.svc.cluster.local:8181/v1/data/zt"
+      bundles:
+        - name: zt-baseline
+          url: "oci://registry.example.com/opa/zt-baseline:1.2.3"
+          polling_seconds: 60
+          signature:
+            provider: cosign
+            verify_key_ref: "vault://kv/opa/cosign.pub"
+    peps:
+      - name: edge-ingress
+        kind: nginx-ingress
+        namespace: ingress-nginx
+      - name: mesh-sidecar
+        kind: istio-envoy
+        namespace: istio-system
+      - name: k8s-admission
+        kind: gatekeeper-opa
+        namespace: gatekeeper-system
+
+identity:
+  providers: &idp_providers
+    - name: keycloak
+      type: oidc
+      issuer: "https://idp.example.com/realms/core"
+      jwks_uri: "https://idp.example.com/realms/core/protocol/openid-connect/certs"
+      audiences: ["cybersecurity-core"]
+      pkce: required
+      mfa:
+        default: webauthn
+        fallback: totp
+        recovery_codes: disabled
+        step_up_triggers:
+          - risk_score >= 70
+          - resource.classification in ["secret","restricted"]
+          - action in ["delete","rotate_secrets","elevate_privileges"]
+    - name: saml-enterprise
+      type: saml
+      metadata_url: "https://sso.example.com/metadata"
+      mfa:
+        default: webauthn
+        fallback: u2f
+  tokens:
+    access:
+      format: jwt
+      alg: RS256
+      lifetime_seconds: 600
+      dpop: required
+      audience_enforced: true
+      issuer_enforced: true
+    refresh:
+      lifetime_seconds: 3600
+      rotation: rotate_always
+      reuse_detection: strict
+    service_to_service:
+      format: mTLS + SPIFFE
+      spiffe_trust_domain: "spiffe://aethernova.local"
+      cert_lifetime_minutes: 30
+  directories:
+    scim_sync: true
+    join_approval_required: true
+  accounts:
+    human:
+      passwordless_preferred: true
+      allowed_methods: ["webauthn","fido2"]
+    machine:
+      creation_via: "workflows-only"
+      secret_scopes: ["narrow","time-bound"]
+      rotation_days: 7
+  roles_rbac:
+    - id: platform.admin
+      description: "Полный доступ к платформе с журналированием и step-up MFA"
+      permissions: ["*"]
+      requires_mfa: true
+    - id: security.analyst
+      permissions: ["siem.read","soar.run","threatintel.read"]
+    - id: service.account
+      permissions: ["svc.read","svc.write"]
+  attributes_abac:
+    - name: clearance
+      values: ["public","internal","restricted","secret"]
+    - name: device_posture
+      values: ["healthy","degraded","untrusted"]
+    - name: data_residency
+      values: ["eu","us","restricted-eu"]
+  relationships_rebac:
+    - type: "member_of"
+    - type: "admin_of"
+    - type: "delegated_by"
+
+device_posture:
+  provider: mdm|edr
+  checks:
+    os:
+      allowed_families: ["Windows","macOS","Linux","iOS","Android"]
+      min_versions:
+        Windows: "10.0.19045"
+        macOS: "12.7"
+        Linux: "5.10"
+    security_stack:
+      full_disk_encryption: required
+      firewall_enabled: required
+      edr_running: required
+      secure_boot: required
+      tpm_present: preferred
+      jailbreak_root_detect: block
+    patching:
+      max_days_since_patch: 14
+    attestation:
+      remote_attestation_required: true
+      verifiers:
+        - "http://attest.platform.svc/verify"
+    posture_score:
+      weights:
+        os: 20
+        security_stack: 40
+        patching: 20
+        attestation: 20
+      thresholds:
+        healthy: ">=85"
+        degraded: "65-84"
+        untrusted: "<65"
+  actions:
+    on_untrusted: ["block","notify","open_ticket"]
+    on_degraded: ["step_up_mfa","limit_scope","time_bound_session"]
+
+network:
+  service_mesh:
+    enabled: true
+    mTLS: required
+    cert_rotation_minutes: 30
+    cipher_suites:
+      - TLS_AES_256_GCM_SHA384
+      - TLS_CHACHA20_POLY1305_SHA256
+  microsegmentation:
+    strategy: identity-aware
+    default_policy: deny
+    policies:
+      - name: api-to-authz
+        from: { spiffe_id: "spiffe://aethernova.local/ns/core/sa/api" }
+        to:   { spiffe_id: "spiffe://aethernova.local/ns/core/sa/authorization" }
+        ports: ["tcp/8080"]
+        methods: ["POST","GET"]
+        conditions:
+          risk_score_lt: 70
+          data_class_max: "restricted"
+      - name: api-to-kafka
+        from: { spiffe_id: "spiffe://aethernova.local/ns/core/sa/api" }
+        to:   { dns: "b-*.msk.example.amazonaws.com" }
+        ports: ["tcp/9094"]
+        conditions:
+          tls_sni_required: true
+  egress:
+    default_policy: deny
+    allowlist:
+      - "*.github.com:443"
+      - "crl.example.com:80"
+      - "registry.example.com:443"
+    dns_policy:
+      require_dnssec: true
+      block_domains: ["*.cryptominer.example","*.malware.example"]
+
+access_policies:
+  evaluation_order: ["rbac","abac","rebac","risk","context"]
+  rules:
+    - id: view-internal
+      effect: allow
+      target:
+        action: ["read","list"]
+        resource: ["svc:*","cfg:*"]
+      when:
+        rbac.role_in: ["security.analyst","platform.admin"]
+        abac.clearance_in: ["internal","restricted","secret"]
+        device_posture_in: ["healthy","degraded"]
+    - id: admin-sensitive
+      effect: allow
+      target:
+        action: ["delete","rotate_secrets","elevate_privileges"]
+        resource: ["secret:*","admin:*"]
+      when:
+        rbac.role_in: ["platform.admin"]
+        abac.clearance_in: ["secret"]
+        device_posture_in: ["healthy"]
+        risk_score_lt: 60
+        step_up_mfa: true
+    - id: deny-default
+      effect: deny
+      target:
+        action: ["*"]
+        resource: ["*"]
+
+risk_engine:
+  inputs:
+    - source: "siem.anomalies"
+    - source: "ueba.behavior"
+    - source: "geo.ip"
+    - source: "impossible_travel"
+    - source: "device.posture"
+    - source: "threatintel.iocs"
+  scoring:
+    base: 0..100
+    weights:
+      ueba.behavior: 30
+      impossible_travel: 25
+      device.posture: 20
+      siem.anomalies: 15
+      threatintel.iocs: 10
+  thresholds:
+    allow_below: 40
+    step_up_40_69: true
+    block_from: 70
+  actions:
+    on_step_up: ["mfa_webauthn","session_reissue_narrow_scope"]
+    on_block: ["terminate_session","notify_secops","open_incident_p1"]
+
+data_protection:
+  classification:
+    levels: ["public","internal","restricted","secret"]
+    default: "internal"
+  encryption:
+    at_rest:
+      required: true
+      kms:
+        provider: aws-kms|vault|gcp-kms
+        keys:
+          default: "arn:aws:kms:region:acct:key/xxxxxxxx"
+    in_transit:
+      tls_min: "1.2"
+      hsts: "max-age=31536000; includeSubDomains; preload"
+  dlp:
+    detectors:
+      - name: pii
+        patterns: ["email","phone","ssn"]
+      - name: pci
+        patterns: ["pan","cvv"]
+      - name: secrets
+        patterns: ["aws_access_key","private_key","token"]
+    actions:
+      restricted: ["mask","block","alert"]
+      secret: ["block","alert","quarantine"]
+  sharing_controls:
+    exfil_channels_block: ["pastebin","anonfile","ipfs-public"]
+    watermarking: enabled
+    download_limits_mb: 50
+
+secrets_management:
+  manager: vault|aws-secrets-manager
+  rotation:
+    default_days: 7
+    high_risk_days: 1
+  access:
+    require_approvals_for_production: true
+    scope:
+      max_ttl_minutes: 60
+      renewal_allowed: true
+  audit:
+    log_secret_metadata_only: true
+
+supply_chain_security:
+  images:
+    require_signed: true
+    signer: cosign
+    cosign:
+      pubkey_ref: "vault://kv/cosign/pubkey"
+      rekor_verify: true
+  attestations:
+    sbom_required: true
+    sbom_formats: ["spdx","cyclonedx"]
+    slsa_level_min: 3
+    vuln_gate:
+      max_severity: "high"
+      allowlist_cves: []
+  sources:
+    registries_allow: ["registry.example.com","ghcr.io/your-org"]
+    registries_deny: ["docker.io/library/*"]
+  build_pipelines:
+    require_oidc_federation_to_cloud: true
+    provenance_required: true
+
+kubernetes_security:
+  admission_controls:
+    gatekeeper:
+      enabled: true
+      bundles:
+        - "oci://registry.example.com/policies/k8s/zt-baseline:1.5.0"
+    kyverno:
+      enabled: true
+      policies:
+        - name: disallow-privileged
+        - name: require-readonlyrootfs
+        - name: require-probes
+  namespaces:
+    isolation: true
+    defaults:
+      network_policy_default_deny: true
+  runtime:
+    seccomp_default: true
+    apparmor_profiles: ["runtime/default"]
+    capabilities_drop: ["ALL"]
+  quotas:
+    limit_range_enforced: true
+  service_accounts:
+    automount_token: false
+    bound_service_account_token: true
+
+observability_logging:
+  pii_redaction: true
+  sinks:
+    - type: siem
+      url: "https://siem.example.com/ingest"
+    - type: datalake
+      s3_bucket: "s3://org-sec-logs"
+      sse_kms_key_arn: "arn:aws:kms:region:acct:key/yyyyyyyy"
+  retention_days:
+    default: 365
+    audit: 2555
+  integrity:
+    hashing: "sha256"
+    chain_of_custody: enabled
+    transparency_log:
+      provider: rekor
+      url: "https://rekor.example.com"
+  metrics:
+    otel:
+      endpoint: "http://otel-collector.observ.svc:4317"
+      exporters: ["prometheus","otlp"]
+  alerts:
+    high_severity_routes:
+      - "pagerduty:sec-p1"
+      - "slack:#sec-incidents"
+
+soar_automation:
+  playbooks:
+    - id: p1-credential-stuffing
+      triggers: ["siem.rule.credstuffing","risk.score>=70"]
+      steps: ["block_ip","invalidate_tokens","force_mfa_reset","notify_blue_team"]
+    - id: p1-data-exfil
+      triggers: ["dlp.block","egress.anomaly"]
+      steps: ["quarantine_session","block_egress","snapshot_artifacts","notify_dpo"]
+  approvals:
+    required_for: ["quarantine_user>24h","permanent_block"]
+    approvers: ["platform-security-core:oncall"]
+
+break_glass:
+  enabled: true
+  accounts:
+    - upn: "breakglass-admin@example.com"
+      ttl_minutes: 30
+      scope: ["read","incident_mitigation"]
+      mfa: required
+      dual_control_approvals: 2
+      session_recording: true
+  audit:
+    require_incident_id: true
+    post_mortem_due_hours: 24
+
+compliance_mapping:
+  frameworks:
+    iso27001:
+      annex_a_controls: ["A.5","A.6","A.8","A.9","A.12","A.13","A.14","A.16","A.18"]
+    soc2:
+      trust_services_criteria: ["Security","Availability","Confidentiality"]
+    pci_dss_v4:
+      requirements: ["1","2","3","6","7","8","10","11","12"]
+  evidence_collection:
+    automated: true
+    exporters: ["confluence","gdrive","evidence-lake"]
+
+testing_and_validation:
+  policy_tests:
+    frequency_cron: "0 */6 * * *"
+    suites:
+      - name: access-regression
+        runner: "opa-test"
+      - name: network-baseline
+        runner: "mesh-policy-check"
+  chaos_security:
+    enabled: true
+    experiments:
+      - "revoke-ca-rollover"
+      - "break-mtls-short-lived-certs"
+      - "idp-outage-stepup"
+
+environments:
+  dev:
+    enforcement_mode: monitor
+    idp_overrides:
+      providers: *idp_providers
+    risk_engine:
+      thresholds:
+        allow_below: 60
+        step_up_40_69: true
+        block_from: 80
+    egress:
+      allow_temporal_wildcards: true
+  staging:
+    enforcement_mode: enforce
+    risk_engine:
+      thresholds:
+        allow_below: 50
+        step_up_40_69: true
+        block_from: 70
+  prod:
+    enforcement_mode: enforce
+    risk_engine:
+      thresholds:
+        allow_below: 40
+        step_up_40_69: true
+        block_from: 70
+    data_protection_overrides:
+      classification:
+        default: "restricted"
+    observability_logging:
+      retention_days:
+        default: 730
+        audit: 3650
+    kubernetes_security:
+      admission_controls:
+        gatekeeper:
+          enabled: true
+        kyverno:
+          enabled: true
+      runtime:
+        seccomp_default: true
+        apparmor_profiles: ["runtime/default"]

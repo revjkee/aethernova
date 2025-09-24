@@ -1,0 +1,420 @@
+# AI NPC Demo — Industrial configuration
+version: 1.2.0
+engine_api_version: 1.0.0
+env: dev  # dev | staging | prod
+
+meta:
+  project: "NeuroCity AI NPC Demo"
+  description: "Realtime AI-driven NPCs with speech, memory, emotions and world interactions"
+  authors:
+    - "NeuroCity Engineering"
+  created_at: "2025-08-13"
+  schema_url: "https://schemas.neurocity.local/ai_npc_demo/1.2.0/config.schema.json"
+
+################################################################################
+# SECRETS & KEYS (populate via environment, not inline)
+################################################################################
+secrets:
+  # Read from environment variables at runtime. Example: ${OPENAI_API_KEY}
+  llm_api_key: "${LLM_API_KEY}"
+  asr_api_key: "${ASR_API_KEY}"
+  tts_api_key: "${TTS_API_KEY}"
+  vector_db_url: "${VECTOR_DB_URL}"     # e.g., "postgres://user:pass@host:5432/db"
+  telemetry_token: "${OTEL_TOKEN}"
+  signing_key_id: "${KMS_KEY_ID}"       # optional for content signing
+
+################################################################################
+# RUNTIME PROFILES
+################################################################################
+profiles:
+  dev:
+    log_level: DEBUG
+    hot_reload: true
+    safety_mode: relaxed
+    tracing:
+      enable: true
+      sample_rate: 0.25
+  staging:
+    log_level: INFO
+    hot_reload: false
+    safety_mode: standard
+    tracing:
+      enable: true
+      sample_rate: 0.1
+  prod:
+    log_level: WARN
+    hot_reload: false
+    safety_mode: strict
+    tracing:
+      enable: true
+      sample_rate: 0.05
+
+################################################################################
+# MODELS (LLM, ASR, TTS, EMOTION)
+################################################################################
+models:
+  llm:
+    provider: "openai"           # openai | anthropic | local
+    model: "gpt-4o-realtime"     # or "gpt-4.1-mini", "local-phi3"
+    temperature: 0.7
+    top_p: 0.95
+    max_tokens: 512
+    system_prompt_file: "./prompts/npc_system_prompt.txt"
+    timeout_ms: 12000
+    parallel_tool_calls: true
+    json_mode: false
+    # Rate limits (per NPC)
+    rate_limits:
+      rpm: 120
+      tpm: 120000
+  asr:
+    provider: "whisper"
+    model: "medium"
+    language: "auto"
+    vad:
+      enable: true
+      min_silence_ms: 220
+      speech_pad_ms: 120
+  tts:
+    provider: "elevenlabs"
+    voice: "Rachel"
+    format: "pcm_s16le"
+    sample_rate_hz: 24000
+    latency_hint: "balanced"  # fast | balanced | quality
+  emotion:
+    classifier: "affectnet-lite"  # rule-based fallback if unavailable
+    smoothing:
+      window: 1.2
+      clamp: [0.0, 1.0]
+
+################################################################################
+# MEMORY & STATE
+################################################################################
+memory:
+  working:
+    max_items: 64
+    ttl_s: 900
+  episodic:
+    window: 200
+    persist_every: 20
+  semantic:
+    vector_store: "pgvector"     # pgvector | chroma | qdrant
+    dim: 1024
+    similarity: "cosine"
+    max_candidates: 15
+    insert_batch: 32
+  long_term:
+    db: "sqlite://./data/npc_memory.db"   # replace with Postgres in prod
+    snapshot_interval_s: 120
+  redact:
+    pii:
+      enable: true
+      strategies: ["mask-email", "mask-phone", "mask-location"]
+  summarization:
+    enable: true
+    when_items_over: 50
+    strategy: "map-reduce"
+    max_tokens: 256
+
+################################################################################
+# SAFETY & MODERATION
+################################################################################
+safety:
+  mode: "${profiles.${env}.safety_mode}"
+  content_filters:
+    hate: strict
+    self_harm: strict
+    sexual: standard
+    violence: standard
+  jailbreak_detection:
+    enable: true
+    heuristics:
+      - pattern: "(ignore|bypass).*(rules|policy)"
+      - pattern: "prompt injection"
+  rate_guard:
+    per_user_rps: 5
+    per_ip_rps: 10
+  output_sanitizer:
+    max_len: 2048
+    allow_markdown: false
+
+################################################################################
+# WORLD & SIMULATION
+################################################################################
+world:
+  tick_hz: 30
+  gravity: [0, -9.81, 0]
+  navmesh:
+    file: "./assets/navmesh/city_block.navmesh"
+  time_scale: 1.0
+  random_seed: 424242
+  events_bus:
+    type: "local"  # local | nats | kafka
+    topic_prefix: "ai_npc_demo"
+
+################################################################################
+# NPC DEFINITIONS
+################################################################################
+npcs:
+  - id: "npc_vendor_001"
+    name: "Mira"
+    persona:
+      role: "Street food vendor"
+      traits: ["friendly", "curious", "entrepreneurial"]
+      backstory: |
+        Runs a ramen stand at the corner of Neon Ave and 3rd.
+        Knows local gossip and regular customers' preferences.
+    goals:
+      short_term:
+        - "Greet nearby player within 5s"
+        - "Offer daily special"
+      long_term:
+        - "Increase repeat customers"
+        - "Maintain reputation ≥ 4.5"
+    speech:
+      style: "casual"
+      max_utterance_s: 6
+      interjection_weight: 0.15
+    emotions:
+      baseline: { valence: 0.65, arousal: 0.35 }
+      reactivity:
+        surprise: 0.7
+        anger: 0.2
+        joy: 0.8
+        fear: 0.1
+        sadness: 0.2
+    sensors:
+      hear_radius_m: 12
+      see_radius_m: 18
+      field_of_view_deg: 120
+    actuators:
+      locomotion_speed_mps: 1.2
+      gesture: true
+      gaze_tracking: true
+    tools:
+      - name: "menu_lookup"
+        type: "function"
+        timeout_ms: 800
+      - name: "route_to"
+        type: "function"
+        timeout_ms: 1200
+    behavior:
+      # High-level behavior tree with reactive layer
+      tree:
+        selector:
+          - condition: "player_nearby(distance_m<=3)"
+            sequence:
+              - action: "greet_player"
+              - action: "offer_special"
+              - condition: "player_positive_affect()"
+                action: "upsell_combo"
+          - condition: "inventory_low('noodles', < 5)"
+            action: "request_restock('noodles')"
+          - action: "idle_cycle"
+      reactive:
+        # Event → Reaction (debounced)
+        on_player_wave: "wave_back"
+        on_player_thanks: "say('Anytime!')"
+        on_player_insult: "deescalate_and_boundary"
+      cooldowns:
+        greet_player_ms: 7000
+        offer_special_ms: 12000
+        upsell_combo_ms: 15000
+    rewards:
+      # For optional RL shaping
+      purchase: +3.0
+      positive_sentiment: +0.5
+      boundary_enforced: +0.2
+      player_report: -5.0
+
+  - id: "npc_guard_007"
+    name: "Rex"
+    persona:
+      role: "Night shift security"
+      traits: ["vigilant", "stern", "fair"]
+      backstory: "Ex-military, keeps order around the plaza."
+    emotions:
+      baseline: { valence: 0.35, arousal: 0.55 }
+      reactivity:
+        anger: 0.35
+        fear: 0.15
+        joy: 0.25
+    sensors:
+      hear_radius_m: 16
+      see_radius_m: 25
+      field_of_view_deg: 150
+    behavior:
+      tree:
+        selector:
+          - condition: "disturbance_detected(level>=2)"
+            sequence:
+              - action: "approach_source"
+              - action: "issue_warning"
+              - condition: "noncompliance()"
+                action: "call_backup"
+          - condition: "player_nearby(distance_m<=2)"
+            action: "short_ack"
+          - action: "patrol_route('plaza_loop')"
+      reactive:
+        on_shout: "scan_and_mark_source"
+        on_emergency: "broadcast('Evacuate area now!')"
+    rewards:
+      compliance: +1.5
+      false_alarm: -2.0
+
+################################################################################
+# DIALOG & TOOLING
+################################################################################
+dialog:
+  turn_timeout_ms: 6000
+  max_turns: 12
+  barge_in: true
+  interrupts:
+    enable: true
+    rules:
+      - when: "player_speaks_over_npc()"
+        action: "yield_turn"
+  tool_calling:
+    enable: true
+    parallel: true
+    max_tools_per_turn: 2
+  templates:
+    greet_player: "Hey there! Hungry for {special} today?"
+    issue_warning: "Please stop. This is your first and only warning."
+
+################################################################################
+# SERVER & IO
+################################################################################
+server:
+  http:
+    host: "0.0.0.0"
+    port: 8080
+    cors:
+      origins: ["*"]
+      methods: ["GET","POST","OPTIONS"]
+  ws:
+    enable: true
+    path: "/ws"
+    ping_interval_s: 5
+    max_clients: 256
+  grpc:
+    enable: true
+    host: "0.0.0.0"
+    port: 9090
+  serialization:
+    wire: "json"   # json | msgpack
+    compress: "auto"  # auto | gzip | none
+
+################################################################################
+# PERSISTENCE, CACHE & ASSETS
+################################################################################
+storage:
+  state_db: "sqlite://./data/state.db"
+  snapshots_dir: "./data/snapshots"
+  snapshot_interval_s: 60
+  rotate:
+    keep_last: 20
+
+cache:
+  enabled: true
+  dir: "./.cache"
+  ttl_s: 300
+  llm:
+    prompt_cache: true
+    max_items: 2000
+
+assets:
+  # Optional references for TTS voices, gestures, animations
+  gestures_dir: "./assets/gestures"
+  animations_dir: "./assets/animations"
+  nav_routes:
+    plaza_loop: "./assets/routes/plaza_loop.json"
+
+################################################################################
+# TELEMETRY & LOGGING
+################################################################################
+telemetry:
+  otel:
+    enable: "${profiles.${env}.tracing.enable}"
+    exporter: "otlp_http"
+    endpoint: "https://otel.neurocity.local/v1/traces"
+    sample_rate: "${profiles.${env}.tracing.sample_rate}"
+  metrics:
+    enable: true
+    port: 9108
+    namespace: "ai_npc_demo"
+    labels:
+      env: "${env}"
+  logs:
+    level: "${profiles.${env}.log_level}"
+    format: "json"
+    file: "./logs/ai_npc_demo.log"
+    rotate:
+      max_size_mb: 128
+      backups: 10
+      compress: true
+  audit:
+    enable: true
+    redact_pii: true
+
+################################################################################
+# TEST FIXTURES & REPLAY
+################################################################################
+testing:
+  fixtures_dir: "./tests/fixtures"
+  session_replay:
+    file: "./tests/sessions/market_scene.jsonl.gz"
+    speed: 2.0
+    apply_on_start: false
+
+################################################################################
+# FEATURE FLAGS
+################################################################################
+features:
+  multimodal_vision: false
+  gesture_synthesis: true
+  rl_online_learning: false
+  npc_npc_dialog: true
+  npc_player_proximity_voice: true
+
+################################################################################
+# HEALTHCHECKS
+################################################################################
+health:
+  readiness:
+    checks:
+      - name: "llm-provider"
+        type: "http"
+        url: "https://status.api.llm/health"
+        timeout_ms: 1500
+        optional: true
+      - name: "vector-db"
+        type: "sql"
+        dsn: "${secrets.vector_db_url}"
+        timeout_ms: 1200
+        optional: false
+  liveness:
+    interval_s: 15
+    failure_threshold: 3
+
+################################################################################
+# OVERRIDES PER ENV (merged last)
+################################################################################
+overrides:
+  dev:
+    models:
+      llm:
+        temperature: 0.9
+        max_tokens: 384
+    server:
+      http:
+        port: 8081
+  prod:
+    storage:
+      state_db: "postgres://npc:*****@pg:5432/npc"
+      snapshots_dir: "/var/lib/ai_npc_demo/snapshots"
+    cache:
+      dir: "/var/cache/ai_npc_demo"
+    telemetry:
+      logs:
+        file: "/var/log/ai_npc_demo/ai_npc_demo.log"

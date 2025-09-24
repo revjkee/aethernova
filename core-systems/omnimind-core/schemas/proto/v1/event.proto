@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Omnimind
+//
+// Industrial event contract for Omnimind Core.
+// Design goals:
+// - Stable wire format across languages and runtimes.
+// - Clear separation of generic metadata vs payload.
+// - Partition-friendly routing and deduplication.
+// - Tracing/correlation, signatures, compression, batching.
+// - Forward/backward compatibility via reserved ranges.
+
+syntax = "proto3";
+
+package omnimind.core.schemas.v1;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// ------------------------------ Options (multilanguage) ----------------------
+option optimize_for = SPEED;
+option cc_enable_arenas = true;
+
+option go_package        = "github.com/omnimind/omnimind-core/schemas/proto/v1;v1";
+option java_multiple_files = true;
+option java_package      = "ai.omnimind.core.schemas.v1";
+option csharp_namespace  = "Omnimind.Core.Schemas.V1";
+option php_namespace     = "Omnimind\\Core\\Schemas\\V1";
+option objc_class_prefix = "OMC";
+
+// ------------------------------ Enumerations --------------------------------
+
+// Уровень важности события (для фильтрации и маршрутизации).
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_DEBUG = 1;
+  SEVERITY_INFO = 2;
+  SEVERITY_NOTICE = 3;
+  SEVERITY_WARNING = 4;
+  SEVERITY_ERROR = 5;
+  SEVERITY_CRITICAL = 6;
+  SEVERITY_ALERT = 7;
+}
+
+// Рекомендация по маршрутизации/сжатию (необязательно; потребитель может игнорировать).
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_NONE = 1;
+  COMPRESSION_GZIP = 2;
+  COMPRESSION_ZSTD = 3;
+}
+
+// Типы носителя полезной нагрузки; помогает потребителям выбирать парсер.
+enum PayloadKind {
+  PAYLOAD_KIND_UNSPECIFIED = 0;
+  PAYLOAD_KIND_BINARY = 1;  // bytes
+  PAYLOAD_KIND_JSON = 2;    // string с JSON
+  PAYLOAD_KIND_PROTO = 3;   // google.protobuf.Any
+  PAYLOAD_KIND_STRUCT = 4;  // google.protobuf.Struct
+}
+
+// ------------------------------ Core messages --------------------------------
+
+// Универсальное событийное сообщение.
+// Инварианты:
+// - id уникален в сочетании с source (рекомендуется UUIDv7/ULID, строка в нижнем регистре).
+// - Событие неизменяемо после публикации.
+// - dedup_key = id || subject (или иная политика на стороне потребителя).
+message Event {
+  // Глобальный идентификатор события (UUID/ULID). Регистр — нижний.
+  string id = 1;
+
+  // Полностью квалифицированный тип события, например:
+  // "omnimind.user.created.v1" или "billing.invoice.paid.v2".
+  string type = 2;
+
+  // Источник события: URI, FQN сервиса или ARN-подобный идентификатор.
+  // Пример: "service://user-service" или "urn:omnimind:svc:user".
+  string source = 3;
+
+  // Идентификатор предмета/ресурса в домене источника (например, "user:123").
+  string subject = 4;
+
+  // Время возникновения события (UTC).
+  google.protobuf.Timestamp time = 5;
+
+  // Версия самого контракта события (semver строки вида "1.0.0").
+  string spec_version = 6;
+
+  // MIME-тип полезной нагрузки (например, "application/json", "application/protobuf").
+  string data_content_type = 7;
+
+  // URI схемы данных полезной нагрузки (JSON Schema/Protobuf descriptor URL и т. п.).
+  string data_schema = 8;
+
+  // Дополнительные атрибуты метаданных (ключ/значение). Не для секретов.
+  map<string, string> attributes = 9;
+
+  // Корреляция и причинность:
+  string correlation_id = 10; // связывает цепочку запросов/команд/событий
+  string causation_id   = 11; // id события/команды, породившей текущее
+
+  // Ключ партиционирования для брокера (Kafka/AMQP); если пусто, можно использовать id.
+  string partition_key = 12;
+
+  // Трассировка (W3C). Хранятся как строки без модификаций.
+  string trace_parent = 13; // e.g. "00-<trace-id>-<span-id>-01"
+  string trace_state  = 14;
+
+  // Уровень важности события.
+  Severity severity = 15;
+
+  // Вид полезной нагрузки (подсказка).
+  PayloadKind payload_kind = 16;
+
+  // Полезная нагрузка: допускается только одно представление.
+  oneof data {
+    // Бинарная форма (часто для avro/proto/архивов); используйте data_content_type.
+    bytes data_binary = 17;
+
+    // JSON-строка в UTF-8. Должна быть валидным JSON-документом.
+    string data_json = 18;
+
+    // Вложенный protobuf-сообщение произвольного типа.
+    google.protobuf.Any data_protobuf = 19;
+
+    // Универсальная структура (JSON-подобная).
+    google.protobuf.Struct data_struct = 20;
+  }
+
+  // Рекомендация по сжатию полезной нагрузки на транспортном уровне (необязательная подсказка).
+  Compression compression_hint = 21;
+
+  // Зарезервируйте место под будущее расширение без изменения номеров существующих полей.
+  reserved 22 to 39;
+}
+
+// Подпись события/батча. Значения конкретного алгоритма и KMS остаются на уровень интеграции.
+message Signature {
+  // Алгоритм/профиль, например "Ed25519", "RSA-PSS-SHA256".
+  string algorithm = 1;
+
+  // Идентификатор ключа (KID), thumbprint или ссылка на KMS.
+  string key_id = 2;
+
+  // Сырые байты подписи.
+  bytes value = 3;
+
+  // Хэш тела (опционален, если вычисляется на транспортном уровне).
+  string digest = 4; // "sha256:<hex>", "sha512:<hex>"
+}
+
+// Подсказка маршрутизации для продьюсера/коннектора.
+message RoutingHint {
+  // Имя топика/очереди (логическое).
+  string destination = 1;
+
+  // Явный ключ партиционирования. Если пусто — используйте Event.partition_key или Event.id.
+  string key = 2;
+
+  // Номер партиции (если требуется принудительная маршрутизация; -1 = авто).
+  int32 partition = 3;
+
+  // Вспомогательные метки для роутеров/коннекторов.
+  map<string, string> labels = 4;
+}
+
+// Обёртка для транспорта: событие + метаданные доставки/подписи.
+// Может использоваться в HTTP, Kafka headers и т. п.
+message Envelope {
+  Event event = 1;
+
+  // Набор подписей (например, подписи разных доверенных субъектов).
+  repeated Signature signatures = 2;
+
+  // Подсказки маршрутизации.
+  RoutingHint routing = 3;
+
+  // Низкоуровневые заголовки транспорта (если требуется сохранить).
+  map<string, string> transport_headers = 4;
+
+  reserved 10 to 19;
+}
+
+// Батч событий для эффективной передачи.
+// Инварианты: порядок в пределах одной партиции должен сохраняться при разборе.
+message EventBatch {
+  repeated Envelope items = 1;
+
+  // Фактическое сжатие полезной нагрузки батча на уровне транспорта.
+  Compression compression = 2;
+
+  // Версия формата батча (semver).
+  string format_version = 3;
+
+  reserved 10 to 19;
+}
+
+// ------------------------------ Well-known payloads --------------------------
+// При необходимости добавляйте доменные типы полезной нагрузки здесь или
+// размещайте их в отдельных файлах и встраивайте через Any.
+//
+// Примеры нейтральных событий CRUD:
+
+message CrudCreated {
+  string resource_type = 1; // e.g., "user", "invoice"
+  string resource_id   = 2; // бизнес-идентификатор
+  google.protobuf.Struct snapshot = 3; // снимок объекта без секретов
+}
+
+message CrudUpdated {
+  string resource_type = 1;
+  string resource_id   = 2;
+  google.protobuf.Struct before = 3; // может быть пустым
+  google.protobuf.Struct after  = 4;
+}
+
+message CrudDeleted {
+  string resource_type = 1;
+  string resource_id   = 2;
+  google.protobuf.Struct snapshot = 3; // последняя известная версия
+}

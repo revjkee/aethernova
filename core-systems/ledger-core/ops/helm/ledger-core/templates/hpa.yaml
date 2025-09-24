@@ -1,0 +1,199 @@
+{{- /*
+  Ledger Core — HorizontalPodAutoscaler (HPA)
+  Требует Kubernetes с поддержкой autoscaling/v2.
+
+  Values (прикладные):
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 20
+
+      # Метрики по умолчанию
+      cpu:
+        enabled: true
+        targetAverageUtilization: 70
+      memory:
+        enabled: false
+        targetAverageUtilization: 80
+
+      # Пример containerResource метрик (таргетить конкретный контейнер)
+      containerResources: []
+      # - container: ledger-core
+      #   name: cpu
+      #   targetAverageUtilization: 70
+
+      # Пример метрик типа Pods (например rps_per_pod)
+      podsMetrics: []
+      # - name: requests_per_second
+      #   targetAverageValue: "200"
+
+      # Пример External метрик (Stackdriver/Prometheus Adapter/CloudWatch)
+      externalMetrics: []
+      # - name: http_requests_per_second
+      #   targetAverageValue: "1000"
+      #   selector:
+      #     matchLabels:
+      #       service: ledger-core
+
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Percent
+              value: 20
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 60
+            - type: Pods
+              value: 4
+              periodSeconds: 60
+          selectPolicy: Max
+
+      # Аннотации/метки для HPA‑объекта
+      annotations: {}
+      labels: {}
+*/ -}}
+{{- if and .Values.autoscaling.enabled (.Capabilities.APIVersions.Has "autoscaling/v2") }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "ledger-core.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "ledger-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: "api"
+    {{- with .Values.autoscaling.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.autoscaling.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "ledger-core.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas | default 2 }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas | default 10 }}
+  metrics:
+    {{- $metrics := list -}}
+
+    {{- /* CPU resource metric */ -}}
+    {{- if .Values.autoscaling.cpu.enabled }}
+    {{- $metrics = append $metrics (dict
+      "type" "Resource"
+      "resource" (dict
+        "name" "cpu"
+        "target" (dict
+          "type" "Utilization"
+          "averageUtilization" (.Values.autoscaling.cpu.targetAverageUtilization | default 70)
+        )
+      )
+    ) -}}
+    {{- end }}
+
+    {{- /* Memory resource metric */ -}}
+    {{- if .Values.autoscaling.memory.enabled }}
+    {{- $metrics = append $metrics (dict
+      "type" "Resource"
+      "resource" (dict
+        "name" "memory"
+        "target" (dict
+          "type" "Utilization"
+          "averageUtilization" (.Values.autoscaling.memory.targetAverageUtilization | default 80)
+        )
+      )
+    ) -}}
+    {{- end }}
+
+    {{- /* ContainerResource metrics (на конкретный контейнер) */ -}}
+    {{- range $cr := (.Values.autoscaling.containerResources | default list) }}
+    {{- $metrics = append $metrics (dict
+      "type" "ContainerResource"
+      "containerResource" (dict
+        "container" ($cr.container | default "ledger-core")
+        "name" ($cr.name | default "cpu")
+        "target" (dict
+          "type" "Utilization"
+          "averageUtilization" ($cr.targetAverageUtilization | default 70)
+        )
+      )
+    ) -}}
+    {{- end }}
+
+    {{- /* Pods metrics (AverageValue на под) */ -}}
+    {{- range $pm := (.Values.autoscaling.podsMetrics | default list) }}
+    {{- $metrics = append $metrics (dict
+      "type" "Pods"
+      "pods" (dict
+        "metric" (dict "name" ($pm.name))
+        "target" (dict
+          "type" "AverageValue"
+          "averageValue" ($pm.targetAverageValue | default "1")
+        )
+      )
+    ) -}}
+    {{- end }}
+
+    {{- /* External metrics */ -}}
+    {{- range $em := (.Values.autoscaling.externalMetrics | default list) }}
+    {{- $m := dict
+      "type" "External"
+      "external" (dict
+        "metric" (dict "name" ($em.name))
+        "target" (dict
+          "type" "AverageValue"
+          "averageValue" ($em.targetAverageValue | default "1")
+        )
+      )
+    -}}
+    {{- if $em.selector }}
+    {{- $_ := set (index $m "external" "metric") "selector" ($em.selector) -}}
+    {{- end }}
+    {{- $metrics = append $metrics $m -}}
+    {{- end }}
+
+    {{- /* Рендер итогового списка метрик */ -}}
+    {{- if gt (len $metrics) 0 }}
+    {{- toYaml $metrics | nindent 2 }}
+    {{- else }}
+    # Нет активных метрик — HPA сработает только при ручном изменении реплик
+    []
+    {{- end }}
+
+  {{- /* Поведение масштабирования (стабилизация и политики) */ -}}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: {{ dig "behavior" "scaleDown" "stabilizationWindowSeconds" 300 .Values.autoscaling }}
+      policies:
+        {{- $sdpol := (dig "behavior" "scaleDown" "policies" nil .Values.autoscaling) }}
+        {{- if $sdpol }}
+        {{- toYaml $sdpol | nindent 8 }}
+        {{- else }}
+        - type: Percent
+          value: 20
+          periodSeconds: 60
+        {{- end }}
+    scaleUp:
+      stabilizationWindowSeconds: {{ dig "behavior" "scaleUp" "stabilizationWindowSeconds" 0 .Values.autoscaling }}
+      selectPolicy: {{ dig "behavior" "scaleUp" "selectPolicy" "Max" .Values.autoscaling }}
+      policies:
+        {{- $supol := (dig "behavior" "scaleUp" "policies" nil .Values.autoscaling) }}
+        {{- if $supol }}
+        {{- toYaml $supol | nindent 8 }}
+        {{- else }}
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+        {{- end }}
+{{- else }}
+{{- /* HPA не будет создан: либо autoscaling.disabled, либо нет autoscaling/v2 */ -}}
+{{- end }}

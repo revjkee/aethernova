@@ -1,0 +1,575 @@
+"""
+DataFabric Core — GraphQL Schema (industrial-grade)
+Совместимость: Relay Cursor Connections, Apollo Federation (optional)
+"""
+
+# -----------------------------
+# Custom Scalars
+# -----------------------------
+scalar DateTime        # RFC 3339 / ISO-8601
+scalar Duration        # ISO-8601 Duration (PnDTnHnMnS)
+scalar JSON            # Structured JSON object
+scalar URI             # Absolute or relative URI
+scalar BigInt
+scalar Upload          # GraphQL multipart request (RFC 7231)
+
+# -----------------------------
+# Directives
+# -----------------------------
+"""
+RBAC/ABAC, например:
+@auth(
+  anyRole: ["platform.admin","tenant.admin"],
+  allAttributes: [{key:"tenant", op:EQ, value:"tenant-alpha"}]
+)
+"""
+directive @auth(
+  anyRole: [String!]
+  allRoles: [String!]
+  anyAttributes: [AuthAttr!]
+  allAttributes: [AuthAttr!]
+) on OBJECT | FIELD_DEFINITION
+
+input AuthAttr {
+  key: String!
+  op: AuthOp! = EQ
+  value: String!
+}
+
+enum AuthOp { EQ NE IN NOT_IN }
+
+"""
+Помечает экспериментальные поля (неустойчивая совместимость).
+"""
+directive @experimental(reason: String = "unstable") on FIELD_DEFINITION | OBJECT | ENUM_VALUE
+
+"""
+Apollo Federation (опционально)
+"""
+directive @key(fields: String!) on OBJECT | INTERFACE
+
+# -----------------------------
+# Common Enums
+# -----------------------------
+enum Classification { PUBLIC INTERNAL CONFIDENTIAL RESTRICTED }
+enum PiiLevel { NONE WEAK STRONG }
+enum StorageKind { S3 POSTGRES KAFKA ELASTIC FILESYSTEM }
+enum DataFormat { JSON PARQUET AVRO PROTOBUF BINARY }
+enum Compression { NONE GZIP ZSTD SNAPPY LZ4 }
+enum SortOrder { ASC DESC }
+enum CheckKind { SCHEMA CONSTRAINT STATISTICAL FRESHNESS COMPLETENESS CONSISTENCY PIISAFETY }
+enum Severity { INFO WARN ERROR CRITICAL }
+enum Status { PASS WARN FAIL ERROR }
+
+# -----------------------------
+# Relay Pagination
+# -----------------------------
+interface Node { id: ID! }
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+# -----------------------------
+# Core Types
+# -----------------------------
+type Identity {
+  name: String!
+  namespace: String!
+  owner: String!
+  tenant: String
+  domain: String
+  labels: [KeyValue!]!
+}
+
+type KeyValue { key: String!, value: String! }
+
+type Versioning {
+  datasetVersion: String!
+  schemaVersion: String
+  revision: String
+  updatedAt: DateTime!
+}
+
+type SchemaRef {
+  type: DataSchemaType!
+  uri: URI!
+  message: String
+}
+enum DataSchemaType { JSONSCHEMA AVRO PROTOBUF }
+
+# -----------------------------
+# Storage Targets
+# -----------------------------
+interface StorageTarget {
+  kind: StorageKind!
+}
+
+type S3Target implements StorageTarget {
+  kind: StorageKind!
+  bucket: String!
+  prefix: String!
+  region: String!
+  format: DataFormat!
+  compression: Compression!
+  kmsKeyArn: String
+  objectLock: ObjectLock
+  lifecycle: S3LifecycleHint
+  crrEnabled: Boolean!
+}
+
+type ObjectLock { enabled: Boolean!, mode: ObjectLockMode, days: Int }
+enum ObjectLockMode { GOVERNANCE COMPLIANCE }
+
+type S3LifecycleHint {
+  transitionAfter: Duration
+  transitionTo: S3StorageClass
+  expireAfter: Duration
+}
+enum S3StorageClass { STANDARD_IA GLACIER_IR DEEP_ARCHIVE }
+
+type PostgresTarget implements StorageTarget {
+  kind: StorageKind!
+  database: String!
+  schema: String!
+  table: String!
+  primaryKey: [String!]!
+  indexes: [String!]!
+  retentionSql: String
+}
+
+type KafkaTarget implements StorageTarget {
+  kind: StorageKind!
+  topic: String!
+  partitions: Int!
+  replicationFactor: Int!
+  keyFormat: KafkaKeyFormat!
+  valueFormat: KafkaValueFormat!
+  cleanupPolicy: KafkaCleanupPolicy!
+  retentionMs: BigInt
+  minInsyncReplicas: Int
+  schemaRegistry: URI
+}
+enum KafkaKeyFormat { STRING JSON AVRO PROTOBUF BYTES }
+enum KafkaValueFormat { JSON AVRO PROTOBUF BYTES }
+enum KafkaCleanupPolicy { DELETE COMPACT COMPACT_DELETE }
+
+type ElasticTarget implements StorageTarget {
+  kind: StorageKind!
+  index: String!
+  ilmPolicy: String
+}
+
+type FilesystemTarget implements StorageTarget {
+  kind: StorageKind!
+  path: String!
+  format: DataFormat!
+  compression: Compression!
+}
+
+# -----------------------------
+# Partitioning
+# -----------------------------
+type PartitionColumn {
+  name: String!
+  type: PartitionType!
+  granularity: PartitionGranularity
+  buckets: Int
+}
+enum PartitionType { DATE DATETIME STRING INT BUCKET }
+enum PartitionGranularity { HOUR DAY MONTH YEAR }
+
+type Partitioning { columns: [PartitionColumn!]! }
+
+# -----------------------------
+# Policies / Links
+# -----------------------------
+type ExportPolicy {
+  allowPublic: Boolean!
+  dlpRequired: Boolean!
+  approvals: [String!]!
+}
+
+type RetentionRef { uri: URI! }
+type LineageRef { uri: URI! }
+
+# -----------------------------
+# Quality Model (summary)
+# -----------------------------
+type QualitySlo {
+  freshnessMaxSec: Int
+  maxErrorRatio: Float
+  p95LatencyMs: Int
+}
+
+type QualityRef {
+  checksRef: URI
+  slo: QualitySlo
+}
+
+# -----------------------------
+# Dataset
+# -----------------------------
+type Dataset implements Node @key(fields: "id") {
+  id: ID!
+  identity: Identity!
+  classification: Classification!
+  pii: Boolean!
+  piiLevel: PiiLevel
+  versioning: Versioning!
+  schemaRefs: [SchemaRef!]!
+  storage: [StorageTarget!]!
+  partitioning: Partitioning
+  exportPolicy: ExportPolicy
+  retention: RetentionRef
+  lineage: LineageRef
+  quality: QualityRef
+  tags: [String!]!
+  annotations: [KeyValue!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+# -----------------------------
+# Queries
+# -----------------------------
+type Query {
+  dataset(id: ID!): Dataset @auth(anyRole:["platform.admin","tenant.admin","tenant.reader"])
+  datasets(
+    first: Int, after: String, last: Int, before: String,
+    where: DatasetFilter, orderBy: [DatasetOrder!]
+  ): DatasetConnection @auth(anyRole:["platform.admin","tenant.admin","tenant.reader"])
+
+  searchDatasets(
+    q: String!,
+    first: Int = 20, after: String
+  ): DatasetConnection @auth(anyRole:["platform.admin","tenant.admin","tenant.reader"])
+
+  # Политики и словари
+  classifications: [Classification!]!
+  dataSchemaTypes: [DataSchemaType!]!
+  storageKinds: [StorageKind!]!
+}
+
+input DatasetFilter {
+  namespace: String
+  owner: String
+  tenant: String
+  classificationIn: [Classification!]
+  pii: Boolean
+  tagIn: [String!]
+  updatedAfter: DateTime
+  storageKindAny: [StorageKind!]
+}
+
+input DatasetOrder {
+  field: DatasetOrderField!
+  order: SortOrder! = ASC
+}
+enum DatasetOrderField { NAME UPDATED_AT CLASSIFICATION TENANT }
+
+type DatasetEdge { node: Dataset!, cursor: String! }
+type DatasetConnection { edges: [DatasetEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+# -----------------------------
+# Mutations (idempotent, safe-by-default)
+# -----------------------------
+type Mutation {
+  upsertDataset(input: UpsertDatasetInput!): UpsertDatasetPayload
+    @auth(anyRole:["platform.admin","tenant.admin"])
+  patchDataset(input: PatchDatasetInput!): PatchDatasetPayload
+    @auth(anyRole:["platform.admin","tenant.admin"])
+  deleteDataset(id: ID!, reason: String!): DeleteDatasetPayload
+    @auth(anyRole:["platform.admin"])
+
+  # Загрузка артефактов схем (JSON Schema/Avro/Protobuf) c привязкой к Dataset
+  uploadSchemaArtifact(datasetId: ID!, kind: DataSchemaType!, file: Upload!): UploadSchemaPayload
+    @auth(anyRole:["platform.admin","tenant.admin"])
+}
+
+input UpsertDatasetInput {
+  clientMutationId: String
+  id: ID
+  identity: IdentityInput!
+  classification: Classification!
+  pii: Boolean!
+  piiLevel: PiiLevel
+  versioning: VersioningInput!
+  schemaRefs: [SchemaRefInput!]!
+  storage: [StorageTargetInput!]!
+  partitioning: PartitioningInput
+  exportPolicy: ExportPolicyInput
+  retention: RetentionRefInput
+  lineage: LineageRefInput
+  quality: QualityRefInput
+  tags: [String!]
+  annotations: [KeyValueInput!]
+}
+
+input PatchDatasetInput {
+  clientMutationId: String
+  id: ID!
+  set: PatchDatasetSet!
+}
+input PatchDatasetSet {
+  identity: IdentityInput
+  classification: Classification
+  pii: Boolean
+  piiLevel: PiiLevel
+  versioning: VersioningInput
+  schemaRefs: [SchemaRefInput!]
+  storage: [StorageTargetInput!]
+  partitioning: PartitioningInput
+  exportPolicy: ExportPolicyInput
+  retention: RetentionRefInput
+  lineage: LineageRefInput
+  quality: QualityRefInput
+  tags: [String!]
+  annotations: [KeyValueInput!]
+}
+
+type UpsertDatasetPayload {
+  clientMutationId: String
+  dataset: Dataset
+}
+type PatchDatasetPayload {
+  clientMutationId: String
+  dataset: Dataset
+}
+type DeleteDatasetPayload {
+  id: ID!
+  deleted: Boolean!
+}
+
+type UploadSchemaPayload {
+  dataset: Dataset!
+  artifactUri: URI!
+  sha256: String!
+}
+
+# -----------------------------
+# Inputs
+# -----------------------------
+input IdentityInput {
+  name: String!
+  namespace: String!
+  owner: String!
+  tenant: String
+  domain: String
+  labels: [KeyValueInput!]
+}
+input KeyValueInput { key: String!, value: String! }
+
+input VersioningInput {
+  datasetVersion: String!
+  schemaVersion: String
+  revision: String
+  updatedAt: DateTime
+}
+
+input SchemaRefInput {
+  type: DataSchemaType!
+  uri: URI!
+  message: String
+}
+
+# Storage inputs
+input StorageTargetInput {
+  s3: S3TargetInput
+  postgres: PostgresTargetInput
+  kafka: KafkaTargetInput
+  elastic: ElasticTargetInput
+  filesystem: FilesystemTargetInput
+}
+
+input S3TargetInput {
+  bucket: String!
+  prefix: String = ""
+  region: String!
+  format: DataFormat!
+  compression: Compression = NONE
+  kmsKeyArn: String
+  objectLock: ObjectLockInput
+  lifecycle: S3LifecycleHintInput
+  crrEnabled: Boolean = false
+}
+input ObjectLockInput { enabled: Boolean = false, mode: ObjectLockMode, days: Int }
+input S3LifecycleHintInput {
+  transitionAfter: Duration
+  transitionTo: S3StorageClass
+  expireAfter: Duration
+}
+
+input PostgresTargetInput {
+  database: String!
+  schema: String!
+  table: String!
+  primaryKey: [String!]! = []
+  indexes: [String!]! = []
+  retentionSql: String
+}
+
+input KafkaTargetInput {
+  topic: String!
+  partitions: Int!
+  replicationFactor: Int!
+  keyFormat: KafkaKeyFormat = STRING
+  valueFormat: KafkaValueFormat = JSON
+  cleanupPolicy: KafkaCleanupPolicy = DELETE
+  retentionMs: BigInt
+  minInsyncReplicas: Int
+  schemaRegistry: URI
+}
+
+input ElasticTargetInput {
+  index: String!
+  ilmPolicy: String
+}
+
+input FilesystemTargetInput {
+  path: String!
+  format: DataFormat!
+  compression: Compression = NONE
+}
+
+# Partitioning
+input PartitioningInput { columns: [PartitionColumnInput!]! }
+input PartitionColumnInput {
+  name: String!
+  type: PartitionType!
+  granularity: PartitionGranularity
+  buckets: Int
+}
+
+# Policies / Links
+input ExportPolicyInput {
+  allowPublic: Boolean = false
+  dlpRequired: Boolean = true
+  approvals: [String!] = ["DPO","Security"]
+}
+input RetentionRefInput { uri: URI! }
+input LineageRefInput { uri: URI! }
+
+# Quality
+input QualitySloInput {
+  freshnessMaxSec: Int
+  maxErrorRatio: Float
+  p95LatencyMs: Int
+}
+input QualityRefInput {
+  checksRef: URI
+  slo: QualitySloInput
+}
+
+# -----------------------------
+# Events & Quality Subscriptions
+# -----------------------------
+type EventHeader { key: String!, valueBase64: String! }
+
+enum EventKind { BUSINESS TECHNICAL AUDIT }
+enum EventDataFormat { JSON PROTOBUF AVRO BINARY }
+
+type EventActor {
+  id: String!
+  type: String
+  organizationId: String
+  ip: String
+}
+
+type EventContext {
+  app: String
+  env: String
+  region: String
+  version: String
+  traceId: String
+  spanId: String
+}
+
+type EventPayload {
+  json: JSON
+  text: String
+  binaryBase64: String
+  typeUrl: String
+}
+
+type StreamEvent {
+  id: ID!
+  envelopeId: ID!
+  kind: EventKind!
+  severity: Severity
+  type: String!
+  source: String!
+  subject: String
+  time: DateTime!
+  datacontenttype: String
+  dataFormat: EventDataFormat!
+  pii: Boolean!
+  piiLevel: PiiLevel
+  classification: Classification!
+  actor: EventActor
+  context: EventContext
+  headers: [EventHeader!]!
+  payload: EventPayload
+}
+
+type QualityViolationSample { keys: [String!]!, fields: JSON }
+type QualityViolation {
+  expectationId: ID!
+  kind: CheckKind!
+  severity: Severity!
+  status: Status!
+  message: String!
+  affectedCount: Int!
+  affectedRatio: Float!
+  observed: JSON
+  samples: [QualityViolationSample!]!
+}
+
+type QualityResult {
+  identity: KeyValue!    # {key:name, value:revision} упрощенно
+  datasetId: ID!
+  windowStart: DateTime!
+  windowEnd: DateTime!
+  status: Status!
+  maxSeverity: Severity!
+  totalRecords: Int!
+  checkedRecords: Int!
+  failRatio: Float!
+  metrics: [KeyValue!]!
+  violations: [QualityViolation!]!
+}
+
+type Subscription {
+  streamEvents(datasetId: ID, topic: String, kindIn: [EventKind!], severityGte: Severity): StreamEvent
+    @auth(anyRole:["platform.admin","tenant.admin","tenant.reader"])
+
+  qualityResults(datasetId: ID!, minSeverity: Severity = WARN): QualityResult
+    @auth(anyRole:["platform.admin","tenant.admin","tenant.reader"])
+}
+
+# -----------------------------
+# Errors (GraphQL extensions)
+# -----------------------------
+"""
+Стандартизованный код ошибки в extensions.code:
+- UNAUTHENTICATED / FORBIDDEN / NOT_FOUND
+- CONFLICT / PRECONDITION_FAILED
+- INVALID_INPUT / RATE_LIMITED / INTERNAL
+"""
+
+# -----------------------------
+# Notes
+# -----------------------------
+# 1) Все мутации должны быть идемпотентны: clientMutationId, условные upsert/patch.
+# 2) Поля, содержащие потенциально чувствительные данные, не возвращают PII в открытую.
+# 3) @auth реализует RBAC/ABAC в резолверах; для тенанта прокидывайте контекст.
+# 4) Для codegen: включите strict nullability и mappers для scalar’ов.
+# 5) Схема согласована с:
+#    - schemas/jsonschema/v1/dataset.schema.json
+#    - configs/policies/retention.yaml
+#    - configs/policies/rego/lineage_guard.rego
+#    - schemas/proto/v1/stream/events.proto
+#    - schemas/proto/v1/stream/quality/checks.proto

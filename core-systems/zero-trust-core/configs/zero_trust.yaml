@@ -1,0 +1,532 @@
+# zero-trust-core/configs/zero_trust.yaml
+apiVersion: zerotrust.ae/v1
+kind: ZeroTrustPolicy
+metadata:
+  name: org-wide-zero-trust
+  tenant: production
+  labels:
+    environment: prod
+    owner: security
+  annotations:
+    description: "Организационная политика Zero Trust для production"
+    changeControl: "Все изменения проходят через Pull Request и обязательный code review"
+spec:
+  version: 1
+  defaults:
+    decision: deny        # строгий deny-by-default
+    require:
+      identity: true
+      device: true
+      network: true
+      mfa: true
+    token:
+      type: "JWT"
+      alg: "EdDSA"        # предпочтительно Ed25519
+      maxTTL: "30m"
+    session:
+      absoluteLifetime: "8h"
+      idleTimeout: "30m"
+      binding:
+        ip: true
+        userAgent: true
+        deviceId: true
+
+  identity:
+    providers:
+      - name: primary-oidc
+        type: oidc
+        issuer: "https://idp.example.com"
+        clientId: "zt-admin"
+        jwks_uri: "https://idp.example.com/.well-known/jwks.json"
+        clockSkew: "60s"
+        map:
+          subject: "sub"
+          email: "email"
+          name: "name"
+          roles: "realm_access.roles"
+          groups: "groups"
+          tenant: "tenant"
+        claims_required: ["sub","email","realm_access"]
+      - name: workforce-saml
+        type: saml
+        issuer: "https://saml.example.com/metadata"
+        certificate: "@secrets:saml/primary.crt"
+        map:
+          subject: "NameID"
+          email: "Email"
+          roles: "Roles"
+    attributes:
+      normalization:
+        emailToLower: true
+        trimSpaces: true
+      sources:
+        - provider: primary-oidc
+        - provider: workforce-saml
+      enrichment:
+        - type: http
+          name: hr-attributes
+          method: GET
+          url: "https://hr.example.com/api/users/${sub}"
+          headers:
+            Authorization: "@secrets:http/hr_bearer"
+          cacheTTL: "10m"
+    roles:
+      definitions:
+        - id: admin
+          inherits: [viewer]
+          description: "Полный административный доступ"
+        - id: developer
+          inherits: [viewer]
+          description: "Доступ разработчика к сервисам"
+        - id: auditor
+          inherits: [viewer]
+          description: "Чтение журналов и отчетности"
+        - id: viewer
+          inherits: []
+          description: "Базовый read-only"
+      assignment:
+        rules:
+          - if: 'containsAny(attributes.groups, ["sec-admins","platform-admins"])'
+            grant: ["admin"]
+          - if: 'containsAny(attributes.groups, ["devs","oncall"])'
+            grant: ["developer"]
+          - if: 'containsAny(attributes.groups, ["audit","risk"])'
+            grant: ["auditor"]
+
+  device:
+    posture:
+      signals:
+        - id: os_version
+          provider: mdm
+          required: true
+        - id: disk_encryption
+          provider: mdm
+          required: true
+        - id: secure_boot
+          provider: mdm
+          required: true
+        - id: av_running
+          provider: edr
+          required: true
+        - id: threat_level
+          provider: edr
+          required: true
+        - id: jailbreak
+          provider: mdm
+          required: false
+      trustTiers:
+        - id: high
+          requireAll: ["disk_encryption","secure_boot","av_running"]
+          conditions:
+            - key: threat_level
+              op: "<="
+              value: 1
+        - id: medium
+          requireAll: ["disk_encryption","av_running"]
+          conditions:
+            - key: threat_level
+              op: "<="
+              value: 2
+        - id: low
+          requireAny: ["disk_encryption","av_running"]
+      cacheTTL: "5m"
+    attestation:
+      requireDeviceCertificate: true
+      mTLS:
+        trustAnchors:
+          - "@pki:anchors/org-root-ca.pem"
+        clientAuth: require_and_verify
+        crl:
+          enabled: true
+          urls: ["https://pki.example.com/crl/root.crl"]
+          refresh: "1h"
+        ocsp:
+          enabled: true
+          url: "http://ocsp.pki.example.com"
+          softFail: false
+
+  network:
+    zones:
+      - id: internet
+        cidrs: ["0.0.0.0/0","::/0"]
+      - id: corp
+        cidrs: ["10.0.0.0/8","192.168.0.0/16","172.16.0.0/12"]
+      - id: prod
+        cidrs: ["10.20.0.0/16"]
+      - id: ci
+        cidrs: ["10.30.0.0/16"]
+    egress:
+      policy: deny
+      exceptions:
+        - name: opensearch
+          to: ["prod"]
+          ports: ["9200/tcp","443/tcp"]
+          protocol: tcp
+    ingress:
+      policy: deny
+    microsegmentation:
+      services:
+        - id: billing-api
+          listeners:
+            - "0.0.0.0:8443"
+          allowedClients:
+            - spiffe://org/prod/service/frontend
+            - role:admin
+          require:
+            mTLS: true
+            jwt: true
+        - id: audit-ingest
+          listeners: ["10.20.10.15:9200"]
+          allowedClients:
+            - role:auditor
+            - service:auth
+          require:
+            mTLS: true
+
+  authentication:
+    methods:
+      - id: web_webauthn
+        type: webauthn
+        userVerification: required
+      - id: oidc_default
+        type: oidc
+        providerRef: primary-oidc
+        pkce: S256
+      - id: totp_backup
+        type: totp
+    mfa:
+      policy: conditional
+      triggers:
+        - risk: high
+        - resourceSensitivity: high
+        - deviceTrustBelow: medium
+      allowedMethods: ["webauthn","totp"]
+    passwordless:
+      enabled: true
+      methods: ["webauthn"]
+    serviceToService:
+      mTLSRequired: true
+      jwt:
+        audienceEnforce: true
+        acceptedAudiences: ["internal","payments","audit"]
+        leeway: "30s"
+
+  authorization:
+    engine:
+      mode: hybrid             # rbac + abac + policy (OPA)
+      opa:
+        enabled: true
+        url: "http://opa.security-core.svc.cluster.local:8181"
+        policyPackages:
+          - name: zt-core
+            bundleUrl: "s3://policies/zt-core/"
+            signature:
+              keyid: "opa-ed25519-1"
+              pubkey: "@secrets:opa/pubkey.ed25519"
+        decisionTimeout: "500ms"
+        failClosed: true
+    rbac:
+      rules:
+        - id: admin_all
+          effect: allow
+          roles: ["admin"]
+          resources: ["*"]
+          actions: ["*"]
+        - id: dev_service_read
+          effect: allow
+          roles: ["developer"]
+          resources: ["service:*"]
+          actions: ["read","list","get"]
+        - id: auditor_logs
+          effect: allow
+          roles: ["auditor"]
+          resources: ["audit:*"]
+          actions: ["read","list","get"]
+    abac:
+      attributes:
+        - name: tenant
+          source: identity.claims.tenant
+        - name: env
+          source: context.env
+        - name: device_trust
+          source: device.trustTier
+        - name: sensitivity
+          source: resource.sensitivity
+      policies:
+        - id: same_tenant_only
+          effect: allow
+          when: 'equals(attributes.tenant, resource.tenant)'
+        - id: prod_only_high_trust
+          effect: allow
+          when: 'and(equals(attributes.env,"prod"), in(attributes.device_trust,["high"]))'
+        - id: high_sensitivity_requires_mfa
+          effect: require_mfa
+          when: 'equals(attributes.sensitivity,"high")'
+    precedence:
+      order: ["rbac","abac","opa"]   # результаты объединяются по стратегиям ниже
+      combine:
+        allowOverrides: false        # deny имеет приоритет над allow
+        requireAllEngines: false
+        requireMFAUnion: true
+
+  risk:
+    scoring:
+      factors:
+        - id: geovelocity
+          weight: 2.0
+          source: telemetry.geo
+        - id: impossible_travel
+          weight: 3.0
+          source: telemetry.geo
+        - id: device_posture
+          weight: 2.5
+          source: device.trustTier
+        - id: auth_failures_1h
+          weight: 1.5
+          source: auth.stats.failedLastHour
+      thresholds:
+        low: 0
+        medium: 5
+        high: 8
+    responses:
+      - when: "risk >= high"
+        actions: ["step_up_mfa","shorten_session","alert"]
+      - when: "risk >= medium"
+        actions: ["step_up_mfa"]
+    anomaly:
+      bruteForce:
+        window: "5m"
+        threshold: 10
+        action: block_ip
+      tokenAbuse:
+        window: "10m"
+        threshold: 50
+        action: revoke_sessions
+
+  sessions:
+    store:
+      type: redis
+      url: "@secrets:redis/url"
+      tls: true
+    binding:
+      checkIPChange: true
+      checkDevice: true
+    revocation:
+      onPasswordChange: true
+      onRoleChange: true
+      onHighRisk: true
+
+  tokens:
+    signing:
+      jwksFile: "secrets/jwks.json"
+      algorithms: ["EdDSA","ES256"]
+      rotation:
+        enabled: true
+        maxAgeDays: 30
+        keepLast: 3
+    claims:
+      standard:
+        iss: "https://zt.example.com"
+        aud: ["internal"]
+      custom:
+        - key: "tenant"
+          from: identity.claims.tenant
+        - key: "device_trust"
+          from: device.trustTier
+      constraints:
+        maxTTL: "30m"
+        refreshTTL: "8h"
+        leeway: "30s"
+
+  applications:
+    - id: billing
+      type: http
+      sensitivity: high
+      upstream: "https://billing.internal.svc:8443"
+      routes:
+        - path: "/api/v1/*"
+          methods: ["GET","POST","PUT","DELETE"]
+          auth:
+            required: true
+            methods: ["oidc_default","web_webauthn"]
+            mTLSClientCert: optional
+          authorize:
+            resource: "service:billing"
+            actions:
+              GET: "read"
+              POST: "write"
+              PUT: "write"
+              DELETE: "delete"
+          dataPolicies:
+            dlp: ["pii","pan"]
+            redactResponse:
+              fields: ["ssn","pan","secret"]
+          rateLimit:
+            limit: 300
+            window: "1m"
+            key: "subject"
+    - id: audit-api
+      type: http
+      sensitivity: medium
+      upstream: "https://audit.internal.svc:9200"
+      routes:
+        - path: "/_bulk"
+          methods: ["POST"]
+          auth:
+            required: true
+            serviceToService: true
+            mTLSClientCert: require
+          authorize:
+            resource: "audit:ingest"
+            actions:
+              POST: "write"
+
+  dataProtection:
+    dlp:
+      detectors:
+        - id: pii
+          patterns:
+            - type: regex
+              name: email
+              expr: "(?i)\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b"
+        - id: pan
+          patterns:
+            - type: luhn
+              minLen: 13
+              maxLen: 19
+      actions:
+        - id: redact
+          strategy: hash
+          params:
+            alg: sha256
+    classification:
+      taxonomies:
+        - id: public
+          rules: []
+        - id: confidential
+          rules:
+            - header: "X-Data-Class"
+              equals: "confidential"
+        - id: restricted
+          rules:
+            - path: "$.payload.card"
+              exists: true
+
+  secrets:
+    vault:
+      addr: "@secrets:vault/addr"
+      token: "@secrets:vault/token"
+      namespace: "@secrets:vault/namespace"
+      mounts:
+        - name: "kv-app"
+          path: "kv/app"
+          version: 2
+      transit:
+        mount: "transit"
+        keys:
+          - name: "zt-jwt-sign"
+            type: "ed25519"
+    kms:
+      providers:
+        - id: aws-kms
+          region: "eu-west-1"
+          keyId: "arn:aws:kms:eu-west-1:123456789012:key/abcd-ef"
+    cache:
+      ttl: "60s"
+
+  telemetry:
+    logging:
+      level: info
+      format: json
+      redact:
+        - "authorization"
+        - "password"
+        - "cookie"
+    audit:
+      enabled: true
+      categoryMap:
+        authn: AUTHN
+        authz: AUTHZ
+        policy: POLICY
+        admin: ADMIN
+      exporters:
+        - type: opensearch
+          endpoints: ["https://opensearch.internal:9200"]
+          auth: basic
+          username: "@secrets:opensearch/user"
+          password: "@secrets:opensearch/pass"
+          dataStream: "security-audit"
+          buffer:
+            maxEvents: 2000
+            maxBytes: "5MB"
+            flushInterval: "800ms"
+        - type: file
+          path: "/var/log/security/audit.ndjson"
+    metrics:
+      prometheus:
+        enabled: true
+        bind: "0.0.0.0:9090"
+    traces:
+      otlp:
+        endpoint: "http://otel-collector:4317"
+        sampling: 0.2
+
+  admin:
+    api:
+      bind: "0.0.0.0:8080"
+      cors:
+        origins: ["http://localhost:3000","http://localhost:5173"]
+      auth:
+        allowServiceTokens: true
+        requireMFAForDangerous: true
+    breakGlass:
+      accounts:
+        - subject: "user:break-glass"
+          methods: ["webauthn"]
+          expiry: "7d"
+          reason: "только для аварийного доступа"
+      storage:
+        sealedVaultPath: "kv/app/break-glass"
+      guardrails:
+        requireTicket: true
+        requireTwoPerson: true
+        notifyChannels:
+          - "slack://sec-incident"
+          - "email://sec-ops@example.com"
+
+  compliance:
+    references:
+      soc2: ["CC6.1","CC7.2","CC8.1"]
+      iso27001: ["A.8.2","A.9.1","A.9.4","A.13.1"]
+    evidence:
+      collectors:
+        - id: iam-roles
+          type: http
+          url: "https://iam.example.com/api/roles"
+          cacheTTL: "10m"
+        - id: zt-policy-hash
+          type: inline
+          valueFrom: "specHash"   # вычисляется рантаймом
+    controls:
+      - id: MFA-HighRisk
+        description: "Step-up MFA при высоком риске"
+        mapping: ["CC6.1","A.9.4"]
+        rule: 'risk >= high -> require_mfa'
+
+  governance:
+    approvals:
+      requiredFor:
+        - path: "authorization.rbac.rules[*]"
+        - path: "applications[*]"
+      minApprovers: 2
+    changeWindows:
+      freeze:
+        - from: "2025-12-24T00:00:00Z"
+          to:   "2026-01-02T00:00:00Z"
+
+  featureFlags:
+    adaptiveAccess: true
+    tokenBinding: true
+    opaBundleVerify: true
+
+# Конец файла

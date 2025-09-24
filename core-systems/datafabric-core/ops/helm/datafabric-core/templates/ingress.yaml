@@ -1,0 +1,219 @@
+{{- /*
+  datafabric-core/templates/ingress.yaml
+  Требуемые values (см. values.yaml ранее):
+    ingress:
+      enabled: true
+      className: nginx
+      annotations: {}
+      labels: {}
+      hosts:
+        - host: core.datafabric.example.com
+          paths:
+            - path: /
+              pathType: Prefix
+              service:
+                name: ""         # по умолчанию fullname
+                port: http       # имя порта из Service (http|metrics) или число
+          extraPaths: []          # дополнительные route-и до основного backend (например, для ACME)
+      tls:
+        - secretName: datafabric-core-tls
+          hosts: [core.datafabric.example.com]
+      canary:
+        enabled: false
+        annotations: {}           # например: nginx.ingress.kubernetes.io/canary-by-header, weight и т.п.
+      whitelistSourceRange: []    # список CIDR для nginx.ingress.kubernetes.io/whitelist-source-range
+      sslRedirect: true
+      forceHttps: true
+      proxy:
+        bodySize: "10m"
+        readTimeout: "60"
+        sendTimeout: "60"
+        bufferSize: "8k"
+      websocket: true
+      grpc: false
+      modsecurity:
+        enabled: false
+        snippet: ""               # custom SecRule и т.п.
+      auth:
+        basic:
+          enabled: false
+          secretName: ""          # secret с htpasswd в ключе "auth"
+      externalDNS:
+        enabled: false
+        ttl: 300
+      mtls:
+        enabled: false
+        secretName: ""            # secret с ca.crt
+      internal:
+        enabled: false
+        className: "nginx-internal"
+        annotations: {}
+        hosts: []                 # если пусто — унаследует из ingress.hosts
+        tls: []                   # если пусто — унаследует из ingress.tls
+*/ -}}
+
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "datafabric-core.fullname" . }}
+  labels:
+    {{- include "datafabric-core.labels" . | nindent 4 }}
+    {{- with .Values.ingress.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- /* Базовые NGINX аннотации (работают только с соответствующим контроллером) */}}
+    {{- if hasKey .Values.ingress "sslRedirect" }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "{{ .Values.ingress.sslRedirect }}"
+    {{- end }}
+    {{- if .Values.ingress.forceHttps }}
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    {{- end }}
+    {{- if .Values.ingress.proxy.bodySize }}
+    nginx.ingress.kubernetes.io/proxy-body-size: "{{ .Values.ingress.proxy.bodySize }}"
+    {{- end }}
+    {{- if .Values.ingress.proxy.readTimeout }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "{{ .Values.ingress.proxy.readTimeout }}"
+    {{- end }}
+    {{- if .Values.ingress.proxy.sendTimeout }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "{{ .Values.ingress.proxy.sendTimeout }}"
+    {{- end }}
+    {{- if .Values.ingress.proxy.bufferSize }}
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "{{ .Values.ingress.proxy.bufferSize }}"
+    {{- end }}
+    {{- if .Values.ingress.websocket }}
+    nginx.ingress.kubernetes.io/websocket-services: "{{ include "datafabric-core.fullname" . }}"
+    {{- end }}
+    {{- if .Values.ingress.grpc }}
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    {{- end }}
+    {{- if .Values.ingress.whitelistSourceRange }}
+    nginx.ingress.kubernetes.io/whitelist-source-range: "{{ join "," .Values.ingress.whitelistSourceRange }}"
+    {{- end }}
+    {{- if .Values.ingress.auth.basic.enabled }}
+    nginx.ingress.kubernetes.io/auth-type: "basic"
+    nginx.ingress.kubernetes.io/auth-secret: "{{ .Values.ingress.auth.basic.secretName }}"
+    nginx.ingress.kubernetes.io/auth-realm: "Authentication Required"
+    {{- end }}
+    {{- if .Values.ingress.modsecurity.enabled }}
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    {{- if .Values.ingress.modsecurity.snippet }}
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      {{- .Values.ingress.modsecurity.snippet | nindent 6 }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.ingress.externalDNS.enabled }}
+    external-dns.alpha.kubernetes.io/ttl: "{{ .Values.ingress.externalDNS.ttl }}"
+    {{- end }}
+    {{- if .Values.ingress.mtls.enabled }}
+    nginx.ingress.kubernetes.io/auth-tls-secret: "{{ .Release.Namespace }}/{{ .Values.ingress.mtls.secretName }}"
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    nginx.ingress.kubernetes.io/auth-tls-verify-depth: "2"
+    nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream: "true"
+    {{- end }}
+    {{- if and .Values.ingress.canary.enabled (eq (default "" .Values.ingress.className) "nginx") }}
+    nginx.ingress.kubernetes.io/canary: "true"
+    {{- with .Values.ingress.canary.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- range .Values.ingress.tls }}
+    - secretName: {{ .secretName | quote }}
+      {{- if .hosts }}
+      hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  rules:
+    {{- $svcDefault := include "datafabric-core.fullname" . -}}
+    {{- $httpPort := (index .Values.service.ports "http").port | default 8080 -}}
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- /* Дополнительные маршруты (например, /.well-known/acme-challenge/) */}}
+          {{- with .extraPaths }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+          {{- range .paths }}
+          - path: {{ .path | default "/" | quote }}
+            pathType: {{ .pathType | default "Prefix" | quote }}
+            backend:
+              service:
+                name: {{ (default $svcDefault .service.name) | quote }}
+                port:
+                  {{- if kindIs "string" .service.port }}
+                  name: {{ .service.port | default "http" | quote }}
+                  {{- else }}
+                  number: {{ .service.port | default $httpPort }}
+                  {{- end }}
+          {{- end }}
+    {{- end }}
+---
+{{- if .Values.ingress.internal.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "datafabric-core.fullname" . }}-internal
+  labels:
+    {{- include "datafabric-core.labels" . | nindent 4 }}
+    traffic: internal
+  annotations:
+    {{- with .Values.ingress.internal.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.internal.className | quote }}
+  {{- $intTls := ternary .Values.ingress.internal.tls .Values.ingress.tls (gt (len .Values.ingress.internal.tls) 0) -}}
+  {{- if $intTls }}
+  tls:
+    {{- range $intTls }}
+    - secretName: {{ .secretName | quote }}
+      {{- if .hosts }}
+      hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  rules:
+    {{- $svcDefault := include "datafabric-core.fullname" . -}}
+    {{- $httpPort := (index .Values.service.ports "http").port | default 8080 -}}
+    {{- $intHosts := ternary .Values.ingress.internal.hosts .Values.ingress.hosts (gt (len .Values.ingress.internal.hosts) 0) -}}
+    {{- range $intHosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- with .extraPaths }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+          {{- range .paths }}
+          - path: {{ .path | default "/" | quote }}
+            pathType: {{ .pathType | default "Prefix" | quote }}
+            backend:
+              service:
+                name: {{ (default $svcDefault .service.name) | quote }}
+                port:
+                  {{- if kindIs "string" .service.port }}
+                  name: {{ .service.port | default "http" | quote }}
+                  {{- else }}
+                  number: {{ .service.port | default $httpPort }}
+                  {{- end }}
+          {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

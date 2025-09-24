@@ -1,0 +1,208 @@
+{{- /*
+Industrial Ingress template for policy-core.
+Requires helpers:
+- "policy-core.fullname"
+- "policy-core.labels"
+- "policy-core.selectorLabels"
+- "policy-core.serviceName" (optional; fallback to fullname)
+Values reference (short):
+.ingress:
+  enabled: bool
+  className: string
+  defaultPathType: "Prefix"|"ImplementationSpecific"|"Exact"
+  annotations: {string:string}
+  tls:
+    - secretName: string
+      hosts: [host1, host2]
+  hosts:
+    - host: example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: string (optional; default serviceName)
+            port: 80 or "http"
+  nginx:
+    sslRedirect: true
+    hsts: true
+    hstsMaxAge: 31536000
+    hstsIncludeSubdomains: true
+    hstsPreload: true
+    securityHeaders: true
+    rateLimit:
+      connections: null
+      rps: null
+      burst: null
+    proxyBodySize: 10m
+    proxyReadTimeout: 60
+    proxySendTimeout: 60
+    bufferSize: 8k
+  rewrite:
+    enabled: false
+    target: /$1
+  grpc:
+    enabled: false
+  websockets:
+    enabled: false
+    services: []  # list of service names for nginx websocket-services
+  whitelistSourceRange: []  # e.g. ["1.2.3.4/32","10.0.0.0/8"]
+  basicAuth:
+    enabled: false
+    secretName: policy-core-basic-auth
+  canary:
+    enabled: false
+    weight: 0            # 0..100
+    header: ""           # e.g. "X-Canary"
+    headerValue: ""      # e.g. "always"
+    cookie: ""           # e.g. "canary"
+certManager:
+  enabled: false
+  clusterIssuer: ""      # or use .issuerRef.name and .issuerRef.kind
+  issuerRef:
+    name: ""
+    kind: "Issuer"       # or "ClusterIssuer"
+*/ -}}
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "policy-core.fullname" . }}
+  labels:
+    {{- include "policy-core.labels" . | nindent 4 }}
+  annotations:
+    {{- /*
+      User-provided annotations (highest priority).
+      Support 'tpl' to allow templated values.
+    */ -}}
+    {{- with .Values.ingress.annotations }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+
+    {{- /* Ingress class annotation for legacy controllers (spec.ingressClassName is set below). */ -}}
+    {{- if .Values.ingress.className }}
+    kubernetes.io/ingress.class: {{ .Values.ingress.className | quote }}
+    {{- end }}
+
+    {{- /* cert-manager annotations */ -}}
+    {{- if .Values.certManager.enabled }}
+    {{- if .Values.certManager.clusterIssuer }}
+    cert-manager.io/cluster-issuer: {{ .Values.certManager.clusterIssuer | quote }}
+    {{- else if and .Values.certManager.issuerRef.name .Values.certManager.issuerRef.kind }}
+    cert-manager.io/issuer: {{ .Values.certManager.issuerRef.name | quote }}
+    cert-manager.io/issuer-kind: {{ .Values.certManager.issuerRef.kind | quote }}
+    {{- end }}
+    {{- end }}
+
+    {{- /* NGINX Controller hardening and tuning */ -}}
+    {{- $ng := .Values.ingress.nginx }}
+    {{- if $ng }}
+    {{- if hasKey $ng "sslRedirect" }}
+    nginx.ingress.kubernetes.io/ssl-redirect: {{ ternary "true" "false" $ng.sslRedirect | quote }}
+    {{- end }}
+    {{- if $ng.hsts }}
+    nginx.ingress.kubernetes.io/hsts: "true"
+    {{- if $ng.hstsMaxAge }}nginx.ingress.kubernetes.io/hsts-max-age: {{ $ng.hstsMaxAge | quote }}{{- end }}
+    {{- if $ng.hstsIncludeSubdomains }}nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"{{- end }}
+    {{- if $ng.hstsPreload }}nginx.ingress.kubernetes.io/hsts-preload: "true"{{- end }}
+    {{- end }}
+    {{- if $ng.proxyBodySize }}nginx.ingress.kubernetes.io/proxy-body-size: {{ $ng.proxyBodySize | quote }}{{- end }}
+    {{- if $ng.proxyReadTimeout }}nginx.ingress.kubernetes.io/proxy-read-timeout: {{ $ng.proxyReadTimeout | quote }}{{- end }}
+    {{- if $ng.proxySendTimeout }}nginx.ingress.kubernetes.io/proxy-send-timeout: {{ $ng.proxySendTimeout | quote }}{{- end }}
+    {{- if $ng.bufferSize }}nginx.ingress.kubernetes.io/proxy-buffer-size: {{ $ng.bufferSize | quote }}{{- end }}
+
+    {{- /* Rate limiting */ -}}
+    {{- if $ng.rateLimit }}
+    {{- if $ng.rateLimit.connections }}nginx.ingress.kubernetes.io/limit-connections: {{ $ng.rateLimit.connections | quote }}{{- end }}
+    {{- if $ng.rateLimit.rps }}nginx.ingress.kubernetes.io/limit-rps: {{ $ng.rateLimit.rps | quote }}{{- end }}
+    {{- if $ng.rateLimit.burst }}nginx.ingress.kubernetes.io/limit-burst-multiplier: {{ $ng.rateLimit.burst | quote }}{{- end }}
+    {{- end }}
+
+    {{- /* Optional security headers via configuration-snippet */ -}}
+    {{- if $ng.securityHeaders }}
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "Referrer-Policy: no-referrer";
+      more_set_headers "Permissions-Policy: interest-cohort=()";
+      more_set_headers "Content-Security-Policy: default-src 'self'";
+    {{- end }}
+    {{- end }}
+
+    {{- /* Rewrite support */ -}}
+    {{- if and .Values.ingress.rewrite .Values.ingress.rewrite.enabled }}
+    nginx.ingress.kubernetes.io/rewrite-target: {{ .Values.ingress.rewrite.target | default "/$1" | quote }}
+    {{- end }}
+
+    {{- /* Backend protocol for gRPC */ -}}
+    {{- if and .Values.ingress.grpc .Values.ingress.grpc.enabled }}
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    {{- end }}
+
+    {{- /* Whitelist CIDRs */ -}}
+    {{- with .Values.ingress.whitelistSourceRange }}
+    nginx.ingress.kubernetes.io/whitelist-source-range: {{ join "," . | quote }}
+    {{- end }}
+
+    {{- /* Basic auth */ -}}
+    {{- if and .Values.ingress.basicAuth .Values.ingress.basicAuth.enabled }}
+    nginx.ingress.kubernetes.io/auth-type: "basic"
+    nginx.ingress.kubernetes.io/auth-secret: {{ .Values.ingress.basicAuth.secretName | quote }}
+    nginx.ingress.kubernetes.io/auth-realm: "Authentication Required"
+    {{- end }}
+
+    {{- /* Canary traffic splitting */ -}}
+    {{- if and .Values.ingress.canary .Values.ingress.canary.enabled }}
+    nginx.ingress.kubernetes.io/canary: "true"
+    {{- with .Values.ingress.canary.weight }}
+    nginx.ingress.kubernetes.io/canary-weight: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.ingress.canary.header }}
+    nginx.ingress.kubernetes.io/canary-by-header: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.ingress.canary.headerValue }}
+    nginx.ingress.kubernetes.io/canary-by-header-value: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.ingress.canary.cookie }}
+    nginx.ingress.kubernetes.io/canary-by-cookie: {{ . | quote }}
+    {{- end }}
+    {{- end }}
+
+    {{- /* Websocket services hint (nginx) */ -}}
+    {{- if and .Values.ingress.websockets .Values.ingress.websockets.enabled }}
+    {{- with .Values.ingress.websockets.services }}
+    nginx.ingress.kubernetes.io/websocket-services: {{ join "," . | quote }}
+    {{- end }}
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+
+  {{- /* TLS blocks: either explicit .ingress.tls or managed by cert-manager via annotations */ -}}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  rules:
+    {{- $svcDefault := (include "policy-core.serviceName" . | default (include "policy-core.fullname" .)) }}
+    {{- $ptDefault := .Values.ingress.defaultPathType | default "Prefix" }}
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path | default "/" | quote }}
+            pathType: {{ .pathType | default $ptDefault | quote }}
+            backend:
+              service:
+                name: {{ .service.name | default $svcDefault | quote }}
+                port:
+                  {{- if kindIs "string" .service.port }}
+                  name: {{ .service.port | default "http" | quote }}
+                  {{- else }}
+                  number: {{ .service.port | default 80 }}
+                  {{- end }}
+          {{- end }}
+    {{- end }}
+{{- end }}

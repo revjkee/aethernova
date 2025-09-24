@@ -1,0 +1,372 @@
+version: 1
+app:
+  name: engine-core
+  env: ${APP_ENV:production}          # production, staging, development
+  base_url: ${APP_BASE_URL:https://example.com}
+  debug_security_headers: false       # только для отладки в non-prod
+  trust_proxy: true                   # прокси перед приложением добавляет заголовки
+
+secrets:
+  source: env                         # секреты не хранятся в yaml
+  jwt_signing_key_env: JWT_SIGNING_KEY
+  jwt_refresh_key_env: JWT_REFRESH_KEY
+  csrf_secret_env: CSRF_SECRET
+  session_secret_env: SESSION_SECRET
+  oauth_client_secrets_env_prefix: OAUTH_  # префикс для провайдеров
+  tls_private_key_env: TLS_PRIVATE_KEY
+  tls_certificate_env: TLS_CERTIFICATE
+  mtls_ca_bundle_env: MTLS_CA_BUNDLE
+
+crypto:
+  fips_compat: true
+  random_source: os_urandom
+  password_hashing:
+    algorithm: argon2id
+    params:
+      time_cost: 3
+      memory_cost_kib: 65536
+      parallelism: 2
+      salt_len: 16
+      hash_len: 32
+  jwt:
+    alg: ES256                           # ES256 или EdDSA (Ed25519) при доступности
+    issuer: engine-core
+    audience: ["engine-core", "engine-api"]
+    access_ttl_seconds: 900              # 15 минут
+    refresh_ttl_seconds: 2592000         # 30 дней
+    clock_skew_seconds: 60
+    require_exp: true
+    require_iat: true
+    require_nbf: false
+  tls:
+    minimum_version: TLS1_2
+    prefer_server_ciphers: true
+    ciphersuites:
+      - TLS_AES_256_GCM_SHA384
+      - TLS_AES_128_GCM_SHA256
+      - TLS_CHACHA20_POLY1305_SHA256
+    hsts:
+      enabled: true
+      max_age_seconds: 31536000
+      include_subdomains: true
+      preload: true
+  mtls:
+    enabled: false
+    client_auth: require_and_verify
+    ca_bundle_source: env
+
+headers:
+  content_security_policy:
+    enabled: true
+    # Пример строгой CSP, обновите под фронтенд
+    policy: >
+      default-src 'none';
+      base-uri 'none';
+      connect-src 'self' https://api.example.com;
+      img-src 'self' data:;
+      script-src 'self';
+      style-src 'self' 'unsafe-inline';
+      font-src 'self';
+      frame-ancestors 'none';
+      form-action 'self';
+      upgrade-insecure-requests
+  referrer_policy: no-referrer
+  x_content_type_options: nosniff
+  x_frame_options: DENY
+  permissions_policy:
+    enabled: true
+    policy: >
+      accelerometer=(), camera=(), geolocation=(), gyroscope=(),
+      magnetometer=(), microphone=(), payment=(), usb=()
+  cross_origin_embedder_policy: require-corp
+  cross_origin_opener_policy: same-origin
+  cross_origin_resource_policy: same-site
+  cache_control_api: no-store
+
+cors:
+  enabled: true
+  allow_origins:
+    - https://example.com
+    - https://app.example.com
+  allow_methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+  allow_headers:
+    - Authorization
+    - Content-Type
+    - X-Request-ID
+    - X-CSRF-Token
+  allow_credentials: true
+  max_age_seconds: 600
+  expose_headers: [X-Request-ID, X-RateLimit-Remaining, X-RateLimit-Reset]
+
+csrf:
+  enabled: true
+  cookie:
+    name: __Host-csrf
+    secure: true
+    http_only: true
+    same_site: Strict
+    path: /
+  header_name: X-CSRF-Token
+  rotate_secret_on_login: true
+  exempt_paths:
+    - /health
+    - /metrics
+    - /webhook/public/*
+
+sessions:
+  enabled: true
+  store: server                        # server, redis, database
+  cookie_name: __Host-session
+  ttl_seconds: 3600
+  idle_timeout_seconds: 900
+  cookie_secure: true
+  cookie_http_only: true
+  cookie_same_site: Lax
+  cookie_path: /
+  rotate_on_auth: true
+
+authentication:
+  modes: [jwt, session]
+  require_mfa_for_roles: [admin, security_admin]
+  mfa:
+    totp:
+      issuer: engine-core
+      drift_windows: 1
+    webauthn:
+      rp_id: example.com
+      user_verification: required
+  oauth:
+    enabled: true
+    providers:
+      github:
+        client_id_env: OAUTH_GITHUB_CLIENT_ID
+        client_secret_env: OAUTH_GITHUB_CLIENT_SECRET
+        scopes: ["read:user", "user:email"]
+        allow_organizations: []
+      google:
+        client_id_env: OAUTH_GOOGLE_CLIENT_ID
+        client_secret_env: OAUTH_GOOGLE_CLIENT_SECRET
+        scopes: ["openid", "email", "profile"]
+        hd_whitelist: []
+  service_tokens:
+    enabled: true
+    audience: ["engine-core-internal"]
+    rotation_days: 30
+    allow_algorithms: [ES256, EdDSA]
+
+authorization:
+  rbac:
+    roles:
+      anonymous:
+        allows: []
+      user:
+        allows:
+          - resource: profile
+            actions: [read, update]
+          - resource: assets
+            actions: [upload, read]
+      auditor:
+        allows:
+          - resource: audit_log
+            actions: [read]
+      admin:
+        allows:
+          - resource: "*"
+            actions: ["*"]
+      security_admin:
+        allows:
+          - resource: security_config
+            actions: [read, update]
+          - resource: audit_log
+            actions: [read, export]
+    default_role: anonymous
+    deny_by_default: true
+  abac:
+    enabled: false
+
+input_validation:
+  max_json_body_bytes: 1048576          # 1 MB
+  max_form_body_bytes: 2097152          # 2 MB
+  allowed_content_types:
+    - application/json
+    - multipart/form-data
+    - application/x-www-form-urlencoded
+  path_normalization: strict
+  disallow_null_bytes: true
+  patterns:
+    email: "^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$"
+    uuid: "^[0-9a-fA-F-]{36}$"
+  sql_safety:
+    orm_only: true
+    disallow_raw_sql: true
+  deserialization:
+    safe_yaml_loader: true
+    json_number_limit_digits: 20
+
+file_uploads:
+  enabled: true
+  dest_dir: uploads
+  max_file_bytes: 10485760              # 10 MB
+  allowed_extensions: [".jpg", ".jpeg", ".png", ".pdf"]
+  detect_mime_from_content: true
+  antivirus:
+    enabled: true
+    engine: clamd
+    socket: /var/run/clamd.scan/clamd.sock
+    timeout_ms: 3000
+  image_sanitization:
+    enabled: true
+    strip_metadata: true
+    reencode: true
+
+rate_limiting:
+  enabled: true
+  strategy: sliding_window
+  redis_dsn_env: RATE_LIMIT_REDIS_DSN
+  limits:
+    default:
+      requests: 100
+      per_seconds: 60
+      burst: 50
+    login:
+      requests: 10
+      per_seconds: 60
+      burst: 5
+    password_reset:
+      requests: 5
+      per_seconds: 3600
+      burst: 2
+  ip_whitelist: []
+  ip_blacklist: []
+
+anti_bruteforce:
+  enabled: true
+  login_fail_threshold: 5
+  cooloff_seconds: 900
+  user_and_ip_scoped: true
+
+bot_protection:
+  enabled: true
+  require_hard_challenges_on:
+    - /auth/login
+    - /auth/register
+    - /api/v1/payment/*
+  challenge_provider: turnstile          # или captcha
+  provider_secret_env: BOT_CHALLENGE_SECRET
+
+observability_security:
+  audit_log:
+    enabled: true
+    category_masks:
+      auth: true
+      admin_actions: true
+      data_export: true
+      security_changes: true
+    pii_redaction:
+      enabled: true
+      fields: ["email", "phone", "token", "ip"]
+  tamper_evident_hash_chain:
+    enabled: true
+    algorithm: SHA256
+  anomaly_detection:
+    enabled: true
+    thresholds:
+      sudden_401_rate_per_min: 50
+      geo_impossible_login_minutes: 15
+      mfa_bypass_attempts_per_hour: 3
+
+network_policies:
+  allowed_egress_hosts:
+    - api.payment.example.com:443
+    - storage.example.com:443
+  dns_resolver:
+    enforce_system_only: true
+  outbound_proxy:
+    enabled: false
+  spki_pinning:
+    enabled: true
+    pins:
+      - host: api.payment.example.com
+        base64_spki_hashes:
+          - "sha256-hash-base64-1"
+          - "sha256-hash-base64-2"
+
+webhooks:
+  signatures:
+    required: true
+    alg: HMACSHA256
+    secret_env: WEBHOOK_SECRET
+    tolerance_seconds: 300
+  ip_allowlist: []
+  retry_backoff:
+    initial_ms: 500
+    max_ms: 60000
+    factor: 2.0
+
+feature_flags:
+  enforce_security_headers: true
+  read_only_mode: false
+  strict_transport_security_required: true
+
+dependencies_policy:
+  allow_prereleases: false
+  allowed_licenses:
+    - MIT
+    - Apache-2.0
+    - BSD-2-Clause
+    - BSD-3-Clause
+  vulnerability_gate:
+    max_severity: high        # критические блокируют релиз
+    block_on_critical: true
+
+platform_hardening:
+  drop_privileges: true
+  no_new_privileges: true
+  seccomp_profile: default
+  restrict_sysfs_procfs: true
+  tmpfs_runtime_dirs: ["/tmp", "/run/engine"]
+  umask: "027"
+
+profiles:
+  production:
+    headers:
+      content_security_policy:
+        enabled: true
+    csrf:
+      enabled: true
+    cors:
+      allow_origins: ["https://example.com", "https://app.example.com"]
+    sessions:
+      cookie_secure: true
+      cookie_same_site: Lax
+    rate_limiting:
+      limits:
+        default:
+          requests: 100
+          per_seconds: 60
+          burst: 50
+  staging:
+    headers:
+      content_security_policy:
+        enabled: true
+    cors:
+      allow_origins: ["https://staging.example.com"]
+    rate_limiting:
+      limits:
+        default:
+          requests: 50
+          per_seconds: 60
+          burst: 25
+  development:
+    headers:
+      content_security_policy:
+        enabled: false
+    csrf:
+      enabled: true
+    cors:
+      allow_origins: ["http://localhost:3000", "http://127.0.0.1:3000"]
+    sessions:
+      cookie_secure: false
+      cookie_same_site: Lax
+    rate_limiting:
+      enabled: false

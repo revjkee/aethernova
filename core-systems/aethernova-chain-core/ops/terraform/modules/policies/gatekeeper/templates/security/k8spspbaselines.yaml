@@ -1,0 +1,302 @@
+# path: aethernova-chain-core/ops/terraform/modules/policies/gatekeeper/templates/security/k8spspbaselines.yaml
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8spspbaselines
+  annotations:
+    metadata.gatekeeper.sh/title: "PSS Baseline — consolidated"
+    metadata.gatekeeper.sh/version: "v1.0.0"
+    description: |
+      Consolidated PSS Baseline enforcement for Pods:
+      - Disallow privileged containers
+      - Disallow hostNetwork/hostPID/hostIPC
+      - Forbid hostPath volumes
+      - Limit capabilities.add to the PSS Baseline safe list
+      - Forbid/limit hostPort usage
+      - Forbid seccomp 'Unconfined'
+      - Restrict AppArmor overrides (RuntimeDefault/Localhost)
+      - Allow only the PSS 'safe' sysctls
+      - Block Windows HostProcess
+      References: Kubernetes PSS (Baseline) and Gatekeeper docs.
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sPSSBaseline
+      validation:
+        # OpenAPI v3 schema for user parameters
+        openAPIV3Schema:
+          type: object
+          properties:
+            allowedCapabilitiesAdd:
+              type: array
+              description: "Допустимые Capabilities для .securityContext.capabilities.add (PSS Baseline safe list)"
+              items:
+                type: string
+              default:
+                - AUDIT_WRITE
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+                - FSETID
+                - KILL
+                - MKNOD
+                - NET_BIND_SERVICE
+                - SETFCAP
+                - SETGID
+                - SETPCAP
+                - SETUID
+                - SYS_CHROOT
+            allowHostPorts:
+              type: boolean
+              description: "Разрешить hostPort только из списка allowedHostPorts"
+              default: false
+            allowedHostPorts:
+              type: array
+              description: "Список разрешённых hostPort (целые порты). Игнорируется, если allowHostPorts=false."
+              items:
+                type: integer
+                minimum: 1
+                maximum: 65535
+              default: []
+            allowedAppArmorProfiles:
+              type: array
+              description: "Разрешённые AppArmor профили для Pod/Container (кроме RuntimeDefault, который всегда допустим)"
+              items:
+                type: string
+              default:
+                - Localhost
+                - localhost/*
+                - runtime/default
+            allowedSysctls:
+              type: array
+              description: "Разрешённые 'safe' sysctls по PSS Baseline"
+              items:
+                type: string
+              default:
+                - kernel.shm_rmid_forced
+                - net.ipv4.ip_local_port_range
+                - net.ipv4.ip_unprivileged_port_start
+                - net.ipv4.tcp_syncookies
+                - net.ipv4.ping_group_range
+                - net.ipv4.ip_local_reserved_ports
+                - net.ipv4.tcp_keepalive_time
+                - net.ipv4.tcp_fin_timeout
+                - net.ipv4.tcp_keepalive_intvl
+                - net.ipv4.tcp_keepalive_probes
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8spspbaselines
+
+        import future.keywords.in
+        import data.lib.k8s.helpers as h
+
+        default params := {
+          "allowedCapabilitiesAdd": [
+            "AUDIT_WRITE","CHOWN","DAC_OVERRIDE","FOWNER","FSETID","KILL","MKNOD",
+            "NET_BIND_SERVICE","SETFCAP","SETGID","SETPCAP","SETUID","SYS_CHROOT"
+          ],
+          "allowHostPorts": false,
+          "allowedHostPorts": [],
+          "allowedAppArmorProfiles": ["Localhost","localhost/*","runtime/default"],
+          "allowedSysctls": [
+            "kernel.shm_rmid_forced",
+            "net.ipv4.ip_local_port_range",
+            "net.ipv4.ip_unprivileged_port_start",
+            "net.ipv4.tcp_syncookies",
+            "net.ipv4.ping_group_range",
+            "net.ipv4.ip_local_reserved_ports",
+            "net.ipv4.tcp_keepalive_time",
+            "net.ipv4.tcp_fin_timeout",
+            "net.ipv4.tcp_keepalive_intvl",
+            "net.ipv4.tcp_keepalive_probes"
+          ]
+        }
+
+        # Merge user-provided parameters
+        final_params := merge_objects(params, input.parameters)
+
+        # Shortcuts
+        pod := input.review.object
+
+        # Helpers ----------------------------------------------------------------
+
+        is_pod {
+          pod.kind == "Pod"
+        }
+
+        containers[c] {
+          c := pod.spec.containers[_]
+        }
+        init_containers[c] {
+          c := pod.spec.initContainers[_]
+        }
+        eph_containers[c] {
+          c := pod.spec.ephemeralContainers[_]
+        }
+
+        all_containers[c] {
+          containers[c]
+        }
+        all_containers[c] {
+          init_containers[c]
+        }
+        all_containers[c] {
+          eph_containers[c]
+        }
+
+        # Safe get
+        get(obj, path, default) = val {
+          some i
+          val := walk(obj, path)[_]
+        } else = default {
+          default := default
+        }
+
+        # hostPort collector
+        host_ports[p] {
+          c := all_containers[_]
+          p := c.ports[_].hostPort
+        }
+
+        # AppArmor annotations (legacy keys)
+        apparmor_anns := {k: v |
+          some k, v
+          k := input.review.object.metadata.annotations[k]
+          startswith(k, "container.apparmor.security.beta.kubernetes.io/")
+        }
+
+        # Violations -------------------------------------------------------------
+
+        # 1) Disallow Windows HostProcess (Baseline)
+        violation[{"msg": msg}] {
+          is_pod
+          # Any of the HostProcess flags set to true must be denied
+          some flag in {
+            get(pod.spec.securityContext, ["windowsOptions","hostProcess"], false),
+            get(c.securityContext, ["windowsOptions","hostProcess"], false) | c := all_containers[_]
+          }
+          flag == true
+          msg := "PSS Baseline: windowsOptions.hostProcess must be undefined/false"
+        }
+
+        # 2) Disallow host namespaces (hostNetwork/hostPID/hostIPC)
+        violation[{"msg": msg}] {
+          is_pod
+          (pod.spec.hostNetwork == true) or (pod.spec.hostPID == true) or (pod.spec.hostIPC == true)
+          msg := "PSS Baseline: hostNetwork/hostPID/hostIPC must be undefined/false"
+        }
+
+        # 3) Disallow privileged containers
+        violation[{"msg": msg}] {
+          is_pod
+          c := all_containers[_]
+          get(c.securityContext, ["privileged"], false) == true
+          msg := sprintf("PSS Baseline: privileged must be undefined/false (container: %q)", [c.name])
+        }
+
+        # 4) Capabilities.add limited to safe list
+        violation[{"msg": msg}] {
+          is_pod
+          c := all_containers[_]
+          some cap
+          cap := get(c.securityContext, ["capabilities","add"], [])
+          # find any capability not in safe list
+          some x
+          x := cap[_]
+          not x in final_params.allowedCapabilitiesAdd
+          msg := sprintf("PSS Baseline: capabilities.add contains disallowed capability %q (container: %q)", [x, c.name])
+        }
+
+        # 5) Forbid hostPath volumes entirely
+        violation[{"msg": msg}] {
+          is_pod
+          some v
+          v := pod.spec.volumes[_]
+          v.hostPath
+          msg := "PSS Baseline: hostPath volumes are forbidden"
+        }
+
+        # 6) Forbid/limit hostPort usage
+        violation[{"msg": msg}] {
+          is_pod
+          not final_params.allowHostPorts
+          some p
+          p := host_ports[_]
+          msg := sprintf("PSS Baseline: hostPort usage is disallowed (port: %v)", [p])
+        }
+
+        violation[{"msg": msg}] {
+          is_pod
+          final_params.allowHostPorts
+          some p
+          p := host_ports[_]
+          not p in final_params.allowedHostPorts
+          msg := sprintf("PSS Baseline: hostPort %v not in allowedHostPorts", [p])
+        }
+
+        # 7) Seccomp must not be Unconfined
+        violation[{"msg": msg}] {
+          is_pod
+          # Pod- or container-level seccomp type
+          # deny if any equals 'Unconfined'
+          get(pod.spec.securityContext, ["seccompProfile","type"], "") == "Unconfined"
+          msg := "PSS Baseline: seccompProfile.type must not be 'Unconfined'"
+        }
+        violation[{"msg": msg}] {
+          is_pod
+          c := all_containers[_]
+          get(c.securityContext, ["seccompProfile","type"], "") == "Unconfined"
+          msg := sprintf("PSS Baseline: seccompProfile.type must not be 'Unconfined' (container: %q)", [c.name])
+        }
+
+        # 8) AppArmor restrictions: only RuntimeDefault or allowed Localhost/*
+        violation[{"msg": msg}] {
+          is_pod
+          # Pod-level alpha/beta field (new structured field)
+          t := get(pod.spec.securityContext, ["appArmorProfile","type"], "")
+          t != ""  # defined
+          not (t == "RuntimeDefault" or t in final_params.allowedAppArmorProfiles)
+          msg := sprintf("PSS Baseline: appArmorProfile.type %q is not allowed (Pod)", [t])
+        }
+        violation[{"msg": msg}] {
+          is_pod
+          c := all_containers[_]
+          t := get(c.securityContext, ["appArmorProfile","type"], "")
+          t != ""
+          not (t == "RuntimeDefault" or t in final_params.allowedAppArmorProfiles)
+          msg := sprintf("PSS Baseline: appArmorProfile.type %q is not allowed (container: %q)", [t, c.name])
+        }
+        # Legacy annotation form: container.apparmor.security.beta.kubernetes.io/<name>
+        violation[{"msg": msg}] {
+          is_pod
+          some k, v
+          apparmor_anns[k]
+          not (v == "runtime/default" or startswith(v, "localhost/"))
+          msg := sprintf("PSS Baseline: AppArmor annotation %q must be runtime/default or localhost/* (got: %q)", [k, v])
+        }
+
+        # 9) Restrict /proc mount type
+        violation[{"msg": msg}] {
+          is_pod
+          c := all_containers[_]
+          pm := get(c.securityContext, ["procMount"], "Default")
+          pm != "Default"
+          msg := sprintf("PSS Baseline: procMount must be 'Default' (container: %q)", [c.name])
+        }
+
+        # 10) Sysctls limited to safe subset
+        violation[{"msg": msg}] {
+          is_pod
+          some s
+          s := get(pod.spec.securityContext, ["sysctls"], [])
+          some itm
+          itm := s[_]
+          name := itm.name
+          not name in final_params.allowedSysctls
+          msg := sprintf("PSS Baseline: sysctl %q is not in the allowed safe list", [name])
+        }
+
+  # Match only Pods; fine-grain scoping задаётся самим Constraint
+  enforcementAction: deny

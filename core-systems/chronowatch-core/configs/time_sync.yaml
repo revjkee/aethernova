@@ -1,0 +1,185 @@
+# chronowatch-core/configs/time_sync.yaml
+apiVersion: chronowatch.aethernova.io/v1
+kind: TimeSyncConfig
+metadata:
+  name: chronowatch-core-time-sync
+  labels:
+    app.kubernetes.io/name: chronowatch-core
+    app.kubernetes.io/component: timesync
+    app.kubernetes.io/part-of: chronowatch
+spec:
+  schemaVersion: 1
+  # Стратегия синхронизации: chrony|timesyncd|ptp|hybrid
+  strategy: chrony
+
+  # Часовой пояс приложения (отображение). Системное время — UTC.
+  timezone: Europe/Stockholm
+
+  # Общие пороги для мониторинга качества синхронизации
+  monitoring:
+    enabled: true
+    # Допустимое смещение относительно эталона (миллисекунды)
+    offsetThresholdsMs:
+      warning: 25
+      critical: 100
+    # Допустимый джиттер источников (миллисекунды)
+    jitterThresholdsMs:
+      warning: 10
+      critical: 50
+    # Минимальное число согласованных источников
+    minSynchronizedSources: 2
+    # Период экспорта метрик и проверки статуса
+    scrapeIntervalSec: 15
+
+  # NTP/NTS профиль. Используется при strategy: chrony|timesyncd|hybrid
+  ntp:
+    enabled: true
+    # Предпочтительная безопасность NTS (Network Time Security). Требует поддерживаемых серверов.
+    preferNTS: true
+    # Источники. Указывайте корпоративные NTS/NTP-серверы. Публичные добавляйте только при необходимости.
+    servers:
+      - host: "nts-a.internal.ntp"
+        nts: true          # включить NTS
+        ntsKePort: 4460    # порт NTS-KE; по умолчанию 4460
+        iburst: true       # быстрый старт
+        maxPoll: 10        # макс. интервал опроса 2^10 сек
+        minPoll: 6         # мин. интервал опроса 2^6 сек
+        trusted: true
+      - host: "nts-b.internal.ntp"
+        nts: true
+        iburst: true
+        maxPoll: 10
+        minPoll: 6
+        trusted: true
+    # Пулы как резерв. Пример для региона. Замените на корпоративные или региональные.
+    pools:
+      - name: "pool.ntp.org"
+        iburst: true
+        maxSources: 2
+        enabled: false
+    # Политика корректировок
+    policy:
+      # Разрешить резкий шаг системного времени при больших рассинхронизациях на старте
+      allowStartMakestep: true
+      makestep:
+        thresholdSeconds: 1.0
+        firstUpdates: 3
+      # Синхронизация RTC с системными часами
+      rtcSync: true
+      # Минимум согласованных источников до объявления sync
+      minSources: 2
+      # Ограничение источников по сетевайм hop или локальности
+      sourceFilters:
+        allowedSubnets: []   # например: ["10.0.0.0/8","192.168.0.0/16"]
+        denySubnets: []
+      # Leap smear требует специальных серверов; включайте только если источники поддерживают
+      leapSmear:
+        enabled: false
+
+    security:
+      # Траст-стор для проверки NTS
+      trustAnchors:
+        caBundlePath: "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+      # Пины публичных ключей NTS-KE серверов (опционально)
+      keyPins: []  # пример: ["sha256:AAAAAAAA...", "sha256:BBBBBBBB..."]
+
+  # Chrony-специфичные параметры. Активны при strategy: chrony|hybrid
+  chrony:
+    driftFile: "/var/lib/chrony/chrony.drift"
+    logDir: "/var/log/chrony"
+    # Аппаратные метки времени, если поддерживаются драйвером NIC
+    hwtimestamp:
+      enabled: false
+      interfaces: []  # например: ["eth0","eth1"]
+    # Дополнительные «сырые» строки, которые рендерер вставит в chrony.conf дословно
+    extraDirectives: []  # например: ["maxsources 8","minsources 2"]
+
+  # systemd-timesyncd профиль. Активен при strategy: timesyncd|hybrid
+  timesyncd:
+    fallbackNTP: []  # например: ["time1.internal.ntp","time2.internal.ntp"]
+    rootDistanceMaxSec: 5
+    pollIntervalMinSec: 32
+    pollIntervalMaxSec: 2048
+
+  # Профиль PTP для низкой латентности. Активен при strategy: ptp|hybrid
+  ptp:
+    enabled: false
+    interface: "eth0"
+    domainNumber: 0
+    delayMechanism: "E2E"   # E2E|P2P
+    clockClassFloor: 248     # избегать плохих мастер-часов
+    summaryInterval:
+      logAnnounceInterval: 1
+      logSyncInterval: 0
+      logMinDelayReqInterval: 0
+    # Дополнительные параметры ptp4l/phc2sys
+    ptp4lExtra: []
+    phc2sys:
+      enabled: true
+      # Синхронизировать системные часы от PHC интерфейса
+      source: "eno1"         # укажите интерфейс с PHC; пусто — автоопределение
+      stepThresholdNs: 5000000
+      pollIntervalSec: 4
+
+  # Интеграция с Kubernetes. Управляется DaemonSet-ом узлов или node-job-ом.
+  kubernetes:
+    enabled: true
+    # Управлять timesync демоном из кластера
+    manageNodeTimesync: false
+    # Аннотации для DaemonSet/Pod
+    podAnnotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9109"
+      prometheus.io/path: "/metrics"
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+    tolerations:
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+    nodeSelector: {}
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+      readOnlyRootFilesystem: false
+      capabilities:
+        add: ["CAP_SYS_TIME","CAP_NET_BIND_SERVICE"]
+
+  # Интеграция с Ansible/ops-рендерером
+  ops:
+    renderer: auto   # auto|ansible|helm|kustomize
+    # Куда рендерить итоговые конфиги на узле
+    paths:
+      chronyConf: "/etc/chrony.conf"
+      timesyncdConf: "/etc/systemd/timesyncd.conf"
+      ptp4lConf: "/etc/ptp4l.conf"
+      phc2sysConf: "/etc/phc2sys.conf"
+    systemd:
+      restartPolicy: on-change  # always|on-change|manual
+      units:
+        chrony: "chronyd.service"
+        timesyncd: "systemd-timesyncd.service"
+        ptp4l: "ptp4l.service"
+        phc2sys: "phc2sys.service"
+
+  # Верификация после применения
+  postApplyChecks:
+    # Команды или проверки, которые должен выполнить раннер
+    checks:
+      - name: "chrony-sources-synced"
+        when: "strategy in ['chrony','hybrid']"
+        cmd: "chronyc sources -v"
+        mustContain: ["^\\^\\*"]   # выбранный источник
+      - name: "offset-within-threshold"
+        cmd: "chronyc tracking | awk '/Last offset/ {print $3}'"
+        comparator: "abs_ms_lt"
+        thresholdMs: 25
+    timeoutSec: 30
+    retry:
+      attempts: 3
+      backoffSec: 5

@@ -1,0 +1,429 @@
+// SPDX-License-Identifier: Apache-2.0
+// engine-core/schemas/proto/v1/engine/telemetry.proto
+//
+// Промышленный API телеметрии (метрики, логи, трейсинг) с батч‑экспортом:
+//  - Ресурсные атрибуты и скоуп (инструментация)
+//  - Метрики: Counter/UpDownCounter/Gauge/Sum/Histogram/ExponentialHistogram/Summary
+//    * AggregationTemporality (DELTA/CUMULATIVE), monotonic, exemplars со ссылками на trace/span
+//  - Логи: структурированные записи, severity, атрибуты, контекст запроса
+//  - Трейсинг: спаны, события, ссылки, статус
+//  - Экспорт: Export{Metrics,Logs,Traces} с опциями (компрессия, идемпотентность, таймаут)
+//  - ACK/частичные ошибки через engine.v1.error.Error
+//
+// Требует: common.proto, error.proto
+
+syntax = "proto3";
+
+package engine.v1.engine;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "engine-core/schemas/proto/v1/common.proto";
+import "engine-core/schemas/proto/v1/error.proto";
+
+option go_package          = "github.com/yourorg/engine-core/gen/proto/engine/v1/engine;enginev1";
+option java_package        = "com.yourorg.engine.v1.engine";
+option java_multiple_files = true;
+option csharp_namespace    = "YourOrg.Engine.V1.Engine";
+option objc_class_prefix   = "ENG";
+option php_namespace       = "YourOrg\\Engine\\V1\\Engine";
+
+// -----------------------------
+// Базовые типы/атрибуты
+// -----------------------------
+
+// Универсальное значение атрибута (как в OTLP).
+message AttributeValue {
+  oneof value {
+    string string_value = 1;
+    bool bool_value = 2;
+    int64 int_value = 3;
+    double double_value = 4;
+    Array array_value = 5;
+    bytes bytes_value = 6; // для хэшей/идентификаторов
+  }
+  message Array {
+    repeated AttributeValue values = 1;
+  }
+}
+
+// Пара атрибутов.
+message KeyValue {
+  string key = 1;
+  AttributeValue value = 2;
+}
+
+// Описание ресурса (service, host, cloud, k8s, и пр.).
+message Resource {
+  repeated KeyValue attributes = 1; // напр.: service.name, service.version, host.name
+  reserved 2 to 10;
+}
+
+// Описание "скоупа" инструментирования (пакет/библиотека).
+message InstrumentationScope {
+  string name = 1;    // напр., "engine-core/metrics"
+  string version = 2; // "1.2.3"
+  repeated KeyValue attributes = 3;
+  reserved 4 to 10;
+}
+
+// -----------------------------
+// Метрики
+// -----------------------------
+
+enum AggregationTemporality {
+  AGGREGATION_TEMPORALITY_UNSPECIFIED = 0;
+  DELTA = 1;        // значение за интервал между start_time и time
+  CUMULATIVE = 2;   // накопительное от начала измерений
+}
+
+message Exemplar {
+  double as_double = 1;
+  int64 as_int = 2;
+  google.protobuf.Timestamp time = 3;
+  // Ссылка на трассировку (если есть).
+  bytes trace_id = 4; // 16 байт
+  bytes span_id = 5;  // 8 байт
+  repeated KeyValue filtered_attributes = 6; // атрибуты, не попавшие в агрегаты
+  reserved 7 to 10;
+}
+
+message NumberDataPoint {
+  message Flags {
+    bool no_recorded_value = 1; // недоступно значение
+  }
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp time = 2;
+  repeated KeyValue attributes = 3;
+  oneof value {
+    double as_double = 4;
+    int64 as_int = 5;
+  }
+  repeated Exemplar exemplars = 6;
+  uint32 count = 7; // если применимо (для агрегаторов)
+  Flags flags = 8;
+  reserved 9 to 20;
+}
+
+message HistogramDataPoint {
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp time = 2;
+  repeated KeyValue attributes = 3;
+  uint64 count = 4;
+  double sum = 5;
+  repeated double bucket_counts = 6; // длина = len(explicit_bounds)+1
+  repeated double explicit_bounds = 7; // возрастающие границы
+  repeated Exemplar exemplars = 8;
+  // Сумма квадратов (для stddev), если агрегатор поддерживает.
+  double sum_of_squared_deviation = 9;
+  reserved 10 to 20;
+}
+
+message ExponentialHistogramDataPoint {
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp time = 2;
+  repeated KeyValue attributes = 3;
+  int32 scale = 4;
+  int64 zero_count = 5;
+  // Бин с отрицательными и положительными экспоненциальными ведрами
+  message Buckets {
+    int32 offset = 1;
+    repeated uint64 bucket_counts = 2;
+  }
+  Buckets negative = 6;
+  Buckets positive = 7;
+  repeated Exemplar exemplars = 8;
+  double sum = 9;
+  uint64 count = 10;
+  reserved 11 to 20;
+}
+
+message SummaryDataPoint {
+  google.protobuf.Timestamp start_time = 1;
+  google.protobuf.Timestamp time = 2;
+  repeated KeyValue attributes = 3;
+  uint64 count = 4;
+  double sum = 5;
+  message QuantileValue {
+    double quantile = 1; // 0..1
+    double value = 2;
+  }
+  repeated QuantileValue quantile_values = 6; // напр.: 0.5, 0.9, 0.99
+  reserved 7 to 20;
+}
+
+enum MetricType {
+  METRIC_TYPE_UNSPECIFIED = 0;
+  GAUGE = 1;
+  SUM = 2;               // Counter/UpDownCounter (с семантикой ниже)
+  HISTOGRAM = 3;
+  EXPONENTIAL_HISTOGRAM = 4;
+  SUMMARY = 5;
+}
+
+// Описание метрики и её точек.
+message Metric {
+  string name = 1;       // "http.server.requests"
+  string description = 2;
+  string unit = 3;       // "1", "ms", "By"
+  MetricType type = 4;
+  // Для SUM:
+  bool monotonic = 5;    // true для Counter (неубывающий)
+  AggregationTemporality temporality = 6;
+
+  // Наборы точек данных в зависимости от типа.
+  repeated NumberDataPoint gauge = 10;                // если type = GAUGE
+  repeated NumberDataPoint sum = 11;                  // если type = SUM
+  repeated HistogramDataPoint histogram = 12;         // если type = HISTOGRAM
+  repeated ExponentialHistogramDataPoint exp_hist = 13; // если type = EXPONENTIAL_HISTOGRAM
+  repeated SummaryDataPoint summary = 14;             // если type = SUMMARY
+
+  reserved 15 to 20;
+}
+
+// Блок метрик для конкретного ресурса и скоупа.
+message ScopeMetrics {
+  InstrumentationScope scope = 1;
+  repeated Metric metrics = 2;
+  reserved 3 to 10;
+}
+
+message ResourceMetrics {
+  Resource resource = 1;
+  repeated ScopeMetrics scope_metrics = 2;
+  reserved 3 to 10;
+}
+
+// -----------------------------
+// Логи
+// -----------------------------
+
+enum LogSeverityNumber {
+  LOG_SEVERITY_NUMBER_UNSPECIFIED = 0;
+  TRACE = 1;
+  TRACE2 = 2;
+  TRACE3 = 3;
+  TRACE4 = 4;
+  DEBUG = 5;
+  DEBUG2 = 6;
+  DEBUG3 = 7;
+  DEBUG4 = 8;
+  INFO = 9;
+  INFO2 = 10;
+  INFO3 = 11;
+  INFO4 = 12;
+  WARN = 13;
+  WARN2 = 14;
+  WARN3 = 15;
+  WARN4 = 16;
+  ERROR = 17;
+  ERROR2 = 18;
+  ERROR3 = 19;
+  ERROR4 = 20;
+  FATAL = 21;
+  FATAL2 = 22;
+  FATAL3 = 23;
+  FATAL4 = 24;
+}
+
+message LogRecord {
+  google.protobuf.Timestamp time = 1;
+  google.protobuf.Timestamp observed_time = 2;
+  LogSeverityNumber severity_number = 3;
+  string severity_text = 4; // "INFO", "WARN", и т.п.
+  string body = 5;          // краткое сообщение (может быть пустым при json_body)
+  // Структурированные поля (ключ‑значение).
+  repeated KeyValue attributes = 6;
+
+  // Контекст трассировки.
+  bytes trace_id = 7; // 16 байт
+  bytes span_id = 8;  // 8 байт
+  string trace_flags = 9; // W3C flags (опционально)
+
+  // Произвольный бинарный payload (например, JSON) + content_type.
+  bytes payload = 10;
+  string content_type = 11; // "application/json", "text/plain"
+
+  reserved 12 to 20;
+}
+
+message ScopeLogs {
+  InstrumentationScope scope = 1;
+  repeated LogRecord records = 2;
+}
+
+message ResourceLogs {
+  Resource resource = 1;
+  repeated ScopeLogs scope_logs = 2;
+}
+
+// -----------------------------
+// Трейсинг
+// -----------------------------
+
+enum SpanKind {
+  SPAN_KIND_UNSPECIFIED = 0;
+  INTERNAL = 1;
+  SERVER = 2;
+  CLIENT = 3;
+  PRODUCER = 4;
+  CONSUMER = 5;
+}
+
+message Status {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    OK = 1;
+    ERROR = 2;
+  }
+  Code code = 1;
+  string message = 2;
+}
+
+message SpanEvent {
+  string name = 1;
+  google.protobuf.Timestamp time = 2;
+  repeated KeyValue attributes = 3;
+  reserved 4 to 10;
+}
+
+message SpanLink {
+  bytes trace_id = 1; // 16 байт
+  bytes span_id = 2;  // 8 байт
+  repeated KeyValue attributes = 3;
+  reserved 4 to 10;
+}
+
+message Span {
+  // Идентификаторы по W3C/OTLP: 16‑байтовый TraceID, 8‑байтовый SpanID.
+  bytes trace_id = 1;
+  bytes span_id = 2;
+  bytes parent_span_id = 3;
+
+  string name = 4;
+  SpanKind kind = 5;
+  google.protobuf.Timestamp start_time = 6;
+  google.protobuf.Timestamp end_time = 7;
+
+  repeated KeyValue attributes = 8;
+  repeated SpanEvent events = 9;
+  repeated SpanLink links = 10;
+
+  Status status = 11;
+
+  reserved 12 to 20;
+}
+
+message ScopeSpans {
+  InstrumentationScope scope = 1;
+  repeated Span spans = 2;
+}
+
+message ResourceSpans {
+  Resource resource = 1;
+  repeated ScopeSpans scope_spans = 2;
+}
+
+// -----------------------------
+// Экспорт и сервис
+// -----------------------------
+
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMP_NONE = 1;
+  COMP_GZIP = 2;
+  COMP_ZSTD = 3;
+}
+
+message ExportOptions {
+  Compression compression = 1;
+  google.protobuf.Duration timeout = 2;
+  string idempotency_key = 3;        // стабилизирует ответ при ретраях (>=24ч retention)
+  map<string, string> headers = 4;   // для out‑of‑band аутентификации на шлюзе, если нужно
+  reserved 5 to 10;
+}
+
+message ExportMetricsRequest {
+  repeated ResourceMetrics resource_metrics = 1;
+  ExportOptions options = 2;
+}
+
+message ExportMetricsResponse {
+  // Частичные ошибки на уровне батча (например, одна метрика отклонена).
+  repeated engine.v1.error.Error partial_errors = 1;
+  // Сводка приёма — для дебага.
+  uint64 accepted_points = 2;
+  reserved 3 to 10;
+}
+
+message ExportLogsRequest {
+  repeated ResourceLogs resource_logs = 1;
+  ExportOptions options = 2;
+}
+
+message ExportLogsResponse {
+  repeated engine.v1.error.Error partial_errors = 1;
+  uint64 accepted_records = 2;
+  reserved 3 to 10;
+}
+
+message ExportTracesRequest {
+  repeated ResourceSpans resource_spans = 1;
+  ExportOptions options = 2;
+}
+
+message ExportTracesResponse {
+  repeated engine.v1.error.Error partial_errors = 1;
+  uint64 accepted_spans = 2;
+  reserved 3 to 10;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool ready = 1;
+  string version = 2;
+  google.protobuf.Timestamp now = 3;
+}
+
+// Сервис экспорта телеметрии.
+// Конечные точки рекомендуется защищать аутентификацией и лимитами.
+service TelemetryService {
+  rpc ExportMetrics(ExportMetricsRequest) returns (ExportMetricsResponse);
+  rpc ExportLogs(ExportLogsRequest) returns (ExportLogsResponse);
+  rpc ExportTraces(ExportTracesRequest) returns (ExportTracesResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// -----------------------------
+// Контракты/инварианты реализации
+// -----------------------------
+//
+// 1) Метрики:
+//    - Для SUM при monotonic=true значения не уменьшаются в рамках одного временного ряда.
+//    - temporality:
+//        DELTA      => start_time и time ограничивают интервал; сервер агрегирует по окнам.
+//        CUMULATIVE => сервер может конвертировать в DELTA при необходимости хранения.
+//    - Histogram: len(bucket_counts) == len(explicit_bounds)+1, bounds возрастают.
+//    - Exemplars допускают привязку trace_id/span_id (для корреляции с трассировкой).
+//
+// 2) Логи:
+//    - severity_number определяет уровень; severity_text может быть пуст и маппится сервером.
+//    - payload+content_type применяйте для структурированных JSON; attributes — для индексации.
+//    - trace_id/span_id заполняйте при наличии активного контекста трассировки.
+//
+// 3) Трейсинг:
+//    - start_time <= end_time; parent_span_id может быть нулём для корневого спана.
+//    - links допускают связывание с внешними/асинхронными контекстами.
+//    - status.code=ERROR требует осмысленного message.
+//
+// 4) Экспорт:
+//    - Идемпотентность: одинаковый idempotency_key должен возвращать тот же итог для повторов.
+//    - compression управляет компрессией полезной нагрузки запроса; COMP_NONE — по умолчанию.
+//    - partial_errors содержат типизированные ошибки (INVALID_ARGUMENT, RESOURCE_EXHAUSTED и пр.).
+//
+// 5) Эволюция:
+//    - Поля, помеченные reserved, не переиспользовать.
+//    - Клиенты должны игнорировать незнакомые поля и новые варианты oneof/enums.
+//
+// Конец файла.

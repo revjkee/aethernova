@@ -1,0 +1,275 @@
+# ============================================
+# security-core :: env profile (development)
+# ============================================
+version: 1
+profile: "dev"
+
+meta:
+  service: "security-core"
+  environment: "dev"
+  base_url: "http://localhost:8080"
+  issuer: "http://localhost:8080"        # для JWT iss в dev
+  audience:
+    - "security-core"
+    - "http://localhost:8080"
+
+server:
+  bind_host: "0.0.0.0"
+  port: 8080
+  # В dev TLS обычно терминируется прокси/не используется
+  tls:
+    enabled: false
+  gzip: true
+  request_id_header: "X-Request-ID"
+  # Dev-автоперезагрузка кода/конфигов
+  dev_reload:
+    enabled: true
+    watch_paths:
+      - "./src/security_core"
+      - "./configs"
+    debounce_ms: 200
+
+security_headers:
+  hsts:
+    enabled: false               # в dev отключено
+  csp:
+    enabled: true
+    # Разрешаем localhost и data: для удобства UI в dev, но без unsafe-eval
+    policy: >
+      default-src 'self';
+      img-src 'self' data:;
+      font-src 'self' data:;
+      script-src 'self' 'unsafe-inline' http://localhost:3000 http://localhost:5173;
+      style-src 'self' 'unsafe-inline';
+      connect-src 'self' http://localhost:3000 http://localhost:5173 http://localhost:4318 http://localhost:4317;
+      frame-ancestors 'none';
+  referrer_policy: "no-referrer"
+
+cors:
+  enabled: true
+  allowed_origins:
+    - "http://localhost:3000"     # React (CRA)
+    - "http://localhost:5173"     # Vite
+    - "http://localhost:8080"     # локальный бэкенд
+  allowed_methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+  allowed_headers: ["Authorization","Content-Type","X-Request-ID","X-CSRF-Token"]
+  allow_credentials: true
+  max_age_sec: 600
+
+csrf:
+  enabled: true
+  mode: "double-submit-cookie"
+  header_name: "X-CSRF-Token"
+  cookie_name: "sc_csrf"
+  same_site: "Lax"
+  secure: false                   # dev: без TLS
+  domain: "localhost"
+
+storage:
+  postgres:
+    url_env: "SC_DB_URL"          # пример: postgres://user:pass@localhost:5432/security_core_dev
+    pool:
+      min: 1
+      max: 8
+      timeout_sec: 5
+    migrations:
+      run_on_start: true
+      directory: "./migrations"
+  redis:
+    url_env: "SC_REDIS_URL"       # пример: redis://localhost:6379/2
+    tls_required: false
+    namespace: "sc:dev"
+
+authn:
+  # В dev используем те же высокие стандарты, но с гибкими лимитами
+  local:
+    enabled: true
+    username_format: "email"
+    password_policy:
+      min_length: 10
+      require:
+        lower: true
+        upper: true
+        digit: true
+        symbol: false
+    account_lockout:
+      threshold: 20
+      window: "10m"
+      lockout_duration: "5m"
+  oidc:
+    enabled: true
+    providers:
+      - name: "dev-oidc"
+        issuer: "${DEV_OIDC_ISSUER:http://localhost:4444/}" # например, локальный провайдер
+        client_id_env: "DEV_OIDC_CLIENT_ID"
+        client_secret_env: "DEV_OIDC_CLIENT_SECRET"
+        scopes: ["openid","email","profile"]
+        pkce: "S256_required"
+        nonce_required: true
+        max_age_sec: 7200
+        claim_mapping:
+          sub: "subject"
+          email: "email"
+  mfa:
+    default: "optional"
+    methods:
+      totp:
+        enabled: true
+        issuer: "security-core (dev)"
+        period_sec: 30
+        digits: 6
+      webauthn:
+        enabled: true
+        rp_id: "localhost"
+        rp_name: "security-core dev"
+        origins: ["http://localhost:8080","http://localhost:3000","http://localhost:5173"]
+        attestation: "none"
+        user_verification: "preferred"
+
+sessions:
+  store:
+    type: "redis"
+    redis_url_env: "SC_REDIS_URL"
+    namespace: "sc:dev:sessions"
+    tls_required: false
+  cookie:
+    name: "sc_session_dev"
+    same_site: "Lax"
+    secure: false
+    http_only: true
+    domain: "localhost"
+    path: "/"
+  ttl:
+    access_token: "15m"
+    refresh_token: "7d"
+    absolute_session_lifetime: "14d"
+    idle_timeout: "60m"
+  refresh_rotation:
+    enabled: true
+    mode: "rotate-and-revoke-previous"
+
+jwt:
+  signing:
+    # В dev разрешаем эпhemeral‑ключи, чтобы не хранить приватный ключ на диске.
+    algorithm: "EdDSA"            # Ed25519; при несовместимости можно сменить на RS256
+    dev_key_mode: "ephemeral"     # ephemeral | file | env
+    file_path: "./runtime/dev-keys/jwt_signing_key.pem"
+    env_key_var: "SC_JWT_SIGNING_KEY_PEM"
+  claims:
+    issuer: "${JWT_ISSUER:http://localhost:8080}"
+    audience:
+      - "security-core"
+      - "http://localhost:8080"
+    include: ["sub","jti","iat","nbf","exp","tenant","roles","scopes"]
+    jti_uniqueness_ttl: "7d"
+    max_ttl: "20m"
+    leeway_sec: 60
+  jwks_publish:
+    enabled: true
+    path: "/.well-known/jwks.json"
+    cache_headers:
+      max_age_sec: 60
+  key_rotation:
+    schedule_cron: "@weekly"
+    overlap_ttl: "3d"
+
+rate_limits:
+  login:
+    per_ip_per_min: 40
+    per_identity_per_min: 20
+    burst: 40
+  totp_verify_per_min: 60
+  token_exchange_per_min: 120
+
+risk_engine:
+  ip_reputation:
+    enabled: false               # dev: по умолчанию off
+  geo_anomaly:
+    enabled: false
+  device_fingerprint:
+    enabled: false
+
+observability:
+  logging:
+    level: "DEBUG"
+    format: "json"
+    context_fields: ["request_id","trace_id","tenant","subject"]
+    pii_redaction:
+      enabled: true
+      fields: ["email","phone","ip"]
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+      additional_labels:
+        component: "authn"
+        tier: "dev"
+  tracing:
+    otlp:
+      enabled: true
+      # Локальный OTEL collector
+      endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4317}"
+      protocol: "grpc"
+      sample_ratio: 1.0
+
+privacy_compliance:
+  gdpr:
+    data_subject_rights: ["access","erase","export"]
+    retention_days:
+      auth_logs: 30
+      sessions: 7
+      revoked_tokens: 7
+    consent_required_for_analytics: false
+
+feature_flags:
+  enable_admin_console: true
+  enable_service_accounts: true
+  enable_policy_engine_opa: true
+  enable_webauthn_passkeys: true
+  # Dev‑специфичные флаги
+  dev_allow_seed_data: true
+  dev_verbose_errors: true
+
+seed:
+  enabled: true
+  tenant: "public"
+  admin_user:
+    email: "${DEV_ADMIN_EMAIL:admin@local}"
+    password_env: "DEV_ADMIN_PASSWORD"     # не хранить пароль в файле
+    require_mfa: false
+
+external_integrations:
+  email:
+    driver: "console"                       # console | smtp
+    smtp:
+      host_env: "DEV_SMTP_HOST"
+      port_env: "DEV_SMTP_PORT"
+      username_env: "DEV_SMTP_USER"
+      password_env: "DEV_SMTP_PASS"
+      tls: false
+  sms:
+    driver: "noop"                          # noop в dev
+  sentry:
+    enabled: false
+
+network_policies:
+  allowed_redirect_urls:
+    - "http://localhost:3000/callback"
+    - "http://localhost:5173/callback"
+    - "http://localhost:8080/callback"
+  ip_allowlist: []
+  ip_denylist: []
+
+paths:
+  runtime_dir: "./runtime"
+  tmp_dir: "./runtime/tmp"
+  uploads_dir: "./runtime/uploads"
+
+# Совместимость с Kubernetes/Helm: метки/аннотации для dev‑сборок
+k8s:
+  labels:
+    app.kubernetes.io/part-of: "core-systems"
+    app.kubernetes.io/component: "security-core"
+    observability.neurocity.io/tier: "dev"
+  annotations:
+    config.profile: "dev"

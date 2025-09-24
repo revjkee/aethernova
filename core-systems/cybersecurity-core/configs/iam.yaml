@@ -1,0 +1,503 @@
+# cybersecurity-core/configs/iam.yaml
+version: "1.0"
+kind: IAMConfig
+metadata:
+  org: "Aethernova"
+  system: "cybersecurity-core"
+  owners:
+    - email: sec-lead@aethernova.org
+    - email: platform-ops@aethernova.org
+  labels:
+    security.aethernova.io/tier: "core"
+    managed-by: "iam-controller"
+  annotations:
+    description: "Единая политика IAM и RBAC для платформы. Не содержит секретов."
+
+defaults:
+  mfa:
+    required: true
+    methods: ["webauthn", "totp"]
+    step_up:
+      enabled: true
+      when_roles: ["org:owner", "sec:incident-responder", "ops:sre"]
+  session:
+    max_duration: "8h"
+    default_duration: "1h"
+    require_reason_for_elevation: true
+    ip_allowlist_for_privileged:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+  device_posture:
+    require_compliant_device: true
+    os_allow: ["Windows", "macOS", "Linux"]
+    block_jailbreak_root: true
+
+identity_providers:
+  oidc:
+    enabled: true
+    issuer_url: "secret://idp/oidc#issuer_url"
+    client_id_ref: "secret://idp/oidc#client_id"
+    client_secret_ref: "secret://idp/oidc#client_secret"
+    claim_mappings:
+      subject: "sub"
+      email: "email"
+      groups: "groups"
+    groups_sync:
+      source: "SCIM"
+      interval: "10m"
+  saml:
+    enabled: false
+  webauthn:
+    enabled: true
+    rp_id: "auth.aethernova.org"
+    attestation: "none"
+
+directories:
+  users:
+    # Шаблоны маршрутизации пользователей в группы
+    routing:
+      - match_email_suffix: "@aethernova.org"
+        add_groups: ["grp:employees"]
+      - match_email_suffix: "@contractor.aethernova.org"
+        add_groups: ["grp:contractors"]
+  groups:
+    - id: "grp:employees"
+      description: "Все штатные сотрудники"
+    - id: "grp:contractors"
+      description: "Подрядчики с ограниченными правами"
+    - id: "grp:security"
+      description: "Команда безопасности"
+    - id: "grp:platform-ops"
+      description: "Платформенная команда SRE/DevOps"
+    - id: "grp:developers"
+      description: "Инженеры разработки"
+    - id: "grp:release-managers"
+      description: "Ответственные за релизы"
+    - id: "grp:auditors"
+      description: "Аудит и комплаенс"
+
+roles:
+  # Роли задают универсальные привилегии и скоупы. Привязки ниже.
+  - id: "org:owner"
+    description: "Организационный владелец (через JIT, под границей привилегий)."
+    scopes: ["global"]
+    permission_sets:
+      aws: ["aws:restricted-admin"]
+      gcp: ["gcp:org-view", "gcp:project-admin-guarded"]
+      azure: ["az:subscription-admin-guarded"]
+      k8s: ["k8s:cluster-admin-guarded"]
+  - id: "org:admin"
+    description: "Администратор организации (без критических опасных действий)."
+    scopes: ["global"]
+    permission_sets:
+      aws: ["aws:platform-admin"]
+      gcp: ["gcp:project-admin-guarded"]
+      azure: ["az:platform-admin"]
+      k8s: ["k8s:namespace-admin"]
+  - id: "sec:auditor"
+    description: "Только чтение журналов и конфигурации безопасности."
+    scopes: ["security", "observability"]
+    permission_sets:
+      aws: ["aws:security-audit"]
+      gcp: ["gcp:security-viewer"]
+      azure: ["az:security-reader"]
+      k8s: ["k8s:rbac-readonly", "k8s:observability-readonly"]
+  - id: "sec:incident-responder"
+    description: "IR: чтение, изоляция подов, дрова сети, сбор артефактов."
+    scopes: ["security"]
+    permission_sets:
+      aws: ["aws:ir-operator"]
+      gcp: ["gcp:ir-operator"]
+      azure: ["az:ir-operator"]
+      k8s: ["k8s:incident-operator"]
+  - id: "ops:sre"
+    description: "Эксплуатация платформы и инфраструктуры."
+    scopes: ["platform"]
+    permission_sets:
+      aws: ["aws:platform-operator"]
+      gcp: ["gcp:platform-operator"]
+      azure: ["az:platform-operator"]
+      k8s: ["k8s:platform-operator"]
+  - id: "dev:app-operator"
+    description: "Операторы приложений в своих неймспейсах."
+    scopes: ["apps"]
+    permission_sets:
+      k8s: ["k8s:ns-app-operator"]
+  - id: "dev:read-only"
+    description: "Только чтение логов/метрик/трассировок своего сервиса."
+    scopes: ["apps"]
+    permission_sets:
+      k8s: ["k8s:ns-readonly"]
+  - id: "dev:release-manager"
+    description: "Выпуск релизов, управление HelmRelease в своем домене."
+    scopes: ["apps"]
+    permission_sets:
+      k8s: ["k8s:ns-deployer"]
+
+bindings:
+  # Привязки групп/пользователей/сервис-аккаунтов к ролям
+  groups:
+    - group: "grp:security"
+      roles: ["org:admin", "sec:incident-responder", "sec:auditor"]
+    - group: "grp:platform-ops"
+      roles: ["ops:sre"]
+    - group: "grp:developers"
+      roles: ["dev:read-only", "dev:app-operator"]
+    - group: "grp:release-managers"
+      roles: ["dev:release-manager"]
+    - group: "grp:auditors"
+      roles: ["sec:auditor"]
+  users:
+    # Прямые назначения допускаются только для bootstrap
+    - email: "ceo@aethernova.org"
+      roles: ["org:owner"]
+      constraints:
+        jit:
+          required: true
+          max_duration: "2h"
+          approvals: 2
+  service_accounts:
+    - sa: "ci-runner"
+      namespace: "ci"
+      roles: ["dev:release-manager"]
+      constraints:
+        allowed_times: ["00:00-06:00Z", "18:00-23:59Z"]
+        require_oidc_federation: true
+
+permission_sets:
+  # Наборы разрешений со ссылками на policy templates и границы привилегий
+  aws:
+    policies:
+      - id: "aws:restricted-admin"
+        description: "Админ под жесткой границей привилегий и мандатными условиями."
+        boundary_ref: "aws:boundary/restricted"
+        managed:
+          - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+          - "arn:aws:iam::aws:policy/AdministratorAccess"
+        session_policy:
+          json: |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "DenyDangerous",
+                  "Effect": "Deny",
+                  "Action": [
+                    "iam:DeleteRole","iam:DeleteUser","iam:CreateAccessKey",
+                    "kms:DisableKey","kms:ScheduleKeyDeletion",
+                    "organizations:LeaveOrganization"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+      - id: "aws:platform-admin"
+        description: "Админ платформы без IAM/KMS критических действий."
+        managed: ["arn:aws:iam::aws:policy/PowerUserAccess"]
+      - id: "aws:security-audit"
+        description: "Аудиторские права"
+        managed:
+          - "arn:aws:iam::aws:policy/SecurityAudit"
+          - "arn:aws:iam::aws:policy/job-function/ViewOnlyAccess"
+      - id: "aws:platform-operator"
+        description: "Операции с EKS/EC2/ELB и наблюдаемостью."
+        inline:
+          json: |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {"Effect":"Allow","Action":["eks:*","ec2:Describe*","elasticloadbalancing:*","logs:*","cloudwatch:*","autoscaling:*"],"Resource":"*"},
+                {"Effect":"Deny","Action":["iam:*","kms:*"],"Resource":"*"}
+              ]
+            }
+      - id: "aws:ir-operator"
+        description: "IR: изоляция нод/подов, снимки дисков, чтение логов."
+        inline:
+          json: |
+            {
+              "Version":"2012-10-17",
+              "Statement":[
+                {"Effect":"Allow","Action":["ec2:CreateSnapshot","ec2:CreateTags","ec2:ModifyInstanceAttribute","ec2:RebootInstances","ssm:StartSession","ssm:SendCommand"],"Resource":"*"},
+                {"Effect":"Allow","Action":["logs:FilterLogEvents","logs:GetLogEvents","cloudwatch:Get*","cloudwatch:List*"],"Resource":"*"},
+                {"Effect":"Deny","Action":["iam:*","kms:*"],"Resource":"*"}
+              ]
+            }
+    boundaries:
+      - id: "aws:boundary/restricted"
+        json: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {"Effect":"Deny","Action":[
+                "iam:*","organizations:*","kms:ScheduleKeyDeletion","kms:DisableKey",
+                "ec2:TerminateInstances","s3:DeleteBucket","s3:PutBucketPolicy"
+              ],"Resource":"*"}
+            ]
+          }
+
+  gcp:
+    roles:
+      - id: "gcp:org-view"
+        bindings:
+          - project: "*"
+            role: "roles/viewer"
+      - id: "gcp:project-admin-guarded"
+        conditional_bindings:
+          - project: "*"
+            role: "roles/editor"
+            condition:
+              title: "BusinessHoursOnly"
+              expression: 'request.time.getHours("UTC") >= 6 && request.time.getHours("UTC") <= 20'
+      - id: "gcp:security-viewer"
+        bindings:
+          - project: "*"
+            role: "roles/iam.securityReviewer"
+      - id: "gcp:platform-operator"
+        bindings:
+          - project: "*"
+            role: "roles/container.admin"
+        denies:
+          - role: "roles/iam.admin"
+  azure:
+    role_definitions:
+      - id: "az:subscription-admin-guarded"
+        built_in: "Owner"
+        deny_assignments:
+          - actions: ["Microsoft.Authorization/*/Delete","Microsoft.KeyVault/vaults/delete"]
+      - id: "az:platform-admin"
+        built_in: "Contributor"
+      - id: "az:security-reader"
+        built_in: "Security Reader"
+      - id: "az:platform-operator"
+        built_in: "Monitoring Contributor"
+      - id: "az:ir-operator"
+        custom:
+          actions:
+            - "Microsoft.Compute/virtualMachines/restart/action"
+            - "Microsoft.Compute/virtualMachines/deallocate/action"
+            - "Microsoft.Insights/*/read"
+          not_actions: ["Microsoft.Authorization/*", "Microsoft.KeyVault/*"]
+
+kubernetes:
+  # Абстракция над RBAC; применяется контROLLERом в реальные ClusterRole/Role
+  cluster_roles:
+    - id: "k8s:cluster-admin-guarded"
+      rules:
+        - apiGroups: ["*"]
+          resources: ["*"]
+          verbs: ["*"]
+      deny_rules:
+        - apiGroups: [""]
+          resources: ["secrets"]
+          verbs: ["delete"]
+    - id: "k8s:platform-operator"
+      rules:
+        - apiGroups: ["apps","batch"]
+          resources: ["deployments","statefulsets","daemonsets","jobs","cronjobs"]
+          verbs: ["get","list","watch","create","update","patch","delete"]
+        - apiGroups: [""]
+          resources: ["services","endpoints","configmaps","events","pods","pods/eviction","persistentvolumeclaims"]
+          verbs: ["*"]
+    - id: "k8s:incident-operator"
+      rules:
+        - apiGroups: [""]
+          resources: ["pods","pods/exec","pods/ephemeralcontainers"]
+          verbs: ["get","list","watch","create","update","patch","delete"]
+        - apiGroups: ["networking.k8s.io"]
+          resources: ["networkpolicies"]
+          verbs: ["create","update","patch","delete"]
+  namespace_roles:
+    - id: "k8s:ns-app-operator"
+      rules:
+        - apiGroups: ["apps","batch"]
+          resources: ["deployments","statefulsets","jobs","cronjobs"]
+          verbs: ["get","list","watch","create","update","patch","delete"]
+        - apiGroups: [""]
+          resources: ["pods","pods/exec","services","endpoints","configmaps","events","persistentvolumeclaims"]
+          verbs: ["*"]
+    - id: "k8s:ns-deployer"
+      rules:
+        - apiGroups: ["helm.toolkit.fluxcd.io","kustomize.toolkit.fluxcd.io"]
+          resources: ["helmreleases","kustomizations"]
+          verbs: ["get","list","watch","create","update","patch","delete"]
+    - id: "k8s:ns-readonly"
+      rules:
+        - apiGroups: ["*"]
+          resources: ["*"]
+          verbs: ["get","list","watch"]
+    - id: "k8s:rbac-readonly"
+      rules:
+        - apiGroups: ["rbac.authorization.k8s.io"]
+          resources: ["roles","clusterroles","rolebindings","clusterrolebindings"]
+          verbs: ["get","list","watch"]
+    - id: "k8s:observability-readonly"
+      rules:
+        - apiGroups: [""]
+          resources: ["pods","services","endpoints","events"]
+          verbs: ["get","list","watch"]
+
+  bindings:
+    # Массовые добавления по шаблонам
+    namespace_selector:
+      - match_labels: {"team": "platform"}
+        add_roles:
+          groups:
+            - group: "grp:platform-ops"
+              roles: ["k8s:platform-operator"]
+      - match_labels: {"env": "prod"}
+        add_roles:
+          groups:
+            - group: "grp:auditors"
+              roles: ["k8s:observability-readonly","k8s:rbac-readonly"]
+    explicit:
+      - namespace: "observability"
+        groups:
+          - group: "grp:platform-ops"
+            roles: ["k8s:platform-operator"]
+          - group: "grp:auditors"
+            roles: ["k8s:observability-readonly"]
+      - namespace: "ci"
+        service_accounts:
+          - sa: "ci-runner"
+            roles: ["k8s:ns-deployer"]
+
+workload_identity:
+  aws_irsa:
+    enabled: true
+    roles:
+      - namespace: "observability"
+        service_account: "otel-collector"
+        role_arn: "arn:aws:iam::123456789012:role/wi-otel-collector"
+        policy_ref: "aws:platform-operator"
+      - namespace: "ci"
+        service_account: "ci-runner"
+        role_arn: "arn:aws:iam::123456789012:role/wi-ci-runner"
+        policy_ref: "aws:platform-operator"
+  gcp_wi:
+    enabled: true
+    bindings:
+      - namespace: "observability"
+        service_account: "otel-collector"
+        gcp_service_account: "otel-collector@proj.iam.gserviceaccount.com"
+        roles: ["roles/logging.logWriter","roles/monitoring.metricWriter"]
+  azure_federated_identity:
+    enabled: true
+    bindings:
+      - namespace: "observability"
+        service_account: "otel-collector"
+        federated_identity_credential_name: "fic-otel-collector"
+        client_id_ref: "secret://azure/sp-otel#client_id"
+        tenant_id_ref: "secret://azure/sp-otel#tenant_id"
+
+jit_access:
+  enabled: true
+  approvers_groups: ["grp:security","grp:platform-ops"]
+  min_approvals: 2
+  max_duration: "2h"
+  cooldown: "4h"
+  audit_reason_required: true
+  ticket_reference_required: true
+
+break_glass:
+  enabled: false
+  ephemeral_role: "org:owner"
+  max_duration: "1h"
+  approvals: 2
+  conditions:
+    business_hours_only: false
+    geo_restrictions: ["EU","US"]
+  audit:
+    sinks:
+      - type: "otlp"
+        endpoint: "otel-collector.observability.svc.cluster.local:4317"
+      - type: "syslog"
+        endpoint: "security-syslog.platform-security.svc.cluster.local:514"
+
+secrets_management:
+  providers:
+    - type: "vault"
+      mount: "kv/platform"
+      address_ref: "secret://vault/core#addr"
+      token_ref: "secret://vault/core#token"
+    - type: "aws-secrets-manager"
+      region: "eu-central-1"
+    - type: "gcp-secret-manager"
+      project: "aethernova-prod"
+    - type: "azure-key-vault"
+      vault_name: "aethernova-kv-prod"
+  policies:
+    forbid_inline_secrets: true
+    rotation_days:
+      access_keys: 30
+      tokens: 7
+      oidc_clients: 90
+
+sso_apps:
+  - name: "Grafana"
+    protocol: "OIDC"
+    audience: "grafana"
+    default_groups: ["grp:employees"]
+    role_mappings:
+      "grp:auditors": ["Viewer"]
+      "grp:platform-ops": ["Admin"]
+  - name: "ArgoCD"
+    protocol: "OIDC"
+    audience: "argo"
+    role_mappings:
+      "grp:developers": ["role:readonly"]
+      "grp:release-managers": ["role:admin"]
+
+policy_as_code:
+  opa:
+    bundles:
+      - name: "admission-baseline"
+        ref: "configmap://cybersecurity-core/cybersecurity-core-config#opa-policies.rego"
+    mandatory_enforcement: true
+
+audit:
+  sinks:
+    - type: "loki"
+      url: "http://loki.observability.svc.cluster.local:3100"
+    - type: "otlp"
+      endpoint: "otel-collector.observability.svc.cluster.local:4317"
+  detections:
+    - id: "iam:privilege-escalation-attempt"
+      match:
+        provider: ["aws","gcp","azure"]
+        action_in:
+          - "iam:PassRole"
+          - "iam:AttachRolePolicy"
+          - "resourcemanager.projects.setIamPolicy"
+          - "Microsoft.Authorization/roleAssignments/write"
+      severity: "high"
+    - id: "k8s:secrets-deletion"
+      match:
+        provider: ["k8s"]
+        resource: ["secrets"]
+        verb: ["delete"]
+      severity: "critical"
+
+compliance:
+  frameworks:
+    - name: "CIS-Kubernetes-1.24"
+      mode: "monitor"
+    - name: "ISO-27001"
+      mode: "monitor"
+  controls:
+    - id: "AC-2"
+      title: "Account Management"
+      status: "implemented"
+      refs: ["identity_providers","directories","jit_access","break_glass"]
+    - id: "AC-6"
+      title: "Least Privilege"
+      status: "implemented"
+      refs: ["roles","permission_sets","kubernetes.cluster_roles","permission_sets.aws.boundaries"]
+
+change_management:
+  approvals_required: 1
+  signer_keys:
+    - "pgp:security-signing-key-1"
+    - "pgp:platform-signing-key-2"
+  provenance:
+    sbom_required: true

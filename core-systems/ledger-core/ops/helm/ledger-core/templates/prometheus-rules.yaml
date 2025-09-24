@@ -1,0 +1,267 @@
+{{- /*
+ops/helm/ledger-core/templates/prometheus-rules.yaml
+
+Values пример:
+monitoring:
+  enabled: true
+  alerts:
+    enabled: true
+    selector:
+      extraMatchLabels: {}   # доп. лейблы для селектора pod'ов (например, {"app.kubernetes.io/instance": "prod"})
+    severity:
+      warning: warning
+      critical: critical
+    availability:
+      minReadyPods: 1
+      for: 5m
+    errors:
+      rateThresholdWarning: 0.02   # 2% 5xx
+      rateThresholdCritical: 0.10  # 10% 5xx
+      for: 5m
+    latency:
+      p95: 0.5                     # секунды
+      p99: 1.0
+      for: 10m
+    restarts:
+      increases5m: 3
+      for: 10m
+    memory:
+      usageToLimitWarning: 0.85
+      usageToLimitCritical: 0.95
+      for: 10m
+    cpu:
+      throttlingRatio: 0.25
+      for: 10m
+    queue:                         # опционально; сработает только если есть такие метрики
+      enabled: true
+      backlogMetric: 'ledger_worker_queue_backlog'   # суммарный бэклог
+      oldestAgeMetric: 'ledger_worker_oldest_job_age_seconds'
+      backlogWarning: 100
+      backlogCritical: 1000
+      oldestWarning: 300
+      oldestCritical: 900
+*/ -}}
+{{- if and .Values.monitoring.enabled .Values.monitoring.alerts.enabled (has "monitoring.coreos.com/v1" .Capabilities.APIVersions) }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "ledger-core.fullname" . }}-rules
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "ledger-core.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/part-of: ledger
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  groups:
+    - name: {{ include "ledger-core.fullname" . }}.availability
+      rules:
+        # Готовность pod'ов приложения (по стандартным меткам и kube-state-metrics)
+        - alert: LedgerCoreNoReadyPods
+          expr: |
+            (
+              sum by (namespace) (
+                kube_pod_status_ready{condition="true"} * on(namespace,pod) group_left(label_app_kubernetes_io_name)
+                kube_pod_labels{namespace="{{ .Release.Namespace }}",label_app_kubernetes_io_name="{{ include "ledger-core.name" . }}"
+                  {{- range $k, $v := (default dict .Values.monitoring.alerts.selector.extraMatchLabels) }},label_{{ $k }}="{{ $v }}"{{- end }}
+                }
+              )
+            ) < {{ default 1 .Values.monitoring.alerts.availability.minReadyPods }}
+          for: {{ default "5m" .Values.monitoring.alerts.availability.for }}
+          labels:
+            severity: {{ default "critical" .Values.monitoring.alerts.severity.critical }}
+          annotations:
+            summary: "Ledger-core: нет достаточного числа готовых pod'ов"
+            description: "В namespace {{ .Release.Namespace }} количество Ready pod'ов ниже порога."
+            runbook_url: https://runbooks.example.com/ledger-core/availability
+
+    - name: {{ include "ledger-core.fullname" . }}.errors
+      rules:
+        # Доля 5xx (вариант для http_requests_total)
+        - alert: LedgerCoreHighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}", status=~"5.."
+                {{- /* Пытаемся фильтровать по меткам приложения, если они пробрасываются в метрики */ -}}
+                ,app=~"{{ include "ledger-core.name" . }}|{{ include "ledger-core.fullname" . }}"
+              }[5m])) by ()
+            ) / clamp_min(
+              sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}"
+                ,app=~"{{ include "ledger-core.name" . }}|{{ include "ledger-core.fullname" . }}"
+              }[5m])) by (), 1
+            ) > {{ default 0.1 .Values.monitoring.alerts.errors.rateThresholdCritical }}
+          for: {{ default "5m" .Values.monitoring.alerts.errors.for }}
+          labels:
+            severity: {{ default "critical" .Values.monitoring.alerts.severity.critical }}
+          annotations:
+            summary: "Ledger-core: высокий уровень 5xx (http_requests_total)"
+            description: "Доля 5xx превышает критический порог в {{ default 0.1 .Values.monitoring.alerts.errors.rateThresholdCritical }}."
+            runbook_url: https://runbooks.example.com/ledger-core/http-errors
+        # Доля 5xx (вариант для http_server_requests_seconds_count — Spring/Actuator)
+        - alert: LedgerCoreHighErrorRateSpring
+          expr: |
+            (
+              sum(rate(http_server_requests_seconds_count{namespace="{{ .Release.Namespace }}", status=~"5.."
+                ,uri!~"/actuator/.*"
+              }[5m])) by ()
+            ) / clamp_min(
+              sum(rate(http_server_requests_seconds_count{namespace="{{ .Release.Namespace }}", uri!~"/actuator/.*"}[5m])) by (), 1
+            ) > {{ default 0.02 .Values.monitoring.alerts.errors.rateThresholdWarning }}
+          for: {{ default "5m" .Values.monitoring.alerts.errors.for }}
+          labels:
+            severity: {{ default "warning" .Values.monitoring.alerts.severity.warning }}
+          annotations:
+            summary: "Ledger-core: повышенная доля 5xx (Spring)"
+            description: "Доля 5xx превышает warning‑порог {{ default 0.02 .Values.monitoring.alerts.errors.rateThresholdWarning }}."
+            runbook_url: https://runbooks.example.com/ledger-core/http-errors
+
+    - name: {{ include "ledger-core.fullname" . }}.latency
+      rules:
+        # P95 latency (универсальный: берём max из двух типичных гистограмм, если одна отсутствует)
+        - alert: LedgerCoreHighLatencyP95
+          expr: |
+            max(
+              histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace="{{ .Release.Namespace }}"}[5m]))),
+              histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{namespace="{{ .Release.Namespace }}", uri!~"/actuator/.*"}[5m])))
+            ) > {{ default 0.5 .Values.monitoring.alerts.latency.p95 }}
+          for: {{ default "10m" .Values.monitoring.alerts.latency.for }}
+          labels:
+            severity: {{ default "warning" .Values.monitoring.alerts.severity.warning }}
+          annotations:
+            summary: "Ledger-core: P95 латентность выше порога"
+            description: "P95 > {{ default 0.5 .Values.monitoring.alerts.latency.p95 }}s в течение {{ default "10m" .Values.monitoring.alerts.latency.for }}."
+            runbook_url: https://runbooks.example.com/ledger-core/latency
+        - alert: LedgerCoreHighLatencyP99
+          expr: |
+            max(
+              histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{namespace="{{ .Release.Namespace }}"}[5m]))),
+              histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{namespace="{{ .Release.Namespace }}", uri!~"/actuator/.*"}[5m])))
+            ) > {{ default 1.0 .Values.monitoring.alerts.latency.p99 }}
+          for: {{ default "10m" .Values.monitoring.alerts.latency.for }}
+          labels:
+            severity: {{ default "critical" .Values.monitoring.alerts.severity.critical }}
+          annotations:
+            summary: "Ledger-core: P99 латентность критическая"
+            description: "P99 > {{ default 1.0 .Values.monitoring.alerts.latency.p99 }}s."
+            runbook_url: https://runbooks.example.com/ledger-core/latency
+
+    - name: {{ include "ledger-core.fullname" . }}.stability
+      rules:
+        - alert: LedgerCoreCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="{{ .Release.Namespace }}"
+              }[5m]) > {{ default 3 .Values.monitoring.alerts.restarts.increases5m }}
+          for: {{ default "10m" .Values.monitoring.alerts.restarts.for }}
+          labels:
+            severity: {{ default "warning" .Values.monitoring.alerts.severity.warning }}
+          annotations:
+            summary: "Ledger-core: повышенные рестарты контейнеров"
+            description: "Контейнеры рестартуют чаще порога в namespace {{ .Release.Namespace }}."
+            runbook_url: https://runbooks.example.com/ledger-core/crashloop
+
+    - name: {{ include "ledger-core.fullname" . }}.saturation
+      rules:
+        - alert: LedgerCoreHighMemoryUsage
+          expr: |
+            max by (pod) (
+              container_memory_working_set_bytes{namespace="{{ .Release.Namespace }}", container!=""}
+              /
+              clamp_min(container_spec_memory_limit_bytes{namespace="{{ .Release.Namespace }}", container!=""}, 1)
+            )
+            > {{ default 0.85 .Values.monitoring.alerts.memory.usageToLimitWarning }}
+          for: {{ default "10m" .Values.monitoring.alerts.memory.for }}
+          labels:
+            severity: {{ default "warning" .Values.monitoring.alerts.severity.warning }}
+          annotations:
+            summary: "Ledger-core: высокая загрузка памяти"
+            description: "Использование памяти pod превышает {{ mul 100 (default 0.85 .Values.monitoring.alerts.memory.usageToLimitWarning) }}% лимита."
+            runbook_url: https://runbooks.example.com/ledger-core/resources
+        - alert: LedgerCoreMemoryAlmostFull
+          expr: |
+            max by (pod) (
+              container_memory_working_set_bytes{namespace="{{ .Release.Namespace }}", container!=""}
+              /
+              clamp_min(container_spec_memory_limit_bytes{namespace="{{ .Release.Namespace }}", container!=""}, 1)
+            )
+            > {{ default 0.95 .Values.monitoring.alerts.memory.usageToLimitCritical }}
+          for: {{ default "10m" .Values.monitoring.alerts.memory.for }}
+          labels:
+            severity: {{ default "critical" .Values.monitoring.alerts.severity.critical }}
+          annotations:
+            summary: "Ledger-core: память почти исчерпана"
+            description: "Использование памяти > {{ mul 100 (default 0.95 .Values.monitoring.alerts.memory.usageToLimitCritical) }}% лимита."
+            runbook_url: https://runbooks.example.com/ledger-core/resources
+        - alert: LedgerCoreCpuThrottlingHigh
+          expr: |
+            (
+              sum by (pod) (rate(container_cpu_cfs_throttled_periods_total{namespace="{{ .Release.Namespace }}", container!=""}[5m]))
+              /
+              clamp_min(sum by (pod) (rate(container_cpu_cfs_periods_total{namespace="{{ .Release.Namespace }}", container!=""}[5m])), 1)
+            ) > {{ default 0.25 .Values.monitoring.alerts.cpu.throttlingRatio }}
+          for: {{ default "10m" .Values.monitoring.alerts.cpu.for }}
+          labels:
+            severity: {{ default "warning" .Values.monitoring.alerts.severity.warning }}
+          annotations:
+            summary: "Ledger-core: высокий CPU throttling"
+            description: "Доля throttled периодов превосходит порог."
+            runbook_url: https://runbooks.example.com/ledger-core/resources
+
+    {{- if .Values.monitoring.alerts.queue.enabled }}
+    - name: {{ include "ledger-core.fullname" . }}.queue
+      rules:
+        - alert: LedgerCoreQueueBacklogHigh
+          expr: |
+            clamp_max(
+              sum({{ .Values.monitoring.alerts.queue.backlogMetric }}{namespace="{{ .Release.Namespace }}"}) by (),
+              +Inf
+            ) > {{ default 100 .Values.monitoring.alerts.queue.backlogWarning }}
+          for: 10m
+          labels:
+            severity: {{ default "warning" .Values.monitoring.alerts.severity.warning }}
+          annotations:
+            summary: "Ledger-core: рост бэклога очереди"
+            description: "Backlog > {{ default 100 .Values.monitoring.alerts.queue.backlogWarning }} задач."
+            runbook_url: https://runbooks.example.com/ledger-core/queue
+        - alert: LedgerCoreQueueBacklogCritical
+          expr: |
+            clamp_max(
+              sum({{ .Values.monitoring.alerts.queue.backlogMetric }}{namespace="{{ .Release.Namespace }}"}) by (),
+              +Inf
+            ) > {{ default 1000 .Values.monitoring.alerts.queue.backlogCritical }}
+          for: 10m
+          labels:
+            severity: {{ default "critical" .Values.monitoring.alerts.severity.critical }}
+          annotations:
+            summary: "Ledger-core: критический бэклог очереди"
+            description: "Backlog > {{ default 1000 .Values.monitoring.alerts.queue.backlogCritical }} задач."
+            runbook_url: https://runbooks.example.com/ledger-core/queue
+        - alert: LedgerCoreOldestJobAgeHigh
+          expr: |
+            clamp_max(
+              max({{ .Values.monitoring.alerts.queue.oldestAgeMetric }}{namespace="{{ .Release.Namespace }}"}) by (),
+              +Inf
+            ) > {{ default 300 .Values.monitoring.alerts.queue.oldestWarning }}
+          for: 10m
+          labels:
+            severity: {{ default "warning" .Values.monitoring.alerts.severity.warning }}
+          annotations:
+            summary: "Ledger-core: большой возраст старейшей задачи"
+            description: "Возраст старейшей задачи превышает {{ default 300 .Values.monitoring.alerts.queue.oldestWarning }}s."
+            runbook_url: https://runbooks.example.com/ledger-core/queue
+        - alert: LedgerCoreOldestJobAgeCritical
+          expr: |
+            clamp_max(
+              max({{ .Values.monitoring.alerts.queue.oldestAgeMetric }}{namespace="{{ .Release.Namespace }}"}) by (),
+              +Inf
+            ) > {{ default 900 .Values.monitoring.alerts.queue.oldestCritical }}
+          for: 10m
+          labels:
+            severity: {{ default "critical" .Values.monitoring.alerts.severity.critical }}
+          annotations:
+            summary: "Ledger-core: критический возраст старейшей задачи"
+            description: "Возраст старейшей задачи превышает {{ default 900 .Values.monitoring.alerts.queue.oldestCritical }}s."
+            runbook_url: https://runbooks.example.com/ledger-core/queue
+    {{- end }}
+{{- end }}

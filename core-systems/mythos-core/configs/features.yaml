@@ -1,0 +1,274 @@
+version: 1
+schema_url: https://spec.aethernova.dev/mythos-core/feature-flags.schema.json
+generated_at: 2025-08-27T00:00:00Z
+
+defaults:
+  evaluation_order:
+    - prerequisites
+    - kill_switch
+    - schedules
+    - targets_allow_deny
+    - rules
+    - percentage
+    - fallback
+  stickiness:
+    attribute: user.id            # допустимо: user.id, session.id, device.id, custom.<attr>
+    salt: mythos-core-2025        # измените при полной перетасовке бакетов
+    algorithm: murmur3            # совместимо со многими SDK
+  rollout_precision: 0.1          # шаг процента
+  unknown_flag_behavior: off      # off | error | passthrough
+  time_zone: UTC
+
+environments:
+  # Значения по умолчанию применяются ко всем окружениям, далее можно переопределять
+  _base: &env_base
+    traffic: 100
+    constraints:
+      # Общие ограничения окружения (например, блок «реальных» пользователей в stage)
+      - cel: env.name != "stage" || user.org in ["aethernova","neurocity","qa"]
+  dev:
+    <<: *env_base
+    name: dev
+  stage:
+    <<: *env_base
+    name: stage
+  prod:
+    <<: *env_base
+    name: prod
+    constraints:
+      - cel: request.ip not_in cidr("10.0.0.0/8") || true   # пример зарезервирован для будущих ограничений
+
+attributes:
+  # Справочник доступных атрибутов для правил (валидация в CI)
+  user.id:         { type: string, required: true }
+  user.org:        { type: string, enum: ["aethernova","neurocity","partners","external","qa"] }
+  user.role:       { type: string, enum: ["admin","maintainer","developer","qa","viewer"] }
+  session.id:      { type: string }
+  request.ip:      { type: ip }
+  request.country: { type: string, iso: ISO-3166-1-alpha2 }
+  device.locale:   { type: string, example: "ru-RU" }
+  env.name:        { type: string, enum: ["dev","stage","prod"] }
+
+segments:
+  # Переиспользуемые сегменты (оптимизация для правил)
+  internal-admins:
+    description: Внутренние админы Aethernova/NeuroCity
+    rule:
+      cel: user.org in ["aethernova","neurocity"] && user.role == "admin"
+  beta-testers:
+    description: Добровольцы бета-тестов из внутренних оргов
+    rule:
+      cel: user.org in ["aethernova","neurocity"] && user.role in ["developer","qa"]
+
+flags:
+  # ------------------------------------------------------------------------
+  - key: core_api_v2
+    description: Второе поколение Core API (совместимость REST/JSON, новые лимиты).
+    owner: core-platform
+    tags: [core, api, breaking]
+    created_at: 2025-07-01T00:00:00Z
+    kill_switch:
+      default: false
+      reason: Экстренное отключение при инцидентах (SLO/SLA breach)
+    prerequisites: []       # нет зависимостей
+    variants:               # бинарный флаг: control/treatment для совместимости с A/B отчётами
+      - key: off
+        weight: 0
+      - key: on
+        weight: 100
+    env:
+      dev:
+        enabled: true
+        percentage: 100
+        targets:
+          allow_segments: [internal-admins, beta-testers]
+          # allow/deny в dev обычно нестрогие
+      stage:
+        enabled: true
+        percentage: 50.0
+        stickiness: { attribute: user.id }    # можно переопределить по env
+        rules:
+          - when:
+              cel: request.country in ["SE","DE","PL"]   # гео-таргетинг канареек
+            percentage: 75.0
+          - when:
+              cel: user.role == "qa"
+            percentage: 100
+        schedules:
+          - window: { start: 2025-09-01T09:00:00Z, end: 2025-09-01T17:00:00Z }
+            percentage: 90.0
+      prod:
+        enabled: false
+        percentage: 0
+        targets:
+          allow_segments: [internal-admins]
+          allow_users: ["u_0001","u_0042"]   # явные allow-листовые пользователи
+        gradual:
+          # План раскатки (CI может использовать как источник истины для автопромоушена)
+          - at: 2025-09-10T08:00:00Z
+            percentage: 5
+          - at: 2025-09-11T08:00:00Z
+            percentage: 15
+          - at: 2025-09-12T08:00:00Z
+            percentage: 30
+          - at: 2025-09-13T08:00:00Z
+            percentage: 60
+          - at: 2025-09-14T08:00:00Z
+            percentage: 100
+        rollback:
+          condition: |
+            # CEL: активировать откат при росте 5xx или ошибках клиентов
+            metrics("api_v2_5xx_rate","5m") > 0.5 || metrics("api_v2_client_error_rate","5m") > 2.0
+
+  # ------------------------------------------------------------------------
+  - key: maintenance_banner
+    description: Отображение уведомления о техработах.
+    owner: sre
+    tags: [ux, safety]
+    kill_switch: { default: false }
+    variants:
+      - key: off
+        weight: 0
+      - key: info
+        weight: 100
+        payload:
+          type: json
+          value:
+            severity: info
+            message: "Плановые работы сегодня с 22:00 до 23:00 UTC."
+    env:
+      dev:   { enabled: true,  percentage: 100 }
+      stage: { enabled: true,  percentage: 100 }
+      prod:
+        enabled: true
+        percentage: 0
+        schedules:
+          - window: { start: 2025-09-05T22:00:00Z, end: 2025-09-05T23:00:00Z }
+            percentage: 100
+
+  # ------------------------------------------------------------------------
+  - key: ai_embeddings_v3
+    description: Новый пайплайн векторизации (оптимизация латентности, качество поиска).
+    owner: ai-platform
+    tags: [ai, search, experiment]
+    prerequisites: [core_api_v2]   # требует включенного core_api_v2 для субъекта
+    kill_switch: { default: false }
+    variants:
+      - key: control
+        weight: 50
+        payload:
+          type: json
+          value: { model: "emb-v2", dims: 768 }
+      - key: treatment
+        weight: 50
+        payload:
+          type: json
+          value: { model: "emb-v3", dims: 1024 }
+    env:
+      dev:
+        enabled: true
+        percentage: 100
+        rules:
+          - when: { cel: user.role in ["developer","qa"] }
+            variant: treatment
+      stage:
+        enabled: true
+        percentage: 100
+        stickiness: { attribute: user.id }
+        rules:
+          - when: { cel: user.org in ["aethernova","neurocity"] }
+            split:
+              treatment: 70
+              control: 30
+      prod:
+        enabled: false
+        percentage: 0
+        targets:
+          allow_segments: [beta-testers]
+        notes: "Прод будет включаться после стабильности core_api_v2=100%."
+
+  # ------------------------------------------------------------------------
+  - key: request_shaping
+    description: Включение адаптивных ограничений на основе нагрузки.
+    owner: sre
+    tags: [sre, rate-limit]
+    kill_switch: { default: true, reason: "По умолчанию выключено, включается при инцидентах" }
+    env:
+      dev:   { enabled: false, percentage: 0 }
+      stage: { enabled: false, percentage: 0 }
+      prod:
+        enabled: false
+        percentage: 0
+        rules:
+          - when:
+              cel: metrics("qps","1m") > 500 && metrics("latency_p95_ms","5m") > 250
+            percentage: 100
+
+configs:
+  # --------- Динамические конфиги (remote config), типизированные и валидируемые ---------
+  - key: rate_limits
+    description: Глобальные лимиты запросов (RPS/клиент/ключ).
+    owner: sre
+    schema:
+      type: object
+      required: [default, per_org]
+      properties:
+        default: { type: integer, minimum: 10, maximum: 10000 }
+        burst:   { type: integer, minimum: 10, maximum: 20000 }
+        per_org:
+          type: object
+          additionalProperties: { type: integer, minimum: 1, maximum: 20000 }
+    env:
+      dev:
+        value: { default: 2000, burst: 4000, per_org: { aethernova: 5000, neurocity: 4000 } }
+      stage:
+        value: { default: 1500, burst: 3000, per_org: { aethernova: 4000 } }
+      prod:
+        value: { default: 800, burst: 1600, per_org: { partners: 500 } }
+
+  - key: search_relevance
+    description: Тюнинг ранжирования поиска (веса сигналов).
+    owner: ai-platform
+    schema:
+      type: object
+      properties:
+        weights:
+          type: object
+          properties:
+            bm25:   { type: number, minimum: 0, maximum: 5 }
+            dense:  { type: number, minimum: 0, maximum: 5 }
+            recency:{ type: number, minimum: 0, maximum: 5 }
+          additionalProperties: false
+      additionalProperties: false
+    env:
+      dev:   { value: { weights: { bm25: 1.0, dense: 1.0, recency: 0.5 } } }
+      stage: { value: { weights: { bm25: 0.9, dense: 1.2, recency: 0.6 } } }
+      prod:  { value: { weights: { bm25: 0.8, dense: 1.4, recency: 0.7 } } }
+
+policies:
+  # Политики безопасности и аудита
+  audit:
+    required_change_ticket: true
+    fields:
+      - jira_issue
+      - approver
+      - reason
+  change_control:
+    prod_requires_approval_from: ["sre","core-platform"]
+    freeze_windows:
+      - { start: "2025-12-24T00:00:00Z", end: "2025-12-26T23:59:59Z" }
+  export:
+    signed_bundle: true       # требовать подпись артефакта в CI
+    compression: zstd
+
+examples:
+  # Примеры вызовов для SDK (документационно, не используется рантаймом)
+  sdk:
+    js:
+      get_flag: |
+        // const on = flags.isEnabled("core_api_v2", ctx)
+        // const variant = flags.getVariant("ai_embeddings_v3", ctx)
+    python:
+      get_config: |
+        # cfg = flags.get_config("rate_limits", ctx).value
+        # if flags.is_enabled("maintenance_banner", ctx): render_banner()

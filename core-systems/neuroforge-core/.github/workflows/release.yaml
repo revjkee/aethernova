@@ -1,0 +1,290 @@
+# neuroforge-core/.github/workflows/release.yaml
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Do everything except publish (true/false)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: "release-${{ github.ref_name }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: write          # создать релиз и загрузить ассеты
+  packages: write          # публиковать в GHCR
+  id-token: write          # OIDC для PyPI Trusted Publishing и cosign keyless
+  attestations: write      # provenance attestations
+  actions: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  PACKAGE_NAME: "neuroforge-core"
+  IMAGE_NAME: "ghcr.io/${{ github.repository }}"
+  # Включаем/выключаем подпись и сканы (можно сделать false при отладке)
+  ENABLE_COSIGN: "true"
+  ENABLE_SBOM: "true"
+  ENABLE_TRIVY: "true"
+  DRY_RUN: "${{ github.event.inputs.dry_run || 'false' }}"
+
+jobs:
+  prepare:
+    name: Prepare metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive version from tag
+        id: meta
+        shell: bash
+        run: |
+          ref="${GITHUB_REF#refs/tags/}"
+          if [[ -z "$ref" ]]; then
+            echo "No tag ref found"; exit 1
+          fi
+          # Ожидаем формат vX.Y.Z[-prerelease]
+          tag="$ref"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *"-"* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved version: $version (prerelease=${{ steps.meta.outputs.prerelease }})"
+
+  build-python:
+    name: Build sdist & wheels
+    runs-on: ubuntu-latest
+    needs: prepare
+    outputs:
+      artifact-name: dist-${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install build==1.* twine==5.* cibuildwheel==2.*
+
+      - name: Build sdist
+        run: python -m build --sdist --outdir dist/
+
+      - name: Build wheels (cibuildwheel)
+        env:
+          CIBW_BUILD: "cp311-* cp312-*"
+          CIBW_SKIP: "pp* *-musllinux*"
+          CIBW_ARCHS: "auto64"
+          CIBW_TEST_COMMAND: "python -c \"import ${PACKAGE_NAME.replace('-', '_')}\""
+        run: python -m cibuildwheel --output-dir dist
+
+      - name: Verify artifacts
+        run: |
+          ls -lah dist
+          python -m twine check dist/*
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum * | tee SHA256SUMS.txt
+
+      - name: Upload dist as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ needs.prepare.outputs.version }}
+          path: dist/*
+
+  publish-pypi:
+    name: Publish to PyPI (Trusted Publishing)
+    runs-on: ubuntu-latest
+    needs: [prepare, build-python]
+    if: ${{ env.DRY_RUN != 'true' }}
+    environment:
+      name: pypi
+      url: https://pypi.org/p/${{ env.PACKAGE_NAME }}
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ needs.prepare.outputs.version }}
+          path: dist
+
+      - name: Publish using Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true
+          verbose: true
+
+  build-image:
+    name: Build & push container
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: ${{ env.DRY_RUN != 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.prerelease == 'false' }}
+            type=sha
+
+      - name: Build image (with provenance)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.DRY_RUN != 'true' }}
+          provenance: true
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ needs.prepare.outputs.version }}
+
+      - name: Extract image ref
+        id: ref
+        run: |
+          echo "image_ref=${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SBOM (Syft)
+        if: ${{ env.ENABLE_SBOM == 'true' }}
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.ref.outputs.image_ref }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        if: ${{ env.ENABLE_SBOM == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ needs.prepare.outputs.version }}
+          path: sbom.spdx.json
+
+      - name: Trivy scan (image)
+        if: ${{ env.ENABLE_TRIVY == 'true' }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.ref.outputs.image_ref }}
+          format: 'table'
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'   # Не валим релиз; отчёт — в лог
+
+      - name: Install cosign
+        if: ${{ env.ENABLE_COSIGN == 'true' && env.DRY_RUN != 'true' }}
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Cosign sign (keyless OIDC)
+        if: ${{ env.ENABLE_COSIGN == 'true' && env.DRY_RUN != 'true' }}
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign --yes ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+      - name: Attest build provenance
+        if: ${{ env.DRY_RUN != 'true' }}
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [prepare, build-python, build-image]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ needs.prepare.outputs.version }}
+          path: dist
+
+      - name: Download SBOM (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-${{ needs.prepare.outputs.version }}
+          path: .
+        continue-on-error: true
+
+      - name: Create release notes
+        id: notes
+        uses: heinrichreimer/action-github-changelog-generator@v2.4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Generate top-level SHA256
+        run: |
+          sha256sum dist/* | tee RELEASE_SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: "neuroforge-core ${{ needs.prepare.outputs.version }}"
+          body: ${{ steps.notes.outputs.changelog || 'Automated release' }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          files: |
+            dist/*
+            sbom.spdx.json
+            RELEASE_SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  post-verify:
+    name: Post-release sanity checks
+    runs-on: ubuntu-latest
+    needs: [prepare, publish-pypi, release]
+    if: ${{ always() && env.DRY_RUN != 'true' }}
+    steps:
+      - name: Verify PyPI availability (pip index)
+        run: |
+          python -m pip install --upgrade pip
+          pip index versions ${{ env.PACKAGE_NAME }} || true
+      - name: Show release URL
+        run: echo "https://github.com/${{ github.repository }}/releases/tag/${{ needs.prepare.outputs.tag }}"

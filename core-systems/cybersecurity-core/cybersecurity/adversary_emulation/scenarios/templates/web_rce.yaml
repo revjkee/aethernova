@@ -1,0 +1,273 @@
+# I'll answer as the world-famous adversary emulation and red-teaming expert in web exploitation,
+# recipient of the Black Hat USA Arsenal recognition.
+#
+# TL;DR:
+# Промышленный шаблон сценария эмуляции противника для безопасного (LAB-ONLY) моделирования Web RCE.
+# По умолчанию dry_run: true, действует строгая проверка области (scope), запрет на внешние IP/домены,
+# моки/лабораторные эндпоинты, canary-маркировка и детерминированная валидация без вреда целям.
+#
+# Проверяемость и ссылки (утверждения привязаны к общепринятым стандартам моделирования атак):
+# - MITRE ATT&CK T1190 Exploit Public-Facing Application (описание техники, контекст): https://attack.mitre.org/techniques/T1190/
+# - MITRE ATT&CK T1059 Command and Scripting Interpreter (контекст эмуляции команд): https://attack.mitre.org/techniques/T1059/
+# - MITRE ATT&CK T1105 Ingress Tool Transfer (ограничиваем имитацию передачи артефактов): https://attack.mitre.org/techniques/T1105/
+# - MITRE ATT&CK T1041 Exfiltration Over C2 Channel (запрещаем в шаблоне, только canary-сигнал в LAB): https://attack.mitre.org/techniques/T1041/
+# - OWASP Top 10 (инъекции/небезопасные десериализации как общий класс): https://owasp.org/Top10/
+# - NIST SP 800-53 (контроль доступа/мониторинг событий: AC-3, SI-4): https://csrc.nist.gov/publications/detail/sp/800-53/rev-5/final
+#
+# Вне лаборатории использовать запрещено. Привязки к конкретным CVE преднамеренно отсутствуют — Не могу подтвердить это.
+# Этот файл — конфигурация для внутреннего раннера сценариев adversary_emulation. Он не содержит эксплойтов и
+# использует только безопасные лабораторные векторы (__lab_rce__) и canary-сигналы.
+
+apiVersion: adversary.emulation/v1
+kind: ScenarioTemplate
+
+metadata:
+  id: "web_rce"
+  name: "Web RCE (LAB-ONLY) — безопасная эмуляция эксплуатаций публичного веб-приложения"
+  version: "1.0.0"
+  authors:
+    - name: "Aethernova Cyber Team"
+      contact: "secops@aethernova.local"
+  created_at: "2025-09-04T00:00:00Z"
+  updated_at: "2025-09-04T00:00:00Z"
+  severity: "high"
+  description: >
+    Эмуляция атакующего, эксплуатирующего публичное веб-приложение для удалённого выполнения команд.
+    Сценарий предназначен исключительно для лабораторной среды с маркировкой targets[*].tags содержит 'lab'.
+    Включает строгие guardrails, canary-валидацию и детерминированные проверки без побочных эффектов.
+  tags: ["web", "rce", "lab-only", "emulation", "safe-mode"]
+  mitre_attack:
+    - id: "T1190"
+      name: "Exploit Public-Facing Application"
+      url: "https://attack.mitre.org/techniques/T1190/"
+    - id: "T1059"
+      name: "Command and Scripting Interpreter"
+      url: "https://attack.mitre.org/techniques/T1059/"
+  nist_800_53:
+    - id: "AC-3"
+      title: "Access Enforcement"
+      url: "https://csrc.nist.gov/publications/detail/sp/800-53/rev-5/final"
+    - id: "SI-4"
+      title: "System Monitoring"
+      url: "https://csrc.nist.gov/publications/detail/sp/800-53/rev-5/final"
+  references:
+    - title: "OWASP Top 10 (Injection / Insecure Design / Software Integrity)"
+      url: "https://owasp.org/Top10/"
+
+guardrails:
+  require_explicit_scope: true
+  block_on_unverified_targets: true
+  dry_run_default: true
+  allowed_target_tags: ["lab", "staging"]
+  prohibited_target_tags: ["prod", "pci", "phi", "pii"]
+  block_external_ip: true
+  block_dns_outbound: true
+  allow_canary_only: true
+  ratelimits:
+    per_target_rps: 2
+    global_rps: 20
+    concurrent_targets: 5
+    http_connection_pool_size: 16
+  timeouts:
+    http_request_seconds: 5
+    scenario_total_seconds: 600
+  safe_endpoints:
+    # Лабораторные эндпоинты, предоставляющие контролируемый "ответ" без реального RCE.
+    # В реальном эксплойте раннер работать не будет — только на __lab_rce__.
+    - path: "/__lab_rce__"
+    - path: "/__lab_probe__"
+  opsec_notes:
+    - "Запрещены долговременные артефакты на целевом хосте; любые файлы — только в /tmp/__lab_canary__ и удаляются."
+    - "Запрещены загрузки инструментов (T1105) и эксфильтрация данных (T1041). Разрешён только canary-пинг LAB-контроллера."
+    - "Все команды нормализуются к безопасным 'echo' и метке canary; реальное выполнение команд не производится."
+
+requirements:
+  runner_min_version: ">=1.4.0"
+  capabilities: ["http-client", "canary-sink", "templating", "tls"]
+  target_requirements:
+    - "tags содержит 'lab'"
+    - "служба HTTP доступна на портах 80/443 или кастомном порту (inventory.service == 'http')"
+
+variables:
+  # Значения могут быть переопределены при запуске сценария.
+  targets_selector: "inventory.tags contains 'lab' and inventory.service == 'http'"
+  http_method: "POST"
+  base_path: "/__lab_rce__"
+  payload_kind: "echo"          # только 'echo' разрешено
+  payload_marker: "AETERNOVA_CANARY"
+  canary_token: "{{ random_uuid }}"          # шаблон раннера
+  canary_sink_url: "https://canary.sink.local/ingest"  # только LAB-ресурс
+  include_headers:
+    X-Lab-Scenario: "web_rce"
+    X-Canary-Token: "{{ canary_token }}"
+  include_params:
+    cmd: "echo {{ payload_marker }}:{{ canary_token }}"
+  http_tls_verify: true
+  http_follow_redirects: false
+  max_retries: 1
+  retry_backoff_ms: 200
+
+preconditions:
+  - id: "scope-check"
+    description: "Подтверждение явного разрешения и лабораторных тегов"
+    assert:
+      - "context.approval.ticket is not null"
+      - "all(target.tags contains 'lab' for target in context.targets)"
+  - id: "inventory-check"
+    description: "Наличие HTTP-службы у каждой цели"
+    assert:
+      - "all('http' in target.services for target in context.targets)"
+
+success_criteria:
+  any_of:
+    - "Получен HTTP 200/204/202 от /__lab_rce__"
+    - "LAB canary-sink получил событие с canary_token"
+  metrics_thresholds:
+    min_success_rate: 0.6
+    max_http_error_rate: 0.2
+    max_runtime_seconds: 300
+
+execution:
+  strategy: "sequential-batched"
+  batch_size: 5
+  steps:
+
+    - id: "healthcheck"
+      name: "Проверка доступности /__lab_probe__"
+      action: "http_request"
+      with:
+        method: "GET"
+        path: "/__lab_probe__"
+        headers: "{{ include_headers }}"
+        params: {}
+      expect:
+        status_any_of: [200, 204, 404]   # 404 допустим — не обязательно развернут probe
+        max_time_ms: 1000
+      record:
+        save_response_body_snippet: true
+        save_timing: true
+
+    - id: "canary-register"
+      name: "Регистрация canary-события перед попыткой RCE"
+      action: "canary_emit"
+      with:
+        sink_url: "{{ canary_sink_url }}"
+        token: "{{ canary_token }}"
+        meta:
+          scenario: "web_rce"
+          phase: "pre"
+      expect:
+        accepted: true
+      on_error: "continue"   # canary-sink может быть оффлайн в офлайн-лабе
+
+    - id: "attempt-rce"
+      name: "Лабораторная попытка 'RCE' (на самом деле echo-маркер)"
+      action: "http_request"
+      with:
+        method: "{{ http_method }}"
+        path: "{{ base_path }}"
+        headers: "{{ include_headers }}"
+        params: "{{ include_params }}"
+        body: ""
+      expect:
+        status_any_of: [200, 202, 204]
+        max_time_ms: 2000
+        # Опционально: некоторые лабораторные сервисы возвращают маркер в заголовке
+        contains_any_in_headers:
+          - key: "X-Lab-Exec"
+            value: "ok"
+      record:
+        save_response_headers: true
+        save_timing: true
+
+    - id: "canary-verify"
+      name: "Проверка поступления canary-сигнала"
+      action: "canary_check"
+      with:
+        sink_url: "{{ canary_sink_url }}"
+        token: "{{ canary_token }}"
+        timeout_ms: 1500
+      expect:
+        received: true
+      on_error: "continue"
+
+    - id: "no-op-persistence"
+      name: "Подтверждение отсутствия персистентности"
+      action: "assert"
+      with:
+        expression: "true"   # Техническая заглушка: сценарий не создаёт персистентность
+      expect:
+        ok: true
+
+detection:
+  telemetry:
+    - source: "http_client"
+      fields: ["status", "latency_ms", "target", "path"]
+    - source: "canary_sink"
+      fields: ["token", "received_at"]
+  siem_enrichment:
+    add_tags: ["emulation:web_rce", "lab-only"]
+  edr_expectations:
+    notes:
+      - "EDR/WAAP может логировать обращение к /__lab_rce__ как аномалию — ожидаемо."
+      - "Не должно быть событий реального запуска шелла — только эхо-маркер."
+
+validation:
+  - id: "rate-limit-check"
+    description: "Подтверждение соблюдения rate-limits раннером"
+    assert:
+      - "metrics.rps_per_target <= guardrails.ratelimits.per_target_rps + 0.5"
+  - id: "success-criteria"
+    description: "Минимальная успешность"
+    assert:
+      - "metrics.success_rate >= success_criteria.metrics_thresholds.min_success_rate"
+
+cleanup:
+  strategy: "best-effort"
+  steps:
+    - id: "canary-close"
+      action: "canary_emit"
+      with:
+        sink_url: "{{ canary_sink_url }}"
+        token: "{{ canary_token }}"
+        meta:
+          scenario: "web_rce"
+          phase: "post"
+      expect:
+        accepted: true
+      on_error: "ignore"
+
+outputs:
+  exports:
+    - name: "rce_attempts"
+      value: "{{ metrics.total_requests }}"
+    - name: "rce_successes"
+      value: "{{ metrics.success_requests }}"
+    - name: "targets_tested"
+      value: "{{ metrics.targets_total }}"
+    - name: "canary_confirmed"
+      value: "{{ metrics.canary_received }}"
+  report:
+    format: "markdown"
+    include_sections:
+      - "summary"
+      - "targets"
+      - "telemetry"
+      - "guardrails"
+      - "recommendations"
+    redact:
+      secrets: true
+      tokens: true
+
+compatibility:
+  runner:
+    name: "aethernova-adversary-runner"
+    min_version: "1.4.0"
+    features_required:
+      - "http-client@1"
+      - "canary-sink@1"
+      - "templating@1"
+
+notes:
+  - "Шаблон имитирует RCE безопасным образом (echo-маркер), не выполняя реальные команды на целевой системе."
+  - "Ссылки на ATT&CK/OWASP/NIST приведены для картирования техник и контроля. Конкретные CVE не указаны — Не могу подтвердить это."

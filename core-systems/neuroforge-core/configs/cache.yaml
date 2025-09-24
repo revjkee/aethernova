@@ -1,0 +1,334 @@
+# NeuroForge Core — Industrial Cache Configuration
+# Все значения переопределяются ENV: ${VAR:-default}. Комментарии — часть контракта.
+
+cache:
+  enabled: ${CACHE_ENABLED:-true}
+
+  # ----------------------------- Architecture ---------------------------------
+  layers:
+    # L1 — процессный (in-memory) кэш для быстрых повторных обращений.
+    l1:
+      enabled: ${CACHE_L1_ENABLED:-true}
+      engine: inmem                 # inmem — встроенный LRU/TinyLFU
+      policy: ${CACHE_L1_POLICY:-slru}   # lru|slru|tinylfu
+      max_entries: ${CACHE_L1_MAX_ENTRIES:-100000}
+      max_entry_bytes: ${CACHE_L1_MAX_ENTRY_BYTES:-262144}   # 256 KiB
+      default_ttl_s: ${CACHE_L1_TTL_S:-5}                   # короткая TTL для горячего слоя
+      clock_resolution_ms: 10
+      metrics_cardinality_limit: 200
+      eviction_sample: 5            # для randomized eviction
+
+    # L2 — распределённый кэш (Redis/Memcached). Используется как источник истины для кэша.
+    l2:
+      enabled: ${CACHE_L2_ENABLED:-true}
+      backend: ${CACHE_L2_BACKEND:-redis}   # redis|memcached|none
+
+      redis:
+        mode: ${REDIS_MODE:-standalone}     # standalone|sentinel|cluster
+        url: ${CACHE_REDIS_URL:-redis://localhost:6379/0}
+        # При sentinel/cluster используйте urls и дополнительные поля:
+        urls: ${CACHE_REDIS_URLS:-}         # запятая-разделённый список
+        sentinel:
+          master_name: ${REDIS_SENTINEL_MASTER:-mymaster}
+          urls: ${REDIS_SENTINEL_URLS:-}    # redis+sentinel://host1:26379,host2:26379
+        cluster:
+          route_by_latency: ${REDIS_CLUSTER_LATENCY_ROUTE:-true}
+          read_from_replicas: ${REDIS_CLUSTER_READ_REPLICAS:-true}
+        tls:
+          enabled: ${REDIS_TLS_ENABLED:-false}
+          insecure_skip_verify: ${REDIS_TLS_INSECURE:-false}
+          ca_file: ${REDIS_TLS_CA:-}
+          cert_file: ${REDIS_TLS_CERT:-}
+          key_file: ${REDIS_TLS_KEY:-}
+        auth:
+          username: ${REDIS_USERNAME:-}
+          password: ${REDIS_PASSWORD:-}
+        pool:
+          size: ${REDIS_POOL_SIZE:-200}
+          min_idle: ${REDIS_MIN_IDLE:-20}
+          max_conn_age_s: ${REDIS_CONN_MAX_AGE_S:-300}
+        timeouts:
+          dial_ms: ${REDIS_DIAL_MS:-1000}
+          read_ms: ${REDIS_READ_MS:-20}
+          write_ms: ${REDIS_WRITE_MS:-20}
+        keyspace_notifications: ${REDIS_KEYSPACE_NOTIF:-Exg$l}  # рекомендуемый профиль для invalidation
+
+      memcached:
+        servers: ${MEMCACHED_SERVERS:-127.0.0.1:11211}
+        max_item_bytes: ${MEMCACHED_MAX_ITEM_BYTES:-1048576}
+        timeouts:
+          dial_ms: 100
+          read_ms: 20
+          write_ms: 20
+        consistent_hashing: true
+
+  # ----------------------------- Namespacing ----------------------------------
+  namespace:
+    global_prefix: ${CACHE_PREFIX:-nf}
+    separator: ":"
+    # Перечень логических пространств (все ключи формируются как <prefix>:<space>:<key>).
+    spaces:
+      auth:
+        prefix: "auth"
+        default_ttl_s: 300
+        negative_ttl_s: 30
+      sessions:
+        prefix: "sess"
+        default_ttl_s: 3600
+      profiles:
+        prefix: "prf"
+        default_ttl_s: 900
+      features:
+        prefix: "feat"
+        default_ttl_s: 600
+      http:
+        prefix: "http"
+        default_ttl_s: 60
+        vary_headers: ["accept-encoding", "accept-language", "authorization"]
+      inference:
+        prefix: "ml"
+        default_ttl_s: 120
+        max_entry_bytes: 1048576
+      config:
+        prefix: "cfg"
+        default_ttl_s: 300
+      schema:
+        prefix: "sch"
+        default_ttl_s: 1800
+      ratelimit:
+        prefix: "rl"
+        default_ttl_s: 120
+
+  # ---------------------------- Serialization ---------------------------------
+  serialization:
+    format: ${CACHE_SERDE_FORMAT:-msgpack}   # msgpack|json
+    # Для JSON — безопасное сериализующее представление без NaN и с энкодером дат.
+    json:
+      ensure_ascii: false
+      forbid_nan: true
+    msgpack:
+      use_bin_type: true
+      strict_map_key: true
+
+  # ------------------------------- Compression --------------------------------
+  compression:
+    enabled: ${CACHE_COMPRESSION_ENABLED:-true}
+    min_bytes: ${CACHE_COMPRESSION_MIN_BYTES:-512}
+    algo: ${CACHE_COMPRESSION_ALGO:-zstd}    # zstd|gzip|snappy
+    level: ${CACHE_COMPRESSION_LEVEL:-3}
+
+  # ------------------------- Stampede Protection ------------------------------
+  stampede:
+    # Двухуровневое TTL: soft/hard с ранним обновлением.
+    soft_ttl_factor: ${CACHE_SOFT_TTL_FACTOR:-0.8}     # softTTL = TTL*factor
+    refresh_jitter_pct: ${CACHE_REFRESH_JITTER_PCT:-20} # разброс для распределения перегенерации
+    mutex:
+      enabled: ${CACHE_MUTEX_ENABLED:-true}
+      backoff_ms:
+        min: 10
+        max: 200
+      ttl_s: 10
+      key_prefix: "mx"                                 # <prefix>:mx:<key>
+    early_recompute_window_s: ${CACHE_EARLY_WINDOW_S:-5}
+    negative_cache:
+      enabled: ${CACHE_NEGATIVE_ENABLED:-true}
+      ttl_s: ${CACHE_NEGATIVE_TTL_S:-15}
+
+  # ------------------------------ Consistency ---------------------------------
+  policy:
+    mode: ${CACHE_MODE:-cache_aside}   # cache_aside|read_through|write_through|write_behind
+    # Для write_through/behind укажите очереди/ретраи:
+    write_back:
+      queue: ${CACHE_WRITE_BACK_QUEUE:-}
+      max_retry: 5
+      retry_backoff_ms: 100
+
+  # ------------------------------- Invalidation -------------------------------
+  invalidation:
+    # Прямой паттерн-килл опасен в проде; используйте метки и pub/sub.
+    strategy: ${CACHE_INVALIDATION_STRATEGY:-pubsub}   # pubsub|keys|surrogate_keys
+    pubsub:
+      channel: ${CACHE_PUBSUB_CHANNEL:-nf.cache.inval}
+      # Сообщения вида:
+      # { "op": "del|tag", "keys": ["<space>:<k>"], "tags": ["profile:123"], "reason": "update" }
+    surrogate_keys:
+      enabled: ${CACHE_SURROGATE_ENABLED:-false}
+      header: "Surrogate-Key"
+      # Пример: для HTTP кэша присваиваем тэги "profile:123 profile:roles"
+    key_scan:
+      # Использовать только для batch-операций в maintenance-окнах
+      enabled: ${CACHE_KEYSCAN_ENABLED:-false}
+      count_per_scan: 500
+    # Автоматическое соблюдение max_entry_bytes для пространств, иначе пропуск item.
+    oversize_behavior: drop   # drop|truncate
+
+  # ------------------------------ Limits & QoS --------------------------------
+  limits:
+    max_entry_bytes: ${CACHE_MAX_ENTRY_BYTES:-2097152}    # 2 MiB глобальный
+    max_batch_keys: ${CACHE_MAX_BATCH_KEYS:-500}
+    max_ops_per_second: ${CACHE_MAX_OPS_RPS:-50000}
+
+  circuit_breaker:
+    enabled: ${CACHE_CB_ENABLED:-true}
+    failure_ratio_threshold: 0.5
+    minimum_requests: 50
+    open_state_duration_s: 10
+    half_open_max_calls: 10
+    timeout_ms: 50
+
+  backoff:
+    policy: exponential
+    base_ms: 5
+    max_ms: 200
+    jitter: true
+
+  # ------------------------------ Observability -------------------------------
+  metrics:
+    enabled: ${CACHE_METRICS_ENABLED:-true}
+    backend: ${CACHE_METRICS_BACKEND:-prometheus}      # prometheus|otlp|both
+    labels:
+      service: neuroforge-core
+      env: ${NF_ENV:-dev}
+    # Гистограммы латентности (в секундах)
+    histogram_buckets_s: [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+  tracing:
+    enabled: ${CACHE_TRACING_ENABLED:-false}
+    span_names:
+      get: "cache.get"
+      set: "cache.set"
+      mget: "cache.mget"
+      del: "cache.del"
+      lock: "cache.lock"
+
+  # ------------------------------- Security -----------------------------------
+  security:
+    redact_keys: ["password", "token", "authorization", "cookie", "api_key", "secret"]
+    denylist_key_patterns: ["*secret*", "*token*", "*password*"]
+    # Опциональное шифрование value на стороне приложения (envelope):
+    encryption:
+      enabled: ${CACHE_ENCRYPT_ENABLED:-false}
+      key_id: ${CACHE_ENCRYPT_KEY_ID:-}
+      aad_context: "neuroforge-cache"
+
+  # ------------------------------- Warmup -------------------------------------
+  warmup:
+    enabled: ${CACHE_WARMUP_ENABLED:-true}
+    # Задачи прогрева ключевых пространств при старте/релизе.
+    jobs:
+      - name: "profiles-hotset"
+        space: "profiles"
+        source: "sql"                      # sql|http|custom
+        query: "SELECT id FROM profiles WHERE updated_at > now() - interval '7 days' LIMIT 5000"
+        ttl_s: 900
+        concurrency: 8
+      - name: "features-flags"
+        space: "features"
+        source: "http"
+        endpoint: "${FEATURES_ENDPOINT:-http://localhost:8080/api/v1/flags}"
+        ttl_s: 600
+        concurrency: 4
+
+  # ------------------------------ Spaces detail -------------------------------
+  spaces:
+    auth:
+      ttl_s: 300
+      l1_ttl_s: 10
+      stampede_protection: true
+      keys:
+        - name: "jwt-pubkeys"
+          pattern: "jwks::{kid}"
+          ttl_s: 3600
+          negative_ttl_s: 60
+    sessions:
+      ttl_s: 3600
+      session_consistency: strong
+    profiles:
+      ttl_s: 900
+      tags:
+        - "profile:{id}"
+        - "profile:roles:{id}"
+      invalidate_on:
+        - event: "profile.updated"
+          key_expr: "profiles::{id}"
+          tags: ["profile:{id}"]
+    http:
+      ttl_s: 60
+      cache_control_respect: true
+      vary_headers: ["accept-encoding", "accept-language", "authorization"]
+      surrogate_keys:
+        enabled: ${HTTP_SURROGATE_ENABLED:-false}
+    inference:
+      ttl_s: 120
+      max_entry_bytes: 1048576
+      compression:
+        enabled: true
+        min_bytes: 256
+
+  # --------------------------- Health & Diagnostics ---------------------------
+  health:
+    ping_interval_s: 10
+    redis_ping_threshold_ms: 50
+    mem_pressure_threshold_pct: 85
+
+# ------------------------------ Environments ----------------------------------
+environments:
+  dev:
+    cache:
+      limits:
+        max_ops_per_second: 5000
+      layers:
+        l1:
+          max_entries: 20000
+          default_ttl_s: 2
+        l2:
+          redis:
+            url: ${CACHE_REDIS_URL:-redis://localhost:6379/1}
+      warmup:
+        enabled: false
+
+  stage:
+    cache:
+      layers:
+        l1:
+          default_ttl_s: 5
+        l2:
+          redis:
+            url: ${CACHE_REDIS_URL:-redis://stage-redis:6379/0}
+      circuit_breaker:
+        open_state_duration_s: 5
+      invalidation:
+        pubsub:
+          channel: "nf.stage.cache.inval"
+
+  prod:
+    cache:
+      layers:
+        l1:
+          policy: tinylfu
+          max_entries: 250000
+          default_ttl_s: 5
+        l2:
+          redis:
+            mode: ${REDIS_MODE:-cluster}
+            urls: ${CACHE_REDIS_URLS:-redis://r1:6379,redis://r2:6379,redis://r3:6379}
+            cluster:
+              route_by_latency: true
+              read_from_replicas: true
+            pool:
+              size: 1000
+              min_idle: 100
+      compression:
+        enabled: true
+        algo: zstd
+        level: 3
+      circuit_breaker:
+        open_state_duration_s: 10
+        timeout_ms: 30
+      invalidation:
+        pubsub:
+          channel: "nf.prod.cache.inval"
+      metrics:
+        backend: both
+      security:
+        encryption:
+          enabled: ${CACHE_ENCRYPT_ENABLED:-false}

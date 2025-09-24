@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: BackupPipeline
+metadata:
+  name: teslaai-backup-pipeline
+  namespace: monitoring-failover
+  labels:
+    app: backup
+    tier: failover
+    environment: production
+    component: resilience
+
+spec:
+  schedule: "0 */6 * * *"  # каждые 6 часов
+  retentionPolicy:
+    keepLast: 6
+    keepDaily: 7
+    keepWeekly: 4
+    keepMonthly: 6
+    prune: true
+
+  storage:
+    type: s3
+    endpoint: https://s3.teslaai.internal
+    bucket: teslaai-backups
+    region: eu-central-1
+    credentialsSecretRef:
+      name: s3-backup-credentials
+    encryption:
+      enabled: true
+      kmsKey: alias/teslaai-backup-key
+
+  sources:
+    - name: postgres-database
+      type: postgresql
+      host: postgres.teslaai.svc.cluster.local
+      port: 5432
+      database: teslaai
+      usernameSecretRef:
+        name: postgres-backup-creds
+      options:
+        consistentSnapshot: true
+        excludeTables:
+          - alembic_version
+          - logs_archive
+
+    - name: redis-cache
+      type: redis
+      host: redis.teslaai.svc.cluster.local
+      port: 6379
+
+    - name: file-assets
+      type: filesystem
+      path: /data/assets
+      hostPath: true
+      includes:
+        - "**/*.model"
+        - "**/*.json"
+      excludes:
+        - "**/tmp/**"
+
+  hooks:
+    preBackup:
+      - name: notify-start
+        exec:
+          command: ["/opt/scripts/notify_start.sh"]
+    postBackup:
+      - name: verify-integrity
+        exec:
+          command: ["/opt/scripts/verify_snapshot.sh"]
+      - name: notify-complete
+        exec:
+          command: ["/opt/scripts/notify_success.sh"]
+    onFailure:
+      - name: alert-admin
+        exec:
+          command: ["/opt/scripts/notify_failure.sh"]
+      - name: auto-fallback
+        exec:
+          command: ["/opt/scripts/trigger_secondary_backup.sh"]
+
+  monitoring:
+    prometheusMetrics: true
+    metricsPort: 9465
+    healthChecks:
+      enabled: true
+      path: /health
+      intervalSeconds: 60
+
+  auditLogging:
+    enabled: true
+    destination: "logs/backup-events"
+    format: json
+
+  annotations:
+    maintainer: infra@teslaai.org
+    description: "Промышленный бэкап-контур TeslaAI с failover-алгоритмами и валидацией"

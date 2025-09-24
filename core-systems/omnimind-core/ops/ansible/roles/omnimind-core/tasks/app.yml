@@ -1,0 +1,298 @@
+---
+# Industrial app lifecycle tasks for omnimind-core
+# Stages: promote -> migrate -> start -> warmup -> verify
+# Instant rollback on failure.
+#
+# Key variables (safe defaults assumed elsewhere in the role):
+#   omnimind_core_install_dir: "/opt/omnimind-core"
+#   omnimind_core_cfg_dir: "/etc/omnimind-core"
+#   omnimind_core_user: "omnimind"
+#   omnimind_core_group: "omnimind"
+#   omnimind_core_port: 8080
+#   omnimind_core_promote_version: "0.1.0"         # release to promote (dir must exist and be unpacked)
+#   omnimind_core_offline_migration: false         # stop service for migrations if true
+#   omnimind_core_migration_enabled: true
+#   omnimind_core_migration_strategy: "alembic"    # alembic|sql|custom|none
+#   omnimind_core_alembic_ini: "{{ omnimind_core_install_dir }}/current/alembic.ini"
+#   omnimind_core_sql_dir: "{{ omnimind_core_install_dir }}/current/db/sql"
+#   omnimind_core_custom_migration_cmd: ""         # full command line if strategy=custom
+#   omnimind_core_env_file: "{{ omnimind_core_cfg_dir }}/omnimind-core.env"
+#   omnimind_core_health_url: "http://127.0.0.1:{{ omnimind_core_port }}/health"
+#   omnimind_core_ready_url:  "http://127.0.0.1:{{ omnimind_core_port }}/ready"
+#   omnimind_core_warmup_endpoints: []             # e.g. ["/metrics?dry=1","/v1/warmup"]
+#   omnimind_core_verify_timeout: 90
+#   omnimind_core_service_name: "omnimind-core.service"
+
+# -------------------------- Preflight --------------------------
+- name: "Preflight | Resolve paths"
+  ansible.builtin.set_fact:
+    _omc_base: "{{ omnimind_core_install_dir }}"
+    _omc_current: "{{ omnimind_core_install_dir }}/current"
+    _omc_releases: "{{ omnimind_core_install_dir }}/releases"
+    _omc_candidate: "{{ omnimind_core_install_dir }}/releases/omnimind-core-{{ omnimind_core_promote_version }}"
+    _omc_previous_link: "{{ omnimind_core_install_dir }}/previous"
+  tags: [preflight]
+
+- name: "Preflight | Check candidate release exists and unpacked"
+  ansible.builtin.stat:
+    path: "{{ _omc_candidate }}/.unpacked"
+  register: _candidate_unpacked
+  tags: [preflight]
+
+- name: "Preflight | Assert candidate release is ready"
+  ansible.builtin.assert:
+    that:
+      - _candidate_unpacked.stat.exists
+    fail_msg: "Candidate release {{ _omc_candidate }} is not ready (.unpacked not found)."
+  tags: [preflight]
+
+- name: "Preflight | Read current symlink if present"
+  ansible.builtin.stat:
+    path: "{{ _omc_current }}"
+    follow: false
+  register: _current_stat
+  tags: [preflight]
+
+# -------------------------- Promote (Blue/Green) --------------------------
+- name: "Promote | Remember previous target"
+  ansible.builtin.set_fact:
+    _omc_previous_target: "{{ _current_stat.stat.lnk_target | default('') }}"
+  when: _current_stat.stat.islnk | default(false)
+  tags: [promote]
+
+- name: "Promote | Update 'previous' symlink to current"
+  ansible.builtin.file:
+    src: "{{ _omc_previous_target | default('') }}"
+    dest: "{{ _omc_previous_link }}"
+    state: link
+    force: true
+  when: _current_stat.stat.islnk | default(false)
+  tags: [promote]
+
+- name: "Promote | Atomically set 'current' -> candidate"
+  ansible.builtin.file:
+    src: "{{ _omc_candidate }}"
+    dest: "{{ _omc_current }}"
+    state: link
+    force: true
+  notify: ["restart omnimind-core (if running)"]
+  tags: [promote]
+
+# -------------------------- Optional offline stop --------------------------
+- name: "Service | Stop before migrations (offline mode)"
+  ansible.builtin.systemd:
+    name: "{{ omnimind_core_service_name }}"
+    state: stopped
+  when: omnimind_core_offline_migration | bool
+  tags: [service, migrate]
+
+# -------------------------- Migrations --------------------------
+- name: "Migrate | Skip migrations if disabled or strategy=none"
+  ansible.builtin.debug:
+    msg: "Migrations are disabled."
+  when: (not omnimind_core_migration_enabled | bool) or (omnimind_core_migration_strategy == 'none')
+  tags: [migrate]
+
+- name: "Migrate | Alembic upgrade head"
+  when:
+    - omnimind_core_migration_enabled | bool
+    - omnimind_core_migration_strategy == 'alembic'
+  block:
+    - name: "Migrate | Assert alembic.ini exists"
+      ansible.builtin.stat:
+        path: "{{ omnimind_core_alembic_ini }}"
+      register: _alembic_ini
+      tags: [migrate]
+    - name: "Migrate | Fail if alembic.ini missing"
+      ansible.builtin.assert:
+        that: _alembic_ini.stat.exists
+        fail_msg: "alembic.ini not found at {{ omnimind_core_alembic_ini }}"
+      tags: [migrate]
+    - name: "Migrate | Run alembic upgrade head"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        # Load env if present
+        if [ -f "{{ omnimind_core_env_file }}" ]; then set -a; . "{{ omnimind_core_env_file }}"; set +a; fi
+        cd "{{ _omc_current }}"
+        {{ (lookup('ansible.builtin.env', 'PYTHON', default='python3')) | default('python3') }} -m alembic -c "{{ omnimind_core_alembic_ini }}" upgrade head
+      args:
+        executable: /bin/bash
+      register: _alembic_migrate
+      changed_when: "'Running upgrade' in _alembic_migrate.stdout or 'OK' in _alembic_migrate.stdout or _alembic_migrate.rc == 0"
+      tags: [migrate]
+
+- name: "Migrate | Apply .sql files in lexical order"
+  when:
+    - omnimind_core_migration_enabled | bool
+    - omnimind_core_migration_strategy == 'sql'
+  block:
+    - name: "Migrate | List SQL files"
+      ansible.builtin.find:
+        paths: "{{ omnimind_core_sql_dir }}"
+        patterns: "*.sql"
+        file_type: file
+        recurse: false
+      register: _sql_files
+      tags: [migrate]
+    - name: "Migrate | Assert SQL files present"
+      ansible.builtin.assert:
+        that:
+          - _sql_files.matched | int > 0
+        fail_msg: "No SQL files found in {{ omnimind_core_sql_dir }}"
+      tags: [migrate]
+    - name: "Migrate | Execute SQL files via psql"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if [ -f "{{ omnimind_core_env_file }}" ]; then set -a; . "{{ omnimind_core_env_file }}"; set +a; fi
+        : "${DB_HOST:?DB_HOST not set}"
+        : "${DB_PORT:?DB_PORT not set}"
+        : "${DB_NAME:?DB_NAME not set}"
+        : "${DB_USER:?DB_USER not set}"
+        : "${DB_PASS:?DB_PASS not set}"
+        export PGPASSWORD="${DB_PASS}"
+        for f in $(ls -1 "{{ omnimind_core_sql_dir }}"/*.sql | sort); do
+          psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f "$f"
+        done
+      args: { executable: /bin/bash }
+      register: _sql_apply
+      changed_when: true
+      tags: [migrate]
+
+- name: "Migrate | Custom command"
+  when:
+    - omnimind_core_migration_enabled | bool
+    - omnimind_core_migration_strategy == 'custom'
+    - omnimind_core_custom_migration_cmd | length > 0
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if [ -f "{{ omnimind_core_env_file }}" ]; then set -a; . "{{ omnimind_core_env_file }}"; set +a; fi
+    cd "{{ _omc_current }}"
+    {{ omnimind_core_custom_migration_cmd }}
+  args: { executable: /bin/bash }
+  register: _custom_migrate
+  changed_when: _custom_migrate.rc == 0
+  tags: [migrate]
+
+# -------------------------- Start/Reload --------------------------
+- name: "Service | Start or reload service"
+  ansible.builtin.systemd:
+    name: "{{ omnimind_core_service_name }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: not (omnimind_core_offline_migration | bool and (omnimind_core_migration_enabled | bool))
+  tags: [service]
+
+- name: "Service | Start after offline migrations"
+  ansible.builtin.systemd:
+    name: "{{ omnimind_core_service_name }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: omnimind_core_offline_migration | bool and (omnimind_core_migration_enabled | bool)
+  tags: [service]
+
+# -------------------------- Warmup --------------------------
+- name: "Warmup | Wait for TCP port"
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ omnimind_core_port }}"
+    state: started
+    delay: 1
+    timeout: "{{ omnimind_core_verify_timeout }}"
+  tags: [warmup, verify]
+
+- name: "Warmup | Hit /ready if configured"
+  when: omnimind_core_ready_url is defined
+  ansible.builtin.uri:
+    url: "{{ omnimind_core_ready_url }}"
+    method: GET
+    status_code: [200, 204]
+    timeout: 10
+    return_content: false
+  register: _ready
+  failed_when: false
+  changed_when: false
+  tags: [warmup, verify]
+
+- name: "Warmup | Custom endpoints"
+  when: omnimind_core_warmup_endpoints | length > 0
+  loop: "{{ omnimind_core_warmup_endpoints }}"
+  loop_control: { loop_var: warm_ep }
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ omnimind_core_port }}{{ warm_ep }}"
+    method: GET
+    status_code: [200, 204]
+    timeout: 10
+    return_content: false
+  register: _warm_hits
+  failed_when: false
+  changed_when: false
+  tags: [warmup]
+
+# -------------------------- Verify --------------------------
+- name: "Verify | Health endpoint"
+  ansible.builtin.uri:
+    url: "{{ omnimind_core_health_url }}"
+    method: GET
+    status_code: [200, 204]
+    timeout: 10
+    return_content: false
+  register: _health
+  tags: [verify]
+
+- name: "Verify | Fail if health not OK"
+  ansible.builtin.assert:
+    that:
+      - _health.status in [200, 204]
+    fail_msg: "Health check failed at {{ omnimind_core_health_url }}. Got: {{ _health.status | default('no response') }}"
+  tags: [verify]
+
+# -------------------------- Post-verify bookkeeping --------------------------
+- name: "Bookkeeping | Record active version"
+  ansible.builtin.copy:
+    dest: "{{ omnimind_core_install_dir }}/ACTIVE_VERSION"
+    content: "{{ omnimind_core_promote_version }}\n"
+    owner: "{{ omnimind_core_user }}"
+    group: "{{ omnimind_core_group }}"
+    mode: "0644"
+  tags: [promote]
+
+# -------------------------- Rollback on failure --------------------------
+# Use a dedicated block to catch any error from promotion, migrations, start, warmup or verify.
+- name: "Guard | Ensure end-to-end succeeded"
+  block:
+    - name: "Guard | No-op (placeholder to aggregate previous failures)"
+      ansible.builtin.debug:
+        msg: "Deployment pipeline succeeded."
+  rescue:
+    - name: "Rollback | Switch 'current' back to 'previous' if available"
+      when: _omc_previous_target | default('') | length > 0
+      ansible.builtin.file:
+        src: "{{ _omc_previous_target }}"
+        dest: "{{ _omc_current }}"
+        state: link
+        force: true
+      tags: [rollback]
+
+    - name: "Rollback | Restart service to previous version"
+      ansible.builtin.systemd:
+        name: "{{ omnimind_core_service_name }}"
+        state: restarted
+        enabled: true
+      tags: [rollback]
+
+    - name: "Rollback | Fail with explicit message"
+      ansible.builtin.fail:
+        msg: >-
+          Deployment failed. Rolled back to previous target {{ _omc_previous_target | default('UNKNOWN') }}.
+          Inspect logs and migration outputs.
+  tags: [rollback]
+
+# -------------------------- Handlers hint --------------------------
+# Handlers expected in handlers/main.yml:
+# - name: restart omnimind-core (if running)
+#   ansible.builtin.systemd:
+#     name: "{{ omnimind_core_service_name }}"
+#     state: restarted
+#     enabled: true

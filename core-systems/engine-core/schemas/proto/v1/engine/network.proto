@@ -1,0 +1,263 @@
+syntax = "proto3";
+
+package engine.v1;
+
+option java_multiple_files = true;
+option java_package = "com.aethernova.engine.v1";
+option java_outer_classname = "EngineNetworkProto";
+option csharp_namespace = "Aethernova.Engine.V1";
+option go_package = "github.com/aethernova/engine-core/schemas/gen/go/engine/v1;enginev1";
+option php_namespace = "Aethernova\\Engine\\V1";
+option ruby_package = "Aethernova::Engine::V1";
+option objc_class_prefix = "ENG";
+option optimize_for = SPEED;
+option cc_enable_arenas = true;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+
+// Версионирование схемы на уровне протокола, для гибкой эволюции
+message SchemaVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+}
+
+// Общие алгоритмы сжатия и кодирования содержимого
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_NONE = 1;
+  COMPRESSION_GZIP = 2;
+  COMPRESSION_ZSTD = 3;
+}
+
+enum Encoding {
+  ENCODING_UNSPECIFIED = 0;
+  ENCODING_RAW_BYTES = 1;         // bytes payload без интерпретации
+  ENCODING_PROTO = 2;             // google.protobuf.Any
+  ENCODING_JSON = 3;              // JSON в bytes
+}
+
+enum ChecksumAlgo {
+  CHECKSUM_ALGO_UNSPECIFIED = 0;
+  CHECKSUM_CRC32C = 1;
+  CHECKSUM_SHA256 = 2;
+}
+
+message Checksum {
+  ChecksumAlgo algo = 1;
+  bytes value = 2;                 // Двоичное представление хэша
+}
+
+// Статус подтверждения доставки
+enum AckStatus {
+  ACK_STATUS_UNSPECIFIED = 0;
+  ACK_OK = 1;                      // Сообщение принято и применено
+  ACK_APPLIED_LATER = 2;           // Принято, применится асинхронно
+  ACK_DUPLICATE = 3;               // Дубликат, проигнорировано
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_INVALID_ARGUMENT = 1;
+  ERROR_UNAUTHENTICATED = 2;
+  ERROR_PERMISSION_DENIED = 3;
+  ERROR_NOT_FOUND = 4;
+  ERROR_CONFLICT = 5;
+  ERROR_RESOURCE_EXHAUSTED = 6;
+  ERROR_ABORTED = 7;
+  ERROR_OUT_OF_RANGE = 8;
+  ERROR_UNAVAILABLE = 9;
+  ERROR_INTERNAL = 10;
+  ERROR_UNSUPPORTED = 11;
+  ERROR_TIMEOUT = 12;
+  ERROR_CHECKSUM_MISMATCH = 13;
+}
+
+// Класс сообщения, для фильтрации и маршрутизации
+enum MessageClass {
+  MESSAGE_CLASS_UNSPECIFIED = 0;
+  MESSAGE_CLASS_CONTROL = 1;       // Handshake, FlowControl, Heartbeat
+  MESSAGE_CLASS_DATA = 2;          // Snapshot, Delta, Chunk
+  MESSAGE_CLASS_ACK = 3;           // Ack, Nack
+}
+
+// Заголовок каждого сообщения
+message Header {
+  string message_id = 1;                          // Уникальный ID сообщения, ULID или UUID
+  string correlation_id = 2;                      // Для связывания запросов и ответов
+  string trace_id = 3;                            // Трассировка
+  string span_id = 4;
+  string stream_id = 5;                           // Логический поток синхронизации
+  uint64 sequence = 6;                            // Порядковый номер в потоке
+  uint64 prev_sequence = 7;                       // Для контроля целостности последовательности
+  string tenant_id = 8;                           // Многотенантность
+  string partition_key = 9;                       // Ключ партиции для масштабирования
+  SchemaVersion schema = 10;                      // Версия схемы
+  Encoding encoding = 11;                         // Кодирование полезной нагрузки
+  Compression compression = 12;                   // Сжатие полезной нагрузки
+  Checksum checksum = 13;                         // Контрольная сумма всего Envelope.data payload
+  google.protobuf.Timestamp sent_at = 14;         // Время отправки
+  google.protobuf.Duration ttl = 15;              // Опциональный TTL сообщения
+  MessageClass class = 16;                        // Класс сообщения
+  map<string, string> labels = 17;                // Доп. ключи для маршрутизации и политики
+  string producer_id = 18;                        // Идентификатор отправителя (нода, сервис)
+  string region = 19;                             // Регион отправителя
+  bool requires_ack = 20;                         // Требуется ли явный ACK
+  // Зарезервированные поля для будущих расширений
+  reserved 21 to 24;
+}
+
+// Описание ресурса, к которому относится Snapshot или Delta
+message ResourceRef {
+  string resource_type = 1;       // Например engine.Config или engine.State
+  string resource_id = 2;         // Идентификатор ресурса
+  uint64 version = 3;             // Версия состояния ресурса
+}
+
+// Полная копия состояния
+message Snapshot {
+  Header header = 1;
+  ResourceRef resource = 2;
+  bytes payload = 3;                             // Сериализованное состояние в выбранном encoding
+  // Опциональная сегментация на чанки, если payload большой
+  bool chunked = 4;
+}
+
+// Типы изменений для дельт
+enum ChangeOp {
+  CHANGE_OP_UNSPECIFIED = 0;
+  UPSERT = 1;                 // Создать или обновить
+  DELETE = 2;                 // Удалить элемент
+  REPLACE = 3;                // Полная замена
+  PATCH_JSON = 4;             // JSON Patch RFC 6902
+  PATCH_MERGE = 5;            // Merge Patch RFC 7386
+}
+
+message Change {
+  ChangeOp op = 1;
+  string path = 2;            // Путь к полю или ресурсу, например settings.feature_flags[3]
+  bytes data = 3;             // Данные изменения согласно encoding
+}
+
+message Delta {
+  Header header = 1;
+  ResourceRef resource_from = 2;   // С версии
+  ResourceRef resource_to = 3;     // К версии
+  repeated Change changes = 4;
+  bool chunked = 5;                // Если дельта передается чанками
+}
+
+// Подтверждение получения
+message Ack {
+  Header header = 1;               // Заголовок ACK
+  string acked_message_id = 2;     // ID подтверждаемого сообщения
+  uint64 acked_sequence = 3;       // Позиция в потоке
+  AckStatus status = 4;            // Статус применения
+  string note = 5;                 // Диагностическая информация
+}
+
+// Отрицательное подтверждение с ошибкой
+message Nack {
+  Header header = 1;
+  string failed_message_id = 2;
+  uint64 failed_sequence = 3;
+  ErrorCode code = 4;
+  string reason = 5;
+  google.protobuf.Struct details = 6;  // Структурированные детали
+}
+
+// Чанки для крупных payload
+message Chunk {
+  Header header = 1;
+  string object_id = 2;            // Идентификатор собираемого объекта (message_id первого сообщения)
+  uint32 index = 3;                // Номер чанка начиная с 0
+  uint32 total = 4;                // Сколько чанков ожидается всего
+  bytes data = 5;                  // Фрагмент данных
+  Checksum checksum = 6;           // Контрольная сумма чанка
+  bool last = 7;                   // Быстрый признак последнего чанка
+}
+
+// Поддерживаемые возможности узла
+message Capabilities {
+  repeated Encoding encodings = 1;
+  repeated Compression compressions = 2;
+  uint32 max_chunk_bytes = 3;                 // Рекомендованный максимальный размер чанка
+  uint64 max_inflight_messages = 4;           // Кредит сообщений в полете
+  bool ack_batching_supported = 5;            // Поддержка батч‑ACK
+  bool delta_merge_supported = 6;             // Сerver‑side merge дельт
+  bool checksum_required = 7;                 // Требование проверять checksum
+  repeated string resource_types = 8;         // Типы ресурсов, поддерживаемые узлом
+}
+
+// Приветствие и согласование параметров
+message Hello {
+  Header header = 1;
+  string node_id = 2;
+  string software = 3;                        // Версия ПО узла
+  SchemaVersion protocol = 4;                 // Версия протокола
+  Capabilities capabilities = 5;
+  map<string, string> metadata = 6;           // Доп. сведения, напр. build, commit
+}
+
+// Прощание
+message Bye {
+  Header header = 1;
+  string reason = 2;
+}
+
+// Управление потоком
+message FlowControl {
+  Header header = 1;
+  uint64 credit = 2;                          // Сколько новых сообщений разрешено отправить
+  uint64 window_size = 3;                     // Скользящее окно
+  bool reset = 4;                             // Сбросить счетчики и начать заново
+}
+
+// Периодический сигнал живости
+message Heartbeat {
+  Header header = 1;
+  google.protobuf.Timestamp observed_at = 2;
+  uint64 last_applied_sequence = 3;           // Последняя примененная позиция
+}
+
+// Политика повторной передачи на уровне протокола
+message RetryPolicy {
+  uint32 max_attempts = 1;                    // 0 или отсутствует — бесконечно
+  google.protobuf.Duration initial_backoff = 2;
+  google.protobuf.Duration max_backoff = 3;
+  double backoff_multiplier = 4;              // Например 2.0
+}
+
+// Обертка сообщения для двунаправленного стриминга
+message Envelope {
+  Header header = 1;
+  RetryPolicy retry = 2;                      // Рекомендация по ретраю для этого сообщения
+  oneof data {
+    Hello hello = 10;
+    Bye bye = 11;
+    FlowControl flow_control = 12;
+    Heartbeat heartbeat = 13;
+
+    Snapshot snapshot = 20;
+    Delta delta = 21;
+    Chunk chunk = 22;
+
+    Ack ack = 30;
+    Nack nack = 31;
+  }
+}
+
+// Сервис синхронизации состояния двигателя
+service EngineSync {
+  // Двунаправленный поток, где обе стороны обмениваются Envelope
+  rpc Stream (stream Envelope) returns (stream Envelope);
+
+  // Необязательный RPC для явного подтверждения, если вне Stream
+  rpc Confirm (Ack) returns (Ack);
+
+  // Тест доступности канала управления
+  rpc Ping (Heartbeat) returns (Heartbeat);
+}

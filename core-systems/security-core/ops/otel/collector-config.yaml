@@ -1,0 +1,225 @@
+# OpenTelemetry Collector (contrib) — production-grade configuration
+# Безопасная приёмка из приложений security-core и нод, нормализация и экспорт в OTLP-бэкенд.
+# Требуются бинарь otelcol-contrib и права на чтение k8s метаданных.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 64
+        tls:
+          # Для mTLS задайте файлы/секреты; по умолчанию — plaintext внутри кластера.
+          insecure: ${OTEL_INSECURE:true}
+      http:
+        endpoint: 0.0.0.0:4318
+        read_timeout: 30s
+        write_timeout: 30s
+  # Метрики узла (CPU/Memory/FS/Network) — полезно в DaemonSet
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu: {}
+      load: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      network: {}
+      processes: {}
+  # kubelet cAdvisor — метрики подов/контейнеров
+  kubeletstats:
+    collection_interval: 30s
+    auth_type: serviceAccount
+    endpoint: ${KUBELET_ENDPOINT:https://$(HOST_IP):10250}
+    insecure_skip_verify: true
+    metric_groups:
+      - container
+      - pod
+      - node
+      - volume
+  # Сбор логов контейнеров через filelog (DaemonSet на ноде)
+  filelog:
+    include:
+      - /var/log/pods/*/*/*.log
+    start_at: beginning
+    operators:
+      - type: container
+      - type: move
+        from: attributes.stream
+        to: attributes.log.iostream
+      - type: regex_parser
+        regex: '^(?P<time>[^ ]+) (?P<severity>[A-Z]+) (?P<body>.*)'
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: 2006-01-02T15:04:05.000Z07:00
+
+processors:
+  # Ограничение памяти коллектора, защита от OOM
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Добавление k8s метаданных к сигналам от подов
+  k8sattributes:
+    auth_type: serviceAccount
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.namespace.name
+        - k8s.node.name
+        - k8s.pod.uid
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - container.id
+        - container.name
+        - k8s.pod.start_time
+    filter:
+      node_from_env_var: K8S_NODE_NAME
+    pod_association:
+      - from: resource_attribute
+        name: k8s.pod.ip
+      - from: resource_attribute
+        name: net.host.ip
+      - from: connection
+
+  # Обнаружение ресурсов среды (k8s, host, env)
+  resourcedetection:
+    detectors: [env, system, k8s]
+    timeout: 5s
+    override: false
+
+  # Нормализация атрибутов и удаление PII/секретов
+  attributes/sanitize:
+    actions:
+      # Удаление потенциальных секретов
+      - key: http.request.header.authorization
+        action: delete
+      - key: http.request.header.cookie
+        action: delete
+      - key: db.statement
+        action: hash
+      - key: user.email
+        action: delete
+      - key: user.id
+        action: delete
+      - key: credentials
+        action: delete
+      # Унификация статусов
+      - key: http.status_code
+        action: convert
+        converted_type: int
+
+  # Фильтрация шумных событий (опционально)
+  filter/logs:
+    logs:
+      exclude:
+        match_type: regexp
+        record_attributes:
+          - key: log.iostream
+            value: "stdout"
+
+  # Батчирование для эффективности и снижение нагрузки на сеть/бэкенд
+  batch:
+    send_batch_size: 8192
+    timeout: 5s
+
+  # Очередь/ретраи на уровне экспортёров задаются в exporters.(retry_on_failure|sending_queue)
+  # Семплинг трейсинга: хвостовой семплинг с SLO/ошибками
+  tailsampling:
+    decision_wait: 5s
+    num_traces: 200000
+    expected_new_traces_per_sec: 1000
+    policies:
+      - name: errors-priority
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: long-latency
+        type: latency
+        latency:
+          threshold_ms: 400
+      - name: health-endpoints-low
+        type: string_attribute
+        string_attribute:
+          key: http.target
+          values: ["/health", "/livez", "/readyz"]
+          enabled: true
+          invert_match: true
+      - name: probabilistic-backstop
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: ${TRACE_SAMPLE_PERCENT:10}
+
+exporters:
+  # Основной экспорт — OTLP (Axiom/Tempo/OTelCollector/Elastic и т.д.)
+  otlp:
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:?set-otlp-endpoint}
+    tls:
+      insecure: ${OTEL_EXPORTER_OTLP_INSECURE:false}
+      insecure_skip_verify: ${OTEL_EXPORTER_OTLP_INSECURE_SKIP_VERIFY:false}
+      ca_file: ${OTEL_EXPORTER_OTLP_CA_FILE:}
+      cert_file: ${OTEL_EXPORTER_OTLP_CERT_FILE:}
+      key_file: ${OTEL_EXPORTER_OTLP_KEY_FILE:}
+    headers:
+      authorization: ${OTEL_EXPORTER_OTLP_AUTH_TOKEN:}
+    compression: gzip
+    timeout: 15s
+    sending_queue:
+      enabled: true
+      num_consumers: 8
+      queue_size: 131072
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 5m
+
+  # Экспорт метрик в Prometheus (pull) — для локального дебага
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: security_core
+    const_labels:
+      cluster: ${CLUSTER_NAME:local}
+      component: otel-collector
+
+  # Диагностика (только в non-prod)
+  logging:
+    loglevel: warn
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+  # Надёжная очередь на диск для буферизации при сбоях бэкенда
+  file_storage:
+    directory: ${OTEL_FILE_STORAGE_DIR:/var/lib/otelcol/queue}
+    timeout: 10s
+    create_directory: true
+
+service:
+  telemetry:
+    logs:
+      level: ${OTEL_LOG_LEVEL:info}
+  extensions: [health_check, pprof, zpages, file_storage]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, attributes/sanitize, tailsampling, batch]
+      exporters: [otlp, logging]
+    metrics:
+      receivers: [otlp, hostmetrics, kubeletstats]
+      processors: [memory_limiter, k8sattributes, resourcedetection, batch]
+      exporters: [otlp, prometheus, logging]
+    logs:
+      receivers: [otlp, filelog]
+      processors: [memory_limiter, k8sattributes, resourcedetection, attributes/sanitize, filter/logs, batch]
+      exporters: [otlp, logging]

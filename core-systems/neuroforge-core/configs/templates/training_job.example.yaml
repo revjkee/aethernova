@@ -1,0 +1,358 @@
+# ==============================================================================
+# NeuroForge Core — Training Job Configuration (template)
+# ==============================================================================
+# Назначение: единая декларативная конфигурация обучения модели.
+# Файл потребляется вашим рантаймом (CLI/сервис), который маппит эту схему
+# в конкретные бэкенды: Kubernetes Job/Argo/Kubeflow/Ray/SLURM и т.п.
+# Любое значение можно переопределить переменными окружения ${VAR:-default}.
+# ==============================================================================
+
+version: "1.0"
+
+metadata:
+  project: "neuroforge-core"
+  name: "bert-classifier-train"
+  owner: "ml-team@company.com"
+  description: "Обучение BERT-классификатора на корпоративном датасете"
+  labels:
+    team: "ml"
+    component: "training"
+    stage: "${NF_ENV:-dev}"
+    compliance: "pii"
+  tags: ["nlp", "bert", "pytorch"]
+
+runtime:
+  runner: "${TRAIN_RUNNER:-kubernetes}"   # kubernetes|ray|slurm|local
+  image: "${TRAIN_IMAGE:-ghcr.io/org/neuroforge-train:latest}"
+  imagePullPolicy: "IfNotPresent"
+  command: ["python", "-m", "train"]
+  args:
+    - "--config"
+    - "/app/configs/runtime.yaml"
+  workingDir: "/app"
+  env:                                       # публичные env
+    - name: NF_ENV
+      value: "${NF_ENV:-dev}"
+    - name: MPLCONFIGDIR
+      value: "/tmp/mpl"                      # для readOnly FS
+  envFromSecrets:                             # секреты только из Secret/KeyVault
+    - name: "WANDB_API_KEY"
+      from: "secret://ml/wandb"
+      key: "api_key"
+    - name: "S3_ACCESS_KEY_ID"
+      from: "secret://ml/s3"
+      key: "access_key_id"
+    - name: "S3_SECRET_ACCESS_KEY"
+      from: "secret://ml/s3"
+      key: "secret_access_key"
+
+  resources:
+    cpu: "${TRAIN_CPU:-4}"                   # cores
+    memory: "${TRAIN_MEM:-16Gi}"
+    gpu:
+      type: "${TRAIN_GPU_TYPE:-nvidia}"
+      count: ${TRAIN_GPU_COUNT:-1}
+      # при MIG/подразделении: "nvidia.com/mig-1g.10gb"
+      resourceName: "${TRAIN_GPU_RESOURCE:-nvidia.com/gpu}"
+    ephemeralStorage: "10Gi"
+    priorityClassName: "${TRAIN_PRIORITY_CLASS:-}"
+    nodeSelector:
+      "kubernetes.io/os": "linux"
+    tolerations: []                          # переопределяйте в оверлеях
+    spot:
+      enabled: ${TRAIN_SPOT_ENABLED:-false}
+      maxPrice: "${TRAIN_SPOT_MAX_PRICE:-}"  # пусто = по рыночной
+
+  scheduling:
+    maxRunDuration: "${TRAIN_TIMEOUT:-8h}"   # дедлайн на задачу
+    queue: "${TRAIN_QUEUE:-default}"
+    backoffLimit: ${TRAIN_RETRIES:-3}        # retries на уровне Job
+    retryPolicy:
+      type: "exponential"
+      baseSeconds: 10
+      maxSeconds: 300
+      jitter: true
+    startAfter: ""                           # опциональный ISO8601 или cron
+    # Для периодических запусков используйте оркестратор (Argo/KFP schedule)
+
+  security:
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilitiesDrop: ["ALL"]
+    fsGroup: 2000
+    seccompProfile: "RuntimeDefault"
+
+  io:
+    volumes:
+      - name: "scratch"
+        type: "emptyDir"
+        mountPath: "/scratch"
+        sizeLimit: "40Gi"
+      - name: "datasets-cache"
+        type: "emptyDir"
+        mountPath: "/datasets/.cache"
+        sizeLimit: "20Gi"
+    # Примеры монтирования секретов/конфигов:
+    # - name: "aws-cred"
+    #   type: "secret"
+    #   secretName: "aws-credentials"
+    #   mountPath: "/var/secrets/aws"
+    #   readOnly: true
+
+  distributed:
+    enabled: ${TRAIN_DIST_ENABLED:-false}
+    framework: "${TRAIN_DIST_FRAMEWORK:-ddp}"  # ddp|horovod|deepspeed
+    # параметры для DDP:
+    ddp:
+      nprocPerNode: ${TRAIN_DDP_NPROC:-1}
+      masterAddr: "${TRAIN_MASTER_ADDR:-auto}"
+      masterPort: ${TRAIN_MASTER_PORT:-29500}
+      backend: "${TRAIN_DDP_BACKEND:-nccl}"
+      elastic:
+        enabled: ${TRAIN_DDP_ELASTIC:-false}
+        minNodes: ${TRAIN_ELASTIC_MIN_NODES:-1}
+        maxNodes: ${TRAIN_ELASTIC_MAX_NODES:-1}
+    # параметры DeepSpeed:
+    deepspeed:
+      configFile: "/app/configs/deepspeed.json"   # можно инлайнить через valuesFrom
+    # параметры Horovod:
+    horovod:
+      nprocPerNode: ${TRAIN_HVD_NPROC:-1}
+      fusionThresholdMB: 64
+
+  determinism:
+    seed: ${TRAIN_SEED:-1337}
+    cudnn:
+      deterministic: true
+      benchmark: false
+    numpy_deterministic: true
+
+  precision:
+    mixed: ${TRAIN_AMP_ENABLED:-true}
+    dtype: "bf16"               # fp16|bf16|fp32 (bf16 приоритетно на A100/CPU AVX512)
+
+data:
+  # Источники данных: загрузка либо монтирование (в зависимости от runner)
+  sources:
+    - name: "train"
+      type: "${DATA_TRAIN_TYPE:-s3}"           # s3|gcs|az|nfs|http|local|dvc
+      uri: "${DATA_TRAIN_URI:-s3://ml-bucket/datasets/corpus/train}"
+      readOnly: true
+      cache:
+        enabled: true
+        path: "/datasets/cache/train"
+        maxSize: "50Gi"
+      version: "${DATA_TRAIN_VERSION:-}"       # dvc tag/commit или dataset version
+      checksum: "${DATA_TRAIN_CHECKSUM:-}"     # опциональная гарантия целостности
+    - name: "val"
+      type: "${DATA_VAL_TYPE:-s3}"
+      uri: "${DATA_VAL_URI:-s3://ml-bucket/datasets/corpus/val}"
+      readOnly: true
+      cache:
+        enabled: true
+        path: "/datasets/cache/val"
+        maxSize: "20Gi"
+  # Политики доступа и лицензии
+  governance:
+    pii: "encrypted_at_rest"
+    legalHoldEnforced: true
+    allowedLicenses: ["cc-by-4.0", "apache-2.0", "internal"]
+    lineage:
+      enabled: true
+      outputPath: "/artifacts/lineage.json"
+
+dataloader:
+  framework: "pytorch"
+  numWorkers: ${DL_NUM_WORKERS:-8}
+  prefetchFactor: ${DL_PREFETCH:-4}
+  pinMemory: true
+  persistentWorkers: true
+  dropLast: true
+
+training:
+  framework: "pytorch"
+  entrypoint: "train.py"                         # относительный путь в image
+  hyperparameters:
+    maxEpochs: ${MAX_EPOCHS:-10}
+    trainBatchSize: ${TRAIN_BS:-32}
+    evalBatchSize: ${EVAL_BS:-64}
+    learningRate: ${LR:-3.0e-5}
+    weightDecay: ${WD:-0.01}
+    warmupSteps: ${WARMUP_STEPS:-1000}
+    gradAccumSteps: ${GRAD_ACCUM:-1}
+    maxGradNorm: ${MAX_GRAD_NORM:-1.0}
+    labelSmoothing: ${LBL_SMOOTH:-0.0}
+  optimizer:
+    type: "adamw"
+    params:
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+  scheduler:
+    type: "cosine"
+    params:
+      tMax: ${SCHED_TMAX:-0}                     # 0 => авто по эпохам
+      minLr: ${MIN_LR:-1.0e-6}
+  earlyStopping:
+    enabled: true
+    metric: "val/accuracy"
+    mode: "max"                                  # max|min
+    patience: ${ES_PATIENCE:-3}
+    minDelta: 0.0001
+  evaluation:
+    enabled: true
+    frequency: "epoch"                           # epoch|steps
+    everyNSteps: ${EVAL_EVERY_STEPS:-1000}
+    metrics:
+      - name: "accuracy"
+      - name: "f1_macro"
+      - name: "roc_auc"
+    thresholds:                                  # опциональные гейты качества
+      accuracy: ">=0.90"
+  logging:
+    level: "${LOG_LEVEL:-info}"
+    intervalSteps: ${LOG_EVERY_STEPS:-50}
+    tensorboard:
+      enabled: true
+      logDir: "/artifacts/tb"
+    wandb:
+      enabled: ${WANDB_ENABLED:-false}
+      project: "${WANDB_PROJECT:-neuroforge}"
+      entity: "${WANDB_ENTITY:-}"
+      tags: ["${NF_ENV:-dev}", "train"]
+      offline: ${WANDB_OFFLINE:-false}
+  profiling:
+    enabled: ${PROFILER_ENABLED:-false}
+    framework: "pytorch"
+    schedule:
+      wait: 1
+      warmup: 1
+      active: 2
+
+checkpoints:
+  localDir: "/artifacts/checkpoints"
+  saveLast: true
+  saveTopK: 3
+  monitor: "val/accuracy"
+  mode: "max"
+  everyNEpochs: 1
+  upload:
+    provider: "${CKPT_PROVIDER:-s3}"             # s3|gcs|az|none
+    uri: "${CKPT_URI:-s3://ml-bucket/ckpts/bert-classifier}"
+    sse: "${CKPT_SSE:-AES256}"
+    retentionDays: ${CKPT_RETENTION_DAYS:-90}
+  resume:
+    policy: "${RESUME_POLICY:-auto}"             # auto|latest|none
+    uri: "${RESUME_URI:-}"                       # переопределит auto
+
+artifacts:
+  outputDir: "/artifacts/outputs"
+  keepLocal: true
+  upload:
+    provider: "${ARTIFACTS_PROVIDER:-s3}"
+    uri: "${ARTIFACTS_URI:-s3://ml-bucket/artifacts/bert-classifier}"
+    include:
+      - "/artifacts/outputs/**"
+      - "/artifacts/reports/**"
+    exclude:
+      - "**/*.tmp"
+      - "**/.ipynb_checkpoints/**"
+
+model_registry:
+  provider: "${REGISTRY_PROVIDER:-mlflow}"       # mlflow|wandb|none
+  mlflow:
+    trackingUri: "${MLFLOW_TRACKING_URI:-http://mlflow:5000}"
+    experimentName: "${MLFLOW_EXPERIMENT:-bert-classifier}"
+    registerAs: "${MODEL_NAME:-bert-classifier}"
+    stageAfterRegister: "${MODEL_STAGE:-Staging}"  # None|Staging|Production
+  wandb:
+    modelAlias: "latest"
+
+observability:
+  metrics:
+    backend: "${METRICS_BACKEND:-prometheus}"   # prometheus|otlp|both
+    port: ${METRICS_PORT:-9090}
+    path: "/metrics"
+  tracing:
+    enabled: ${OTEL_TRACES_ENABLED:-false}
+    exporter: "otlp"
+    endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+    serviceName: "nf-train"
+    sampleRatio: ${OTEL_TRACES_SAMPLER_RATIO:-0.1}
+  logs:
+    structure: "json"
+    redactKeys: ["password","authorization","api_key","token","cookie"]
+
+notifications:
+  onSuccess:
+    enabled: ${NOTIFY_SUCCESS_ENABLED:-false}
+    channels:
+      - type: "slack"
+        webhook: "${SLACK_WEBHOOK_URL:-}"
+        message: "✅ Training succeeded: {{run.id}} — {{metrics.val/accuracy}}"
+  onFailure:
+    enabled: ${NOTIFY_FAILURE_ENABLED:-true}
+    channels:
+      - type: "slack"
+        webhook: "${SLACK_WEBHOOK_URL:-}"
+        message: "❌ Training failed: {{run.id}} — see logs {{links.run}}"
+      - type: "email"
+        to: ["ml-oncall@company.com"]
+
+quality_gates:
+  # Прерывание релиза, если метрики хуже порогов.
+  failIfBelow:
+    - metric: "val/accuracy"
+      threshold: 0.90
+    - metric: "val/f1_macro"
+      threshold: 0.88
+
+hooks:
+  preStart:
+    - name: "check-data-access"
+      shell: "python -m tools.data_access_check --uri ${DATA_TRAIN_URI}"
+    - name: "sync-hf-cache"
+      shell: "python -m tools.sync_hf_cache --models bert-base-uncased"
+  postComplete:
+    - name: "export-report"
+      shell: "python -m tools.make_report --out /artifacts/reports/report.html"
+  onFailure:
+    - name: "dump-last-logs"
+      shell: "python -m tools.tail_logs --n 5000 > /artifacts/reports/last_logs.txt || true"
+
+# =========================== Backend-specific Hints ===========================
+# Ниже — подсказки для маппинга на конкретные раннеры.
+backendHints:
+  kubernetes:
+    namespace: "${TRAIN_NAMESPACE:-ml}"
+    serviceAccount: "${TRAIN_SA:-trainer}"
+    affinity:
+      requiredDuringSchedulingIgnoredDuringExecution: []
+    tolerations: []
+    topologySpreadConstraints: []
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: "1"
+    preStopSleepSeconds: 5
+  slurm:
+    partition: "${SLURM_PARTITION:-gpu}"
+    qos: "${SLURM_QOS:-normal}"
+    gpusPerNode: ${SLURM_GPUS_PER_NODE:-1}
+    nodes: ${SLURM_NODES:-1}
+  ray:
+    address: "${RAY_ADDRESS:-auto}"
+    numWorkers: ${RAY_NUM_WORKERS:-0}
+    resourcesPerWorker:
+      CPU: ${RAY_CPU_PER_WORKER:-2}
+      GPU: ${RAY_GPU_PER_WORKER:-0}
+
+# ============================== Validation Schema =============================
+# (опционально) лёгкая валидация на уровне загрузчика
+schema:
+  required:
+    - metadata.name
+    - runtime.image
+    - training.hyperparameters
+  enums:
+    runtime.runner: ["kubernetes","ray","slurm","local"]
+    runtime.distributed.framework: ["ddp","horovod","deepspeed"]

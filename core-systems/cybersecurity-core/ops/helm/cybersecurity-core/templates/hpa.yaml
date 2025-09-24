@@ -1,0 +1,159 @@
+{{- /*
+cybersecurity-core/templates/hpa.yaml
+Промышленный HPA с поддержкой:
+- Resource (CPU/Memory) + ContainerResource (per-container)
+- External/Pods metrics (через Prometheus Adapter)
+- Поведение масштабирования (policies, stabilization)
+Все параметры берутся из .Values.autoscaling.*
+*/ -}}
+{{- if .Values.autoscaling.enabled }}
+apiVersion: {{- if .Capabilities.APIVersions.Has "autoscaling/v2" -}} autoscaling/v2 {{- else -}} autoscaling/v2beta2 {{- end }}
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "cybersecurity-core.fullname" . }}
+  labels:
+    {{- include "cybersecurity-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: cybersecurity-core
+  {{- with .Values.autoscaling.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "cybersecurity-core.fullname" . }}
+  minReplicas: {{ required "autoscaling.minReplicas is required" .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ required "autoscaling.maxReplicas is required" .Values.autoscaling.maxReplicas }}
+  {{- /* ----- Metrics ----- */}}
+  {{- $a := .Values.autoscaling -}}
+  metrics:
+    {{- /* CPU resource metric */}}
+    {{- with $a.cpu }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          {{- if .averageUtilization }}
+          type: Utilization
+          averageUtilization: {{ .averageUtilization }}
+          {{- else if .averageValue }}
+          type: AverageValue
+          averageValue: {{ .averageValue | quote }}
+          {{- else }}
+          type: Utilization
+          averageUtilization: 70
+          {{- end }}
+    {{- end }}
+
+    {{- /* Memory resource metric */}}
+    {{- with $a.memory }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          {{- if .averageUtilization }}
+          type: Utilization
+          averageUtilization: {{ .averageUtilization }}
+          {{- else if .averageValue }}
+          type: AverageValue
+          averageValue: {{ .averageValue | quote }}
+          {{- end }}
+    {{- end }}
+
+    {{- /* ContainerResource metric (per-container) */}}
+    {{- with $a.containerResource }}
+    - type: ContainerResource
+      containerResource:
+        name: {{ required "autoscaling.containerResource.name is required (cpu|memory)" .name }}
+        container: {{ required "autoscaling.containerResource.containerName is required" .containerName }}
+        target:
+          {{- if .averageUtilization }}
+          type: Utilization
+          averageUtilization: {{ .averageUtilization }}
+          {{- else if .averageValue }}
+          type: AverageValue
+          averageValue: {{ .averageValue | quote }}
+          {{- end }}
+    {{- end }}
+
+    {{- /* Pods metrics (rate на Pod) */}}
+    {{- range $idx, $m := $a.podMetrics }}
+    - type: Pods
+      pods:
+        metric:
+          name: {{ required (printf "autoscaling.podMetrics[%d].name is required" $idx) $m.name }}
+          {{- with $m.selector }}
+          selector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- end }}
+        target:
+          type: {{ required (printf "autoscaling.podMetrics[%d].target.type is required (AverageValue|Value)" $idx) $m.target.type }}
+          {{- if eq (upper $m.target.type) "AVERAGEVALUE" }}
+          averageValue: {{ required (printf "autoscaling.podMetrics[%d].target.averageValue is required" $idx) $m.target.averageValue | quote }}
+          {{- else if eq (upper $m.target.type) "VALUE" }}
+          value: {{ required (printf "autoscaling.podMetrics[%d].target.value is required" $idx) $m.target.value | quote }}
+          {{- end }}
+    {{- end }}
+
+    {{- /* External metrics (Prometheus Adapter и т.п.) */}}
+    {{- range $idx, $m := $a.externalMetrics }}
+    - type: External
+      external:
+        metric:
+          name: {{ required (printf "autoscaling.externalMetrics[%d].name is required" $idx) $m.name }}
+          {{- with $m.selector }}
+          selector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- end }}
+        target:
+          type: {{ required (printf "autoscaling.externalMetrics[%d].target.type is required (AverageValue|Value)" $idx) $m.target.type }}
+          {{- if eq (upper $m.target.type) "AVERAGEVALUE" }}
+          averageValue: {{ required (printf "autoscaling.externalMetrics[%d].target.averageValue is required" $idx) $m.target.averageValue | quote }}
+          {{- else if eq (upper $m.target.type) "VALUE" }}
+          value: {{ required (printf "autoscaling.externalMetrics[%d].target.value is required" $idx) $m.target.value | quote }}
+          {{- end }}
+    {{- end }}
+
+  {{- /* ----- Behavior (policies & stabilization) ----- */}}
+  {{- with $a.behavior }}
+  behavior:
+    {{- with .scaleUp }}
+    scaleUp:
+      {{- if .stabilizationWindowSeconds }}
+      stabilizationWindowSeconds: {{ .stabilizationWindowSeconds }}
+      {{- end }}
+      {{- if .selectPolicy }}
+      selectPolicy: {{ .selectPolicy }}
+      {{- end }}
+      {{- if .policies }}
+      policies:
+        {{- range .policies }}
+        - type: {{ required "autoscaling.behavior.scaleUp.policies[].type is required (Pods|Percent)" .type }}
+          value: {{ required "autoscaling.behavior.scaleUp.policies[].value is required" .value }}
+          periodSeconds: {{ default 60 .periodSeconds }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- with .scaleDown }}
+    scaleDown:
+      {{- if .stabilizationWindowSeconds }}
+      stabilizationWindowSeconds: {{ .stabilizationWindowSeconds }}
+      {{- end }}
+      {{- if .selectPolicy }}
+      selectPolicy: {{ .selectPolicy }}
+      {{- end }}
+      {{- if .policies }}
+      policies:
+        {{- range .policies }}
+        - type: {{ required "autoscaling.behavior.scaleDown.policies[].type is required (Pods|Percent)" .type }}
+          value: {{ required "autoscaling.behavior.scaleDown.policies[].value is required" .value }}
+          periodSeconds: {{ default 60 .periodSeconds }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}

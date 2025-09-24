@@ -1,0 +1,216 @@
+# mythos-core/ops/k8s/overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Базовые манифесты (Deployment/Service/Ingress/HPA/…)
+resources:
+  - ../../base
+
+# Prod namespace и префикс имён (опционально)
+namespace: mythos-prod
+namePrefix: prod-
+
+# Единые метки/аннотации окружения
+commonLabels:
+  app.kubernetes.io/part-of: mythos-core
+  app.kubernetes.io/environment: prod
+commonAnnotations:
+  maintainer: platform@mythos.local
+  contact: sre@mythos.local
+  checksum/purpose: "prod-overlay"
+
+# Генераторы конфигурации и секретов (НЕ храните реальные секреты в VCS)
+# Поведение merge — дополняет/переопределяет ключи base-конфигов
+generatorOptions:
+  disableNameSuffixHash: false
+  annotations:
+    reloader.stakater.com/match: "true"   # роллинг-перезапуск при изменении CM/Secret
+
+configMapGenerator:
+  - name: mythos-core-config
+    behavior: merge
+    literals:
+      - APP_ENV=prod
+      - LOG_LEVEL=INFO
+      - PROMETHEUS_SCRAPE_ENABLED=true
+      - OTEL_TRACING_ENABLED=true
+      - HTTP_REQUEST_TIMEOUT_S=30
+      - FEATURE_EXPERIMENTAL_API=false
+
+secretGenerator:
+  - name: mythos-core-secrets
+    behavior: merge
+    # В реальном проде используйте SealedSecrets/ExternalSecrets вместо литералов
+    literals:
+      - SECRET_KEY=__REPLACE_IN_CI__
+      - JWT_SECRET=__REPLACE_IN_CI__
+      - SENTRY_DSN=__REPLACE_IN_CI__
+
+# Обновление контейнерного образа/тега
+images:
+  - name: ghcr.io/ORG/mythos-core
+    newName: ghcr.io/ORG/mythos-core
+    newTag: v1.0.0 # поменяйте на релизный тег
+
+# При желании задать стартовые реплики (HPA их перезапишет)
+replicas:
+  - name: mythos-core-api
+    count: 4
+
+# Точечные патчи для Deployment, HPA, Service, Ingress (inline JSON6902)
+patches:
+  # 1) Deployment: ресурсы, envFrom, readiness/liveness/startup, spread, узлы/толерации
+  - target:
+      version: v1
+      kind: Deployment
+      name: mythos-core-api
+    patch: |
+      - op: add
+        path: /spec/strategy
+        value:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 25%
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: mythos-core
+                app.kubernetes.io/component: api
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          nodepool: workloads
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - key: "workload"
+            operator: "Equal"
+            value: "regular"
+            effect: "NoSchedule"
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: mythos-core-config
+          - secretRef:
+              name: mythos-core-secrets
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+      - op: add
+        path: /spec/template/spec/containers/0/startupProbe
+        value:
+          httpGet:
+            path: /healthz
+            port: http
+          failureThreshold: 30
+          periodSeconds: 5
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 2
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 3
+          timeoutSeconds: 2
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9100"
+          prometheus.io/path: "/metrics"
+
+  # 2) HPA: прод-настройки min/max и цели
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: mythos-core-api
+    patch: |
+      - op: replace
+        path: /spec/minReplicas
+        value: 4
+      - op: replace
+        path: /spec/maxReplicas
+        value: 40
+      - op: replace
+        path: /spec/metrics/0/resource/target/averageUtilization
+        value: 55     # CPU %
+      - op: replace
+        path: /spec/metrics/1/resource/target/averageUtilization
+        value: 65     # Memory %
+      - op: replace
+        path: /spec/behavior/scaleDown/stabilizationWindowSeconds
+        value: 300
+      - op: replace
+        path: /spec/behavior/scaleUp/policies/0/value
+        value: 100
+
+  # 3) Service: аннотации (ingress-controller/NLB и т.д.) — оставлены нейтральными
+  - target:
+      version: v1
+      kind: Service
+      name: mythos-core-api
+    patch: |
+      - op: add
+        path: /metadata/annotations
+        value:
+          service.kubernetes.io/topology-aware-hints: "auto"
+
+  # 4) Ingress: прод-домен и TLS
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: mythos-core
+    patch: |
+      - op: add
+        path: /metadata/annotations
+        value:
+          nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+          nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      - op: replace
+        path: /spec/tls
+        value:
+          - hosts: ["api.mythos.example.com"]
+            secretName: mythos-core-tls
+      - op: replace
+        path: /spec/rules/0/host
+        value: api.mythos.example.com

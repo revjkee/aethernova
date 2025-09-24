@@ -1,0 +1,245 @@
+# Policy Core — Quickstart configuration (industrial-grade example)
+# Внимание: значения по умолчанию безопасны (deny-by-default).
+# Переменные окружения показаны в форме ${ENV:-default} и должны подставляться загрузчиком конфига.
+
+version: 1
+app:
+  name: policy-core-quickstart
+  environment: ${APP_ENV:-dev}
+  timezone: UTC
+
+logging:
+  level: ${LOG_LEVEL:-INFO}        # TRACE|DEBUG|INFO|WARN|ERROR
+  json: true                       # Структурный JSON-лог
+  destination: stdout              # stdout|stderr|file
+  file_path: ${LOG_FILE:-}         # Если destination=file
+  include_correlation_id: true
+  include_request_attrs: true
+
+telemetry:
+  opentelemetry:
+    enabled: ${OTEL_ENABLED:-false}
+    service_name: policy-core
+    exporter: otlp
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}
+    insecure: ${OTEL_INSECURE:-true}
+    sampling_ratio: ${OTEL_SAMPLING_RATIO:-1.0}
+
+# ---------- Policy Enforcement Point (PEP) ----------
+pep:
+  deny_on_error: true
+  default_ttl_seconds: 5
+  cache_capacity: 10000
+  correlation_field: correlation_id
+  circuit_breaker:
+    failure_threshold: 5
+    reset_timeout_seconds: 15
+    half_open_max_calls: 3
+
+# ---------- Policy Decision Point (PDP) Profiles ----------
+profiles:
+  active: ${POLICY_PROFILE:-embedded}  # embedded | remote
+
+  # Встроенный PDP с простым ABAC-движком (пример правил)
+  embedded:
+    engine: abac
+    rules:
+      # Сначала явные запреты (deny)
+      - id: deny_suspended_users
+        effect: Deny
+        actions: ["*"]
+        condition: subject.status == "suspended"
+        reason: "account_suspended"
+
+      - id: deny_from_blocked_ips
+        effect: Deny
+        actions: ["*"]
+        condition: env.ip in env.blocklist_ips
+        reason: "ip_blocked"
+
+      # Базовые разрешения
+      - id: admin_full_access
+        effect: Permit
+        actions: ["*"]
+        condition: "'admin' in subject.roles"
+        obligations:
+          audit.tag:
+            level: "high"
+            tags: ["admin_access"]
+          ledger.append:
+            stream: "policy.decision"
+            extra:
+              rule: "admin_full_access"
+        ttl_seconds: 10
+
+      - id: read_own_profile
+        effect: Permit
+        actions: ["profile:read"]
+        condition: subject.id == resource.owner_id
+        obligations:
+          audit.tag:
+            level: "low"
+            tags: ["self_read"]
+        ttl_seconds: 15
+
+      - id: write_own_profile_limited_hours
+        effect: Permit
+        actions: ["profile:update"]
+        condition: subject.id == resource.owner_id and 9 <= env.now_hour <= 21
+        obligations:
+          redact.fields:
+            fields: ["resource.ssn", "resource.passport_number"]
+          audit.tag:
+            level: "medium"
+            tags: ["self_update"]
+        ttl_seconds: 5
+
+      - id: finance_read_if_scope
+        effect: Permit
+        actions: ["invoice:read", "payment:read"]
+        condition: "'finance.read' in subject.scopes"
+        obligations:
+          audit.tag:
+            level: "medium"
+            tags: ["finance_read"]
+        ttl_seconds: 5
+
+      # Ограничение по региону (пример геополитики)
+      - id: deny_export_restricted_region
+        effect: Deny
+        actions: ["dataset:export"]
+        condition: env.region in ["IR","KP","SY"]
+        reason: "export_restricted"
+
+    attribute_mapping:
+      # Как из запроса формировать subject/resource/environment
+      subject:
+        id: $.subject.id
+        roles: $.subject.roles[]           # список ролей
+        scopes: $.subject.scopes[]         # список OAuth scopes
+        status: $.subject.status
+        tenant: $.subject.tenant
+      resource:
+        id: $.resource.id
+        owner_id: $.resource.owner_id
+        type: $.resource.type
+      environment:
+        ip: $.environment.ip
+        region: $.environment.region
+        now_hour: $.environment.now_hour
+        blocklist_ips: $.environment.blocklist_ips[]
+
+  # Внешний PDP (REST/gRPC). Аутентика — bearer или mTLS (пример полей).
+  remote:
+    engine: http
+    endpoint: ${PDP_URL:-http://localhost:8080/decide}
+    timeout_seconds: 2.5
+    retries:
+      max_attempts: 2
+      base_backoff_seconds: 0.2
+      max_backoff_seconds: 1.0
+      jitter: 0.3
+    auth:
+      type: bearer
+      token: ${PDP_TOKEN:-}
+      # type: mtls
+      # cert_file: ${PDP_CLIENT_CERT:-}
+      # key_file: ${PDP_CLIENT_KEY:-}
+      # ca_file: ${PDP_CA:-}
+    headers:
+      X-Tenant: ${TENANT_ID:-default}
+    # Опциональное включение подписи запроса
+    request_signing:
+      enabled: false
+      algo: hs256
+      key_b64: ${PDP_SIGNING_KEY_B64:-}
+
+# ---------- Obligations Runner ----------
+obligations:
+  defaults: &obligations_defaults
+    timeout_seconds: 5.0
+    max_attempts: 3
+    base_backoff_seconds: 0.5
+    max_backoff_seconds: 30.0
+    jitter: 0.2
+    idempotency_cache_capacity: 20000
+
+  handlers:
+    audit.tag:
+      <<: *obligations_defaults
+      enabled: true
+      concurrency_limit: 128
+      idempotency_ttl_seconds: 600
+      failure_threshold: 10
+      reset_timeout_seconds: 10
+      half_open_max_calls: 5
+
+    redact.fields:
+      <<: *obligations_defaults
+      enabled: true
+      concurrency_limit: 64
+      idempotency_ttl_seconds: 600
+
+    ledger.append:
+      <<: *obligations_defaults
+      enabled: true
+      concurrency_limit: 64
+      idempotency_ttl_seconds: 300
+      # Пример: на основе этого хендлера приложение вызывает адаптер ledger
+
+# ---------- Ledger Adapter (append-only hash chain) ----------
+ledger:
+  type: hash_chain_file
+  base_dir: ${POLICY_LEDGER_DIR:-./var/policy-ledger}
+  segment_max_bytes: ${POLICY_LEDGER_SEGMENT_MAX:-8388608}  # 8 MiB
+  fsync_on_write: ${POLICY_LEDGER_FSYNC:-true}
+  idempotency_ttl_seconds: 300
+  hmac_secret_b64: ${POLICY_LEDGER_HMAC_B64:-}   # Если задано — добавляет HMAC к записям
+  anchor_every: ${POLICY_LEDGER_ANCHOR_EVERY:-0} # 0 — выключено, иначе каждые N записей
+  anchor:
+    # Тип анкеринга определяет код обратного вызова (webhook, командный, noop)
+    type: ${POLICY_LEDGER_ANCHOR_TYPE:-noop}     # noop|webhook|command
+    webhook:
+      url: ${POLICY_LEDGER_ANCHOR_URL:-}
+      timeout_seconds: 2.0
+      headers:
+        Authorization: ${POLICY_LEDGER_ANCHOR_TOKEN:-}
+    command:
+      exec: ${POLICY_LEDGER_ANCHOR_CMD:-}
+      args: ${POLICY_LEDGER_ANCHOR_ARGS:-}
+
+# ---------- Security & Limits ----------
+security:
+  allow_clock_skew_seconds: 60
+  max_subject_attrs: 128
+  max_resource_attrs: 256
+  max_env_attrs: 256
+  max_request_bytes: 131072
+
+# ---------- Quickstart dataset (демо-пользователи/ресурсы) ----------
+seed:
+  users:
+    - id: "u-admin"
+      roles: ["admin"]
+      scopes: ["finance.read"]
+      status: "active"
+    - id: "u-alice"
+      roles: ["user"]
+      scopes: ["finance.read"]
+      status: "active"
+    - id: "u-bob"
+      roles: ["user"]
+      scopes: []
+      status: "suspended"
+  resources:
+    - id: "r-alice-profile"
+      owner_id: "u-alice"
+      type: "profile"
+    - id: "r-bob-profile"
+      owner_id: "u-bob"
+      type: "profile"
+  env:
+    region: "SE"
+    ip: "203.0.113.10"
+    now_hour: 14
+    blocklist_ips: ["198.51.100.77"]

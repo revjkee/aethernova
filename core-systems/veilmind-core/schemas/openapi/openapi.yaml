@@ -1,0 +1,554 @@
+openapi: 3.1.0
+info:
+  title: VeilMind Core API
+  version: 1.0.0
+  description: |
+    Ядро VeilMind — безопасные сервисы Zero-Trust, приватность и телеметрия.
+    Контракт предназначен для генерации клиентов, валидации и конформанс‑тестов.
+  termsOfService: https://veilmind.example/terms
+  contact:
+    name: VeilMind API Support
+    email: api-support@veilmind.example
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://api.veilmind.example
+    description: Production
+  - url: https://staging.api.veilmind.example
+    description: Staging
+
+tags:
+  - name: health
+    description: Здоровье сервиса и готовность
+  - name: auth
+    description: Аутентификация и выпуск токенов
+  - name: privacy
+    description: PDP‑решения приватности и проверка согласий
+  - name: redaction
+    description: Симуляция редактирования для дебага и тестов
+  - name: telemetry
+    description: Метаданные и самонаблюдение API
+
+externalDocs:
+  description: Документация и гайдлайны
+  url: https://docs.veilmind.example
+
+security:
+  - oauth2: [openid, vm.read]
+  - mTLS: []
+  - apiKeyHeader: []
+
+x-idempotency:
+  header: Idempotency-Key
+  ttlSeconds: 86400
+
+paths:
+  /v1/health:
+    get:
+      summary: Проверка здоровья сервиса (агрегированный статус)
+      description: Возвращает агрегированный статус и метаданные билда.
+      tags: [health]
+      operationId: HealthCheck
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/Traceparent'
+        - name: probe
+          in: query
+          schema: { type: string, enum: [liveness, readiness, startup] }
+          description: Тип проверки. По умолчанию readiness.
+        - name: includeMetrics
+          in: query
+          description: Список индикаторов для включения (через запятую)
+          schema: { type: string }
+      security: []  # публичная, но за CDN может быть ограничена
+      responses:
+        '200':
+          description: ОК
+          headers:
+            X-VM-Build-Version: { description: Версия билда, schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthCheckResponse' }
+              examples:
+                ok:
+                  value:
+                    timestamp: '2025-08-21T10:00:00Z'
+                    service: 'core'
+                    status: 'SERVING'
+                    serving: true
+                    uptime: '3600s'
+                    build: { version: '1.0.0+abcd', commit: 'abcd1234', runtime: 'python3.12', platform: 'linux/amd64' }
+        '503':
+          description: Деградация или недоступность
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthCheckResponse' }
+      x-rateLimit: { anonymous: '60rpm' }
+
+  /v1/health/{service}:
+    get:
+      summary: Проверка здоровья конкретного сервиса/подсистемы
+      tags: [health]
+      operationId: HealthCheckService
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/Traceparent'
+        - name: service
+          in: path
+          required: true
+          schema: { type: string, maxLength: 64 }
+        - name: probe
+          in: query
+          schema: { type: string, enum: [liveness, readiness, startup] }
+      responses:
+        '200': { $ref: '#/components/responses/Health200' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/oauth2/token:
+    post:
+      summary: Получение токена по OAuth2 (Client Credentials или Refresh Token)
+      tags: [auth]
+      operationId: OAuth2Token
+      security:
+        - clientSecretBasic: []
+        - mTLS: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                grant_type:
+                  type: string
+                  enum: [client_credentials, refresh_token]
+                scope:
+                  type: string
+                  description: Пространство через пробел, напр. "vm.read vm.write"
+                refresh_token:
+                  type: string
+              required: [grant_type]
+      responses:
+        '200':
+          description: Успех
+          headers:
+            Cache-Control: { schema: { type: string }, description: 'no-store' }
+            Pragma:        { schema: { type: string }, description: 'no-cache' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuth2TokenResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/privacy/decision:
+    post:
+      summary: Решение PDP по приватности
+      description: |
+        Возвращает машинно‑исполняемое решение для PEP с обязанностями
+        (редактирование, хэширование, запрет хранения, сроки retention).
+      tags: [privacy]
+      operationId: PrivacyDecision
+      security:
+        - oauth2: [vm.privacy.evaluate]
+        - mTLS: []
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PrivacyDecisionRequest' }
+            examples:
+              analytics:
+                value:
+                  purpose: 'ANALYTICS'
+                  jurisdiction: 'EEA'
+                  category: 'PII_BASIC'
+                  attribute: 'ip'
+                  legal_basis: 'consent'
+                  context: { system: 'ml.analytics', destination_region: 'US' }
+      responses:
+        '200':
+          description: Успех
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrivacyDecisionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/privacy/consent/verify:
+    post:
+      summary: Проверка действительности согласия
+      tags: [privacy]
+      operationId: ConsentVerify
+      security:
+        - oauth2: [vm.privacy.read]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                subject_id: { type: string }
+                purpose: { type: string }
+                jurisdiction: { type: string }
+                version: { type: string }
+              required: [subject_id, purpose]
+      responses:
+        '200':
+          description: Статус согласия
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid: { type: boolean }
+                  collected_at: { type: string, format: date-time, nullable: true }
+                  expires_at: { type: string, format: date-time, nullable: true }
+                  source: { type: string, nullable: true }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/redaction/simulate:
+    post:
+      summary: Симуляция редактирования с учетом профиля
+      description: |
+        Прогоняет входной payload через движок редактирования по профилю и
+        возвращает редактированный результат и статистику.
+      tags: [redaction]
+      operationId: RedactionSimulate
+      security:
+        - oauth2: [vm.redaction.simulate]
+      parameters:
+        - name: profile
+          in: query
+          required: false
+          schema: { type: string, default: 'hash_low_cardinality' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                source: { type: string, enum: [http, grpc, db, process, files] }
+                payload: { type: object, additionalProperties: true }
+              required: [source, payload]
+      responses:
+        '200':
+          description: Результат симуляции
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  redacted: { type: object, additionalProperties: true }
+                  stats:
+                    type: object
+                    properties:
+                      redacted_fields: { type: integer }
+                      removed_fields: { type: integer }
+                      errors: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/telemetry/meta:
+    get:
+      summary: Метаданные билда/функций
+      tags: [telemetry]
+      operationId: TelemetryMeta
+      security: []
+      responses:
+        '200':
+          description: ОК
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BuildInfo' }
+          headers:
+            X-RateLimit-Limit:  { $ref: '#/components/headers/RateLimit-Limit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            X-RateLimit-Reset:  { $ref: '#/components/headers/RateLimit-Reset' }
+
+components:
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.veilmind.example/oauth2/token
+          scopes:
+            openid: 'OIDC идентичность'
+            vm.read: 'Чтение стандартных API'
+            vm.write: 'Запись стандартных API'
+            vm.privacy.evaluate: 'Оценка приватности'
+            vm.privacy.read: 'Чтение статусов согласий'
+            vm.redaction.simulate: 'Симуляция редактирования'
+    clientSecretBasic:
+      type: http
+      scheme: basic
+      description: Client Credentials через Basic (client_id/client_secret)
+    mTLS:
+      type: mutualTLS
+      description: mTLS для сервис‑к‑сервису
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  parameters:
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      schema: { type: string, maxLength: 128 }
+      description: Пользовательский корреляционный идентификатор
+    Traceparent:
+      name: traceparent
+      in: header
+      required: false
+      schema: { type: string }
+      description: Заголовок W3C Trace Context
+
+  headers:
+    RateLimit-Limit:
+      description: Лимит запросов за окно
+      schema: { type: integer }
+    RateLimit-Remaining:
+      description: Остаток в текущем окне
+      schema: { type: integer }
+    RateLimit-Reset:
+      description: Время сброса окна в секундах UNIX
+      schema: { type: integer }
+
+  responses:
+    Health200:
+      description: ОК
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/HealthCheckResponse' }
+    BadRequest:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            bad:
+              value:
+                error: { code: 'invalid_request', message: 'probe must be readiness|liveness|startup' }
+    Unauthorized:
+      description: Неавторизовано
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Доступ запрещен
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Не найдено
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: Превышен лимит запросов
+      headers:
+        Retry-After:
+          schema: { type: integer, description: Секунды до следующей попытки }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: invalid_request }
+            message: { type: string }
+            target: { type: string, nullable: true }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+                  field: { type: string }
+            correlation_id: { type: string, nullable: true }
+      examples:
+        default:
+          error: { code: 'invalid_request', message: 'Validation failed' }
+
+    HealthCheckResponse:
+      type: object
+      required: [timestamp, service, status, serving]
+      properties:
+        timestamp: { type: string, format: date-time }
+        service:   { type: string }
+        status:
+          type: string
+          enum: [SERVING, DEGRADED, MAINTENANCE, NOT_SERVING]
+        serving: { type: boolean }
+        uptime: { type: string, description: 'google.protobuf.Duration, например "3600s"' }
+        build: { $ref: '#/components/schemas/BuildInfo' }
+        probes:
+          type: object
+          properties:
+            liveness:  { $ref: '#/components/schemas/ProbeStatus' }
+            readiness: { $ref: '#/components/schemas/ProbeStatus' }
+            startup:   { $ref: '#/components/schemas/ProbeStatus' }
+        issues:
+          type: array
+          items: { $ref: '#/components/schemas/HealthIssue' }
+        indicators:
+          type: array
+          items: { $ref: '#/components/schemas/HealthIndicator' }
+        traffic_advice: { $ref: '#/components/schemas/TrafficAdvice' }
+
+    ProbeStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [SERVING, DEGRADED, MAINTENANCE, NOT_SERVING]
+        issues:
+          type: array
+          items: { $ref: '#/components/schemas/HealthIssue' }
+        last_ok: { type: string, format: date-time, nullable: true }
+
+    HealthIssue:
+      type: object
+      properties:
+        code:
+          type: string
+          enum:
+            - DEPENDENCY_DOWN
+            - DEPENDENCY_DEGRADED
+            - RESOURCE_EXHAUSTED
+            - MAINTENANCE_WINDOW
+            - MISCONFIGURATION
+            - STARTUP_FAILURE
+            - AUTHZ_FAILURE
+            - RATE_LIMITED
+        message: { type: string }
+        dependency: { type: string, nullable: true }
+        attributes:
+          type: object
+          additionalProperties: { type: string }
+
+    HealthIndicator:
+      type: object
+      properties:
+        name: { type: string }
+        status:
+          type: string
+          enum: [SERVING, DEGRADED, MAINTENANCE, NOT_SERVING]
+        metrics:
+          type: object
+          additionalProperties: { type: string }
+        thresholds:
+          type: object
+          additionalProperties: { type: string }
+        ts: { type: string, format: date-time }
+
+    TrafficAdvice:
+      type: object
+      properties:
+        drain: { type: boolean, default: false }
+        max_concurrency: { type: integer, nullable: true }
+        backoff: { type: string, nullable: true, description: 'Duration, например "5s"' }
+
+    BuildInfo:
+      type: object
+      properties:
+        version:    { type: string }
+        commit:     { type: string }
+        branch:     { type: string, nullable: true }
+        build_date: { type: string }
+        runtime:    { type: string }
+        platform:   { type: string }
+
+    OAuth2TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer, description: Секунды жизни токена }
+        scope: { type: string }
+        refresh_token: { type: string, nullable: true }
+
+    PrivacyDecisionRequest:
+      type: object
+      required: [purpose, category]
+      properties:
+        purpose:
+          type: string
+          enum: [SECURITY, SUPPORT, ANALYTICS, PERSONALIZATION, MARKETING]
+        jurisdiction:
+          type: string
+          description: Юрисдикция субъекта/обработки (напр. EEA, US, SE)
+        category:
+          type: string
+          enum: [PII_BASIC, PII_SENSITIVE, FINANCIAL, HEALTH, BIOMETRIC, AUTH_SECRETS, NETWORK_IDS, USER_CONTENT, TELEMETRY]
+        attribute:
+          type: string
+          description: Конкретный атрибут внутри категории (например, ip)
+        legal_basis:
+          type: string
+          enum: [consent, contract, legal_obligation, legitimate_interest, vital_interest, public_task]
+        subject_class:
+          type: string
+          enum: [ADULT, TEEN, CHILD]
+        context:
+          type: object
+          additionalProperties: true
+
+    PrivacyDecisionResponse:
+      type: object
+      required: [action, reasons]
+      properties:
+        action:
+          type: string
+          enum: [allow, allow_with_obligations, deny, deny_store]
+        reasons:
+          type: array
+          items: { type: string }
+        obligations:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string }
+              ref:  { type: string, nullable: true }
+              days: { type: integer, nullable: true }
+              profile: { type: string, nullable: true }
+              details:
+                type: object
+                additionalProperties: true
+        retention_days:
+          type: integer
+        redaction_profile:
+          type: string
+        audit_level:
+          type: string
+          enum: [none, basic, verbose]
+
+x-standards:
+  tracing: W3C Trace Context
+  rateLimits: RFC-Standard-RateLimit-Headers
+  errors: RFC-7807-like (упрощенный)
+  security: OAuth2 + mTLS + API Key
+  idempotency: Stripe‑style Idempotency-Key

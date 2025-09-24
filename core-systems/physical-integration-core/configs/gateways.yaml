@@ -1,0 +1,442 @@
+# physical-integration-core/configs/gateways.yaml
+apiVersion: pic.neurocity/v1
+kind: GatewayConfig
+metadata:
+  name: physical-integration-core
+  schemaVersion: 1.3.0
+  owner: platform-ops
+  labels:
+    app.kubernetes.io/part-of: physical-integration-core
+    compliance.isa62443: "true"
+spec:
+  # ---------- Глобальные дефолты (якоря) ----------
+  defaults:
+    security: &default_security
+      tls:
+        enabled: true
+        minVersion: TLS1.2
+        preferServerCipherSuites: true
+        ciphers:
+          - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+          - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+          - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+          - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        curvePreferences:
+          - X25519
+          - CurveP256
+        verifyPeerCertificate: true
+        clientAuth: requireAndVerifyClientCert
+        caBundle:
+          source: secret
+          ref: secrets/ca/root-ca.pem
+        certChain:
+          source: secret
+          ref: secrets/tls/gateway.crt
+        privateKey:
+          source: secret
+          ref: secrets/tls/gateway.key
+      mtls:
+        enabled: true
+        clientCaBundle:
+          source: secret
+          ref: secrets/ca/device-ca.pem
+      authz:
+        policy: zero-trust
+        rbac:
+          roles:
+            - name: ot-reader
+              allow:
+                - read:opcua
+                - read:modbus
+            - name: bus-publisher
+              allow:
+                - write:kafka
+                - write:nats
+          bindings:
+            - subject: spiffe://neurocity/pic/edge-gw
+              roles: [ot-reader, bus-publisher]
+      audit:
+        enabled: true
+        sink:
+          type: file
+          path: /var/log/pic/audit.log
+        redact:
+          enabled: true
+          fields:
+            - payload.credentials
+            - payload.serialNumber
+
+    delivery: &default_delivery
+      qos: at_least_once            # QoS/acks настройка (гарантия >=1)
+      acks: all
+      compression: zstd
+      retry:
+        maxAttempts: 10
+        initialBackoff: 200ms
+        maxBackoff: 30s
+        multiplier: 2.0
+        jitter: 0.2
+        retryOn:
+          - network_error
+          - timeout
+          - broker_overloaded
+      circuitBreaker:
+        failureRateThreshold: 50
+        slowCallRateThreshold: 50
+        slowCallDurationThreshold: 2s
+        permittedNumberOfCallsInHalfOpenState: 5
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 20
+        waitDurationInOpenState: 30s
+      rateLimit:
+        enabled: true
+        limitPerSecond: 500
+        burst: 100
+      dlq:
+        enabled: true
+        type: kafka
+        topic: pic.dlq
+        retention: 168h
+        maxSizeMB: 10240
+
+    observability: &default_observability
+      metrics:
+        prometheus:
+          enabled: true
+          path: /metrics
+          port: 9090
+          histogramBucketsMs: [5, 10, 25, 50, 100, 250, 500, 1000]
+      tracing:
+        otlp:
+          enabled: true
+          endpoint: otel-collector.observability:4317
+          insecure: false
+          sampling:
+            parentBasedRatio: 0.2
+      logging:
+        level: INFO
+        format: json
+        fields:
+          include:
+            - ts
+            - level
+            - msg
+            - gw
+            - site
+            - pipeline
+          maxFieldLength: 8192
+
+    validation: &default_validation
+      schema:
+        enabled: true
+        strategy: reject_on_violation
+        registries:
+          - type: confluent
+            url: https://schema-registry.bus.svc:8081
+            auth:
+              type: mTLS
+              certRef: secrets/tls/gateway.crt
+              keyRef: secrets/tls/gateway.key
+          - type: inline
+            subjects:
+              - name: pic.telemetry.v1
+                format: json
+                schemaRef: schemas/telemetry_v1.json
+        allowedFormats: [json, avro, protobuf]
+      payloadSize:
+        maxBytes: 1048576
+      deduplication:
+        enabled: true
+        window: 5m
+        key: $.deviceId + ":" + $.sequence
+
+    transform: &default_transform
+      pipeline:
+        - name: normalize
+          type: jq
+          expr: |
+            {
+              deviceId: .device.id,
+              site: .site // env.SITE,
+              ts: (.timestamp // now),
+              metrics: .metrics,
+              meta: { fw: .firmware, model: .model }
+            }
+        - name: enrich
+          type: lookup
+          source: file
+          ref: lookups/device_inventory.yaml
+          on: $.deviceId
+          into: $.meta.inventory
+        - name: validate-range
+          type: rule
+          expr: "all($.metrics[].value; . >= -1.0e9 and . <= 1.0e9)"
+
+  # ---------- Источники и приемники шин ----------
+  buses:
+    kafka:
+      clusters:
+        core:
+          brokers: ["kafka-0.bus.svc:9093","kafka-1.bus.svc:9093","kafka-2.bus.svc:9093"]
+          security: *default_security
+          delivery: *default_delivery
+          topics:
+            telemetry:
+              name: pic.telemetry.v1
+              partitions: 12
+              replication: 3
+              config:
+                cleanup.policy: compact,delete
+                min.insync.replicas: 2
+            dlq:
+              name: pic.dlq
+              partitions: 6
+              replication: 3
+    nats:
+      servers: ["nats.bus.svc:4222"]
+      security: *default_security
+      jetstream:
+        enabled: true
+        streams:
+          - name: PIC_TELEMETRY
+            subjects: ["pic.telemetry.v1.*"]
+            retention: limits
+            storage: file
+            max_age: 168h
+
+  # ---------- Описания шлюзов ----------
+  gateways:
+    # === MQTT Ingress (OT edge → IT bus) ===
+    - name: edge-mqtt-gw
+      type: mqtt_ingress
+      site: plant-a
+      endpoints:
+        - uri: "tls://mqtt.edge.plant-a.local:8883"
+          clientId: "pic-edge-a"
+          security:
+            <<: *default_security
+            tls:
+              <<: *default_security.tls
+              sni: "mqtt.edge.plant-a.local"
+          subscribe:
+            topics:
+              - name: "ot/+/telemetry"
+                qos: 1
+              - name: "ot/+/status"
+                qos: 1
+          session:
+            cleanStart: false
+            expiryInterval: 604800
+      transform: *default_transform
+      validation: *default_validation
+      sink:
+        type: kafka
+        clusterRef: core
+        topicRef: telemetry
+      delivery: *default_delivery
+      observability: *default_observability
+
+    # === OPC UA Poller → Kafka ===
+    - name: opcua-poller-gw
+      type: opcua_ingress
+      site: plant-a
+      endpoint:
+        url: "opc.tcp://opcua.server.plant-a.local:4840"
+        securityPolicy: "Basic256Sha256"
+        messageSecurityMode: "SignAndEncrypt"
+        security:
+          <<: *default_security
+          tls:
+            enabled: true
+        auth:
+          method: username_password
+          usernameFrom:
+            source: secret
+            ref: secrets/opcua/creds#username
+          passwordFrom:
+            source: secret
+            ref: secrets/opcua/creds#password
+      subscriptions:
+        samplingIntervalMs: 500
+        publishingIntervalMs: 500
+        queues:
+          - name: line-1
+            nodes:
+              - nodeId: "ns=2;s=Temp.Value"
+                alias: "temp_c"
+              - nodeId: "ns=2;s=Speed.Value"
+                alias: "speed_rpm"
+          - name: line-2
+            nodes:
+              - nodeId: "ns=2;s=Pressure.Value"
+                alias: "pressure_bar"
+      transform:
+        pipeline:
+          - name: to-json
+            type: template
+            format: json
+            body: |
+              {
+                "deviceId": "{{ .source.nodeAlias }}",
+                "ts": {{ .timestamp }},
+                "metrics": {{ toJson .values }},
+                "site": "plant-a"
+              }
+          - name: add-quality
+            type: jq
+            expr: ".quality = \"GOOD\""
+      validation: *default_validation
+      sink:
+        type: kafka
+        clusterRef: core
+        topicRef: telemetry
+      delivery: *default_delivery
+      observability: *default_observability
+
+    # === Modbus TCP → NATS (в реальном времени) ===
+    - name: modbus-tcp-gw
+      type: modbus_tcp_ingress
+      site: plant-b
+      endpoint:
+        host: "plc01.plant-b.local"
+        port: 502
+        unitId: 1
+        timeoutMs: 1000
+        security:
+          tls:
+            enabled: false  # многие PLC без TLS; защищайте сеть сегментацией/VPN
+      polling:
+        intervalMs: 200
+        batches:
+          - name: regs-1
+            function: holding_registers
+            startAddress: 0
+            count: 16
+            map:
+              - name: voltage_v
+                at: 0
+                type: uint16
+                scale: 0.1
+              - name: current_a
+                at: 1
+                type: uint16
+                scale: 0.01
+              - name: energy_kwh
+                at: 2
+                type: uint32be
+                scale: 0.001
+      transform: *default_transform
+      validation: *default_validation
+      sink:
+        type: nats
+        subject: "pic.telemetry.v1.plant-b"
+      delivery:
+        <<: *default_delivery
+        qos: at_most_once     # для минимальной задержки
+      observability: *default_observability
+
+    # === HTTP Webhook Ingress (подписчики из цеха) ===
+    - name: http-webhook-gw
+      type: http_ingress
+      site: plant-a
+      server:
+        bind: 0.0.0.0
+        port: 8443
+        security: *default_security
+        limits:
+          maxBodyBytes: 1048576
+          requestTimeout: 5s
+      routes:
+        - path: /ingest/telemetry
+          methods: [POST]
+          auth:
+            type: oauth2_jwt
+            jwksUri: https://auth.neurocity/realms/pic/protocol/openid-connect/certs
+            audience: pic.ingest
+          transform:
+            pipeline:
+              - name: ensure-array
+                type: jq
+                expr: "if type==\"array\" then . else [.] end"
+          validation: *default_validation
+          sink:
+            type: kafka
+            clusterRef: core
+            topicRef: telemetry
+          delivery: *default_delivery
+      observability: *default_observability
+
+    # === Архив в объектное хранилище (S3/MinIO) ===
+    - name: s3-archive-sink
+      type: s3_sink
+      site: central
+      source:
+        type: kafka
+        clusterRef: core
+        topics: ["pic.telemetry.v1"]
+      bucket:
+        name: "pic-telemetry-archive"
+        prefix: "year={{ .ts | year }}/month={{ .ts | month }}/day={{ .ts | day }}/"
+        partitionByHour: true
+      format:
+        type: parquet
+        schemaSubject: "pic.telemetry.v1"
+        compression: zstd
+      security:
+        tls:
+          enabled: true
+        auth:
+          type: iam
+      delivery:
+        <<: *default_delivery
+        qos: exactly_once   # требует идемпотентного продьюсера/двухфазной записи
+      observability: *default_observability
+
+  # ---------- Профили окружений (перекрытия) ----------
+  profiles:
+    development:
+      logging:
+        level: DEBUG
+      gateways:
+        - match: { name: edge-mqtt-gw }
+          patch:
+            delivery:
+              rateLimit:
+                limitPerSecond: 50
+                burst: 10
+            observability:
+              tracing:
+                otlp:
+                  sampling:
+                    parentBasedRatio: 1.0
+    staging:
+      gateways:
+        - match: { type: http_ingress }
+          patch:
+            server:
+              limits:
+                maxBodyBytes: 524288
+            delivery:
+              retry:
+                maxAttempts: 6
+    production:
+      gatesHardening:
+        denyPlaintextPLC: true
+      gateways:
+        - match: { name: modbus-tcp-gw }
+          patch:
+            delivery:
+              qos: at_least_once
+            polling:
+              intervalMs: 500
+        - match: { type: mqtt_ingress }
+          patch:
+            endpoints:
+              - uri: "tls://mqtt.cluster.prod:8883"
+                clientId: "pic-edge-prod"
+            delivery:
+              retry:
+                maxAttempts: 12
+                initialBackoff: 500ms
+                maxBackoff: 60s
+                multiplier: 2.0

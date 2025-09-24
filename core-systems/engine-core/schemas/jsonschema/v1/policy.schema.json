@@ -1,0 +1,491 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.aethernova.com/engine-core/v1/policy.schema.json",
+  "title": "Aethernova Engine | Policy Model",
+  "description": "Политики доступа/исполнения для PEP/PDP/PAP. Поддерживает PolicySet/Policy/Rule, таргет, выражения условий, комбинаторы, обязательства и аудит.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/Policy" },
+    { "$ref": "#/$defs/PolicySet" }
+  ],
+  "unevaluatedProperties": false,
+
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "description": "ULID/UUIDv4.",
+      "pattern": "^(?:[0-9A-Fa-f-]{36}|[0-9A-HJKMNP-TV-Z]{26})$"
+    },
+    "SemVer": {
+      "type": "string",
+      "description": "SemVer: MAJOR.MINOR.PATCH(-pre)(+build)",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Labels": {
+      "type": "object",
+      "propertyNames": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_.:-]+$" },
+      "additionalProperties": { "type": "string", "maxLength": 256 },
+      "maxProperties": 128,
+      "default": {}
+    },
+    "Decision": {
+      "type": "string",
+      "enum": ["Permit", "Deny", "NotApplicable", "Indeterminate"]
+    },
+    "CombiningAlg": {
+      "type": "string",
+      "enum": [
+        "deny-overrides",
+        "permit-overrides",
+        "first-applicable",
+        "only-one-applicable",
+        "ordered-deny-overrides"
+      ]
+    },
+    "RiskLevel": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "critical"]
+    },
+    "DecimalString": {
+      "type": "string",
+      "description": "Десятичная строка, до 18 знаков после запятой.",
+      "pattern": "^(?:0|[1-9]\\d*)(?:\\.[0-9]{1,18})?$"
+    },
+
+    "Expr": {
+      "type": "object",
+      "description": "Безопасное булево выражение (CEL‑подобное).",
+      "unevaluatedProperties": false,
+      "properties": {
+        "language": { "type": "string", "enum": ["cel", "none"], "default": "none" },
+        "source": { "type": "string", "maxLength": 8000, "default": "" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "language": { "const": "cel" } } },
+          "then": { "required": ["source"] }
+        }
+      ],
+      "default": { "language": "none", "source": "" }
+    },
+
+    "Subject": {
+      "type": "object",
+      "description": "Сведения о субъекте (пользователь/сервис/агент).",
+      "unevaluatedProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Identifier" },
+        "tenant": { "type": "string", "maxLength": 128, "default": "" },
+        "roles": { "type": "array", "items": { "type": "string", "maxLength": 128 }, "uniqueItems": true, "maxItems": 128, "default": [] },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": [ "string", "number", "boolean", "null" ],
+          "default": {}
+        },
+        "mfa": { "type": "boolean", "default": false },
+        "risk": { "$ref": "#/$defs/RiskLevel", "default": "low" },
+        "labels": { "$ref": "#/$defs/Labels" }
+      },
+      "default": {}
+    },
+
+    "Resource": {
+      "type": "object",
+      "description": "Ресурс доступа/операции.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": { "type": "string", "maxLength": 128, "description": "Например: engine.Job, wallet.Transfer" },
+        "id": { "oneOf": [ { "$ref": "#/$defs/Identifier" }, { "type": "string", "maxLength": 256 } ] },
+        "owner": { "type": "string", "maxLength": 256 },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": [ "string", "number", "boolean", "null" ],
+          "default": {}
+        },
+        "labels": { "$ref": "#/$defs/Labels" }
+      },
+      "required": ["type"],
+      "default": {}
+    },
+
+    "Action": {
+      "type": "object",
+      "description": "Действие, запрашиваемое субъектом.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "name": { "type": "string", "maxLength": 128, "description": "Например: read, write, execute, transfer, deploy" },
+        "method": { "type": "string", "maxLength": 64, "default": "" },
+        "amount": { "oneOf": [ { "$ref": "#/$defs/DecimalString" }, { "type": "null" } ], "default": null },
+        "unit": { "type": "string", "maxLength": 32, "default": "" },
+        "labels": { "$ref": "#/$defs/Labels" }
+      },
+      "required": ["name"],
+      "default": {}
+    },
+
+    "Environment": {
+      "type": "object",
+      "description": "Контекст окружения/риска/локации.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "ip": { "type": "string", "maxLength": 64 },
+        "asn": { "type": "integer", "minimum": 0 },
+        "countryCode": { "type": "string", "pattern": "^[A-Z]{2}$" },
+        "region": { "type": "string", "maxLength": 128 },
+        "timezone": { "type": "string", "maxLength": 64 },
+        "time": { "$ref": "#/$defs/Timestamp" },
+        "threatScore": { "type": "integer", "minimum": 0, "maximum": 100, "default": 0 },
+        "labels": { "$ref": "#/$defs/Labels" }
+      },
+      "default": {}
+    },
+
+    "Schedule": {
+      "type": "object",
+      "description": "Ограничение по времени/расписанию.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "timezone": { "type": "string", "maxLength": 64 },
+        "cron": { "type": "string", "maxLength": 128, "description": "Quartz‑совместимое CRON выражение" },
+        "window": {
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "start": { "$ref": "#/$defs/Timestamp" },
+            "end": { "oneOf": [ { "$ref": "#/$defs/Timestamp" }, { "type": "null" } ], "default": null }
+          }
+        }
+      },
+      "default": {}
+    },
+
+    "Target": {
+      "type": "object",
+      "description": "Область применения: кто/что/где/когда/какое действие.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "subject": { "$ref": "#/$defs/Subject" },
+        "resource": { "$ref": "#/$defs/Resource" },
+        "action": { "$ref": "#/$defs/Action" },
+        "environment": { "$ref": "#/$defs/Environment" },
+        "expr": { "$ref": "#/$defs/Expr" },
+        "schedule": { "$ref": "#/$defs/Schedule" },
+        "segments": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 128 },
+          "uniqueItems": true,
+          "maxItems": 128,
+          "default": []
+        }
+      },
+      "default": {}
+    },
+
+    "Obligation": {
+      "type": "object",
+      "description": "Обязательное действие при решении (для PEP).",
+      "unevaluatedProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/Identifier" },
+        "on": { "type": "string", "enum": ["Permit", "Deny"], "description": "При каком решении исполнять" },
+        "type": {
+          "type": "string",
+          "enum": ["log", "notify", "enforce-mfa", "quarantine", "rate-limit", "record-metric", "attach-tags", "require-approval"]
+        },
+        "params": { "type": "object", "additionalProperties": [ "string", "number", "boolean", "null" ], "default": {} },
+        "stopOnFailure": { "type": "boolean", "default": false }
+      },
+      "required": ["on", "type"],
+      "default": {}
+    },
+
+    "Advice": {
+      "type": "object",
+      "description": "Нерегламентированная рекомендация для PEP/клиента.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "message": { "type": "string", "maxLength": 1024 },
+        "params": { "type": "object", "additionalProperties": [ "string", "number", "boolean", "null" ], "default": {} }
+      },
+      "default": {}
+    },
+
+    "Rule": {
+      "type": "object",
+      "description": "Минимальная единица решения: если target + condition истинны — применить effect (Permit/Deny) и обязательства.",
+      "unevaluatedProperties": false,
+      "required": ["id", "effect", "priority"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Identifier" },
+        "name": { "type": "string", "maxLength": 256, "default": "" },
+        "description": { "type": "string", "maxLength": 2000, "default": "" },
+        "priority": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "risk": { "$ref": "#/$defs/RiskLevel", "default": "low" },
+        "enabled": { "type": "boolean", "default": true },
+        "target": { "$ref": "#/$defs/Target" },
+        "condition": { "$ref": "#/$defs/Expr" },
+        "effect": {
+          "type": "string",
+          "enum": ["Permit", "Deny"],
+          "description": "Результат при выполнении условий."
+        },
+        "obligations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Obligation" },
+          "maxItems": 64,
+          "default": []
+        },
+        "advice": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Advice" },
+          "maxItems": 64,
+          "default": []
+        },
+        "limits": {
+          "type": "object",
+          "description": "Лимиты применения правила.",
+          "unevaluatedProperties": false,
+          "properties": {
+            "perRequest": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+            "perSubjectDaily": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+            "perResourceDaily": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+          },
+          "default": {}
+        },
+        "labels": { "$ref": "#/$defs/Labels" }
+      }
+    },
+
+    "Audit": {
+      "type": "object",
+      "description": "Аудит изменений/публикаций политики.",
+      "unevaluatedProperties": false,
+      "required": ["riskLevel", "approvals"],
+      "properties": {
+        "riskLevel": { "$ref": "#/$defs/RiskLevel" },
+        "initiator": { "type": "string", "maxLength": 256, "default": "" },
+        "changeReason": { "type": "string", "maxLength": 1024, "default": "" },
+        "approvals": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "unevaluatedProperties": false,
+            "required": ["by", "at"],
+            "properties": {
+              "by": { "type": "string", "maxLength": 256 },
+              "at": { "$ref": "#/$defs/Timestamp" },
+              "signature": {
+                "type": "object",
+                "unevaluatedProperties": false,
+                "required": ["alg", "sig"],
+                "properties": {
+                  "alg": { "type": "string", "enum": ["ed25519", "secp256k1", "rsa-pss-256", "none"] },
+                  "sig": { "type": "string", "maxLength": 2048 },
+                  "pub": { "type": "string", "maxLength": 2048 }
+                }
+              }
+            }
+          },
+          "default": []
+        }
+      }
+    },
+
+    "Policy": {
+      "type": "object",
+      "description": "Единичная политика с набором правил и комбинатором.",
+      "unevaluatedProperties": false,
+      "required": ["kind", "schemaVersion", "id", "status", "target", "algorithm", "rules", "audit"],
+      "properties": {
+        "kind": { "const": "Policy" },
+        "schemaVersion": { "$ref": "#/$defs/SemVer" },
+        "id": { "$ref": "#/$defs/Identifier" },
+        "name": { "type": "string", "maxLength": 256, "default": "" },
+        "description": { "type": "string", "maxLength": 2000, "default": "" },
+        "status": { "type": "string", "enum": ["draft", "active", "paused", "retired"] },
+        "tenant": { "type": "string", "maxLength": 128, "default": "" },
+        "labels": { "$ref": "#/$defs/Labels" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "effectiveFrom": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "oneOf": [ { "$ref": "#/$defs/Timestamp" }, { "type": "null" } ], "default": null },
+        "priority": { "type": "integer", "minimum": 0, "maximum": 1000000, "default": 100 },
+        "algorithm": { "$ref": "#/$defs/CombiningAlg" },
+        "target": { "$ref": "#/$defs/Target" },
+        "preConditions": { "$ref": "#/$defs/Expr" },
+        "postConditions": { "$ref": "#/$defs/Expr" },
+        "rules": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/Rule" }
+        },
+        "obligations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Obligation" },
+          "maxItems": 64,
+          "default": []
+        },
+        "advice": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Advice" },
+          "maxItems": 64,
+          "default": []
+        },
+        "bindings": {
+          "type": "array",
+          "description": "Список PEP, к которым применяется политика.",
+          "items": {
+            "type": "object",
+            "unevaluatedProperties": false,
+            "required": ["pepId"],
+            "properties": {
+              "pepId": { "type": "string", "maxLength": 128 },
+              "weight": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 0 },
+              "mode": { "type": "string", "enum": ["enforce", "monitor"], "default": "enforce" }
+            }
+          },
+          "maxItems": 1024,
+          "default": []
+        },
+        "audit": { "$ref": "#/$defs/Audit" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "expiresAt": { "type": "string" } } },
+          "then": { "required": ["effectiveFrom"] }
+        }
+      ]
+    },
+
+    "PolicySet": {
+      "type": "object",
+      "description": "Контейнер других Policy/PolicySet с собственным комбинатором и таргетом.",
+      "unevaluatedProperties": false,
+      "required": ["kind", "schemaVersion", "id", "status", "target", "algorithm", "children", "audit"],
+      "properties": {
+        "kind": { "const": "PolicySet" },
+        "schemaVersion": { "$ref": "#/$defs/SemVer" },
+        "id": { "$ref": "#/$defs/Identifier" },
+        "name": { "type": "string", "maxLength": 256, "default": "" },
+        "description": { "type": "string", "maxLength": 2000, "default": "" },
+        "status": { "type": "string", "enum": ["draft", "active", "paused", "retired"] },
+        "tenant": { "type": "string", "maxLength": 128, "default": "" },
+        "labels": { "$ref": "#/$defs/Labels" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "effectiveFrom": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "oneOf": [ { "$ref": "#/$defs/Timestamp" }, { "type": "null" } ], "default": null },
+        "priority": { "type": "integer", "minimum": 0, "maximum": 1000000, "default": 100 },
+        "algorithm": { "$ref": "#/$defs/CombiningAlg" },
+        "target": { "$ref": "#/$defs/Target" },
+        "preConditions": { "$ref": "#/$defs/Expr" },
+        "postConditions": { "$ref": "#/$defs/Expr" },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10000,
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/Policy" },
+              { "$ref": "#/$defs/PolicySet" }
+            ]
+          }
+        },
+        "obligations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Obligation" },
+          "maxItems": 64,
+          "default": []
+        },
+        "advice": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Advice" },
+          "maxItems": 64,
+          "default": []
+        },
+        "bindings": {
+          "type": "array",
+          "description": "Список PEP, к которым применяется набор.",
+          "items": {
+            "type": "object",
+            "unevaluatedProperties": false,
+            "required": ["pepId"],
+            "properties": {
+              "pepId": { "type": "string", "maxLength": 128 },
+              "weight": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 0 },
+              "mode": { "type": "string", "enum": ["enforce", "monitor"], "default": "enforce" }
+            }
+          },
+          "maxItems": 1024,
+          "default": []
+        },
+        "audit": { "$ref": "#/$defs/Audit" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "expiresAt": { "type": "string" } } },
+          "then": { "required": ["effectiveFrom"] }
+        }
+      ]
+    }
+  },
+
+  "examples": [
+    {
+      "kind": "Policy",
+      "schemaVersion": "1.0.0",
+      "id": "01J3YB3Z4G5K7M9N1P2Q3R4S5T",
+      "name": "wallet-transfer-core",
+      "status": "active",
+      "tenant": "aethernova",
+      "priority": 50,
+      "algorithm": "deny-overrides",
+      "target": {
+        "action": { "name": "transfer" },
+        "resource": { "type": "wallet.Transfer" },
+        "expr": { "language": "cel", "source": "subject.risk in ['low','medium'] && environment.countryCode != 'KP'" }
+      },
+      "rules": [
+        {
+          "id": "01J3YB3Z4G5K7M9N1P2Q3R4S60",
+          "name": "require-mfa-over-1000",
+          "priority": 10,
+          "risk": "medium",
+          "enabled": true,
+          "condition": { "language": "cel", "source": "double(action.amount) > 1000" },
+          "effect": "Permit",
+          "obligations": [
+            { "on": "Permit", "type": "enforce-mfa", "params": { "level": "strong" }, "stopOnFailure": true },
+            { "on": "Permit", "type": "log", "params": { "category": "policy", "event": "MFA_REQUIRED" } }
+          ]
+        },
+        {
+          "id": "01J3YB3Z4G5K7M9N1P2Q3R4S61",
+          "name": "deny-high-risk-or-sanctioned",
+          "priority": 5,
+          "risk": "high",
+          "enabled": true,
+          "condition": { "language": "cel", "source": "subject.risk == 'high' || environment.countryCode in ['RU','IR','KP']" },
+          "effect": "Deny",
+          "obligations": [
+            { "on": "Deny", "type": "notify", "params": { "channel": "secops", "severity": "high" } },
+            { "on": "Deny", "type": "log", "params": { "category": "policy", "event": "DENY_RISK" } }
+          ]
+        }
+      ],
+      "bindings": [ { "pepId": "wallet-api", "mode": "enforce" } ],
+      "audit": {
+        "riskLevel": "medium",
+        "initiator": "policy-admin",
+        "changeReason": "Initial rollout",
+        "approvals": [
+          { "by": "security-lead", "at": "2025-08-12T12:00:00Z", "signature": { "alg": "ed25519", "sig": "b64...", "pub": "b64..." } }
+        ]
+      }
+    }
+  ]
+}

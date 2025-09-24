@@ -1,0 +1,132 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Окружение и нейминг
+namespace: security-core-dev
+namePrefix: dev-
+
+# Наследуем базовые манифесты
+resources:
+  - ../../base
+
+# Единые метки/аннотации для трейсинга и поиска
+commonLabels:
+  app.kubernetes.io/name: security-core
+  app.kubernetes.io/instance: security-core
+  app.kubernetes.io/part-of: core-systems
+  app.kubernetes.io/component: service
+  app.kubernetes.io/environment: dev
+  environment: dev
+
+commonAnnotations:
+  security.aethernova/hardening: "true"
+  observability.aethernova/scope: "dev"
+
+# Образ и тег для dev
+images:
+  - name: ghcr.io/your-org/security-core
+    newName: ghcr.io/your-org/security-core
+    newTag: dev
+
+# В dev достаточно одной реплики
+replicas:
+  - name: security-core
+    count: 1
+
+# Генераторы конфигов и секретов с хэшем имени — это гарантированный rollout при изменениях
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/environment: dev
+  annotations:
+    config.kubernetes.io/behavior: merge
+
+configMapGenerator:
+  - name: security-core
+    behavior: merge
+    literals:
+      - APP_ENV=dev
+      - LOG_LEVEL=DEBUG
+      - FEATURE_FLAGS=dev,trace-io,enable-metrics
+      - HTTP_PORT=8080
+    # Опционально: подложите свой dev-конфиг
+    # files:
+    #   - config.yaml=./config/dev/config.yaml
+
+secretGenerator:
+  - name: security-core
+    behavior: merge
+    type: Opaque
+    # В реальном кластере секреты приходят из внешней системы (Vault/SealedSecrets/SOPS).
+    # Ниже — безопасные заглушки для локального dev.
+    literals:
+      - APP_SECRET=change-me-in-ci
+      - API_TOKEN=dev-placeholder
+
+# Точечные патчи JSON6902 к объектам base
+patches:
+  # Запрет автоподстановки SA-токена на уровне ServiceAccount (если присутствует)
+  - target:
+      version: v1
+      kind: ServiceAccount
+      name: security-core
+    patch: |-
+      - op: replace
+        path: /automountServiceAccountToken
+        value: false
+
+  # Патчи к Deployment: dev-логирование, imagePullPolicy, tolerations и очистка checksum-аннотаций
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: security-core
+    patch: |-
+      # Всегда тянуть свежий dev-образ
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: "Always"
+
+      # Добавляем явный LOG_LEVEL=DEBUG (поверх common ENV)
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: LOG_LEVEL
+          value: "DEBUG"
+
+      # Толю для нод dev-пула
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - key: "env"
+            operator: "Equal"
+            value: "dev"
+            effect: "NoSchedule"
+
+      # Узел dev-пула через nodeAffinity (добавляем к уже заданным выражениям)
+      - op: add
+        path: /spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/-
+        value:
+          key: "node-pool"
+          operator: "In"
+          values: ["dev"]
+
+      # В dev приоритет можно опустить (избежать зависимости от PriorityClass)
+      - op: replace
+        path: /spec/template/spec/priorityClassName
+        value: ""
+
+      # Удаляем placeholder-аннотации checksum/* из base (kustomize-хэши CM/Secret уже обеспечат перекатку)
+      - op: remove
+        path: /spec/template/metadata/annotations/checksum~1config
+      - op: remove
+        path: /spec/template/metadata/annotations/checksum~1secret
+      - op: remove
+        path: /metadata/annotations/checksum~1config
+      - op: remove
+        path: /metadata/annotations/checksum~1secret
+
+# Дополнительно: можно включить трансформаторы (при необходимости)
+# transformers:
+#   - dev-labels-transformer.yaml

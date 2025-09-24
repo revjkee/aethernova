@@ -1,0 +1,381 @@
+# policy-core/schemas/graphql/schema.graphql
+# Промышленная GraphQL-схема для Policy Core (PDP/PEP и управление политиками)
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+"RFC3339 timestamp (UTC)"
+scalar DateTime
+
+"UUID v4"
+scalar UUID
+
+"Произвольный JSON (объект/массив/скаляр)"
+scalar JSON
+
+# -------------------------- Директивы --------------------------
+
+"Требование ролей/привилегий к полю/типу. Реализация должна применить ACL на резолверах."
+directive @auth(requires: [Role!]!) on OBJECT | FIELD_DEFINITION
+
+"Лимитирование запросов на поле/тип."
+directive @rateLimit(max: Int!, window: String! = "1m") on FIELD_DEFINITION
+
+"Управление кешированием ответов (Apollo-совместимо)."
+directive @cacheControl(maxAge: Int!, scope: CacheScope! = PRIVATE) on FIELD_DEFINITION | OBJECT
+
+"Маркировка чувствительных полей для автоматической редакции/маскирования на границе."
+directive @redact(mode: RedactMode! = MASK) on FIELD_DEFINITION
+
+enum CacheScope { PUBLIC PRIVATE }
+enum RedactMode { MASK HASH REMOVE }
+
+enum Role {
+  ADMIN
+  EDITOR
+  VIEWER
+  AUDITOR
+  SERVICE
+}
+
+# -------------------------- Универсальные интерфейсы/типы --------------------------
+
+"Relay-совместимая сущность"
+interface Node { id: ID! }
+
+"Информация о странице для Relay-пагинации"
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+enum SortOrder { ASC DESC }
+
+type FieldError {
+  field: String
+  code: String!
+  message: String!
+}
+
+"Стандартный ответ мутаций"
+type MutationResponse {
+  ok: Boolean!
+  code: String!
+  message: String
+  errors: [FieldError!]!
+}
+
+type UserRef {
+  id: ID!
+  username: String!
+  displayName: String
+}
+
+# -------------------------- Доменные enum/типы --------------------------
+
+enum PolicyStatus { DRAFT ACTIVE DEPRECATED ARCHIVED }
+enum PolicyLang { REGO CEDAR DSL }
+enum Effect { Allow Deny Challenge Unknown }
+enum RiskLevel { low medium high critical unknown }
+enum ObligationStatus { Succeeded Failed Skipped Timeout Unknown }
+enum Severity { debug info warning error critical unknown }
+
+type ComplianceRef {
+  framework: String!
+  control: String!
+}
+
+type Integrity @cacheControl(maxAge: 60, scope: PRIVATE) {
+  bundleSha256: String
+  imageDigest: String
+  cosignVerified: Boolean!
+  sbom: SBOMInfo
+}
+type SBOMInfo {
+  ref: String!
+  maxSeverity: VulnerabilitySeverity!
+}
+enum VulnerabilitySeverity { none low medium high critical unknown }
+
+"Общая сущность домена (субъект/ресурс)"
+type Entity {
+  id: String!
+  type: String!
+  labels: [String!]!
+  attributes: JSON! @redact
+}
+
+type DecisionReason {
+  code: String!
+  message: String
+  details: JSON!
+}
+
+type Risk {
+  level: RiskLevel!
+  score: Int! # 0..100
+}
+
+type ObligationResult {
+  id: String!
+  status: ObligationStatus!
+  durationMs: Int!
+  severity: Severity!
+  error: ErrorInfo
+}
+type ErrorInfo {
+  code: String!
+  message: String
+  retriable: Boolean!
+  details: JSON
+}
+
+type ResponseMutations {
+  redactions: Int!
+  masked: Int!
+  watermarks: Int!
+}
+
+# -------------------------- Политики --------------------------
+
+type Policy implements Node @cacheControl(maxAge: 30, scope: PUBLIC) {
+  id: ID!
+  name: String!
+  description: String
+  language: PolicyLang!
+  status: PolicyStatus!
+  version: String!               # semver или git rev
+  sha256: String
+  tags: [String!]!
+  source: String!                # исходник политики (Rego/Cedar/DSL)
+  metadata: JSON!                # произвольные аннотации
+  compliance: [ComplianceRef!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  createdBy: UserRef
+  updatedBy: UserRef
+  integrity: Integrity
+}
+
+input PolicyFilter {
+  ids: [ID!]
+  text: String
+  tags: [String!]
+  status: [PolicyStatus!]
+  language: [PolicyLang!]
+  createdFrom: DateTime
+  createdTo: DateTime
+}
+
+enum PolicySortBy { CREATED_AT UPDATED_AT NAME VERSION }
+input PolicySort {
+  by: PolicySortBy! = UPDATED_AT
+  order: SortOrder! = DESC
+}
+
+type PolicyEdge { node: Policy! cursor: String! }
+type PolicyConnection {
+  edges: [PolicyEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+# -------------------------- Решения --------------------------
+
+type Decision implements Node {
+  id: ID!
+  decisionId: UUID!
+  correlationId: String
+  traceId: String
+  spanId: String
+  eventTime: DateTime!
+  ingestTime: DateTime!
+  environment: String!
+  tenantId: String
+  source: Source!
+  policy: PolicyRef!
+  effect: Effect!
+  latencyMs: Int!
+  risk: Risk!
+  reasons: [DecisionReason!]!
+  subject: Entity!
+  action: String! @redact(mode: MASK)
+  resource: Entity!
+  context: JSON! @redact
+  compliance: [ComplianceRef!]!
+  obligations: [ObligationResult!]!
+  responseMutations: ResponseMutations!
+  integrity: Integrity
+}
+type Source {
+  serviceName: String!
+  serviceVersion: String
+  cluster: String
+  namespace: String
+  host: String
+}
+type PolicyRef {
+  id: ID!
+  version: String!
+  hash: String
+  tags: [String!]!
+}
+
+input DecisionFilter {
+  effects: [Effect!]
+  policyIds: [ID!]
+  tenantId: String
+  from: DateTime
+  to: DateTime
+  subjectId: String
+  resourceId: String
+  minRisk: RiskLevel
+}
+
+enum DecisionSortBy { EVENT_TIME LATENCY_MS RISK_SCORE }
+input DecisionSort {
+  by: DecisionSortBy! = EVENT_TIME
+  order: SortOrder! = DESC
+}
+
+type DecisionEdge { node: Decision! cursor: String! }
+type DecisionConnection {
+  edges: [DecisionEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+# -------------------------- Ввод/оценка --------------------------
+
+input InputEntity {
+  id: String!
+  type: String!
+  labels: [String!]
+  attributes: JSON
+}
+
+input EvaluatePolicyInput {
+  policyId: ID
+  policyTag: String
+  subject: InputEntity!
+  resource: InputEntity!
+  action: String!
+  context: JSON
+}
+
+type EvaluationResult {
+  effect: Effect!
+  latencyMs: Int!
+  reasons: [DecisionReason!]!
+  risk: Risk!
+  obligationsPlan: [String!]!  # список ID обязательств, которые будут исполнены PEP
+}
+
+# -------------------------- Запросы --------------------------
+
+type Query {
+  # Политики
+  policy(id: ID!): Policy @auth(requires: [VIEWER,EDITOR,ADMIN])
+  policies(
+    filter: PolicyFilter
+    first: Int = 20
+    after: String
+    sort: PolicySort = { by: UPDATED_AT, order: DESC }
+  ): PolicyConnection! @auth(requires: [VIEWER,EDITOR,ADMIN]) @rateLimit(max: 60, window: "1m")
+
+  # Решения
+  decision(id: ID!): Decision @auth(requires: [AUDITOR,ADMIN,VIEWER])
+  decisions(
+    filter: DecisionFilter
+    first: Int = 20
+    after: String
+    sort: DecisionSort = { by: EVENT_TIME, order: DESC }
+  ): DecisionConnection! @auth(requires: [AUDITOR,ADMIN,VIEWER]) @rateLimit(max: 60, window: "1m")
+
+  # Побочные-эффектов нет — безопасно выполнять GET
+  evaluatePolicy(input: EvaluatePolicyInput!): EvaluationResult!
+    @auth(requires: [VIEWER,SERVICE,EDITOR,ADMIN]) @rateLimit(max: 120, window: "1m")
+
+  # Техсостояние
+  systemHealth: JSON! @auth(requires: [VIEWER,ADMIN]) @cacheControl(maxAge: 5, scope: PRIVATE)
+}
+
+# -------------------------- Мутации --------------------------
+
+input UpsertPolicyInput {
+  id: ID
+  name: String!
+  description: String
+  language: PolicyLang!
+  source: String!
+  tags: [String!]
+  metadata: JSON
+}
+
+input SetPolicyStatusInput {
+  id: ID!
+  status: PolicyStatus!
+}
+
+input PublishBundleInput {
+  id: ID!              # Policy ID
+  version: String!     # логическая версия
+  expectedSha256: String
+  notes: String
+}
+
+input ValidatePolicyInput {
+  language: PolicyLang!
+  source: String!
+  metadata: JSON
+}
+
+type ValidatePolicyResult {
+  valid: Boolean!
+  errors: [FieldError!]!
+  warnings: [String!]!
+  diagnostics: JSON
+}
+
+type Mutation {
+  upsertPolicy(input: UpsertPolicyInput!): Policy!
+    @auth(requires: [EDITOR,ADMIN])
+
+  setPolicyStatus(input: SetPolicyStatusInput!): MutationResponse!
+    @auth(requires: [EDITOR,ADMIN])
+
+  attachPolicyTags(id: ID!, tags: [String!]!): Policy!
+    @auth(requires: [EDITOR,ADMIN])
+
+  detachPolicyTags(id: ID!, tags: [String!]!): Policy!
+    @auth(requires: [EDITOR,ADMIN])
+
+  deletePolicy(id: ID!): MutationResponse!
+    @auth(requires: [ADMIN])
+
+  publishPolicyBundle(input: PublishBundleInput!): MutationResponse!
+    @auth(requires: [EDITOR,ADMIN])
+
+  validatePolicy(input: ValidatePolicyInput!): ValidatePolicyResult!
+    @auth(requires: [EDITOR,ADMIN,SERVICE]) @rateLimit(max: 120, window: "1m")
+}
+
+# -------------------------- Подписки --------------------------
+
+input DecisionEventFilter {
+  effects: [Effect!]
+  policyIds: [ID!]
+  tenantId: String
+  minRisk: RiskLevel
+}
+
+type Subscription {
+  "Онлайн-поток событий решений для аудита/мониторинга"
+  decisionEvents(filter: DecisionEventFilter): Decision!
+    @auth(requires: [AUDITOR,ADMIN,SERVICE])
+}

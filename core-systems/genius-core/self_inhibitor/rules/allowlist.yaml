@@ -1,0 +1,236 @@
+# Self-Inhibitor Allowlist
+# Назначение: минимально необходимые исключения из общих правил блокировки/редакции.
+# Принцип: least-privilege. Разрешаем только явно безопасные и проверяемые случаи.
+# Совместимость: используется движком Self-Inhibitor поверх базовых детекторов (PII, secrets, injections, dangerous_cmds).
+
+meta:
+  schema: self-inhibitor-allowlist/v1
+  version: 1.0.0
+  updated_at: 2025-08-18T00:00:00Z
+  owner: Security Engineering
+  reviewers:
+    - Platform Security
+    - Privacy Office
+  changelog:
+    - "Initial industrial allowlist with macros and environment-scoped rules."
+  enforcement_notes: |
+    Allowlist применяется после базовой оценки риска. При совпадении условия правила
+    действие может быть понижено до SANITIZE/ALLOW. First-match-wins.
+
+defaults:
+  evaluation_order: first-match-wins
+  # По умолчанию разрешения распространяются на оба направления.
+  direction: [request, response]
+  environments: [prod, staging, dev]
+  redact_by_default: false
+  # Нельзя «разрешить» матчи приватных ключей — это инвариант.
+  invariants:
+    never_allow:
+      - secret_pattern: pem_private_key
+
+macros:
+  # Доменные списки для безопасных операций
+  domains:
+    safe_curl_hosts: &SAFE_CURL_HOSTS
+      - packages.omni.corp
+      - artifacts.omni.corp
+      - repo.omni.corp
+    safe_api_hosts: &SAFE_API_HOSTS
+      - api.omni.corp
+      - telemetry.omni.corp
+
+  # Регулярные выражения, вынесенные в анкоры для переиспользования
+  regex:
+    # Безопасные e-mail только в example.com (RFC пример, не ПИИ в продуктивном смысле)
+    email_example: &RX_EMAIL_EXAMPLE (?i)\b[a-z0-9._%+\-]+@example\.com\b
+    # Тестовые телефоны со служебным префиксом
+    phone_test: &RX_PHONE_TEST (?i)^\+000[\d\-\s()]{7,}\d$
+    # Специальные DEV JWT-маркеры: допускаются лишь в dev/staging, но не в prod
+    jwt_dev: &RX_JWT_DEV \beyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\b
+    # Тестовые токены (фикстуры), никогда не используемые в проде
+    test_token: &RX_TEST_TOKEN \btok_[a-z0-9]{16,}\b
+    # Безопасные IBAN для документации: полностью нулевые и контрольные демо
+    iban_demo: &RX_IBAN_DEMO \b[A-Z]{2}00(?:0[ -]?){10,}\b
+    # Безопасный шаблон «curl | sh» только при наличии sha256-пиннинга и доверенного домена
+    # Пример: curl -fsSL https://packages.omni.corp/install.sh | sh -s -- --sha256=<64 hex>
+    curl_sh_pinned: &RX_CURL_SH_PINNED (?i)\bcurl\s+[-\w\s]*https://([a-z0-9.\-]+)/[\w/\-\.]+\.sh\s*\|\s*sh\b.*--sha256=([a-f0-9]{64})\b
+    # Установка с проверкой подписи: наличие 'gpg --verify' рядом с загрузкой
+    curl_gpg_verify: &RX_CURL_GPG (?i)\bcurl\s+[-\w\s]*https?://([a-z0-9.\-]+)/[\w/\-\.]+\.tar\.\w+\b.*\bgpg\s+--verify\b
+
+  # Описание «каналов» для удобства фильтрации
+  channels:
+    grpc: &CH_GRPC grpc
+    http: &CH_HTTP http
+
+# Список правил. Порядок важен (first-match-wins).
+rules:
+
+  # 1) Разрешить e-mail на example.com в запросах/ответах (документационные примеры)
+  - id: ALLOW_EXAMPLE_EMAIL
+    description: Allow example.com addresses as non-PII doc examples
+    applies_to:
+      channels: [*CH_GRPC, *CH_HTTP]
+      rpc: ["/*"]                 # любой метод
+      direction: [request, response]
+      environments: [prod, staging, dev]
+    when:
+      any:
+        - regex: *RX_EMAIL_EXAMPLE
+    then:
+      action: ALLOW
+      redact: false
+      audit_tag: doc_example_email
+
+  # 2) Разрешить тестовые телефоны с префиксом +000
+  - id: ALLOW_TEST_PHONE
+    description: Allow +000 test phone numbers used in fixtures and docs
+    applies_to:
+      channels: [*CH_GRPC, *CH_HTTP]
+      rpc: ["/*"]
+      direction: [request, response]
+      environments: [prod, staging, dev]
+    when:
+      any:
+        - regex: *RX_PHONE_TEST
+    then:
+      action: ALLOW
+      redact: false
+      audit_tag: doc_example_phone
+
+  # 3) DEV/STAGING: допустить DEV JWT/фикстурные токены, но санитизировать отображение
+  - id: ALLOW_DEV_TOKENS_WITH_SANITIZE
+    description: Allow dev JWT/test tokens outside prod; keep sanitized rendering
+    applies_to:
+      channels: [*CH_GRPC, *CH_HTTP]
+      rpc: ["/omni.Chat/*", "/omni.Tools/*", "/omni.Orchestrator/*"]
+      direction: [request, response]
+      environments: [staging, dev]
+    when:
+      any:
+        - regex: *RX_JWT_DEV
+        - regex: *RX_TEST_TOKEN
+    then:
+      action: SANITIZE
+      redact: true
+      redact_with: "***"
+      audit_tag: dev_token
+    notes: "В прод-окружении эти паттерны остаются запрещенными базовыми правилами."
+
+  # 4) Разрешить демонстрационные IBAN со всеми нулями (документация)
+  - id: ALLOW_DEMO_IBAN
+    description: Allow zeroed demo IBAN used in docs and tests
+    applies_to:
+      channels: [*CH_GRPC, *CH_HTTP]
+      rpc: ["/*"]
+      direction: [request, response]
+      environments: [prod, staging, dev]
+    when:
+      any:
+        - regex: *RX_IBAN_DEMO
+    then:
+      action: ALLOW
+      redact: false
+      audit_tag: doc_example_iban
+
+  # 5) Безопасные инсталляционные команды: разрешить лишь пиннингованные 'curl | sh' на доверенных доменах
+  - id: ALLOW_CURL_SH_PINNED_SAFE_HOSTS
+    description: Allow 'curl | sh' only with sha256 pinning and approved hostnames
+    applies_to:
+      channels: [*CH_HTTP, *CH_GRPC]
+      rpc: ["/omni.DevOps/RunScript", "/omni.Admin/InstallAgent", "/*"]
+      direction: [request]
+      environments: [prod, staging, dev]
+    when:
+      all:
+        - regex: *RX_CURL_SH_PINNED
+        - host_in: *SAFE_CURL_HOSTS
+    then:
+      action: SANITIZE
+      redact: false
+      downgrade_risk_to: MEDIUM
+      audit_tag: pinned_install
+    notes: "Без совпадения домена из SAFE_CURL_HOSTS или без sha256 — правило не срабатывает; базовый детектор заблокирует."
+
+  # 6) Альтернатива: загрузка с GPG-верификацией на одобренных хостах (разрешаем)
+  - id: ALLOW_CURL_GPG_VERIFY_SAFE_HOSTS
+    description: Allow downloads with explicit GPG verification from approved hosts
+    applies_to:
+      channels: [*CH_HTTP, *CH_GRPC]
+      rpc: ["/omni.DevOps/RunScript", "/omni.Admin/InstallAgent", "/*"]
+      direction: [request]
+      environments: [prod, staging, dev]
+    when:
+      all:
+        - regex: *RX_CURL_GPG
+        - host_in: *SAFE_CURL_HOSTS
+    then:
+      action: ALLOW
+      redact: false
+      downgrade_risk_to: LOW
+      audit_tag: gpg_verified_install
+
+  # 7) Разрешить служебные URL корпоративных API в телеметрии/логах (чтобы не вызывать ложную секретность)
+  - id: ALLOW_CORP_API_ENDPOINTS
+    description: Allow corporate API endpoints in logs/telemetry fields
+    applies_to:
+      channels: [*CH_HTTP, *CH_GRPC]
+      rpc: ["/omni.Telemetry/*", "/omni.Logging/*", "/*"]
+      direction: [request, response]
+      environments: [prod, staging, dev]
+    fields:
+      any_of: ["url", "endpoint", "host", "path", "service"]
+    when:
+      any:
+        - host_in: *SAFE_API_HOSTS
+    then:
+      action: ALLOW
+      redact: false
+      audit_tag: corp_api_endpoint
+
+  # 8) Разрешить «примерные» креды токенов фикстур в доках с префиксом tok_
+  - id: ALLOW_DOC_FIXTURE_TOKENS
+    description: Allow fixture-like tokens with 'tok_' prefix in docs and samples
+    applies_to:
+      channels: [*CH_HTTP, *CH_GRPC]
+      rpc: ["/*"]
+      direction: [request, response]
+      environments: [prod, staging, dev]
+    when:
+      any:
+        - regex: *RX_TEST_TOKEN
+    then:
+      action: SANITIZE
+      redact: true
+      redact_with: "tok_***"
+      audit_tag: fixture_token
+
+  # 9) Разрешить e-mail и телефоны в ответах сервисов антиперсонализации при явном RPC-назначении (санитизируем)
+  - id: ALLOW_REDACT_SERVICE_OUTPUTS
+    description: Allow outputs of redaction services while enforcing sanitization
+    applies_to:
+      channels: [*CH_GRPC]
+      rpc: ["/omni.Privacy/Redact", "/omni.Privacy/Detect"]
+      direction: [response]
+      environments: [prod, staging, dev]
+    when:
+      any:
+        - regex: *RX_EMAIL_EXAMPLE
+        - regex: *RX_PHONE_TEST
+    then:
+      action: SANITIZE
+      redact: true
+      redact_with: "***"
+      audit_tag: privacy_module_output
+
+# Инварианты для безопасности, дублируем явно (никогда не ослабляются allowlist'ом)
+invariants:
+  forbid:
+    - description: Never allow private key material in any environment
+      secret_pattern: pem_private_key
+    - description: Never allow 'rm -rf' style destructive commands
+      dangerous_cmd_pattern: (?i)\brm\s+-rf\b
+
+# Полезные комментарии для CI-валидатора:
+# - Проверяйте, что все anchors (*RX_*, *SAFE_*) разрешаются.
+# - Не допускайте пересечения правил, ведущего к ALLOW для prod по секретам.
+# - Проверяйте, что 'invariants.never_allow' и 'invariants.forbid' покрывают критические паттерны.

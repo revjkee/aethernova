@@ -1,0 +1,201 @@
+# Примечание:
+# - Не указываем namespace в base; он задаётся через kustomize/overlay.
+# - Ожидается, что все приложения Mythos Core помечены:
+#     app.kubernetes.io/part-of: mythos-core
+# - Рекомендуется именовать containerPort’ы: http / https / grpc / metrics.
+# - Политики совместимы со стандартом Kubernetes NetworkPolicy (без CNI-расширений).
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  labels:
+    app.kubernetes.io/part-of: mythos-core
+spec:
+  # Применяем ко всем Pod’ам namespace
+  podSelector: {}
+  # Полный запрет входящего и исходящего трафика по умолчанию
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress: []
+
+---
+# Разрешаем egress только на DNS (kube-dns/CoreDNS) TCP/UDP 53.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  labels:
+    app.kubernetes.io/part-of: mythos-core
+spec:
+  podSelector: {}  # всем Pod’ам в namespace требуется DNS
+  policyTypes: [Egress]
+  egress:
+    - to:
+        # kube-system / coredns / kube-dns (match по распространённым меткам)
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchExpressions:
+              - key: k8s-app
+                operator: In
+                values: ["kube-dns"]
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["coredns"]
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# Разрешаем внутренний east-west трафик между сервисами Mythos Core в рамках namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace-mythos
+  labels:
+    app.kubernetes.io/part-of: mythos-core
+spec:
+  # Целевые Pod’ы Mythos Core
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: mythos-core
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        # Источник — Pod’ы Mythos Core в том же namespace
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: mythos-core
+      ports:
+        # Предпочтение именованных портов. Убедитесь, что containerPort’ы так названы.
+        - port: http
+          protocol: TCP
+        - port: grpc
+          protocol: TCP
+        - port: metrics
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: mythos-core
+      ports:
+        - port: http
+          protocol: TCP
+        - port: grpc
+          protocol: TCP
+
+---
+# Разрешаем вход с ingress-контроллера (пример: ingress-nginx) к приложениям Mythos Core.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-ingress-controller
+  labels:
+    app.kubernetes.io/part-of: mythos-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: mythos-core
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        # Разрешаем трафик к приложению на именованных портах.
+        # Если приложение работает на нестандартных портах — именуйте containerPort как 'http'/'https' либо добавьте номера ниже.
+        - port: http
+          protocol: TCP
+        - port: https
+          protocol: TCP
+        # При необходимости — раскомментируйте явные номера:
+        # - port: 80
+        #   protocol: TCP
+        # - port: 443
+        #   protocol: TCP
+
+---
+# Разрешаем сбор метрик Prometheus из namespace "monitoring" (на именованном порту 'metrics').
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  labels:
+    app.kubernetes.io/part-of: mythos-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: mythos-core
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: metrics
+          protocol: TCP
+
+# ---------------------- Опциональные оверлеи (пример) ----------------------
+# Эти политики обычно добавляются в overlays (dev/stage/prod) при необходимости.
+
+# ---
+# # Разрешить egress к Postgres в отдельном namespace (пример).
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: allow-egress-postgres
+#   labels: { app.kubernetes.io/part-of: mythos-core }
+# spec:
+#   podSelector:
+#     matchLabels: { app.kubernetes.io/part-of: mythos-core }
+#   policyTypes: [Egress]
+#   egress:
+#     - to:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: db
+#           podSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: postgres
+#       ports:
+#         - protocol: TCP
+#           port: 5432
+
+# ---
+# # Разрешить ограниченный egress в интернет через HTTPS (например, для загрузки CRL/OCSP или внешних схем).
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: allow-egress-https-restricted
+#   labels: { app.kubernetes.io/part-of: mythos-core }
+# spec:
+#   podSelector:
+#     matchLabels: { app.kubernetes.io/part-of: mythos-core }
+#   policyTypes: [Egress]
+#   egress:
+#     - to:
+#         - ipBlock:
+#             cidr: 0.0.0.0/0
+#             except:
+#               - 10.0.0.0/8
+#               - 172.16.0.0/12
+#               - 192.168.0.0/16
+#       ports:
+#         - protocol: TCP
+#           port: 443

@@ -1,0 +1,314 @@
+---
+# roles/physical-integration-core/tasks/main.yml
+
+# ================
+# 0. Preflight
+# ================
+- name: "Preflight | Проверка версии Ansible и базовых переменных"
+  ansible.builtin.assert:
+    that:
+      - ansible_version.full is version('2.15', '>=')
+      - pic_install_mode in ['k8s', 'edge']
+      - pic_namespace | length > 0
+    quiet: true
+    fail_msg: "Несовместимая версия Ansible или невалидные переменные pic_install_mode/pic_namespace."
+  tags: [preflight]
+
+- name: "Preflight | Проверка наличия коллекций kubernetes.core и community.general (если используются)"
+  ansible.builtin.debug:
+    msg: "Убедитесь, что установлены коллекции kubernetes.core и community.general (ansible-galaxy collection install kubernetes.core community.general)."
+  when: pic_install_mode == 'k8s'
+  tags: [preflight]
+
+# ============================
+# 1. Опциональный hardening хоста
+# ============================
+- name: "Hardening | Установка пакетов для хоста (chrony, jq, curl, socat, conntrack, iptables)"
+  ansible.builtin.package:
+    name: "{{ pic_host_packages }}"
+    state: present
+  when: pic_enable_host_hardening | bool
+  tags: [hardening]
+
+- name: "Hardening | Настройка sysctl для сетевой производительности и Kubernetes совместимости"
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-physical-integration-core.conf
+    state: present
+    reload: true
+  loop: "{{ pic_sysctl_params }}"
+  when: pic_enable_host_hardening | bool
+  tags: [hardening]
+
+- name: "Hardening | Включение модулей ядра overlay и br_netfilter"
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/physical-integration-core.conf
+    mode: '0644'
+    content: |
+      overlay
+      br_netfilter
+  when: pic_enable_host_hardening | bool
+  notify: Reload systemd-modules
+  tags: [hardening]
+
+- name: "Hardening | Конфигурирование NTP (chrony)"
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony/chrony.conf
+    mode: '0644'
+  when: pic_enable_host_hardening | bool
+  notify: Restart chrony
+  tags: [hardening]
+  ignore_errors: true  # шаблон может отсутствовать, оставляем как необязательный
+
+# ============================
+# 2. Kubernetes prerequisites
+# ============================
+- name: "K8s | Проверка kubeconfig"
+  ansible.builtin.assert:
+    that:
+      - (pic_kubeconfig | length) > 0
+    quiet: true
+    fail_msg: "pic_kubeconfig не задан. Укажите путь к kubeconfig для деплоя."
+  when: pic_install_mode == 'k8s'
+  tags: [k8s, preflight]
+
+- name: "K8s | Создание namespace {{ pic_namespace }}"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pic_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ pic_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: physical-integration-core
+          environment: "{{ pic_environment }}"
+  when: pic_install_mode == 'k8s'
+  tags: [k8s, prepare]
+
+- name: "K8s | Опционально создаем NetworkPolicy по умолчанию (deny-all + egress разрешения)"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pic_kubeconfig }}"
+    state: present
+    definition: "{{ pic_default_network_policy }}"
+  when:
+    - pic_install_mode == 'k8s'
+    - pic_enable_default_network_policy | bool
+  tags: [k8s, security]
+
+# ============================
+# 3. Секреты и конфиги
+# ============================
+- name: "Secrets | Ветка A: ExternalSecrets через External Secrets Operator"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pic_kubeconfig }}"
+    state: present
+    definition: "{{ item }}"
+  loop: "{{ pic_external_secrets | default([]) }}"
+  when:
+    - pic_install_mode == 'k8s'
+    - pic_use_external_secrets | bool
+  tags: [k8s, secrets]
+
+- name: "Secrets | Ветка B: Прямые Secret/ConfigMap (если не используем ESO)"
+  block:
+    - name: "Config | Создание ConfigMap pic-config"
+      kubernetes.core.k8s:
+        kubeconfig: "{{ pic_kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: pic-config
+            namespace: "{{ pic_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: physical-integration-core
+          data: "{{ pic_config_map_data }}"
+    - name: "Secret | Создание Secret pic-secrets"
+      kubernetes.core.k8s:
+        kubeconfig: "{{ pic_kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: pic-secrets
+            namespace: "{{ pic_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: physical-integration-core
+          type: Opaque
+          stringData: "{{ pic_secret_data }}"
+  when:
+    - pic_install_mode == 'k8s'
+    - not pic_use_external_secrets | bool
+  tags: [k8s, secrets]
+
+# ============================
+# 4. Деплой Helm-чарта physical-integration-core
+# ============================
+- name: "Helm | Установка/обновление релиза {{ pic_helm_release_name }}"
+  block:
+    - name: "Helm | Upgrade/Install"
+      kubernetes.core.helm:
+        kubeconfig: "{{ pic_kubeconfig }}"
+        name: "{{ pic_helm_release_name }}"
+        chart_ref: "{{ pic_helm_chart_ref }}"
+        chart_version: "{{ pic_helm_chart_version | default(omit) }}"
+        release_namespace: "{{ pic_namespace }}"
+        values: "{{ pic_helm_values }}"
+        wait: true
+        wait_timeout: "{{ pic_helm_wait_timeout }}"
+        atomic: true
+        create_namespace: false
+      register: helm_result
+      tags: [k8s, helm, deploy]
+
+  rescue:
+    - name: "Helm | Откат релиза при неуспехе"
+      kubernetes.core.helm:
+        kubeconfig: "{{ pic_kubeconfig }}"
+        name: "{{ pic_helm_release_name }}"
+        state: rollback
+        release_namespace: "{{ pic_namespace }}"
+      ignore_errors: true
+      tags: [k8s, helm, deploy]
+
+    - name: "Helm | Аварийное сообщение"
+      ansible.builtin.fail:
+        msg: "Helm деплой неуспешен. Выполнен попытка отката. Проверьте логи и значения."
+  when: pic_install_mode == 'k8s'
+
+# ============================
+# 5. Ожидание готовности и валидация
+# ============================
+- name: "Wait | Сбор списка Deployment в namespace"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ pic_kubeconfig }}"
+    kind: Deployment
+    namespace: "{{ pic_namespace }}"
+  register: pic_deploys
+  when: pic_install_mode == 'k8s'
+  tags: [k8s, validate]
+
+- name: "Wait | Ожидание готовности Deployment"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pic_kubeconfig }}"
+    namespace: "{{ pic_namespace }}"
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: "{{ item.metadata.name }}"
+      status:
+        conditions:
+          - type: Available
+            status: "True"
+  loop: "{{ pic_deploys.resources | default([]) }}"
+  retries: 120
+  delay: 5
+  register: wait_results
+  until: wait_results is succeeded
+  when:
+    - pic_install_mode == 'k8s'
+    - (pic_deploys.resources | length) > 0
+  tags: [k8s, validate]
+
+- name: "Validate | Проверка readiness подов"
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ pic_kubeconfig }}"
+    api_version: v1
+    kind: Pod
+    namespace: "{{ pic_namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/part-of=physical-integration-core"
+  register: pic_pods
+  when: pic_install_mode == 'k8s'
+  tags: [k8s, validate]
+
+- name: "Validate | Ассерт по числу готовых подов"
+  ansible.builtin.assert:
+    that:
+      - (pic_pods.resources | selectattr('status.containerStatuses', 'defined') | list | length) > 0
+      - (pic_pods.resources | selectattr('status.containerStatuses', 'defined') | map(attribute='status.containerStatuses') | map('selectattr','ready') | list | length) >= 1
+    quiet: true
+    fail_msg: "Нет готовых подов physical-integration-core."
+  when: pic_install_mode == 'k8s'
+  tags: [k8s, validate]
+
+# ============================
+# 6. Edge режим (опционально)
+# ============================
+- name: "Edge | Предусловия для режима edge (docker/podman)"
+  ansible.builtin.assert:
+    that:
+      - pic_edge_runtime in ['docker', 'podman']
+      - pic_edge_image.repository | length > 0
+    fail_msg: "Для edge режима укажите pic_edge_runtime и pic_edge_image.repository."
+  when: pic_install_mode == 'edge'
+  tags: [edge]
+
+- name: "Edge | Установка Docker (Debian/Ubuntu)"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ! command -v docker >/dev/null 2>&1; then
+      apt-get update -y
+      apt-get install -y docker.io
+      systemctl enable --now docker
+    fi
+  args:
+    executable: /bin/bash
+  when:
+    - pic_install_mode == 'edge'
+    - pic_edge_runtime == 'docker'
+    - ansible_os_family == 'Debian'
+  tags: [edge]
+  become: true
+
+- name: "Edge | Пул образа и запуск контейнера через community.docker"
+  community.docker.docker_container:
+    name: physical-integration-core
+    image: "{{ pic_edge_image.repository }}:{{ pic_edge_image.tag }}{{ '@' + pic_edge_image.digest if pic_edge_image.digest is defined and pic_edge_image.digest|length > 0 else '' }}"
+    restart_policy: always
+    env: "{{ pic_edge_env }}"
+    networks_cli_compatible: true
+    published_ports: "{{ pic_edge_ports }}"
+    volumes: "{{ pic_edge_volumes }}"
+    log_options:
+      max-size: "10m"
+      max-file: "5"
+  when:
+    - pic_install_mode == 'edge'
+    - pic_edge_runtime == 'docker'
+  tags: [edge, deploy]
+  become: true
+
+# ============================
+# 7. Телеметрия/Правила (опционально, если CRD присутствуют)
+# ============================
+- name: "Observability | Установка PrometheusRule (если CRD доступен)"
+  kubernetes.core.k8s:
+    kubeconfig: "{{ pic_kubeconfig }}"
+    state: present
+    definition: "{{ pic_prometheus_rule }}"
+  when:
+    - pic_install_mode == 'k8s'
+    - pic_install_prometheus_rules | bool
+  tags: [k8s, observability]
+
+# ============================
+# 8. Финализация
+# ============================
+- name: "Finalize | Сброс обработчиков"
+  ansible.builtin.meta: flush_handlers
+  tags: [finalize]
+
+- name: "Finalize | Итоговое сообщение"
+  ansible.builtin.debug:
+    msg: >
+      physical-integration-core успешно подготовлен в режиме {{ pic_install_mode }}
+      (namespace={{ pic_namespace }}).
+  tags: [finalize]

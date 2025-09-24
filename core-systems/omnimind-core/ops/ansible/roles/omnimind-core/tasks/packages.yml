@@ -1,0 +1,394 @@
+# omnimind-core/ops/ansible/roles/omnimind-core/tasks/packages.yml
+---
+# ВНИМАНИЕ:
+# - Секреты и приватные репозитории не добавляем здесь.
+# - Хендлеры "reload sysctl" и "restart docker" должны существовать в handlers/main.yml.
+
+- name: "Detect OS family and version"
+  ansible.builtin.setup:
+    gather_subset:
+      - "min"
+      - "distribution"
+      - "hardware"
+  tags: [always]
+
+# -----------------------------------------------------------------------------
+# Defaults / feature flags (можно переопределить через group_vars/host_vars)
+# -----------------------------------------------------------------------------
+- name: "Set feature flags (defaults)"
+  ansible.builtin.set_fact:
+    omni_use_docker: "{{ omni_use_docker | default(true) }}"
+    omni_use_containerd: "{{ omni_use_containerd | default(false) }}"
+    omni_install_nodejs: "{{ omni_install_nodejs | default(false) }}"
+    omni_install_db_tools: "{{ omni_install_db_tools | default(true) }}"
+    omni_install_obs_tools: "{{ omni_install_obs_tools | default(true) }}"
+  tags: [always]
+
+# -----------------------------------------------------------------------------
+# Переключатели списка пакетов по семействам ОС
+# -----------------------------------------------------------------------------
+- name: "Define package lists for Debian/Ubuntu"
+  when: ansible_facts.os_family == "Debian"
+  ansible.builtin.set_fact:
+    omni_base_packages:
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      - unzip
+      - tar
+      - gzip
+      - xz-utils
+      - jq
+      - rsync
+      - wget
+      - netcat-openbsd
+      - iproute2
+      - procps
+      - acl
+      - apt-transport-https
+      - software-properties-common
+    omni_build_packages:
+      - build-essential
+      - pkg-config
+      - libssl-dev
+      - libffi-dev
+      - libpq-dev
+      - python3
+      - python3-venv
+      - python3-pip
+      - python3-dev
+    omni_db_packages:
+      - postgresql-client
+      - redis-tools
+    omni_obs_packages:
+      - rsyslog
+      - logrotate
+  tags: [packages,bootstrap]
+
+- name: "Define package lists for RHEL/Rocky/Alma"
+  when: ansible_facts.os_family == "RedHat"
+  ansible.builtin.set_fact:
+    omni_base_packages:
+      - ca-certificates
+      - curl
+      - gnupg2
+      - redhat-lsb-core
+      - unzip
+      - tar
+      - gzip
+      - xz
+      - jq
+      - rsync
+      - wget
+      - nc
+      - iproute
+      - procps-ng
+      - acl
+      - dnf-plugins-core
+    omni_build_packages:
+      - @'Development Tools'
+      - python3
+      - python3-pip
+      - python3-devel
+      - openssl-devel
+      - libffi-devel
+      - libpq-devel
+      - pkgconf-pkg-config
+    omni_db_packages:
+      - postgresql
+      - redis
+    omni_obs_packages:
+      - rsyslog
+      - logrotate
+  tags: [packages,bootstrap]
+
+# -----------------------------------------------------------------------------
+# Обновление индексов пакетов
+# -----------------------------------------------------------------------------
+- name: "Update APT cache (Debian family)"
+  when: ansible_facts.os_family == "Debian"
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  register: apt_update_result
+  retries: 3
+  delay: 5
+  until: apt_update_result is succeeded
+  tags: [packages,bootstrap]
+
+- name: "Make sure DNF cache is present (RHEL family)"
+  when: ansible_facts.os_family == "RedHat"
+  ansible.builtin.command: dnf makecache
+  changed_when: false
+  register: dnf_cache_result
+  retries: 3
+  delay: 5
+  until: dnf_cache_result.rc == 0
+  tags: [packages,bootstrap]
+
+# -----------------------------------------------------------------------------
+# Базовые системные пакеты
+# -----------------------------------------------------------------------------
+- name: "Install base packages"
+  ansible.builtin.package:
+    name: "{{ omni_base_packages }}"
+    state: present
+  register: base_pkg_result
+  retries: 3
+  delay: 5
+  until: base_pkg_result is succeeded
+  tags: [packages,base]
+
+# -----------------------------------------------------------------------------
+# Dev toolchain / Python toolchain
+# -----------------------------------------------------------------------------
+- name: "Install build/toolchain packages"
+  ansible.builtin.package:
+    name: "{{ omni_build_packages }}"
+    state: present
+  register: build_pkg_result
+  retries: 3
+  delay: 5
+  until: build_pkg_result is succeeded
+  tags: [packages,build,python]
+
+- name: "Upgrade pip/setuptools/wheel to latest safe versions"
+  ansible.builtin.pip:
+    name:
+      - pip
+      - setuptools
+      - wheel
+    state: latest
+    executable: python3 -m pip
+  tags: [packages,python]
+
+# -----------------------------------------------------------------------------
+# Клиенты БД/кэша и инструменты (опционально)
+# -----------------------------------------------------------------------------
+- name: "Install DB and cache tools"
+  when: omni_install_db_tools | bool
+  ansible.builtin.package:
+    name: "{{ omni_db_packages }}"
+    state: present
+  register: db_pkg_result
+  retries: 3
+  delay: 5
+  until: db_pkg_result is succeeded
+  tags: [packages,db]
+
+# -----------------------------------------------------------------------------
+# Набор observability-инструментов (минимум)
+# -----------------------------------------------------------------------------
+- name: "Install observability tools (rsyslog/logrotate)"
+  when: omni_install_obs_tools | bool
+  ansible.builtin.package:
+    name: "{{ omni_obs_packages }}"
+    state: present
+  register: obs_pkg_result
+  retries: 3
+  delay: 5
+  until: obs_pkg_result is succeeded
+  tags: [packages,observability]
+
+# -----------------------------------------------------------------------------
+# Container runtime: Docker Engine (по умолчанию) или containerd
+# -----------------------------------------------------------------------------
+- name: "Enable Docker CE repository (Debian/Ubuntu)"
+  when:
+    - omni_use_docker | bool
+    - ansible_facts.os_family == "Debian"
+  block:
+    - name: "Install Docker repo prerequisites"
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+    - name: "Add Docker GPG key"
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/{{ ansible_facts.distribution | lower }}/gpg
+        state: present
+    - name: "Add Docker APT repository"
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ ansible_facts.architecture | default('amd64') }} signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/{{ ansible_facts.distribution | lower }} {{ ansible_facts.distribution_release | lower }} stable"
+        state: present
+      ignore_errors: true  # на некоторых производных дистрибутивах release может отличаться
+    - name: "Refresh APT after adding Docker repo"
+      ansible.builtin.apt:
+        update_cache: true
+  tags: [packages,container,docker]
+
+- name: "Enable Docker CE repository (RHEL family)"
+  when:
+    - omni_use_docker | bool
+    - ansible_facts.os_family == "RedHat"
+  ansible.builtin.yum_repository:
+    name: docker-ce-stable
+    description: Docker CE Stable - $basearch
+    baseurl: "https://download.docker.com/linux/centos/{{ ansible_facts.architecture }}/stable"
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    enabled: yes
+  tags: [packages,container,docker]
+
+- name: "Install Docker Engine"
+  when: omni_use_docker | bool
+  ansible.builtin.package:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+  register: docker_pkg_result
+  retries: 3
+  delay: 5
+  until: docker_pkg_result is succeeded
+  tags: [packages,container,docker]
+
+- name: "Enable & start Docker service"
+  when: omni_use_docker | bool
+  ansible.builtin.service:
+    name: docker
+    enabled: true
+    state: started
+  tags: [packages,container,docker]
+
+- name: "Ensure deployer is in docker group"
+  when: omni_use_docker | bool
+  ansible.builtin.user:
+    name: "{{ ansible_user | default('deployer') }}"
+    groups: docker
+    append: true
+  tags: [packages,container,docker]
+
+- name: "Install containerd (alternative runtime)"
+  when:
+    - omni_use_containerd | bool
+    - not omni_use_docker | bool
+  ansible.builtin.package:
+    name: containerd.io
+    state: present
+  register: containerd_pkg_result
+  retries: 3
+  delay: 5
+  until: containerd_pkg_result is succeeded
+  tags: [packages,container,containerd]
+
+- name: "Enable & start containerd service"
+  when:
+    - omni_use_containerd | bool
+    - not omni_use_docker | bool
+  ansible.builtin.service:
+    name: containerd
+    enabled: true
+    state: started
+  tags: [packages,container,containerd]
+
+# -----------------------------------------------------------------------------
+# Node.js (опционально, для вспомогательных инструментов/UI-сборки)
+# -----------------------------------------------------------------------------
+- name: "Install Node.js 20.x via Nodesource (Debian/Ubuntu)"
+  when:
+    - omni_install_nodejs | bool
+    - ansible_facts.os_family == "Debian"
+  block:
+    - name: "Add Nodesource GPG key"
+      ansible.builtin.apt_key:
+        url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+        state: present
+    - name: "Add Nodesource repository"
+      ansible.builtin.apt_repository:
+        repo: "deb https://deb.nodesource.com/node_20.x {{ ansible_facts.distribution_release | lower }} main"
+        state: present
+    - name: "Install Node.js 20"
+      ansible.builtin.apt:
+        name: nodejs
+        state: present
+        update_cache: true
+  tags: [packages,nodejs]
+
+- name: "Install Node.js 20 (RHEL family)"
+  when:
+    - omni_install_nodejs | bool
+    - ansible_facts.os_family == "RedHat"
+  block:
+    - name: "Enable Node.js module stream (if available)"
+      ansible.builtin.command: dnf module enable nodejs:20 -y
+      register: node_enable_res
+      changed_when: "'Enabling module streams' in node_enable_res.stdout or node_enable_res.rc == 0"
+      failed_when: false
+    - name: "Install Node.js 20"
+      ansible.builtin.package:
+        name: nodejs
+        state: present
+  tags: [packages,nodejs]
+
+# -----------------------------------------------------------------------------
+# Минимальные sysctl для сетевых сервисов (безопасные дефолты)
+# -----------------------------------------------------------------------------
+- name: "Ensure net.ipv4.ip_forward and fs.inotify sysctls"
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_set: true
+    reload: true
+  loop:
+    - { name: "fs.inotify.max_user_watches", value: "524288" }
+    - { name: "fs.inotify.max_user_instances", value: "1024" }
+    - { name: "net.ipv4.ip_forward", value: "1" }
+  notify: ["reload sysctl"]
+  tags: [packages,sysctl]
+
+# -----------------------------------------------------------------------------
+# Верификация ключевых бинарей
+# -----------------------------------------------------------------------------
+- name: "Verify core binaries presence"
+  vars:
+    binaries:
+      - { name: "python3", cmd: "python3 --version" }
+      - { name: "pip",     cmd: "python3 -m pip --version" }
+      - { name: "curl",    cmd: "curl --version" }
+      - { name: "jq",      cmd: "jq --version" }
+  ansible.builtin.command: "{{ item.cmd }}"
+  register: bin_check
+  changed_when: false
+  failed_when: bin_check.rc != 0
+  loop: "{{ binaries }}"
+  tags: [packages,verify]
+
+- name: "Verify docker CLI (if enabled)"
+  when: omni_use_docker | bool
+  ansible.builtin.command: docker --version
+  register: docker_cli_check
+  changed_when: false
+  failed_when: docker_cli_check.rc != 0
+  tags: [packages,verify,docker]
+
+- name: "Verify containerd (if enabled)"
+  when:
+    - omni_use_containerd | bool
+    - not omni_use_docker | bool
+  ansible.builtin.command: ctr version
+  register: containerd_cli_check
+  changed_when: false
+  failed_when: containerd_cli_check.rc != 0
+  tags: [packages,verify,containerd]
+
+- name: "Verify DB tools (if enabled)"
+  when: omni_install_db_tools | bool
+  block:
+    - name: "psql --version"
+      ansible.builtin.command: psql --version
+      changed_when: false
+      failed_when: false   # некоторые сборки ставят бинарь 'postgresql'
+    - name: "redis-cli --version"
+      ansible.builtin.command: redis-cli --version
+      changed_when: false
+      failed_when: false
+  tags: [packages,verify,db]

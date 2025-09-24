@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rl-agent
+  namespace: agents
+  labels:
+    app.kubernetes.io/name: rl-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: teslaai
+    version: v20x-industrial
+    zero-trust: enforced
+spec:
+  replicas: 2
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: rl-agent
+  template:
+    metadata:
+      labels:
+        app: rl-agent
+        agent.type: reinforcement-learning
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+      annotations:
+        checksum/config: {{ .Values.agentChecksum | default "REPLACE_WITH_HASH" }}
+        container.apparmor.security.beta.kubernetes.io/rl-agent: runtime/default
+    spec:
+      serviceAccountName: agent-rl-sa
+      priorityClassName: high-priority
+      securityContext:
+        runAsUser: 1010
+        fsGroup: 1010
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: rl-agent
+              topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: "gpu"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      nodeSelector:
+        gpu.teslaai.io/enabled: "true"
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: rl-agent
+          image: registry.teslaai.io/agents/rl-agent:1.8.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: metrics
+          envFrom:
+            - configMapRef:
+                name: rl-agent-config
+            - secretRef:
+                name: rl-agent-secret
+          resources:
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+              nvidia.com/gpu: 1
+            requests:
+              cpu: "1000m"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: policy-cache
+              mountPath: /agent/policy
+              readOnly: false
+      volumes:
+        - name: policy-cache
+          emptyDir:
+            sizeLimit: 512Mi

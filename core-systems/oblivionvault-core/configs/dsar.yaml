@@ -1,0 +1,380 @@
+# OblivionVault DSAR Configuration (industrial-grade)
+version: "1.0.0"
+revision: 1
+updated_at: "2025-08-25T00:00:00Z"
+env: ${OV_ENV:-production}            # production | staging | dev
+service_name: "oblivionvault-core-dsar"
+
+metadata:
+  owner_team: "privacy-office"
+  dpo_contact: "dpo@oblivionvault.example"
+  security_contact: "security@oblivionvault.example"
+  jurisdiction_profiles:               # профиль применимых режимов
+    - code: "GDPR"
+      region: "EEA"
+      default_locale: "en"
+    - code: "UK-GDPR"
+      region: "UK"
+      default_locale: "en-GB"
+    - code: "CCPA"
+      region: "US-CA"
+      default_locale: "en-US"
+    - code: "PIPL"
+      region: "CN"
+      default_locale: "zh-CN"
+
+calendars:
+  timezone: "Europe/Stockholm"
+  business_days: [Mon, Tue, Wed, Thu, Fri]
+  holidays_iso:                        # ISO‑даты; можно подключить внешний источник
+    - "2025-01-01"
+    - "2025-12-25"
+
+sla:                                    # конфигурация сроков и эскалаций
+  acknowledgement_days: 7               # уведомление о приёме
+  resolution_days_default: 30           # целевой общий срок
+  extension_days_max: 60                # возможное продление при сложности
+  clock_pauses:
+    - reason: "awaiting_identity_proof"
+    - reason: "legal_hold_assessment"
+  escalation:
+    t1_days_before_due: 7
+    t2_days_before_due: 2
+    t3_overdue_days: 1
+    notify_roles: ["privacy_manager", "dpo", "security_manager"]
+
+roles:                                  # RBAC‑карта ролей
+  requester: ["read_own_artifacts"]
+  intake_agent: ["create_request", "update_request", "read_all_artifacts"]
+  privacy_analyst: ["search_sources", "apply_redaction", "prepare_export"]
+  privacy_manager: ["approve_release", "decline_request", "set_extension"]
+  dpo: ["override_decisions", "approve_sensitive_deletion", "close_request"]
+  security_manager: ["enforce_legal_hold", "forensic_review"]
+  auditor: ["read_metadata", "read_audit_log"]
+
+intake:                                 # каналы приёма запросов
+  channels:
+    web_portal:
+      enabled: true
+      url: "https://privacy.oblivionvault.example/portal"
+      auth: "oauth2"                    # oauth2 | magic_link | sso
+      require_verified_email: true
+    email:
+      enabled: true
+      address: "privacy-requests@oblivionvault.example"
+      pgp_required: false
+    api:
+      enabled: true
+      base_path: "/api/v1/dsar"
+      auth: "mtls_jwt"                  # mTLS + JWT
+      rate_limit_per_min: 5
+  identity_requirements:                # требования к подтверждению личности
+    minimal:
+      factors: ["email_verification"]
+    standard:
+      factors: ["email_verification", "gov_id_check"]
+      provider_ref: "kyc_provider_a"
+    high_risk:
+      factors: ["email_verification", "gov_id_check", "liveness_video"]
+      provider_ref: "kyc_provider_b"
+  risk_thresholds:
+    fraud_score_reject: 0.85
+    fraud_score_manual_review: 0.6
+
+request_types:                          # типы запросов субъекта
+  - code: "access"                      # доступ к данным
+    enabled: true
+  - code: "rectification"
+    enabled: true
+  - code: "erasure"                     # право на удаление
+    enabled: true
+    requires:
+      approvals: ["privacy_manager", "dpo"]
+      checks: ["legal_hold", "retention_policy", "fraud_risk"]
+  - code: "restriction"
+    enabled: true
+  - code: "portability"
+    enabled: true
+  - code: "objection"
+    enabled: true
+  - code: "automated_decision_review"
+    enabled: true
+
+identity_resolution:                    # правила объединения идентичностей
+  keys_priority: ["user_id", "email", "phone", "device_id", "cookie_id", "wallet_addr"]
+  fuzzy_match:
+    enabled: true
+    algorithm: "levenshtein"
+    threshold: 0.86
+  graph:
+    enabled: true
+    edges:
+      - source: "auth_logs"
+        relation: "same_device_cluster"
+      - source: "payments"
+        relation: "same_card_hash"
+  cache_ttl: "24h"
+
+sources_inventory:                      # инвентаризация источников данных
+  default_query_timeout: "120s"
+  connectors:
+    - name: "postgres_app"
+      type: "postgres"
+      dsn: "${DSAR_PG_DSN}"
+      pii_fields: ["email", "phone", "name", "address", "dob", "ip"]
+      key_fields: ["user_id", "email"]
+      queries:
+        access: "SELECT * FROM users WHERE user_id = :user_id OR email = :email"
+        rectification: "UPDATE users SET {{fields}} WHERE user_id = :user_id"
+        erasure_soft: "UPDATE users SET deleted_at = now() WHERE user_id = :user_id"
+        erasure_hard: "DELETE FROM users WHERE user_id = :user_id"
+    - name: "s3_events"
+      type: "s3"
+      bucket: "ov-audit-events-prod"
+      prefix: "events/"
+      role_arn: "${DSAR_S3_ROLE_ARN}"
+      pii_fields: ["ip", "user_agent", "session_id"]
+    - name: "elasticsearch_logs"
+      type: "elasticsearch"
+      url: "${DSAR_ES_URL}"
+      index_patterns: ["app-*-logs-*"]
+      search_template: |
+        {
+          "query": {
+            "bool": {
+              "should": [
+                {"term": {"user_id": "{{user_id}}"}},
+                {"term": {"email.keyword": "{{email}}"}}
+              ],
+              "minimum_should_match": 1
+            }
+          },
+          "size": 1000
+        }
+    - name: "saas_crm"
+      type: "saas"
+      vendor: "HubSpot"
+      token_ref: "secret://kv/saas/hubspot"
+      pii_fields: ["email", "name", "phone", "company"]
+    - name: "redis_sessions"
+      type: "redis"
+      addr: "${DSAR_REDIS_ADDR}"
+      key_pattern: "sess:*:{{user_id}}"
+
+retention_and_legal:
+  legal_hold_provider: "legalhold-service"
+  legal_hold_check: true
+  retention_policies:
+    - dataset: "payments"
+      min_age: "7y"
+    - dataset: "security_logs"
+      min_age: "1y"
+  exclusions:                            # данные, которые не подлежат удалению
+    - reason: "fraud_investigation"
+    - reason: "statutory_retention"
+
+redaction_policy:                        # маскирование и обезличивание
+  default_strategy: "contextual"
+  strategies:
+    contextual:
+      rules:
+        - field: "email"
+          action: "mask"                # mask | hash | null | remove | fpe
+          mask:
+            keep_left: 2
+            keep_right: 2
+            char: "*"
+        - field: "phone"
+          action: "mask"
+          mask:
+            keep_left: 0
+            keep_right: 4
+            char: "*"
+        - field: "ip"
+          action: "hash"
+          hash:
+            algo: "sha256"
+            salt_ref: "secret://kv/dsar/hash_salt"
+        - field: "card_pan"
+          action: "fpe"
+          fpe:
+            domain: "numeric"
+            tweak_ref: "secret://kv/dsar/fpe_tweak"
+    strict:
+      rules:
+        - field: "*"
+          action: "remove"
+  apply_for:
+    preview: "contextual"
+    export_user_copy: "contextual"
+    export_internal: "strict"
+
+workflow:                                # машина состояний
+  states: ["intake", "id_verification", "discovery", "review", "export", "delivery", "closed", "rejected", "on_hold"]
+  transitions:
+    - from: "intake"
+      to: "id_verification"
+      when: ["channel_validated", "request_type_supported"]
+    - from: "id_verification"
+      to: "discovery"
+      when: ["identity_verified"]
+      pause_clock: false
+    - from: "discovery"
+      to: "review"
+      when: ["artifacts_prepared"]
+    - from: "review"
+      to: "export"
+      when: ["manager_approved"]
+    - from: "export"
+      to: "delivery"
+      when: ["package_signed"]
+    - from: "delivery"
+      to: "closed"
+      when: ["delivered_and_acknowledged"]
+    - from: "discovery"
+      to: "on_hold"
+      when: ["legal_hold_detected"]
+      pause_clock: true
+    - from: "review"
+      to: "rejected"
+      when: ["rejection_approved"]
+
+export_packaging:                        # формирование пользовательской копии
+  formats: ["jsonl", "csv", "pdf_summary"]
+  compress: "zip"
+  include_schema: true
+  sign_artifacts: true
+  signature:
+    algo: "ed25519"
+    key_ref: "secret://kv/dsar/signing_key"
+  encrypt:
+    enabled: true
+    method: "age"                        # age | gpg | zip_password
+    recipients_ref: "secret://kv/dsar/recipients"  # список ключей
+  max_package_size_mb: 1024
+  chunking_mb: 200
+
+delivery:
+  method: "secure_link"                  # secure_link | portal_inbox
+  link_ttl: "14d"
+  watermark:
+    enabled: true
+    pattern: "OblivionVault DSAR {{request_id}} {{timestamp}}"
+  notify_on_download: true
+
+notifications:
+  email:
+    provider: "smtp"
+    from: "no-reply@oblivionvault.example"
+    templates:
+      ack:
+        locales:
+          en: "templates/email/ack_en.md"
+          ru: "templates/email/ack_ru.md"
+          sv: "templates/email/ack_sv.md"
+      ready:
+        locales:
+          en: "templates/email/ready_en.md"
+          ru: "templates/email/ready_ru.md"
+          sv: "templates/email/ready_sv.md"
+      extension_notice:
+        locales:
+          en: "templates/email/extension_en.md"
+          ru: "templates/email/extension_ru.md"
+          sv: "templates/email/extension_sv.md"
+  webhooks:
+    enabled: true
+    endpoints:
+      - name: "siem"
+        url: "${DSAR_WEBHOOK_SIEM}"
+        auth_header_ref: "secret://kv/webhooks/siem_token"
+      - name: "ticketing"
+        url: "${DSAR_WEBHOOK_TICKETS}"
+        auth_header_ref: "secret://kv/webhooks/ticket_token"
+
+observability:
+  tracing:
+    enabled: true
+    provider: "otel"
+    sample_rate: 0.2
+  logging:
+    level: "INFO"
+    sink:
+      - type: "stdout"
+      - type: "s3"
+        bucket: "ov-dsar-logs-${OV_ENV}"
+        prefix: "app/"
+  audit:
+    enabled: true
+    sink:
+      type: "kinesis"
+      stream: "ov-dsar-audit-${OV_ENV}"
+    redact_values: true
+    fields:
+      - "actor"
+      - "action"
+      - "timestamp"
+      - "request_id"
+      - "state"
+      - "source"
+      - "decision"
+      - "justification"
+
+security:
+  access:
+    allowed_roles_for_export: ["privacy_analyst", "privacy_manager", "dpo"]
+    dual_control_for_release: true
+  storage:
+    tmp_dir: "/var/run/oblivionvault/dsar/tmp"
+    tmp_ttl: "72h"
+    at_rest_encryption: true
+  secrets_backend: "vault"               # vault | aws_kms | gcp_kms
+  pii_preview_limit_rows: 500
+
+limits:
+  max_requests_per_subject_per_year: 4
+  throttle:
+    per_subject_per_30d: 2
+    per_ip_per_hour: 20
+
+metrics:
+  kpis:
+    on_time_rate_target: 0.95
+    mean_resolution_days_target: 15
+    reopen_rate_max: 0.05
+  exports:
+    avg_package_size_mb_alert: 800
+  alerts:
+    pagerduty_service: "ov-privacy"
+    rules:
+      - name: "dsar_overdue"
+        expr: "count_overdue_requests > 0"
+      - name: "identity_fail_spike"
+        expr: "idv_failure_rate_5m > 0.2"
+
+qa_and_testing:
+  synthetic_data:
+    enabled_in_nonprod: true
+    tag: "__SYNTHETIC__"
+  dry_run_mode:
+    enabled: false
+    drop_export_artifacts: true
+
+validation:
+  strict_schema: true
+  schema_ref: "schemas/dsar_config.schema.json"
+
+integrations:
+  ticketing:
+    provider: "Jira"
+    project_key: "PRIV"
+    create_issue_per_request: true
+  idv:
+    kyc_provider_a:
+      api_url: "${KYC_A_API}"
+      token_ref: "secret://kv/idv/kyc_a"
+    kyc_provider_b:
+      api_url: "${KYC_B_API}"
+      token_ref: "secret://kv/idv/kyc_b"
+
+# Конец файла

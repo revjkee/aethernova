@@ -1,0 +1,255 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: policy-core-prometheus-rules
+  labels:
+    app.kubernetes.io/name: policy-core
+    app.kubernetes.io/component: observability
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+    # =========================
+    # Recording rules (SLO/агрегации)
+    # =========================
+    - name: policy-core.recording
+      interval: 30s
+      rules:
+        # RPS
+        - record: policy_core:http_requests:rate1m
+          expr: sum(rate(policy_core_http_requests_total[1m]))
+        - record: policy_core:http_requests:rate5m
+          expr: sum(rate(policy_core_http_requests_total[5m]))
+
+        # Ошибки HTTP 5xx
+        - record: policy_core:error_ratio:5m
+          expr: |
+            (
+              sum(rate(policy_core_http_requests_total{code=~"5.."}[5m]))
+            )
+            /
+            clamp_min(sum(rate(policy_core_http_requests_total[5m])), 1)
+
+        - record: policy_core:error_ratio:30m
+          expr: |
+            (
+              sum(rate(policy_core_http_requests_total{code=~"5.."}[30m]))
+            )
+            /
+            clamp_min(sum(rate(policy_core_http_requests_total[30m])), 1)
+
+        # p95/p99 задержки по histogram
+        - record: policy_core:latency:p95
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (rate(policy_core_request_duration_seconds_bucket[5m]))
+            )
+        - record: policy_core:latency:p99
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(policy_core_request_duration_seconds_bucket[5m]))
+            )
+
+        # Скорость принятия policy-решений и доля deny
+        - record: policy_core:decisions:rate5m
+          expr: sum(rate(policy_core_decisions_total[5m]))
+        - record: policy_core:deny_ratio:5m
+          expr: |
+            sum(rate(policy_core_decision_denied_total[5m]))
+            /
+            clamp_min(sum(rate(policy_core_decisions_total[5m])), 1)
+
+        # Возраст загруженного бандла
+        - record: policy_core:bundle_age_seconds
+          expr: |
+            time() - max(policy_core_bundle_last_reload_timestamp_seconds)
+
+        # Рестарты контейнера за 5 минут
+        - record: policy_core:pod_restarts_last_5m
+          expr: |
+            sum by (pod) (increase(kube_pod_container_status_restarts_total{container="policy-core"}[5m]))
+
+        # Нагрузка памяти и CPU (текущая доля от лимита)
+        - record: policy_core:memory_usage_ratio
+          expr: |
+            sum by (pod) (
+              container_memory_working_set_bytes{container="policy-core"}
+              /
+              clamp_min(container_spec_memory_limit_bytes{container="policy-core"}, 1)
+            )
+        - record: policy_core:cpu_throttle_ratio:5m
+          expr: |
+            sum by (pod) (
+              rate(container_cpu_cfs_throttled_periods_total{container="policy-core"}[5m])
+              /
+              clamp_min(rate(container_cpu_cfs_periods_total{container="policy-core"}[5m]), 1)
+            )
+
+    # =========================
+    # Alerts: Доступность и ошибки
+    # =========================
+    - name: policy-core.availability
+      rules:
+        - alert: PolicyCoreUpAbsent
+          expr: |
+            up{job="policy-core"} == 0
+          for: 2m
+          labels:
+            severity: P1
+            team: policy-core
+          annotations:
+            summary: "policy-core недоступен"
+            description: "Экспортер policy-core не отвечает (up=0) более 2 минут."
+            runbook: "file://docs/runbooks/policy-core/availability.md"
+
+        - alert: PolicyCoreNoTrafficWithReplicas
+          expr: |
+            clamp_min(sum(kube_deployment_status_replicas_available{deployment="policy-core"}), 0)
+            > 0
+            and
+            policy_core:http_requests:rate5m == 0
+          for: 10m
+          labels:
+            severity: P1
+            team: policy-core
+          annotations:
+            summary: "Нет трафика при доступных репликах"
+            description: "Доступные реплики есть, но RPS=0 более 10 минут. Возможен регресc маршрутизации/Ingress."
+            runbook: "file://docs/runbooks/policy-core/routing.md"
+
+        - alert: PolicyCoreHighErrorRate
+          expr: |
+            (policy_core:error_ratio:5m > 0.05 and policy_core:error_ratio:30m > 0.02)
+          for: 10m
+          labels:
+            severity: P1
+            team: policy-core
+          annotations:
+            summary: "Высокая доля 5xx ошибок"
+            description: "Error ratio за 5м > 5% и за 30м > 2%. Проверить бэкенды/бандл/регрессию."
+            runbook: "file://docs/runbooks/policy-core/error-rate.md"
+
+        - alert: PolicyCorePodRestartBurst
+          expr: policy_core:pod_restarts_last_5m > 3
+          for: 5m
+          labels:
+            severity: P1
+            team: policy-core
+          annotations:
+            summary: "Бурст рестартов pod"
+            description: "Pod перезапускается >3 раз за 5 минут. Возможна авария конфигурации/бандла."
+            runbook: "file://docs/runbooks/policy-core/pod-restarts.md"
+
+    # =========================
+    # Alerts: Производительность и деградация
+    # =========================
+    - name: policy-core.performance
+      rules:
+        - alert: PolicyCoreHighLatency95p
+          expr: policy_core:latency:p95 > 0.5
+          for: 10m
+          labels:
+            severity: P2
+            team: policy-core
+          annotations:
+            summary: "p95 задержки выше SLO"
+            description: "p95 > 500ms более 10 минут — деградация производительности."
+            runbook: "file://docs/runbooks/policy-core/latency.md"
+
+        - alert: PolicyCoreHighLatency99p
+          expr: policy_core:latency:p99 > 1
+          for: 10m
+          labels:
+            severity: P3
+            team: policy-core
+          annotations:
+            summary: "p99 задержки критично высоки"
+            description: "p99 > 1s более 10 минут — возможен общий перегруз/GC/холодные кэши."
+            runbook: "file://docs/runbooks/policy-core/latency.md"
+
+        - alert: PolicyCoreHighDenyRate
+          expr: policy_core:deny_ratio:5m > 0.5
+          for: 15m
+          labels:
+            severity: P3
+            team: policy-core
+          annotations:
+            summary: "Аномально высокий deny-rate"
+            description: "Доля deny > 50% за 15 минут. Возможна ошибка политики/данных."
+            runbook: "file://docs/runbooks/policy-core/policy-deny.md"
+
+    # =========================
+    # Alerts: Политики/бандлы и очереди
+    # =========================
+    - name: policy-core.policy
+      rules:
+        - alert: PolicyCoreBundleTooOld
+          expr: policy_core:bundle_age_seconds > 3600
+          for: 15m
+          labels:
+            severity: P2
+            team: policy-core
+          annotations:
+            summary: "Бандл политик устарел"
+            description: "Возраст загруженного бандла > 1 часа. Проверьте публикацию/обновление."
+            runbook: "file://docs/runbooks/policy-core/bundle.md"
+
+        - alert: PolicyCoreConfigReloadFailed
+          expr: increase(policy_core_config_reload_failed_total[15m]) > 0
+          for: 5m
+          labels:
+            severity: P2
+            team: policy-core
+          annotations:
+            summary: "Сбой перезагрузки конфигурации/бандла"
+            description: "Зафиксированы ошибки reload за последние 15 минут."
+            runbook: "file://docs/runbooks/policy-core/config-reload.md"
+
+        - alert: PolicyCoreDLQNotEmpty
+          expr: policy_core_dlq_messages > 0
+          for: 10m
+          labels:
+            severity: P2
+            team: policy-core
+          annotations:
+            summary: "DLQ не пуст"
+            description: "В очереди Dead-Letter накоплены сообщения. Требуется обработка."
+            runbook: "file://docs/runbooks/policy-core/dlq.md"
+
+        - alert: PolicyCoreAuditBacklog
+          expr: policy_core_audit_queue_depth > 1000
+          for: 15m
+          labels:
+            severity: P2
+            team: policy-core
+          annotations:
+            summary: "Бэклог аудита"
+            description: "Очередь аудита превышает 1000 событий > 15 минут."
+            runbook: "file://docs/runbooks/policy-core/audit.md"
+
+    # =========================
+    # Alerts: Ресурсы контейнера
+    # =========================
+    - name: policy-core.resources
+      rules:
+        - alert: PolicyCoreMemorySaturation
+          expr: policy_core:memory_usage_ratio > 0.9
+          for: 10m
+          labels:
+            severity: P2
+            team: policy-core
+          annotations:
+            summary: "Память близка к лимиту"
+            description: "Working set > 90% memory limit более 10 минут."
+            runbook: "file://docs/runbooks/policy-core/resources.md"
+
+        - alert: PolicyCoreCpuThrottleHigh
+          expr: policy_core:cpu_throttle_ratio:5m > 0.5
+          for: 10m
+          labels:
+            severity: P3
+            team: policy-core
+          annotations:
+            summary: "Высокий CPU-throttling"
+            description: "Более 50% периодов CPU троттлятся на интервале 5м."
+            runbook: "file://docs/runbooks/policy-core/resources.md"

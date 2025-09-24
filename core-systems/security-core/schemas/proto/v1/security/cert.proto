@@ -1,0 +1,405 @@
+// File: security-core/schemas/proto/v1/security/cert.proto
+// Industrial-grade X.509 certificate schema for Aethernova / security-core
+// References: RFC 5280 (PKI), RFC 5912 (ASN.1 modules), RFC 6962 (CT/SCT), RFC 4055 (RSA-PSS),
+//             RFC 5480 (EC keys), RFC 8410 (EdDSA), CA/Browser Forum Baseline Requirements.
+//
+// Design goals:
+// - Stable field numbering with reserved ranges for future use.
+// - Keep raw DER for lossless round-trip; provide parsed structures via oneof where feasible.
+// - Algorithm-agnostic (AlgorithmIdentifier OID + parameters DER), PQ-ready.
+// - Comprehensive extensions coverage; AuthorityInfoAccess/CRLDP/SAN/Policies/NameConstraints, AKI/SKI, BasicConstraints.
+// - CT (SignedCertificateTimestamp) supported.
+//
+// Proto3
+syntax = "proto3";
+
+package security.v1;
+
+option go_package = "github.com/aethernova/security-core/schemas/proto/v1/security;securityv1";
+option java_multiple_files = true;
+option java_package = "org.aethernova.security.v1";
+option java_outer_classname = "CertificateProto";
+option csharp_namespace = "Aethernova.Security.V1";
+option optimize_for = SPEED;
+
+// Generic OID representation: dotted string + arcs for canonicalization/comparison.
+message Oid {
+  // Dotted decimal representation, e.g., "1.2.840.113549.1.1.1".
+  string dotted_string = 1;
+
+  // Numeric arcs (base-128 decoded). Optional; use for fast comparisons.
+  repeated uint64 arcs = 2;
+
+  // Reserved for future canonical hash or name mapping.
+  reserved 3 to 9;
+}
+
+// X.500 Name and RDN structures (RFC 5280).
+message AttributeTypeAndValue {
+  Oid type = 1;            // e.g., CN, O, OU, C (by OID)
+  bytes value_der = 2;     // DER-encoded value for lossless fidelity
+  // Optional normalized UTF-8 (best-effort). Not guaranteed present/complete.
+  optional string value_utf8 = 3;
+
+  reserved 4 to 9;
+}
+
+message RelativeDistinguishedName {
+  // Set of attributes (multi-valued RDN).
+  repeated AttributeTypeAndValue attributes = 1;
+}
+
+message Name {
+  // Sequence of RDNs from most-specific to least-specific.
+  repeated RelativeDistinguishedName rdns = 1;
+}
+
+// AlgorithmIdentifier per RFC 5280/PKCS. Parameters can be absent or any DER.
+message AlgorithmIdentifier {
+  Oid algorithm = 1;
+  // Parameters as DER (e.g., NULL for RSA, curve OID for EC, PSS params, etc.).
+  // Empty if absent.
+  bytes parameters_der = 2;
+
+  reserved 3 to 9;
+}
+
+// SubjectPublicKeyInfo (RFC 5280). Keep raw key + optional parsed forms.
+message SubjectPublicKeyInfo {
+  AlgorithmIdentifier algorithm = 1;
+  // BIT STRING contents of subjectPublicKey (without unused-bits count).
+  bytes subject_public_key = 2;
+
+  // Optional parsed helpers. Implementations may ignore if unavailable.
+  oneof parsed_key {
+    RsaPublicKey rsa = 10;
+    EcPublicKey ec = 11;
+    EdPublicKey ed = 12;
+    // For future post-quantum or hybrid keys; leave generic.
+    GenericPublicKey generic = 13;
+  }
+
+  reserved 3 to 9, 14 to 19;
+}
+
+// RSA per RFC 3447 (PKCS#1)
+message RsaPublicKey {
+  // Big-endian unsigned integers.
+  bytes modulus = 1;          // n
+  uint64 public_exponent = 2; // e (commonly 65537)
+}
+
+// EC per RFC 5480
+message EcPublicKey {
+  // Named curve if provided via parameters (OID). May be unset for explicit params.
+  optional Oid named_curve = 1;
+
+  // Uncompressed point as bytes (0x04 || X || Y), if available.
+  optional bytes uncompressed_point = 2;
+
+  // Cartesian components when decoded; optional.
+  optional bytes x = 3;
+  optional bytes y = 4;
+
+  // Indicate whether point is compressed (0x02/0x03 form).
+  optional bool compressed = 5;
+}
+
+// EdDSA per RFC 8410
+message EdPublicKey {
+  enum EdCurve {
+    ED_CURVE_UNSPECIFIED = 0;
+    ED25519 = 1; // 1.3.101.112
+    ED448   = 2; // 1.3.101.113
+  }
+  EdCurve curve = 1;
+  bytes key = 2; // raw public key bytes
+}
+
+// Catch-all for algorithms not explicitly modeled (e.g., PQ).
+message GenericPublicKey {
+  // Copy of algorithm OID for convenience. Should match SPKI.algorithm.
+  Oid algorithm = 1;
+  bytes key = 2;
+  // Parameters if separate from AlgorithmIdentifier (rare).
+  optional bytes parameters_der = 3;
+}
+
+// Validity window in UTC seconds since Unix epoch.
+message Validity {
+  int64 not_before_utc = 1; // inclusive
+  int64 not_after_utc  = 2; // inclusive (per RFC interpretation by implementer)
+}
+
+// GeneralName (RFC 5280, §4.2.1.6)
+message OtherName {
+  Oid type_id = 1;
+  bytes value_der = 2; // [0] EXPLICIT ANY DEFINED BY type-id, as DER
+}
+
+message GeneralName {
+  oneof name {
+    OtherName other_name = 1;       // [0]
+    bytes rfc822_name = 2;          // [1] IA5String (email)
+    bytes dNS_name = 3;             // [2] IA5String
+    Name directory_name = 4;        // [4]
+    bytes uniform_resource_identifier = 5; // [6] IA5String
+    bytes ip_address = 6;           // [7] OCTET STRING (4 or 16 bytes)
+    Oid registered_id = 7;          // [8]
+    // Rare/legacy:
+    bytes x400_address = 8;         // [3] ORAddress (DER)
+    bytes edi_party_name = 9;       // [5] EdiPartyName (DER)
+  }
+}
+
+// KeyUsage bit flags (RFC 5280, §4.2.1.3)
+message KeyUsage {
+  bool digital_signature = 1;
+  bool content_commitment = 2; // nonRepudiation
+  bool key_encipherment = 3;
+  bool data_encipherment = 4;
+  bool key_agreement = 5;
+  bool key_cert_sign = 6;
+  bool crl_sign = 7;
+  bool encipher_only = 8;
+  bool decipher_only = 9;
+}
+
+// Extended Key Usage (RFC 5280, §4.2.1.12)
+message ExtendedKeyUsage {
+  // Known EKUs (for convenience). Implementations rely on OIDs for authority.
+  enum Known {
+    KNOWN_UNSPECIFIED = 0;
+    SERVER_AUTH = 1;        // 1.3.6.1.5.5.7.3.1
+    CLIENT_AUTH = 2;        // 1.3.6.1.5.5.7.3.2
+    CODE_SIGNING = 3;       // 1.3.6.1.5.5.7.3.3
+    EMAIL_PROTECTION = 4;   // 1.3.6.1.5.5.7.3.4
+    TIME_STAMPING = 5;      // 1.3.6.1.5.5.7.3.8
+    OCSP_SIGNING = 6;       // 1.3.6.1.5.5.7.3.9
+    IPSEC_IKE = 7;          // 1.3.6.1.5.5.7.3.17
+    SMARTCARD_LOGON = 8;    // 1.3.6.1.4.1.311.20.2.2 (Microsoft)
+    DOCUMENT_SIGNING = 9;   // 1.3.6.1.4.1.311.10.3.12 (Microsoft)
+  }
+  repeated Oid usages = 1;          // authoritative list
+  repeated Known known_mapped = 2;  // convenience set
+}
+
+// BasicConstraints (RFC 5280, §4.2.1.9)
+message BasicConstraints {
+  bool ca = 1;
+  // When present, max path length for non-self-issued intermediate certs.
+  optional uint32 path_len_constraint = 2;
+}
+
+// SubjectAltName / IssuerAltName
+message SubjectAltName {
+  repeated GeneralName names = 1;
+}
+message IssuerAltName {
+  repeated GeneralName names = 1;
+}
+
+// SubjectKeyIdentifier / AuthorityKeyIdentifier (RFC 5280, §4.2.1.1 / §4.2.1.1)
+message SubjectKeyIdentifier {
+  bytes key_identifier = 1;
+}
+
+message AuthorityKeyIdentifier {
+  bytes key_identifier = 1;
+  // Optional issuer/serial of the authority cert.
+  optional GeneralName authority_cert_issuer = 2;
+  optional bytes authority_cert_serial_number = 3;
+}
+
+// NameConstraints (RFC 5280, §4.2.1.10)
+message GeneralSubtree {
+  GeneralName base = 1;
+  // Optional min/max; rarely used.
+  optional uint32 minimum = 2; // default 0
+  optional uint32 maximum = 3; // if present, base with maximum additional levels
+}
+
+message NameConstraints {
+  repeated GeneralSubtree permitted_subtrees = 1;
+  repeated GeneralSubtree excluded_subtrees = 2;
+}
+
+// Certificate Policies (RFC 5280, §4.2.1.4)
+message DisplayText {
+  // Carry as UTF-8 (mapped from IA5/BMP/VisibleString by parser).
+  string text = 1;
+}
+
+message NoticeReference {
+  string organization = 1;        // UTF-8
+  repeated uint32 notice_numbers = 2;
+}
+
+message UserNotice {
+  optional NoticeReference notice_ref = 1;
+  optional DisplayText explicit_text = 2;
+}
+
+message PolicyQualifierInfo {
+  Oid policy_qualifier_id = 1; // e.g., id-qt-cps (1.3.6.1.5.5.7.2.1), id-qt-unotice (1.3.6.1.5.5.7.2.2)
+  oneof qualifier {
+    string cps_uri = 2;
+    UserNotice user_notice = 3;
+    bytes raw_der = 4;
+  }
+}
+
+message PolicyInformation {
+  Oid policy_identifier = 1;
+  repeated PolicyQualifierInfo qualifiers = 2;
+}
+
+message CertificatePolicies {
+  repeated PolicyInformation policies = 1;
+}
+
+// CRL Distribution Points (RFC 5280, §4.2.1.13)
+message DistributionPointName {
+  // We mostly see fullName; nameRelativeToCRLIssuer is rare -> keep DER if needed.
+  oneof value {
+    // fullName [0] GeneralNames
+    repeated GeneralName full_name = 1;
+    // nameRelativeToCRLIssuer [1] RDN (DER)
+    bytes name_relative_to_crl_issuer_der = 2;
+  }
+}
+
+message ReasonFlags {
+  bool unused = 1;
+  bool key_compromise = 2;
+  bool ca_compromise = 3;
+  bool affiliation_changed = 4;
+  bool superseded = 5;
+  bool cessation_of_operation = 6;
+  bool certificate_hold = 7;
+  bool privilege_withdrawn = 8;
+  bool aa_compromise = 9;
+}
+
+message DistributionPoint {
+  optional DistributionPointName distribution_point = 1;
+  optional ReasonFlags reasons = 2;
+  optional GeneralName crl_issuer = 3;
+}
+
+message CRLDistributionPoints {
+  repeated DistributionPoint points = 1;
+}
+
+// Authority Information Access (AIA) / Subject Information Access (SIA) (RFC 5280, §4.2.2.1)
+message AccessDescription {
+  Oid access_method = 1;         // e.g., id-ad-ocsp (1.3.6.1.5.5.7.48.1), id-ad-caIssuers (1.3.6.1.5.5.7.48.2)
+  GeneralName access_location = 2;
+}
+message AuthorityInfoAccess {
+  repeated AccessDescription descriptions = 1;
+}
+message SubjectInfoAccess {
+  repeated AccessDescription descriptions = 1;
+}
+
+// Certificate Transparency (RFC 6962)
+message DigitallySigned {
+  AlgorithmIdentifier algorithm = 1; // Hash+Sig OID if available
+  bytes signature = 2;
+}
+
+message SignedCertificateTimestamp {
+  enum Version {
+    SCT_V1 = 0; // RFC 6962 v1
+  }
+  Version version = 1;
+  bytes log_id = 2;           // 32 bytes (SHA-256 of log's public key)
+  uint64 timestamp = 3;       // milliseconds since epoch
+  bytes extensions = 4;       // opaque
+  DigitallySigned signature = 5;
+}
+
+message SignedCertificateTimestamps {
+  repeated SignedCertificateTimestamp scts = 1;
+}
+
+// Generic Extension container + parsed oneof.
+message Extension {
+  Oid id = 1;
+  bool critical = 2;
+  bytes value_der = 3; // Raw DER of extnValue (OCTET STRING contents)
+
+  oneof parsed {
+    BasicConstraints basic_constraints = 10;
+    KeyUsage key_usage = 11;
+    ExtendedKeyUsage extended_key_usage = 12;
+    SubjectAltName subject_alt_name = 13;
+    IssuerAltName issuer_alt_name = 14;
+    AuthorityKeyIdentifier authority_key_identifier = 15;
+    SubjectKeyIdentifier subject_key_identifier = 16;
+    CertificatePolicies certificate_policies = 17;
+    NameConstraints name_constraints = 18;
+    CRLDistributionPoints crl_distribution_points = 19;
+    AuthorityInfoAccess authority_info_access = 20;
+    SubjectInfoAccess subject_info_access = 21;
+    SignedCertificateTimestamps sct_list = 22;
+  }
+
+  // Reserved room for additional first-class parsed extensions.
+  reserved 23 to 39;
+}
+
+// tbsCertificate (RFC 5280, §4.1)
+message TBSCertificate {
+  // Version: 0=v1, 1=v2, 2=v3. Default is v1 if absent in DER.
+  uint32 version = 1;
+
+  // Serial number as unsigned big integer.
+  bytes serial_number = 2;
+
+  // Signature algorithm used to sign this certificate (should match Certificate.signature_algorithm).
+  AlgorithmIdentifier signature = 3;
+
+  Name issuer = 4;
+  Validity validity = 5;
+  Name subject = 6;
+  SubjectPublicKeyInfo subject_public_key_info = 7;
+
+  // Optional unique IDs (rare in modern certs).
+  optional bytes issuer_unique_id = 8;
+  optional bytes subject_unique_id = 9;
+
+  // v3 extensions
+  repeated Extension extensions = 10;
+
+  reserved 11 to 19;
+}
+
+// Full Certificate with outer signature.
+message Certificate {
+  TBSCertificate tbs_certificate = 1;
+
+  // Signature algorithm used at the outer level.
+  AlgorithmIdentifier signature_algorithm = 2;
+
+  // BIT STRING contents (without unused-bits count).
+  bytes signature_value = 3;
+
+  // Original DER-encoded certificate for exact round-trip and auditing.
+  bytes raw_der = 15;
+
+  // Reserved for chain position hints, trust anchors, lint metadata, etc.
+  reserved 4 to 14, 16 to 29;
+}
+
+// Convenience wrapper for chains/bundles.
+message CertificateChain {
+  // Leaf first, followed by intermediates; root optional.
+  repeated Certificate certificates = 1;
+
+  // Optional consolidated metadata.
+  optional bytes metadata_json = 2;
+
+  reserved 3 to 9;
+}

@@ -1,0 +1,227 @@
+name: CI
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # еженедельно по понедельникам 03:00 UTC
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+  # Ускоряем сборки колёс, если возможно
+  CFLAGS: "-O2"
+  # Путь к проекту (можно переопределить)
+  PROJECT_DIR: "."
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Cache Ruff
+        uses: actions/cache@v4
+        with:
+          path: .ruff_cache
+          key: ruff-${{ runner.os }}-${{ hashFiles('**/ruff.toml', '**/pyproject.toml') }}
+
+      - name: Install tooling
+        run: |
+          python -m pip install -U pip wheel setuptools
+          python -m pip install ruff
+
+      - name: Ruff format (check only)
+        run: |
+          ruff format --check $PROJECT_DIR
+
+      - name: Ruff lint
+        run: |
+          ruff check --output-format=github $PROJECT_DIR
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Cache mypy
+        uses: actions/cache@v4
+        with:
+          path: .mypy_cache
+          key: mypy-${{ runner.os }}-${{ hashFiles('**/mypy.ini', '**/pyproject.toml') }}
+
+      - name: Install project and type tools (robust)
+        run: |
+          python -m pip install -U pip wheel setuptools
+          # Устанавливаем dev-зависимости, если они определены
+          if [ -f "requirements-dev.txt" ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f "requirements.txt" ]; then
+            python -m pip install -r requirements.txt
+          fi
+          # Всегда гарантируем наличие инструментов
+          python -m pip install mypy typing-extensions
+          # Локальная установка проекта (editable при наличии setup/pyproject)
+          python -m pip install -e . || true
+
+      - name: Mypy
+        run: |
+          mypy --pretty --show-error-codes --no-error-summary $PROJECT_DIR
+
+  test:
+    name: Tests (matrix)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        python-version: [ "3.10", "3.11", "3.12" ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install project & test deps (robust)
+        shell: bash
+        run: |
+          python -m pip install -U pip wheel setuptools
+          if [ -f "requirements-test.txt" ]; then
+            python -m pip install -r requirements-test.txt
+          elif [ -f "requirements-dev.txt" ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f "requirements.txt" ]; then
+            python -m pip install -r requirements.txt
+          fi
+          python -m pip install pytest pytest-cov coverage ruff mypy
+          python -m pip install -e . || true
+
+      - name: Cache test tooling
+        uses: actions/cache@v4
+        with:
+          path: |
+            .pytest_cache
+            .ruff_cache
+            .mypy_cache
+          key: testcaches-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml', '**/ruff.toml', '**/mypy.ini', '**/requirements*.txt') }}
+
+      - name: PyTest with coverage
+        shell: bash
+        run: |
+          pytest -q --maxfail=1 \
+            --cov="$PROJECT_DIR" --cov-report=xml --cov-report=term-missing \
+            tests
+
+      - name: Upload coverage.xml
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ runner.os }}-py${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  build:
+    name: Build (sdist/wheel)
+    needs: [ lint, typecheck, test ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install build backend
+        run: |
+          python -m pip install -U pip wheel setuptools build
+
+      - name: Build distributions
+        run: |
+          python -m build --sdist --wheel .
+          python -c "import pathlib; [print('Built', p) for p in pathlib.Path('dist').glob('*')]"
+
+      - name: Verify wheels (basic import test)
+        run: |
+          TMP_ENV=.venv_build_check
+          python -m venv "$TMP_ENV"
+          . "$TMP_ENV/bin/activate" || source "$TMP_ENV/Scripts/activate"
+          python -m pip install -U pip
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          import importlib, sys
+          pkgs = ["omnimind_core", "omnimind", "core"]
+          for name in pkgs:
+              try:
+                  importlib.import_module(name)
+                  print("Imported:", name)
+                  break
+              except Exception:
+                  pass
+          else:
+              sys.exit("Could not import project package; adjust package name(s).")
+          PY
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  dependency-review:
+    name: Dependency Review (PR-only)
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high

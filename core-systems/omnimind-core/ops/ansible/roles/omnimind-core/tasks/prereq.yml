@@ -1,0 +1,260 @@
+# omnimind-core/ops/ansible/roles/omnimind-core/tasks/prereq.yml
+---
+# Пререквизиты для развёртывания omnimind-core
+# Ожидается Ansible >= 2.14, Python >= 3.8 на управляемом хосте.
+
+- name: "Assert minimal Ansible/Python versions"
+  ansible.builtin.assert:
+    that:
+      - ansible_version.full is version('2.14', '>=')
+      - ansible_facts.python.version.major | int >= 3
+      - (ansible_facts.python.version.minor | int) >= 8
+    fail_msg: "Ansible>=2.14 и Python>=3.8 на целевом хосте обязательны."
+  tags: [prereq, assert, safety]
+
+- name: "Detect OS family and set package lists"
+  ansible.builtin.set_fact:
+    _base_packages_debian: "{{ [
+        'ca-certificates','curl','git','tar','xz-utils','unzip','jq',
+        'python3','python3-venv','python3-pip','pkg-config','build-essential',
+        'libpq-dev'
+      ] }}"
+    _base_packages_redhat: "{{ [
+        'ca-certificates','curl','git','tar','xz','unzip','jq',
+        'python3','python3-pip','python3-virtualenv','gcc','gcc-c++','make',
+        'pkgconfig','libpq-devel'
+      ] }}"
+    _base_packages_arch: "{{ [
+        'ca-certificates','curl','git','tar','xz','unzip','jq',
+        'python','python-pip','python-virtualenv','base-devel','pkgconf',
+        'postgresql-libs'
+      ] }}"
+  tags: [prereq, facts]
+
+- name: "Install base packages (Debian/Ubuntu)"
+  ansible.builtin.apt:
+    name: "{{ _base_packages_debian }}"
+    update_cache: true
+    state: present
+  when: ansible_facts.os_family == 'Debian'
+  tags: [prereq, packages]
+
+- name: "Install base packages (RHEL/CentOS/Rocky)"
+  ansible.builtin.yum:
+    name: "{{ _base_packages_redhat }}"
+    state: present
+  when: ansible_facts.os_family == 'RedHat'
+  tags: [prereq, packages]
+
+- name: "Install base packages (Arch)"
+  community.general.pacman:
+    name: "{{ _base_packages_arch }}"
+    state: present
+    update_cache: true
+  when: ansible_facts.os_family == 'Archlinux'
+  tags: [prereq, packages]
+
+- name: "Create group for application"
+  ansible.builtin.group:
+    name: "{{ omnimind_group | default('omnimind') }}"
+    gid: "{{ omnimind_gid | default(11001) }}"
+    state: present
+    system: true
+  tags: [prereq, users]
+
+- name: "Create system user for application"
+  ansible.builtin.user:
+    name: "{{ omnimind_user | default('omni') }}"
+    uid: "{{ omnimind_uid | default(11001) }}"
+    group: "{{ omnimind_group | default('omnimind') }}"
+    shell: /usr/sbin/nologin
+    create_home: false
+    system: true
+    state: present
+  tags: [prereq, users]
+
+- name: "Create runtime directories with secure permissions"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ omnimind_user | default('omni') }}"
+    group: "{{ omnimind_group | default('omnimind') }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop:
+    - { path: "/opt/omnimind" }
+    - { path: "/etc/omnimind", mode: "0750" }
+    - { path: "/var/log/omnimind", mode: "0750" }
+    - { path: "/var/run/omnimind", mode: "0750" }
+  tags: [prereq, fs, security]
+
+- name: "Ensure pip is latest (system)"
+  ansible.builtin.pip:
+    name: pip
+    state: latest
+    executable: "{{ (ansible_facts.os_family == 'RedHat') | ternary('pip3','pip3') }}"
+  tags: [prereq, python]
+
+- name: "Install uv (fast Python package manager)"
+  ansible.builtin.pip:
+    name: "uv{{ omnimind_uv_version is defined | ternary('==' ~ omnimind_uv_version, '') }}"
+    state: present
+    executable: pip3
+  tags: [prereq, python]
+
+- name: "Create shared virtualenv for builds (optional)"
+  ansible.builtin.command:
+    cmd: "python3 -m venv /opt/omnimind/venv"
+    creates: "/opt/omnimind/venv/bin/activate"
+  tags: [prereq, python]
+  when: omnimind_create_shared_venv | default(true)
+
+- name: "Adjust directory ownership for venv"
+  ansible.builtin.file:
+    path: "/opt/omnimind/venv"
+    state: directory
+    recurse: true
+    owner: "{{ omnimind_user | default('omni') }}"
+    group: "{{ omnimind_group | default('omnimind') }}"
+    mode: "0750"
+  when: omnimind_create_shared_venv | default(true)
+  tags: [prereq, python, security]
+
+# ---------------- System tuning ----------------
+
+- name: "Apply kernel/sysctl tuning"
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    state: present
+    reload: true
+  loop: "{{ (omnimind_sysctl_overrides | default({
+          'vm.max_map_count': 262144,
+          'fs.file-max': 1048576,
+          'net.core.somaxconn': 1024,
+          'net.ipv4.tcp_tw_reuse': 1
+        })) | dict2items }}"
+  tags: [prereq, sysctl, performance]
+
+- name: "Raise file descriptor and process limits with pam_limits"
+  community.general.pam_limits:
+    domain: "{{ item.domain }}"
+    limit_type: "{{ item.type }}"
+    limit_item: "{{ item.item }}"
+    value: "{{ item.value }}"
+    use_max: false
+  loop:
+    - { domain: "{{ omnimind_user | default('omni') }}", type: 'soft', item: 'nofile', value: "{{ omnimind_nofile_soft | default(1048576) }}" }
+    - { domain: "{{ omnimind_user | default('omni') }}", type: 'hard', item: 'nofile', value: "{{ omnimind_nofile_hard | default(1048576) }}" }
+    - { domain: "{{ omnimind_user | default('omni') }}", type: 'soft', item: 'nproc',  value: "{{ omnimind_nproc_soft  | default(65536) }}" }
+    - { domain: "{{ omnimind_user | default('omni') }}", type: 'hard', item: 'nproc',  value: "{{ omnimind_nproc_hard  | default(65536) }}" }
+  tags: [prereq, limits, performance]
+
+# ---------------- Optional: Docker engine ----------------
+
+- name: "Install Docker engine (optional)"
+  when: omnimind_docker_enable | default(true)
+  block:
+    - name: "Install Docker packages (Debian family)"
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-plugin
+        update_cache: true
+        state: present
+      when: ansible_facts.os_family == 'Debian'
+
+    - name: "Install Docker packages (RedHat family)"
+      ansible.builtin.yum:
+        name:
+          - docker
+          - docker-compose-plugin
+        state: present
+      when: ansible_facts.os_family == 'RedHat'
+
+    - name: "Install Docker packages (Arch)"
+      community.general.pacman:
+        name:
+          - docker
+          - docker-compose
+        state: present
+        update_cache: true
+      when: ansible_facts.os_family == 'Archlinux'
+
+    - name: "Enable and start docker service"
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: "Add application user to docker group"
+      ansible.builtin.user:
+        name: "{{ omnimind_user | default('omni') }}"
+        groups: docker
+        append: true
+  tags: [prereq, docker]
+
+# ---------------- Optional: Firewall rules ----------------
+
+- name: "Open required ports via firewalld (optional)"
+  when:
+    - omnimind_firewall_enable | default(false)
+    - ansible_facts.os_family == 'RedHat'
+  block:
+    - name: "Ensure firewalld present and running"
+      ansible.builtin.yum:
+        name: firewalld
+        state: present
+    - ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+    - name: "Allow ports"
+      ansible.posix.firewalld:
+        port: "{{ item }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop: "{{ omnimind_firewall_ports | default([80, 443, 8000]) }}"
+  tags: [prereq, firewall]
+
+- name: "Open required ports via UFW (optional)"
+  when:
+    - omnimind_firewall_enable | default(false)
+    - ansible_facts.os_family == 'Debian'
+  block:
+    - name: "Ensure ufw is installed"
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: true
+    - name: "Allow ports"
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: "{{ omnimind_firewall_ports | default([80, 443, 8000]) }}"
+    - name: "Enable ufw"
+      community.general.ufw:
+        state: enabled
+        logging: 'on'
+        policy: 'deny'
+  tags: [prereq, firewall]
+
+# ---------------- Validation summary ----------------
+
+- name: "Summarize prepared environment"
+  ansible.builtin.debug:
+    msg:
+      user: "{{ omnimind_user | default('omni') }}"
+      group: "{{ omnimind_group | default('omnimind') }}"
+      dirs:
+        - /opt/omnimind
+        - /etc/omnimind
+        - /var/log/omnimind
+        - /var/run/omnimind
+      docker_enabled: "{{ omnimind_docker_enable | default(true) }}"
+      firewall_enabled: "{{ omnimind_firewall_enable | default(false) }}"
+      python:
+        version: "{{ ansible_facts.python.version.major }}.{{ ansible_facts.python.version.minor }}"
+  tags: [prereq, verify]

@@ -1,0 +1,431 @@
+# File: neuroforge-core/configs/policies/dsl/rollout.policy.yaml
+# Версия DSL политики раскатки для всех компонентов neuroforge-core.
+# Политика интерпретируется CI/CD оркестратором и/или оператором раскаток
+# (например, Argo Rollouts/Flagger/сторонние контроллеры), а также
+# используется сервисами для самопроверок гейтов.
+
+apiVersion: rollout.neuroforge.io/v1
+kind: RolloutPolicy
+
+metadata:
+  name: neuroforge-core-rollout-policy
+  labels:
+    app.kubernetes.io/part-of: neuroforge
+    governance: controlled
+  annotations:
+    owner: platform@your-org.example
+    lastReview: 2025-08-01
+
+spec:
+  defaults:
+    strategy: canary
+    maxParallelRollouts: 1
+    maxUnavailable: 0
+    maxSurge: 25%
+    progressiveTraffic: true
+    analysisWindow: 10m
+    errorBudgetWindow: 28d
+    rollback:
+      mode: automatic
+      toPreviousStable: true
+      monitorWindow: 15m
+      drainConnectionsSeconds: 30
+      preserveHPAReplicas: true
+    freezeWindows:
+      - cron: "0 0 * 12,1,2 *"   # декабрь-январь-февраль ежедневно в 00:00
+        duration: "8h"
+        reason: "peak-season"
+      - cron: "0 0 * * 1"        # каждый понедельник
+        duration: "2h"
+        reason: "ops-window"
+    notifications:
+      channels:
+        - type: slack
+          target: "#deployments"
+        - type: email
+          target: "platform-ops@your-org.example"
+    audit:
+      enabled: true
+      sink: file
+      path: /var/log/neuroforge/rollouts-audit.jsonl
+
+  # Справочник метрик/порогов, используемых в гейтах и анализах
+  metricsCatalog:
+    availability:
+      provider: prometheus
+      query: rate(http_server_requests_seconds_count{status=~"2..|3..",job="api"}[5m])
+      compareWith: rate(http_server_requests_seconds_count{job="api"}[5m])
+      op: ratio
+      threshold: ">= 0.995"
+      window: 10m
+    errorRate:
+      provider: prometheus
+      query: rate(http_server_requests_seconds_count{status=~"5..",job="api"}[2m])
+      threshold: "<= 0.01"       # 1%
+      window: 10m
+    p95LatencyMs:
+      provider: prometheus
+      query: histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket{job="api"}[2m])) by (le))
+      threshold: "<= 300"
+      window: 10m
+    workerTaskFailureRate:
+      provider: prometheus
+      query: rate(celery_task_failure_total[5m]) / (rate(celery_task_received_total[5m]) + 1e-9)
+      threshold: "<= 0.02"
+      window: 10m
+    modelShadowAgreement:
+      provider: prometheus
+      query: avg_over_time(model_shadow_agreement_ratio{model=~".+"}[10m])
+      threshold: ">= 0.98"
+      window: 30m
+    cpuSaturation:
+      provider: prometheus
+      query: avg_over_time(container_cpu_usage_seconds_total{pod=~".*api.*"}[2m]) / on() group_left sum(kube_pod_container_resource_requests{resource="cpu"})
+      threshold: "<= 0.8"
+      window: 10m
+
+  # Глобальные гейты: применяются к каждому релизу
+  globalGates:
+    preflight:
+      - id: provenance
+        type: slsa
+        required: true
+        minLevel: 3
+        subjectMatch: strict
+      - id: sbom
+        type: sbom
+        required: true
+        format: cyclonedx-json
+      - id: vuln-scan
+        type: vulnerability
+        provider: trivy
+        maxSeverity: "High"       # Critical -> блок
+        maxHigh: 0
+        allowlistCves: []
+      - id: signatures
+        type: cosign
+        identities:
+          - issuer: "https://token.actions.githubusercontent.com"
+            subjectRegex: "^https://github.com/your-org/neuroforge-core(.+)"
+    migrations:
+      db:
+        requirePlan: true
+        allowOnlineOnly: true
+        lockTimeout: "2m"
+        maxImpact: "read-only index"
+        policy: "expand-migrate-contract"   # безопасный двуступенчатый паттерн
+      dataset:
+        idempotent: true
+        backfillAllowed: true
+        maxRuntime: "2h"
+        checkpointing: true
+      featureFlags:
+        requireDarkLaunch: true
+        killSwitch: true
+    dependencies:
+      upstream:
+        - name: postgres
+          health: kube/service
+          timeout: "5m"
+        - name: redis
+          health: kube/service
+          timeout: "5m"
+      externalApis:
+        budgetedQPS: 10
+        circuitBreaker:
+          errorThresholdPercentage: 50
+          sleepWindow: "30s"
+
+  # Профили стратегий с точными шагами переключения трафика
+  strategies:
+    canary:
+      steps:
+        - setWeight: 1
+          pause: "5m"
+          analysis:
+            successConditions:
+              - metric: availability
+                expression: ">= 0.995"
+              - metric: errorRate
+                expression: "<= 0.01"
+            failureConditions:
+              - metric: p95LatencyMs
+                expression: "> 350"
+        - setWeight: 5
+          pause: "5m"
+        - setWeight: 15
+          pause: "10m"
+          analysis:
+            successConditions:
+              - metric: cpuSaturation
+                expression: "<= 0.8"
+        - setWeight: 50
+          pause: "15m"
+          manualApproval: true
+        - setWeight: 100
+          bakeTime: "30m"
+      maxStepIncreasePercent: 50
+      antiAffinity:
+        by: availabilityZone
+        maxBlastRadiusPercent: 33
+      abortOn:
+        http5xxSpikePercent: 50
+        sustainedErrorRateMinutes: 5
+    blueGreen:
+      previewService: true
+      waitForGate: "functional-tests"
+      tests:
+        - type: http
+          endpoint: "https://preview.${FQDN}/healthz"
+          expectStatus: 200
+          timeout: "30s"
+      switchMethod: lb-weight-swap
+      postSwitchBake: "30m"
+    model:
+      # Специальная стратегия для выката ML моделей
+      shadowTraffic:
+        percent: 10
+        duration: "30m"
+        evaluation:
+          passConditions:
+            - metric: modelShadowAgreement
+              expression: ">= 0.98"
+      onlineA_B:
+        buckets: 2
+        weightA: 50
+        weightB: 50
+        duration: "1h"
+      rollbackOn:
+        - driftInAccuracyPercent: 1.0
+        - spikesInP95Latency: 20
+
+  # Политика по окружениям
+  environments:
+    dev:
+      inherit: defaults
+      approvals: []
+      strategies:
+        api:
+          use: canary
+        worker:
+          use: canary
+        scheduler:
+          use: canary
+      gates:
+        preflight:
+          - provenance
+          - sbom
+        migrations:
+          db:
+            requirePlan: false
+            allowOnlineOnly: true
+    stage:
+      inherit: defaults
+      approvals:
+        - type: codeOwner
+          team: "platform"
+      regionWaves:
+        - regions: ["eu-central-1a"]
+          maxConcurrentClusters: 1
+        - regions: ["eu-central-1b","eu-central-1c"]
+          maxConcurrentClusters: 1
+      strategies:
+        api:
+          use: canary
+          override:
+            steps:
+              - setWeight: 10
+                pause: "5m"
+              - setWeight: 50
+                pause: "10m"
+              - setWeight: 100
+                bakeTime: "20m"
+        worker:
+          use: canary
+        scheduler:
+          use: blueGreen
+      gates:
+        preflight:
+          - provenance
+          - sbom
+          - vuln-scan
+        post:
+          soakTime: "1h"
+    prod:
+      inherit: defaults
+      approvals:
+        - type: changeAdvisoryBoard
+          quorum: 2
+        - type: productOwner
+          quorum: 1
+      errorBudget:
+        target: "99.5%"
+        window: "28d"
+        policy:
+          ifBurnRateAbove:
+            - burnRate: 2.0
+              window: "1h"
+              action: "block-non-critical"
+            - burnRate: 5.0
+              window: "30m"
+              action: "global-freeze"
+      regionWaves:
+        - regions: ["eu-west-1"]
+          maxConcurrentClusters: 1
+          surgePercent: 10
+          bakeTime: "30m"
+        - regions: ["eu-central-1"]
+          maxConcurrentClusters: 1
+          surgePercent: 10
+          bakeTime: "30m"
+      strategies:
+        api:
+          use: canary
+          override:
+            steps:
+              - setWeight: 1
+                pause: "10m"
+              - setWeight: 5
+                pause: "15m"
+              - setWeight: 25
+                pause: "20m"
+              - setWeight: 50
+                pause: "30m"
+                manualApproval: true
+              - setWeight: 100
+                bakeTime: "45m"
+        worker:
+          use: canary
+          override:
+            steps:
+              - setReplicasPercent: 20
+                pause: "10m"
+              - setReplicasPercent: 60
+                pause: "15m"
+              - setReplicasPercent: 100
+                bakeTime: "30m"
+        scheduler:
+          use: blueGreen
+      gates:
+        preflight:
+          - provenance
+          - sbom
+          - vuln-scan
+          - signatures
+        post:
+          functionalSynthetics:
+            successRate: ">= 0.99"
+            timeout: "15m"
+
+  # Политика управления флагами и темными запусками
+  featureFlags:
+    provider: openfeature
+    darkLaunch:
+      default: true
+      ramp:
+        - percent: 1
+          pause: "10m"
+        - percent: 5
+          pause: "20m"
+        - percent: 20
+          pause: "30m"
+    killSwitch:
+      httpEndpoint: "https://api.${FQDN}/internal/kill"
+      auth: serviceAccount
+      timeout: "5s"
+
+  # Контроль совместимости контрактов API
+  apiContracts:
+    checks:
+      - type: openapi-diff
+        base: artifact:openapi@stable
+        candidate: artifact:openapi@candidate
+        rules:
+          breakingChange: block
+          additiveChange: allow
+      - type: grpc-compat
+        mode: backward
+        blockOn: ["removedMethod","changedRequestFieldKind"]
+
+  # Политика журналирования и корреляции
+  observability:
+    tracing:
+      required: true
+      otelResourceAttrs:
+        service.version: "${ARTIFACT_VERSION}"
+        deployment.environment: "${ENV}"
+    logging:
+      level: info
+      json: true
+      redaction:
+        patterns:
+          - "(?i)authorization: Bearer [A-Za-z0-9._-]+"
+          - "(?i)password=[^&\\s]+"
+    metrics:
+      required: true
+      endpoints:
+        - "/metrics"
+
+  # Профили компонентов и их привязка к стратегиям
+  components:
+    - name: api
+      kind: k8s
+      service: "neuroforge-core-api"
+      deployment: "neuroforge-core-api"
+      autoscalingAware: true
+      trafficPolicy: http
+      healthEndpoint: "/healthz"
+      readinessGate: httpStatus200
+    - name: worker
+      kind: k8s
+      service: "neuroforge-core-worker"
+      deployment: "neuroforge-core-worker"
+      autoscalingAware: true
+      trafficPolicy: queue
+      drainPolicy:
+        gracefulSeconds: 60
+        rejectNewTasks: true
+    - name: scheduler
+      kind: k8s
+      service: "neuroforge-core-scheduler"
+      deployment: "neuroforge-core-scheduler"
+      autoscalingAware: false
+      trafficPolicy: cron
+
+  # Политика откатов и ремедиации
+  remediation:
+    autoRollback:
+      on:
+        - gateFailure
+        - metricBreached
+        - saturationExceeded
+      cooldown: "15m"
+    steps:
+      - action: rollback
+        to: stable
+      - action: scale
+        component: api
+        replicas: "previous"
+      - action: clearCache
+        destination: redis
+      - action: restartSidecars
+        matchLabels:
+          istio: enabled
+    postMortem:
+      required: true
+      timeout: "72h"
+      template: "runbooks/postmortem.md"
+
+  # Исключения/override для срочных фиксов
+  exceptions:
+    hotfix:
+      require:
+        approvals:
+          - type: incidentCommander
+            quorum: 1
+      skipGates:
+        - vuln-scan
+      limit:
+        duration: "24h"
+        scope: "single-component"
+      autoExpire: true

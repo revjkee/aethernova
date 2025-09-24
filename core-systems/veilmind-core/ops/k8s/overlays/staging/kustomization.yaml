@@ -1,0 +1,171 @@
+# veilmind-core/ops/k8s/overlays/staging/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# База
+resources:
+  - ../../base
+
+# Namespace и стандартные метки/аннотации
+namespace: veilmind-staging
+nameSuffix: -stg
+
+commonLabels:
+  app.kubernetes.io/part-of: veilmind
+  app.kubernetes.io/name: veilmind-core
+  app.kubernetes.io/instance: veilmind-core
+  app.kubernetes.io/component: api
+  app.kubernetes.io/version: "0.1.0"
+  env: staging
+
+commonAnnotations:
+  owner: platform@veilmind.example
+  security.aethernova/zero-trust: "true"
+  deploy.kubernetes.io/change-cause: "staging overlay"
+
+# Обновление образов (пример для GHCR)
+images:
+  - name: ghcr.io/your-org/veilmind-core
+    newName: ghcr.io/your-org/veilmind-core
+    newTag: v0.1.0
+
+# Кол-во реплик поверх базового Deployment
+replicas:
+  - name: veilmind-core
+    count: 2
+
+# Генераторы конфигов/секретов (стабильные имена без хешей)
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: veilmind-core-config
+    behavior: merge
+    literals:
+      - APP_ENV=staging
+      - LOG_LEVEL=INFO
+      - OTEL_RESOURCE_ATTRIBUTES=deployment.environment=staging,service.version=0.1.0
+      - ZT_RISK_THRESH_ALLOW=40
+      - ZT_RISK_THRESH_MFA=70
+      - ZT_RISK_THRESH_DENY=85
+      - ZT_RISK_THRESH_QUARANTINE=95
+
+# В staging реальные секреты не коммитим — используйте стороннее Secret-хранилище.
+# Здесь — заглушки для связки envFrom; замените через kustomize config-patch или внешние Secret'ы.
+secretGenerator:
+  - name: veilmind-core-secrets
+    behavior: replace
+    literals:
+      - JWT_SECRET=CHANGE_ME_STAGING
+      - SECRET_KEY=CHANGE_ME_STAGING
+
+# Инлайн-патчи JSON6902: ужесточение безопасности, ресурсы, пробы, envFrom, антиаффинность и spread
+patches:
+  - target:
+      version: v1
+      kind: Deployment
+      name: veilmind-core
+    patch: |-
+      - op: add
+        path: /spec/template/spec/serviceAccountName
+        value: veilmind-core
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          fsGroup: 10001
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          runAsUser: 10001
+          runAsGroup: 10001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /healthz/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 1
+          failureThreshold: 3
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /healthz/live
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+      - op: add
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: veilmind-core-config-stg
+          - secretRef:
+              name: veilmind-core-secrets-stg
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: veilmind-core
+                app.kubernetes.io/component: api
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: veilmind-core
+                      app.kubernetes.io/component: api
+
+  # Аннотации сервиса для staging (пример: internal-only и topology hints)
+  - target:
+      version: v1
+      kind: Service
+      name: veilmind-core
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          service.kubernetes.io/topology-aware-hints: "auto"
+          # external-dns.alpha.kubernetes.io/hostname: api-staging.example.com
+
+  # Обновление меток для metrics-сервиса (если присутствует в base)
+  - target:
+      version: v1
+      kind: Service
+      name: veilmind-core-metrics
+    patch: |-
+      - op: add
+        path: /metadata/labels/monitoring.veilmind.io~1scrape
+        value: "true"
+
+# Примечание:
+# - Deployment/Service/Service-metrics должны существовать в ../../base и называться "veilmind-core".
+# - Секреты с пометкой CHANGE_ME_* замените в CI/CD или через внешний Secret-провайдер.

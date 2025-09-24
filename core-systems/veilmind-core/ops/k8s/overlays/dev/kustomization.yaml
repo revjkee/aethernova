@@ -1,0 +1,112 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Наследуем все манифесты из base
+resources:
+  - ../../base
+
+# Пространство имён и префикс имён ресурсов в dev
+namespace: veilmind-dev
+namePrefix: dev-
+
+# Общие метки/аннотации для трассируемости
+commonLabels:
+  app.kubernetes.io/part-of: veilmind
+  app.kubernetes.io/name: veilmind-core
+  app.kubernetes.io/instance: veilmind-core-dev
+  app.kubernetes.io/environment: dev
+commonAnnotations:
+  owner: platform-team
+  environment: dev
+
+# Генераторы конфигов/секретов: kustomize добавит hash к имени и перезапустит поды
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    managed-by: kustomize
+  annotations:
+    environment: dev
+
+configMapGenerator:
+  - name: veilmind-core-config
+    behavior: merge
+    literals:
+      - APP_ENV=dev
+      - LOG_LEVEL=DEBUG
+      # пример параметров приложения
+      - PEP_SLO_MS=2.0
+      - FEATURE_FLAGS=dev-fast-boot
+    # опционально: подтянуть переменные из файла (если он существует в репо)
+    envs:
+      - config/dev.env
+
+secretGenerator:
+  - name: veilmind-core-secrets
+    behavior: merge
+    type: Opaque
+    # храните значения в зашифрованном виде (например, SOPS), здесь — ссылка на env-файл
+    envs:
+      - secrets.dev.env
+
+# Образ приложения для dev: фиксируем тег/дигест
+images:
+  - name: ghcr.io/CHANGEME-org/veilmind-core
+    newName: ghcr.io/CHANGEME-org/veilmind-core
+    newTag: dev-CHANGEME
+    digest: sha256:CHANGEME
+
+# В dev достаточно одного реплики
+replicas:
+  - name: veilmind-core
+    count: 1
+
+# Точечные изменения шаблона Pod через стратегический мердж-патч
+patches:
+  - target:
+      version: v1
+      kind: Deployment
+      name: veilmind-core
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: veilmind-core
+      spec:
+        # Стратегия из base остаётся, меняем только шаблон
+        template:
+          metadata:
+            annotations:
+              environment: "dev"
+              # checksum/* могут оставаться пустыми — kustomize сам подставит имена с хэшами
+              checksum/config: ""
+              checksum/secret: ""
+            labels:
+              app.kubernetes.io/environment: dev
+          spec:
+            # В dev обычно приоритет не нужен
+            priorityClassName: ""
+            containers:
+              - name: veilmind-core
+                imagePullPolicy: Always
+                env:
+                  - name: APP_ENV
+                    value: "dev"
+                  - name: LOG_LEVEL
+                    value: "DEBUG"
+                # Болеe скромные ресурсы для dev
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "256Mi"
+                # Поторопим readiness/startup в dev, не меняя логику base кардинально
+                readinessProbe:
+                  periodSeconds: 2
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                startupProbe:
+                  periodSeconds: 2
+                  timeoutSeconds: 2
+                  failureThreshold: 30

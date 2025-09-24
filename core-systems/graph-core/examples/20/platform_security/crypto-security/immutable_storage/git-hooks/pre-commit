@@ -1,0 +1,68 @@
+#!/bin/bash
+# path: platform-security/code-protection/immutable_storage/git-hooks/pre-commit
+
+# TeslaAI Genesis — Immutable Code Protection Hook (pre-commit)
+# Защита от саботажа, вставки вредоносного кода, утечек, изменения сигнатур и удаления отпечатков
+
+set -e
+
+# ===== Параметры контроля =====
+FORBIDDEN_PATTERNS=("API_KEY" "SECRET_KEY" "password" "TODO" "FIXME")
+FORBIDDEN_EXTENSIONS=("*.pem" "*.crt" "*.key" "*.env")
+MAX_FILE_SIZE=200000  # 200KB
+WATERMARK_REGEX="TeslaAI-FP: [a-f0-9]{24} - DO NOT DELETE"
+CRITICAL_FILES=("README.md" "main.py" "run.sh" "genesis.py")
+
+# ===== Логика проверки файлов =====
+echo "[✓] Running TeslaAI immutable pre-commit hook..."
+
+FILES=$(git diff --cached --name-only --diff-filter=ACMR)
+
+for file in $FILES; do
+    if [[ ! -f "$file" ]]; then
+        continue
+    fi
+
+    # 1. Блок запрещённых расширений
+    for pattern in "${FORBIDDEN_EXTENSIONS[@]}"; do
+        if [[ "$file" == $pattern ]]; then
+            echo "[ERROR] Запрещено коммитить файл: $file"
+            exit 1
+        fi
+    done
+
+    # 2. Проверка размера
+    FILE_SIZE=$(wc -c < "$file")
+    if (( FILE_SIZE > MAX_FILE_SIZE )); then
+        echo "[ERROR] Файл слишком большой: $file (${FILE_SIZE} bytes)"
+        exit 1
+    fi
+
+    # 3. Поиск запрещённых паттернов
+    for pattern in "${FORBIDDEN_PATTERNS[@]}"; do
+        if grep -q "$pattern" "$file"; then
+            echo "[ERROR] Найден запрещённый паттерн '$pattern' в файле: $file"
+            exit 1
+        fi
+    done
+
+    # 4. Обязательный цифровой отпечаток
+    if [[ "$file" == *.py || "$file" == *.js || "$file" == *.ts ]]; then
+        if ! head -n 5 "$file" | grep -qE "$WATERMARK_REGEX"; then
+            echo "[ERROR] Отсутствует цифровой отпечаток в $file"
+            exit 1
+        fi
+    fi
+
+    # 5. Защита критичных файлов от изменений
+    for critical in "${CRITICAL_FILES[@]}"; do
+        if [[ "$file" == "$critical" ]]; then
+            echo "[WARN] Обнаружено изменение критичного файла: $file"
+            echo "[BLOCKED] Для изменения требуется ручной approve от RBAC-офицера"
+            exit 1
+        fi
+    done
+done
+
+echo "[OK] Все проверки пройдены. Продолжаем коммит..."
+exit 0

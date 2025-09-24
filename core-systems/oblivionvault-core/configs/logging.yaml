@@ -1,0 +1,221 @@
+# oblivionvault-core/configs/logging.yaml
+# Production-grade logging config (Python logging dictConfig)
+# Env placeholders are illustrative; expand them in your loader if needed.
+
+version: 1
+disable_existing_loggers: false
+
+# -------- Global defaults from environment (documented as comments) --------
+# LOG_LEVEL: global minimum level (default INFO)
+# LOG_DIR: directory for log files (default /var/log/oblivionvault)
+# LOG_ROTATE_BYTES: max bytes per file before rotation (default 50MB)
+# LOG_ROTATE_BACKUPS: number of backups to keep (default 10)
+# LOG_JSON: "true" to use JSON on console, else human format (default true)
+# SYSLOG_ENABLED: "true" to enable Syslog handler (default false)
+# SYSLOG_ADDRESS: "udp://127.0.0.1:514" or "unix:///dev/log"
+# HTTP_EXPORT_ENABLED: "false" to disable HTTP export handler (default false)
+# HTTP_EXPORT_URL: e.g. http://loki:3100/loki/api/v1/push
+# SERVICE_NAME: logical service name (default oblivionvault-core)
+# ENVIRONMENT: environment tag (default production)
+
+# -------------------------- Formatters --------------------------
+formatters:
+  json:
+    # Requires python-json-logger (or compatible) in runtime.
+    # If unavailable, switch ROOT.formatters/handlers to "human".
+    format: >-
+      {"ts":"%(asctime)s","lvl":"%(levelname)s","svc":"%(service)s","env":"%(environment)s",
+       "logger":"%(name)s","msg":"%(message)s","file":"%(filename)s","line":%(lineno)d,
+       "func":"%(funcName)s","pid":%(process)d,"tid":"%(threadName)s",
+       "trace_id":"%(trace_id)s","span_id":"%(span_id)s","exc":"%(exc_text)s"}
+    datefmt: "%Y-%m-%dT%H:%M:%S%z"
+    class: pythonjsonlogger.jsonlogger.JsonFormatter
+
+  human:
+    format: "%(asctime)s | %(levelname)-8s | %(service)s | %(environment)s | %(name)s | %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S%z"
+    class: logging.Formatter
+
+  access_json:
+    format: >-
+      {"ts":"%(asctime)s","lvl":"INFO","svc":"%(service)s","env":"%(environment)s",
+       "logger":"access","remote":"%(remote_addr)s","method":"%(method)s",
+       "path":"%(path)s","status":%(status_code)d,"bytes":%(body_bytes_sent)d,
+       "agent":"%(user_agent)s","referer":"%(http_referer)s","rt":%(request_time).6f}
+    datefmt: "%Y-%m-%dT%H:%M:%S%z"
+    class: pythonjsonlogger.jsonlogger.JsonFormatter
+
+  audit_json:
+    format: >-
+      {"ts":"%(asctime)s","lvl":"INFO","svc":"%(service)s","env":"%(environment)s",
+       "logger":"audit","actor":"%(actor)s","action":"%(action)s","target":"%(target)s",
+       "result":"%(result)s","meta":"%(meta)s"}
+    datefmt: "%Y-%m-%dT%H:%M:%S%z"
+    class: pythonjsonlogger.jsonlogger.JsonFormatter
+
+# -------------------------- Filters --------------------------
+filters:
+  enrich_context:
+    # Injects service/environment and optional tracing ids if not present.
+    # Implement as a tiny filter if you need strict guarantees; here we use built-in.
+    # This filter uses a standard logging.Filter with custom attributes via defaults.
+    (): logging.Filter
+  exclude_healthchecks:
+    # Optional: implement a custom filter to drop health checks from access logs
+    # Provide class at: oblivionvault.logging.filters.ExcludeHealthchecks
+    # (message/path based filtering)
+    # (): oblivionvault.logging.filters.ExcludeHealthchecks
+    # patterns: ["/health", "/ready", "/live"]
+    (): logging.Filter
+
+# -------------------------- Handlers --------------------------
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    stream: ext://sys.stdout
+    filters: [enrich_context]
+    formatter: json
+  console_human:
+    class: logging.StreamHandler
+    level: INFO
+    stream: ext://sys.stdout
+    filters: [enrich_context]
+    formatter: human
+
+  file_info:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    filename: "${LOG_DIR:-/var/log/oblivionvault}/app.info.log"
+    maxBytes: ${LOG_ROTATE_BYTES:-52428800}
+    backupCount: ${LOG_ROTATE_BACKUPS:-10}
+    encoding: utf-8
+    delay: true
+    filters: [enrich_context]
+    formatter: json
+
+  file_error:
+    class: logging.handlers.RotatingFileHandler
+    level: ERROR
+    filename: "${LOG_DIR:-/var/log/oblivionvault}/app.error.log"
+    maxBytes: ${LOG_ROTATE_BYTES:-52428800}
+    backupCount: ${LOG_ROTATE_BACKUPS:-10}
+    encoding: utf-8
+    delay: true
+    filters: [enrich_context]
+    formatter: json
+
+  file_access:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    filename: "${LOG_DIR:-/var/log/oblivionvault}/access.log"
+    maxBytes: ${LOG_ROTATE_BYTES:-52428800}
+    backupCount: ${LOG_ROTATE_BACKUPS:-10}
+    encoding: utf-8
+    delay: true
+    # exclude noisy health checks if custom filter is implemented; placeholder kept
+    filters: [enrich_context]
+    formatter: access_json
+
+  file_audit:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    filename: "${LOG_DIR:-/var/log/oblivionvault}/audit.log"
+    maxBytes: ${LOG_ROTATE_BYTES:-52428800}
+    backupCount: ${LOG_ROTATE_BACKUPS:-10}
+    encoding: utf-8
+    delay: true
+    filters: [enrich_context]
+    formatter: audit_json
+
+  # Optional: Syslog (enable via SYSLOG_ENABLED=true)
+  syslog:
+    class: logging.handlers.SysLogHandler
+    level: INFO
+    # address may be a tuple ["host", port] or unix socket path; we accept string and parse in startup if needed
+    address: "/dev/log"
+    facility: user
+    filters: [enrich_context]
+    formatter: json
+
+  # Optional: HTTP export (e.g., Loki via promtail/loki gateway)
+  http_export:
+    class: logging.handlers.HTTPHandler
+    level: WARNING
+    # Split URL: host/secure/url in application init if you need HTTPS
+    host: "loki:3100"
+    url: "/loki/api/v1/push"
+    method: "POST"
+    filters: [enrich_context]
+    formatter: json
+
+# -------------------------- Loggers --------------------------
+loggers:
+  # Frameworks
+  uvicorn:
+    level: INFO
+    handlers: ["console", "file_info"]
+    propagate: false
+  uvicorn.error:
+    level: INFO
+    handlers: ["console", "file_error"]
+    propagate: false
+  uvicorn.access:
+    level: INFO
+    handlers: ["file_access"]
+    propagate: false
+
+  gunicorn:
+    level: INFO
+    handlers: ["console", "file_info"]
+    propagate: false
+  gunicorn.error:
+    level: INFO
+    handlers: ["console", "file_error"]
+    propagate: false
+  gunicorn.access:
+    level: INFO
+    handlers: ["file_access"]
+    propagate: false
+
+  sqlalchemy.engine:
+    level: WARNING
+    handlers: ["file_info"]
+    propagate: false
+
+  # Domain loggers
+  app.audit:
+    level: INFO
+    handlers: ["file_audit"]
+    propagate: false
+  app.access:
+    level: INFO
+    handlers: ["file_access"]
+    propagate: false
+  app.security:
+    level: INFO
+    handlers: ["console", "file_info", "file_error"]
+    propagate: false
+  app:
+    level: INFO
+    handlers: ["console", "file_info"]
+    propagate: false
+
+# -------------------------- Root logger --------------------------
+root:
+  level: ${LOG_LEVEL:-INFO}
+  handlers:
+    - ${LOG_JSON:-true} ? "console" : "console_human"
+    - file_info
+    - file_error
+
+# -------------------------- Extra context via defaults --------------------------
+# These become available to formatters as %(service)s and %(environment)s
+# If your loader does not support 'defaults', inject via LoggerAdapter.
+# Some dictConfig loaders ignore this section; in that case, use a wrapper on logger creation.
+# Keeping here for documentation and to support loaders that merge extras.
+defaults:
+  service: "${SERVICE_NAME:-oblivionvault-core}"
+  environment: "${ENVIRONMENT:-production}"
+  trace_id: ""
+  span_id: ""

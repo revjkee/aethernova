@@ -1,0 +1,164 @@
+{{- /*
+OmniMind Core - ServiceMonitor (Prometheus Operator)
+Промышленный шаблон без зависимости от кастомных helper'ов.
+
+Используемые значения (пример):
+serviceMonitor:
+  enabled: true
+  labels: {}
+  annotations: {}
+  namespace: ""                       # по умолчанию .Release.Namespace
+  namespaceSelector:
+    any: false
+    matchNames: []                    # прим.: ["omnimind-prod"]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "omnimind-core"
+      app.kubernetes.io/component: "metrics"
+  endpoints:
+    - port: "metrics"                 # имя порта из Service; можно targetPort вместо port
+      scheme: "http"
+      path: "/metrics"
+      interval: "30s"
+      scrapeTimeout: "10s"
+      honorLabels: false
+      relabelings: []                 # правила relabel_config
+      metricRelabelings: []           # правила metric_relabel_configs
+      tlsConfig: {}                   # см. https://prometheus-operator.dev/docs/user-guides/servicemonitor/
+      bearerTokenSecret: {}           # { name: "", key: "" }
+      oauth2: {}                      # продвинутые случаи
+  targetLabels: []                    # перенос меток с Service/Pod
+  sampleLimit: 0
+  labelLimit: 0
+  labelNameLengthLimit: 0
+  labelValueLengthLimit: 0
+*/ -}}
+
+{{- if .Values.serviceMonitor.enabled }}
+
+{{- $chartName := default "omnimind-core" .Chart.Name -}}
+{{- $relName := .Release.Name -}}
+{{- $fullname := printf "%s-%s" $relName $chartName | trunc 63 | trimSuffix "-" -}}
+{{- $smName := printf "%s-servicemonitor" $fullname | trunc 63 | trimSuffix "-" -}}
+{{- $ns := default .Release.Namespace .Values.serviceMonitor.namespace -}}
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $smName }}
+  namespace: {{ $ns | quote }}
+  labels:
+    app.kubernetes.io/name: {{ $chartName | quote }}
+    app.kubernetes.io/instance: {{ $fullname | quote }}
+    app.kubernetes.io/component: "metrics"
+    app.kubernetes.io/part-of: "omnimind"
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.serviceMonitor.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* Namespace selector для поиска Service-ов с метриками */ -}}
+  {{- if .Values.serviceMonitor.namespaceSelector }}
+  namespaceSelector:
+    {{- if .Values.serviceMonitor.namespaceSelector.any }}
+    any: true
+    {{- else if .Values.serviceMonitor.namespaceSelector.matchNames }}
+    matchNames:
+      {{- range .Values.serviceMonitor.namespaceSelector.matchNames }}
+      - {{ . | quote }}
+      {{- end }}
+    {{- else }}
+    matchNames:
+      - {{ $ns | quote }}
+    {{- end }}
+  {{- else }}
+  namespaceSelector:
+    matchNames:
+      - {{ $ns | quote }}
+  {{- end }}
+
+  {{- /* Селектор для выбора Service объектов */ -}}
+  selector:
+    {{- if .Values.serviceMonitor.selector }}
+    {{- toYaml .Values.serviceMonitor.selector | nindent 4 }}
+    {{- else }}
+    matchLabels:
+      app.kubernetes.io/name: {{ $chartName | quote }}
+      app.kubernetes.io/component: "metrics"
+    {{- end }}
+
+  {{- /* Перенос меток цели */ -}}
+  {{- if .Values.serviceMonitor.targetLabels }}
+  targetLabels:
+    {{- toYaml .Values.serviceMonitor.targetLabels | nindent 4 }}
+  {{- end }}
+
+  {{- /* Лимиты на метрики/лейблы */ -}}
+  {{- if gt (int (default 0 .Values.serviceMonitor.sampleLimit)) 0 }}
+  sampleLimit: {{ .Values.serviceMonitor.sampleLimit }}
+  {{- end }}
+  {{- if gt (int (default 0 .Values.serviceMonitor.labelLimit)) 0 }}
+  labelLimit: {{ .Values.serviceMonitor.labelLimit }}
+  {{- end }}
+  {{- if gt (int (default 0 .Values.serviceMonitor.labelNameLengthLimit)) 0 }}
+  labelNameLengthLimit: {{ .Values.serviceMonitor.labelNameLengthLimit }}
+  {{- end }}
+  {{- if gt (int (default 0 .Values.serviceMonitor.labelValueLengthLimit)) 0 }}
+  labelValueLengthLimit: {{ .Values.serviceMonitor.labelValueLengthLimit }}
+  {{- end }}
+
+  {{- /* Конфигурация endpoints */ -}}
+  endpoints:
+    {{- $eps := default (list (dict "port" "metrics" "scheme" "http" "path" "/metrics" "interval" "30s" "scrapeTimeout" "10s" "honorLabels" false)) .Values.serviceMonitor.endpoints -}}
+    {{- range $eps }}
+    - {{- /* порт: либо имя порта из Service (port), либо явный containerPort (targetPort) */ -}}
+      {{- if hasKey . "port" }}
+      port: {{ .port | quote }}
+      {{- end }}
+      {{- if hasKey . "targetPort" }}
+      targetPort: {{ .targetPort }}
+      {{- end }}
+      {{- if hasKey . "scheme" }}
+      scheme: {{ .scheme | quote }}
+      {{- end }}
+      {{- if hasKey . "path" }}
+      path: {{ .path | quote }}
+      {{- end }}
+      {{- if hasKey . "interval" }}
+      interval: {{ .interval | quote }}
+      {{- end }}
+      {{- if hasKey . "scrapeTimeout" }}
+      scrapeTimeout: {{ .scrapeTimeout | quote }}
+      {{- end }}
+      {{- if hasKey . "honorLabels" }}
+      honorLabels: {{ .honorLabels }}
+      {{- end }}
+
+      {{- /* TLS и аутентификация (опционально) */ -}}
+      {{- if .tlsConfig }}
+      tlsConfig:
+        {{- toYaml .tlsConfig | nindent 8 }}
+      {{- end }}
+      {{- if .bearerTokenSecret }}
+      bearerTokenSecret:
+        {{- toYaml .bearerTokenSecret | nindent 8 }}
+      {{- end }}
+      {{- if .oauth2 }}
+      oauth2:
+        {{- toYaml .oauth2 | nindent 8 }}
+      {{- end }}
+
+      {{- /* Relabeling / MetricRelabeling (если заданы) */ -}}
+      {{- if .relabelings }}
+      relabelings:
+        {{- toYaml .relabelings | nindent 8 }}
+      {{- end }}
+      {{- if .metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml .metricRelabelings | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,151 @@
+{{- if .Values.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "aethernova.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aethernova.labels" . | nindent 4 }}
+    prometheus: {{ .Values.monitoring.prometheusSelector | default "k8s" | quote }}
+  annotations:
+    {{- include "aethernova.annotations" . | nindent 4 }}
+    {{- /* Примешиваем checksum аннотаций, если сконфигурированы */ -}}
+    {{- $podAnn := include "aethernova.podAnnotations" . | fromYaml }}
+    {{- if $podAnn }}
+    {{- toYaml $podAnn | nindent 4 }}
+    {{- end }}
+spec:
+  {{- /* Namespace выбор: текущий ns по умолчанию, либо список matchNames */ -}}
+  namespaceSelector:
+    {{- if .Values.monitoring.namespaceSelector.matchNames }}
+    matchNames:
+      {{- range $ns := .Values.monitoring.namespaceSelector.matchNames }}
+      - {{ $ns | quote }}
+      {{- end }}
+    {{- else }}
+    matchNames: [{{ .Release.Namespace | quote }}]
+    {{- end }}
+
+  selector:
+    matchLabels:
+      {{- /* Сервис должен иметь эти селекторные метки */ -}}
+      {{- include "aethernova.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: {{ .Values.component | default "node" | quote }}
+      {{- with .Values.monitoring.selector.matchLabels }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+
+  endpoints:
+    - port: {{ .Values.monitoring.telemetry.portName | default "telemetry" | quote }}
+      scheme: {{ .Values.monitoring.scheme | default "http" | quote }}
+      path: {{ .Values.monitoring.path | default "/metrics" | quote }}
+      interval: {{ .Values.monitoring.interval | default "30s" | quote }}
+      scrapeTimeout: {{ .Values.monitoring.scrapeTimeout | default "10s" | quote }}
+      honorLabels: {{ .Values.monitoring.honorLabels | default true }}
+      {{- if .Values.monitoring.proxyUrl }}
+      proxyUrl: {{ .Values.monitoring.proxyUrl | quote }}
+      {{- end }}
+      {{- if eq (default "http" .Values.monitoring.scheme) "https" }}
+      tlsConfig:
+        {{- if .Values.monitoring.tls.insecureSkipVerify }}
+        insecureSkipVerify: true
+        {{- end }}
+        {{- with .Values.monitoring.tls.serverName }}
+        serverName: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.monitoring.tls.caFile }}
+        caFile: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.monitoring.tls.certFile }}
+        certFile: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.monitoring.tls.keyFile }}
+        keyFile: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.monitoring.bearerTokenSecret }}
+      bearerTokenSecret:
+        name: {{ .name | quote }}
+        key: {{ .key | default "token" | quote }}
+      {{- end }}
+      {{- with .Values.monitoring.basicAuth }}
+      basicAuth:
+        username:
+          name: {{ .username.name | quote }}
+          key:  {{ .username.key  | default "username" | quote }}
+        password:
+          name: {{ .password.name | quote }}
+          key:  {{ .password.key  | default "password" | quote }}
+      {{- end }}
+      relabelings:
+        # Канонизируем instance и базовые K8s-метки
+        - action: replace
+          sourceLabels: [__address__]
+          targetLabel: instance
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - action: replace
+          sourceLabels: [namespace]
+          targetLabel: namespace
+        - action: replace
+          sourceLabels: [service]
+          targetLabel: service
+        - action: replace
+          sourceLabels: [pod]
+          targetLabel: pod
+        # Проталкиваем chain_id, если аннотирован в Pod
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_annotation_aethernova_chain_id]
+          targetLabel: chain_id
+        {{- with .Values.monitoring.relabelings }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      metricRelabelings:
+        # Шумные метрики по умолчанию отбрасываем (можно переопределить)
+        - action: drop
+          sourceLabels: [__name__]
+          regex: "go_threads|process_open_fds"
+        {{- with .Values.monitoring.metricRelabelings }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+
+    {{- if .Values.monitoring.grpcMetrics.enabled }}
+    - port: {{ .Values.monitoring.grpcMetrics.portName | default "grpc-metrics" | quote }}
+      scheme: {{ .Values.monitoring.grpcMetrics.scheme | default "http" | quote }}
+      path: {{ .Values.monitoring.grpcMetrics.path | default "/metrics" | quote }}
+      interval: {{ .Values.monitoring.grpcMetrics.interval | default "30s" | quote }}
+      scrapeTimeout: {{ .Values.monitoring.grpcMetrics.scrapeTimeout | default "10s" | quote }}
+      honorLabels: {{ .Values.monitoring.grpcMetrics.honorLabels | default true }}
+      {{- if eq (default "http" .Values.monitoring.grpcMetrics.scheme) "https" }}
+      tlsConfig:
+        insecureSkipVerify: {{ .Values.monitoring.grpcMetrics.tls.insecureSkipVerify | default false }}
+        {{- with .Values.monitoring.grpcMetrics.tls.serverName }}
+        serverName: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      relabelings:
+        - action: replace
+          sourceLabels: [__address__]
+          targetLabel: instance
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        {{- with .Values.monitoring.grpcMetrics.relabelings }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      metricRelabelings:
+        {{- with .Values.monitoring.grpcMetrics.metricRelabelings }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    {{- end }}
+
+  {{- /* Проталкиваем полезные targetLabels в Prometheus */ -}}
+  targetLabels:
+    - app.kubernetes.io/name
+    - app.kubernetes.io/instance
+    - app.kubernetes.io/component
+    {{- with .Values.monitoring.targetLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

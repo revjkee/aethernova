@@ -1,0 +1,262 @@
+# mTLS configuration for security-core
+# Profile selection via env SECURITY_CORE_MTLS_PROFILE: dev|prod (default: prod)
+
+profile_default: prod
+
+metadata:
+  version: "1.0.0"
+  owner: "security-core@neurocity"
+  description: "Mutual TLS policy for all inter-service communications (Zero-Trust baseline)."
+
+kubernetes:
+  # Имена секретов и пути монтирования по умолчанию
+  secrets:
+    server_tls_secret: "security-core-server-tls"        # tls.crt, tls.key, ca.crt
+    client_tls_secret: "security-core-client-tls"        # tls.crt, tls.key, ca.crt
+    trust_bundle_secret: "security-core-trust-bundle"    # ca-bundle.pem
+  mounts:
+    base_dir: "/etc/security-core/tls"
+    server_cert: "/etc/security-core/tls/server/tls.crt"
+    server_key:  "/etc/security-core/tls/server/tls.key"
+    client_cert: "/etc/security-core/tls/client/tls.crt"
+    client_key:  "/etc/security-core/tls/client/tls.key"
+    trust_bundle: "/etc/security-core/tls/ca/ca-bundle.pem"
+  reload:
+    # Если true — включить hot-reload при обновлении Secret/ConfigMap (inotify)
+    enabled: true
+    # Минимальный интервал между перезагрузками, чтобы избежать штормов
+    min_interval_seconds: 5
+
+crypto:
+  # Кривые и шифросuites задаются на уровне политики; конкретный рантайм (Envoy/OpenSSL/BoringSSL) транслирует их.
+  tls:
+    min_version: "TLSv1.3"
+    # Разрешить TLS 1.2 как временный fallback для Legacy-интеграций
+    allow_tls12_fallback: true
+    # TLS 1.3: шифросьюиты фиксированы спецификацией; ниже — явное перечисление для аудита
+    tls13_suites:
+      - "TLS_AES_256_GCM_SHA384"
+      - "TLS_CHACHA20_POLY1305_SHA256"
+      - "TLS_AES_128_GCM_SHA256"
+    # TLS 1.2 (включается только при allow_tls12_fallback=true)
+    tls12_suites:
+      - "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+      - "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
+      - "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+      - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+      - "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+      - "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+    curves:
+      - "X25519"
+      - "secp384r1"
+      - "secp256r1"
+    session:
+      # Отключить session tickets в высокозащищённом профиле
+      tickets_enabled: false
+      resumption_enabled: false
+      # Если resumption включён (например, для L7‑проксей), задайте размер сессий
+      state_lifetime_seconds: 0
+
+revocation:
+  mode: "prefer-ocsp"          # "prefer-ocsp" | "crl-only" | "disabled"
+  ocsp:
+    stapling_required: true    # требовать OCSP stapling от сервера
+    timeout_ms: 2000
+    cache_ttl_seconds: 300
+    must_be_fresh: true        # не принимать stale ответы
+  crl:
+    enabled: true
+    distribution_points:
+      - "http://crl1.neurocity/ca.crl"
+      - "http://crl2.neurocity/ca.crl"
+    refresh_interval_seconds: 900
+
+pinning:
+  # Дополнительная защита: пиннинг публичных ключей CA или leaf‑сертификатов
+  enabled: true
+  # Список SPKI‑пинов (base64 SHA256) для корневых/промежуточных CA
+  spki_sha256_pins:
+    - "BASE64_SHA256_OF_CA_KEY_1"
+    - "BASE64_SHA256_OF_CA_KEY_2"
+  # Strict mode: соединения без совпадения пина отклоняются
+  enforce: true
+
+trust:
+  # Trust anchors (bundle) — единый файл PEM (цепочка корней/промежуточных CA)
+  bundle_path: "/etc/security-core/tls/ca/ca-bundle.pem"
+  # Ограничение доверия по именам CA (Subject DN), если необходимо
+  allowed_issuers:
+    - "CN=NeuroCity Root CA,O=NeuroCity,L=Stockholm,C=SE"
+    - "CN=NeuroCity Intermediate CA,O=NeuroCity,L=Stockholm,C=SE"
+  # Разрешить только ECDSA‑сертификаты для leaf (ускоряет и исключает RSA‑дары)
+  leaf_key_types:
+    - "ECDSA"
+  # Минимальная длина ключа/кривой контролируется библиотекой (ECDSA P‑256/X25519 допустимы по умолчанию)
+
+authorization:
+  # mTLS — это не только шифрование, но и аутентификация клиента/сервера.
+  # Ниже — декларативные списки допуска по атрибутам из сертификата.
+  server:
+    # Сервер проверяет клиентский сертификат
+    client_auth_required: true
+    client_allow:
+      spiffe:
+        enabled: true
+        # Разрешённые префиксы SPIFFE ID
+        trust_domains:
+          - "spiffe://neurocity.local"
+        allow_list:
+          - "spiffe://neurocity.local/ns/security-core/sa/security-api"
+          - "spiffe://neurocity.local/ns/security-core/sa/pipeline"
+      san_dns:
+        allow_list:
+          - "security-api.neurocity.svc"
+          - "pipeline.neurocity.svc"
+      san_uri:
+        allow_prefix:
+          - "urn:neurocity:svc:"
+      subject_dn:
+        allow_prefix:
+          - "CN=security-api,"
+          - "CN=pipeline,"
+    # Жёсткая проверка соответствия org/tenant (ABAC‑слой на уровне канала)
+    abac:
+      enabled: true
+      # Простые правила (выполняются на безопасном интерпретаторе)
+      rules:
+        - name: "same-tenant"
+          expr: "subject.org == resource.org"
+        - name: "region-eu-only"
+          expr: "subject.region in ['SE','DE','NL','FR']"
+  client:
+    # Клиент проверяет серверный сертификат
+    server_name: "security-api.neurocity.svc"  # SNI/hostname
+    server_allow:
+      san_dns:
+        allow_list:
+          - "security-api.neurocity.svc"
+          - "audit.neurocity.svc"
+      subject_dn:
+        allow_prefix:
+          - "CN=security-api,"
+          - "CN=audit,"
+
+rotation:
+  # Политика ротации и контроли свежести
+  server_cert:
+    # Максимальный возраст leaf‑сертификата (в секундах); старше — предупреждение/фейл
+    max_age_seconds: 2419200   # 28 дней
+    renew_before_seconds: 604800  # 7 дней до истечения
+    fail_on_expiry: true
+  client_cert:
+    max_age_seconds: 2419200
+    renew_before_seconds: 604800
+    fail_on_expiry: true
+  # Команды/эндпоинты для уведомления процессов о перезагрузке ключей (SIGHUP, admin API Envoy и т.д.)
+  hot_reload_hooks:
+    enabled: true
+    commands:
+      - ["bash", "-lc", "pidof security-core || true; pkill -HUP -f security-core || true"]
+    envoy_admin:
+      enabled: true
+      url: "http://127.0.0.1:9901/reload-threads"
+      timeout_ms: 2000
+
+telemetry:
+  emit_events: true
+  # Канал логирования для событий TLS (handshake success/failure, ocsp status, pin mismatch)
+  logger: "security"
+  sample_rate: 1.0
+
+modes:
+  sidecar:
+    enabled: true
+    # Envoy/Nginx режим. Конкретные маппинги берёт deployment‑шаблон.
+    envoy:
+      # SDS (Secret Discovery Service) может подключаться вместо файлов.
+      sds_enabled: false
+      # Примеры файлов для Envoy tls_context (указываются в шаблоне кластера/лиcтенера)
+      files:
+        validation_context:
+          trusted_ca: "/etc/security-core/tls/ca/ca-bundle.pem"
+          crl_files:
+            - "/etc/security-core/tls/ca/ca.crl"
+        server_cert:
+          cert_chain: "/etc/security-core/tls/server/tls.crt"
+          private_key: "/etc/security-core/tls/server/tls.key"
+        client_cert:
+          cert_chain: "/etc/security-core/tls/client/tls.crt"
+          private_key: "/etc/security-core/tls/client/tls.key"
+  native:
+    enabled: true
+    # Для gRPC/HTTP‑клиентов/серверов, использующих встроенные TLS‑стеки (OpenSSL/BoringSSL).
+    grpc:
+      use_tls: true
+      require_client_cert: true
+      alpn:
+        - "h2"
+        - "http/1.1"
+    http:
+      hsts_enabled: true
+      hsts_max_age_seconds: 31536000
+      hsts_include_subdomains: true
+      hsts_preload: false
+
+profiles:
+
+  dev:
+    # Ослабленные параметры для локальной разработки без компромисса по базовой безопасности.
+    overrides:
+      crypto:
+        tls:
+          min_version: "TLSv1.3"
+          allow_tls12_fallback: true
+          session:
+            tickets_enabled: false
+            resumption_enabled: false
+      revocation:
+        # В dev можно отключить строгий stapling (оставив онлайн‑проверку)
+        ocsp:
+          stapling_required: false
+          timeout_ms: 1500
+      pinning:
+        enabled: false
+        enforce: false
+      authorization:
+        server:
+          abac:
+            enabled: false
+
+  prod:
+    # Жёсткая политика для продакшена; любые отступления фиксируются и логируются.
+    overrides:
+      crypto:
+        tls:
+          min_version: "TLSv1.3"
+          allow_tls12_fallback: false
+          session:
+            tickets_enabled: false
+            resumption_enabled: false
+      revocation:
+        mode: "prefer-ocsp"
+        ocsp:
+          stapling_required: true
+          must_be_fresh: true
+          timeout_ms: 2000
+        crl:
+          enabled: true
+          refresh_interval_seconds: 900
+      pinning:
+        enabled: true
+        enforce: true
+      authorization:
+        server:
+          abac:
+            enabled: true
+        client:
+          # Требуем точного совпадения SAN DNS
+          server_allow:
+            san_dns:
+              allow_list:
+                - "security-api.neurocity.svc"
+                - "audit.neurocity.svc"
