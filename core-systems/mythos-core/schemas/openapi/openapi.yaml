@@ -1,0 +1,686 @@
+# mythos-core/schemas/openapi/openapi.yaml
+openapi: 3.1.0
+info:
+  title: Mythos Core API
+  version: 1.0.0
+  description: |
+    Публичное и внутреннее API платформы Mythos Core.
+    Включает CRUD сущностей, загрузку ассетов, поиск, аутентификацию, вебхуки и служебные эндпоинты.
+
+    Конвенции:
+      - Идемпотентность: `Idempotency-Key` для **POST**.
+      - Корреляция: `X-Request-ID` в запросе/ответе.
+      - Конкурентный контроль: `ETag` + `If-Match` для **PUT/PATCH**.
+      - Пагинация: cursor-based (`cursor`, `limit`), стандартные RateLimit-заголовки.
+      - Формат времени: RFC 3339.
+      - Ошибки: RFC 9457 Problem+JSON.
+
+  contact:
+    name: Mythos Platform Team
+    email: platform@mythos.local
+  license:
+    name: Proprietary
+    url: https://example.com/legal
+
+servers:
+  - url: https://api.mythos.example.com
+    description: Production
+  - url: https://api.staging.mythos.example.com
+    description: Staging
+  - url: http://localhost:8080
+    description: Dev
+
+tags:
+  - name: Health
+  - name: Auth
+  - name: Entities
+  - name: Assets
+  - name: Search
+  - name: Webhooks
+  - name: Admin
+
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      operationId: healthz
+      responses:
+        '200':
+            description: OK
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/Health'
+                examples:
+                  ok:
+                    value: { status: ok, uptime_s: 12345, version: "1.0.0" }
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      operationId: readyz
+      responses:
+        '200': { description: Ready }
+        '503': { description: Not ready }
+
+  /v1/auth/token:
+    post:
+      tags: [Auth]
+      summary: Получение или обновление токена
+      operationId: issueToken
+      security: [] # может использовать Basic/client auth на уровне шлюза
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+            examples:
+              client_credentials:
+                value: { grant_type: "client_credentials", client_id: "app", client_secret: "secret", scope: "entities:read entities:write" }
+              refresh_token:
+                value: { grant_type: "refresh_token", refresh_token: "..." }
+      responses:
+        '200':
+          description: Token issued
+          headers:
+            Cache-Control: { schema: { type: string }, description: No-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/entities:
+    get:
+      tags: [Entities]
+      summary: Список сущностей (пагинация)
+      operationId: listEntities
+      parameters:
+        - $ref: '#/components/parameters/XRequestID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/Fields'
+        - $ref: '#/components/parameters/Filter'
+      responses:
+        '200':
+          description: OK
+          headers:
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+    post:
+      tags: [Entities]
+      summary: Создание сущности
+      operationId: createEntity
+      parameters:
+        - $ref: '#/components/parameters/XRequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewEntity' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { description: URL созданного ресурса, schema: { type: string, format: uri } }
+            ETag: { description: Версия ресурса, schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entity' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/entities/{id}:
+    parameters:
+      - $ref: '#/components/parameters/EntityID'
+    get:
+      tags: [Entities]
+      summary: Получение сущности
+      operationId: getEntity
+      parameters:
+        - $ref: '#/components/parameters/XRequestID'
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag: { description: Текущая версия ресурса, schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entity' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Entities]
+      summary: Полное обновление (замена) сущности
+      operationId: putEntity
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/XRequestID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Entity' }
+      responses:
+        '200':
+          description: Updated
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entity' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Entities]
+      summary: Частичное обновление (merge-patch)
+      operationId: patchEntity
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/XRequestID'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+              description: Merge-patch по атрибутам/метаданным
+      responses:
+        '200':
+          description: Patched
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entity' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Entities]
+      summary: Удаление сущности
+      operationId: deleteEntity
+      parameters:
+        - in: query
+          name: hard
+          description: Жесткое удаление (иначе soft-delete)
+          schema: { type: boolean, default: false }
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/entities/{id}/relationships:
+    parameters:
+      - $ref: '#/components/parameters/EntityID'
+    get:
+      tags: [Entities]
+      summary: Список связей
+      operationId: listEntityRelations
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/EntityRef' }
+                  count: { type: integer, minimum: 0 }
+    post:
+      tags: [Entities]
+      summary: Добавить связь
+      operationId: addEntityRelation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EntityRef' }
+      responses:
+        '201': { description: Relation created }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Entities]
+      summary: Удалить связь
+      operationId: deleteEntityRelation
+      parameters:
+        - in: query
+          name: rel
+          required: true
+          schema: { type: string }
+        - in: query
+          name: to
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: Deleted }
+
+  /v1/assets:
+    get:
+      tags: [Assets]
+      summary: Список ассетов
+      operationId: listAssets
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/Filter'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssetList' }
+    post:
+      tags: [Assets]
+      summary: Загрузка ассета (multipart)
+      operationId: uploadAsset
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, metadata]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                metadata:
+                  $ref: '#/components/schemas/AssetInput'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Asset' }
+
+  /v1/assets/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Assets]
+      summary: Получить ассет
+      operationId: getAsset
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Asset' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Assets]
+      summary: Удалить ассет
+      operationId: deleteAsset
+      responses:
+        '204': { description: Deleted }
+
+  /v1/search/entities:
+    post:
+      tags: [Search]
+      summary: Поиск сущностей
+      operationId: searchEntities
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResponse' }
+
+  /v1/webhooks/incoming/{provider}:
+    post:
+      tags: [Webhooks]
+      summary: Входящий вебхук от интеграции
+      operationId: incomingWebhook
+      security:
+        - webhookSig: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string, enum: [stripe, github, telegram, generic] }
+        - name: X-Mythos-Signature
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+          application/x-www-form-urlencoded:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '202': { description: Accepted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/events:
+    post:
+      tags: [Entities]
+      summary: Публикация доменного события (с callback)
+      operationId: publishEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Event' }
+      responses:
+        '202': { description: Accepted }
+      callbacks:
+        onProcessed:
+          '{$request.body#/callback_url}':
+            post:
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      properties:
+                        event_id: { type: string }
+                        status: { type: string, enum: [processed, failed] }
+                        error: { $ref: '#/components/schemas/Error' }
+              responses:
+                '200': { description: Acknowledged }
+
+  /v1/admin/keys/rotate:
+    post:
+      tags: [Admin]
+      summary: Ротация ключей подписи
+      operationId: rotateKeys
+      responses:
+        '202': { description: Rotation scheduled }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT Bearer (RS256/EdDSA предпочтительно)
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    webhookSig:
+      type: apiKey
+      in: header
+      name: X-Mythos-Signature
+      description: Подпись входящих вебхуков
+
+  parameters:
+    XRequestID:
+      name: X-Request-ID
+      in: header
+      required: false
+      schema: { type: string, maxLength: 128 }
+      description: Идентификатор запроса для трассировки
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 128 }
+      description: Ключ идемпотентности для POST
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema: { type: string }
+      description: Требуемый ETag ресурса для конкурентного контроля
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+    Sort:
+      name: sort
+      in: query
+      required: false
+      schema:
+        type: string
+        example: created_at:desc
+    Fields:
+      name: fields
+      in: query
+      required: false
+      schema:
+        type: string
+        description: Список полей через запятую
+        example: id,kind,version,attributes.title
+    Filter:
+      name: filter
+      in: query
+      required: false
+      schema:
+        type: string
+        description: |
+          Фильтр (например, CEL/RSQL), реализация-зависимая.
+        example: kind=='content' and status=='active'
+    EntityID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: UUID/ULID сущности
+
+  headers:
+    RateLimit-Limit: { schema: { type: integer }, description: Лимит запросов за окно }
+    RateLimit-Remaining: { schema: { type: integer }, description: Оставшиеся запросы }
+    RateLimit-Reset: { schema: { type: integer }, description: Секунд до сброса окна }
+    Retry-After: { schema: { type: integer }, description: Рекомендуемая пауза в секундах }
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: Требуется аутентификация
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Доступ запрещён
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Не найдено
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: Конфликт версии/уникальности
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Error' } } }
+    PreconditionFailed:
+      description: Нарушение предиката (If-Match)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  schemas:
+    # Можно ссылаться на внешнюю JSON Schema (Draft 2020-12)
+    Entity:
+      $ref: '../jsonschema/v1/entity.schema.json'
+    EntityRef:
+      type: object
+      required: [id, kind, rel]
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        rel:  { type: string }
+        note: { type: string, maxLength: 1024 }
+    NewEntity:
+      type: object
+      required: [kind, attributes]
+      additionalProperties: true
+      properties:
+        id: { type: string, description: 'Опционально (если клиент генерирует ULID/UUID)' }
+        kind: { type: string }
+        version: { type: integer, default: 1 }
+        status: { type: string, default: draft }
+        created_at: { type: string, format: date-time }
+        attributes: { type: object }
+        metadata:  { type: object, additionalProperties: [ { type: string }, { type: number }, { type: boolean }, { type: 'null' } ] }
+    EntityList:
+      type: object
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Entity' }
+        next_cursor:
+          type: string
+          nullable: true
+        count:
+          type: integer
+          minimum: 0
+    AssetInput:
+      type: object
+      required: [file_name, mime_type, size_bytes]
+      properties:
+        file_name:  { type: string, maxLength: 255 }
+        mime_type:  { type: string }
+        size_bytes: { type: integer, minimum: 0 }
+        checksum_sha256: { type: string, pattern: '^[A-Fa-f0-9]{64}$' }
+        encryption:
+          type: object
+          additionalProperties: false
+          properties:
+            algorithm: { type: string, enum: [none, aes256] }
+            kms_key_id: { type: string, maxLength: 256 }
+    Asset:
+      allOf:
+        - $ref: '#/components/schemas/AssetInput'
+        - type: object
+          required: [id, url, created_at]
+          properties:
+            id: { type: string }
+            url: { type: string, format: uri }
+            created_at: { type: string, format: date-time }
+            metadata: { type: object, additionalProperties: true }
+    AssetList:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Asset' }
+        next_cursor:
+          type: string
+          nullable: true
+        count:
+          type: integer
+    SearchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        query: { type: string, minLength: 1 }
+        filter: { type: string, description: 'Дополнительный фильтр (например, CEL/RSQL)' }
+        limit:  { type: integer, minimum: 1, maximum: 100, default: 20 }
+        cursor: { type: string }
+        fields: { type: array, items: { type: string } }
+        sort:   { type: string, example: 'score:desc,created_at:desc' }
+    SearchResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, score, source]
+            properties:
+              id: { type: string }
+              score: { type: number }
+              source: { $ref: '#/components/schemas/Entity' }
+        next_cursor: { type: string, nullable: true }
+        count: { type: integer }
+        took_ms: { type: integer }
+    Event:
+      type: object
+      required: [name, source]
+      additionalProperties: true
+      properties:
+        name: { type: string }
+        source: { type: string }
+        severity: { type: string, enum: [info, warning, error, critical] }
+        payload: { type: object, additionalProperties: true }
+        occurred_at: { type: string, format: date-time }
+        callback_url: { type: string, format: uri }
+    TokenRequest:
+      type: object
+      oneOf:
+        - required: [grant_type, client_id, client_secret]
+        - required: [grant_type, refresh_token]
+      properties:
+        grant_type: { type: string, enum: [client_credentials, refresh_token] }
+        client_id: { type: string }
+        client_secret: { type: string }
+        scope: { type: string }
+        refresh_token: { type: string }
+    TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer }
+        refresh_token: { type: string }
+        scope: { type: string }
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        uptime_s: { type: integer }
+        version: { type: string }
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status: { type: string, enum: [ok, warn, fail] }
+              detail: { type: string }
+    Error:
+      type: object
+      description: RFC 9457 Problem Details
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+      required: [title, status]
+
+x-rateLimit:
+  strategy: sliding-window
+  headers: [RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset]

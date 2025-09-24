@@ -1,0 +1,435 @@
+# File: oblivionvault-core/configs/features.yaml
+# Назначение: Единая промышленная конфигурация фич-флагов и параметров раскатки.
+
+apiVersion: features.oblivionvault.io/v1
+kind: FeatureConfig
+$schema: file://./schemas/features.schema.json  # При желании подключите JSON Schema в вашем репо
+
+metadata:
+  service: oblivionvault-core
+  owner:
+    team: core-platform
+    contacts:
+      - type: slack
+        value: "#oblivionvault-core"
+      - type: email
+        value: core-platform@company.example
+  revision: "2025-08-25T10:00:00Z"
+  version: "1.0.0"
+  changeNotes: "Initial industrial rollout of feature flags for oblivionvault-core"
+
+policies:
+  evaluation:
+    precedence:  # порядок применения переопределений
+      - tenant
+      - environment
+      - global
+    stickiness:
+      attribute: user.id            # user.id | session.id | device.id
+      hash: murmur3                 # тип хеша для детерминированной сегментации
+      salt: "oblivionvault-core"    # изменение соли перемешает сегменты
+    defaultState: off               # поведение при отсутствии явного правила
+  guards:
+    slo:
+      # Фичи автоматически выключаются при нарушении SLO/ошибочном бюджете
+      errorBudget:
+        window: "7d"
+        burnRateThresholds:
+          - window: "5m"
+            maxBurnRate: 2.0
+          - window: "1h"
+            maxBurnRate: 1.0
+      metrics:
+        provider: opentelemetry
+        counters:
+          request_total: "ov.core.http.requests"
+          error_total: "ov.core.http.errors"
+        histograms:
+          latency_ms: "ov.core.http.latency_ms"
+    circuitBreaker:
+      enabled: true
+      rules:
+        - name: http_errors_spike
+          metric: "ov.core.http.error_rate"
+          window: "5m"
+          threshold: 0.05         # 5%
+          action: trip
+          cooldown: "10m"
+        - name: latency_degradation
+          metric: "ov.core.http.p95_latency_ms"
+          window: "5m"
+          threshold: 400
+          action: trip
+          cooldown: "10m"
+  compliance:
+    dataResidency:
+      default: "EU"
+      allowed: ["EU", "US", "APAC"]
+    tags: ["security-defaults-enforced"]
+
+environments:
+  - name: prod
+    description: Production
+    ringDefaults:
+      rings:
+        - name: canary
+          weight: 5
+        - name: beta
+          weight: 20
+        - name: ga
+          weight: 75
+    overrides: []  # Переопределения на уровне окружения при необходимости
+  - name: staging
+    description: Staging
+    ringDefaults:
+      rings:
+        - name: canary
+          weight: 10
+        - name: beta
+          weight: 40
+        - name: ga
+          weight: 50
+    overrides: []
+  - name: dev
+    description: Development
+    ringDefaults:
+      rings:
+        - name: ga
+          weight: 100
+    overrides: []
+
+tenants:
+  # Описания арендаторов и их дефолтов (могут переопределять окружение)
+  - id: "ent-acme"
+    name: "Acme Inc."
+    plan: enterprise
+    region: EU
+    overrides: []
+  - id: "pro-zenit"
+    name: "Zenit Club"
+    plan: pro
+    region: EU
+    overrides: []
+  - id: "free-public"
+    name: "Public Free"
+    plan: free
+    region: EU
+    overrides: []
+
+features:
+  - id: vault_api_v2
+    description: Вторая версия API хранилища с оптимизированными маршрутами и схемами.
+    owner: core-platform
+    links:
+      design: "https://internal/wiki/ov/vault_api_v2"
+      tracker: "JIRA-1234"
+      runbook: "https://internal/runbooks/vault_api_v2"
+    lifecycle:
+      stage: active            # draft|experiment|active|deprecated|sunset
+      createdAt: "2025-06-01"
+      sunsetAt: null
+      riskLevel: medium        # low|medium|high
+    dependencies:
+      requires: []
+      conflicts: ["vault_api_v1_legacy"]
+    killSwitch:
+      enabled: true
+      reasonMetric: "ov.core.vault.v2.kill_reason"
+    rollout:
+      strategy: hybrid         # global|percentage|rings|attributes|schedule|regional|hybrid
+      percentage:
+        enabled: true
+        value: 30              # 30% глобально, до применения других правил
+      rings:
+        enabled: true
+        target: ["canary","beta","ga"]
+      regional:
+        include: ["EU"]
+        exclude: []
+      attributes:
+        rules:
+          - when: "user.tier in ['enterprise','pro']"
+            percentage: 80
+          - when: "platform in ['backend']"
+            force: on
+      schedule:
+        windows:
+          - cron: "0 6 * * *"
+            duration: "6h"
+            mode: allow         # allow|deny
+    parameters:
+      - key: read_timeout_ms
+        type: int
+        default: 800
+        min: 100
+        max: 2000
+      - key: write_timeout_ms
+        type: int
+        default: 1500
+        min: 200
+        max: 5000
+      - key: max_batch_bytes
+        type: int
+        default: 1048576
+        min: 65536
+        max: 8388608
+      - key: audit_topic
+        type: string
+        default: "ov.audit.vault.v2"
+        pattern: "^[a-z0-9_.-]+$"
+    limits:
+      rateLimit:
+        qps: 500
+        burst: 1000
+      quotas:
+        dailyOps: 10000000
+    rbac:
+      allowRoles: ["admin","platform-operator","service-account:ov-core"]
+      denyRoles: []
+    telemetry:
+      emit:
+        onEvaluate: true
+        onActivate: true
+        onDeactivate: true
+      events:
+        - name: "ov.feature.vault_api_v2.activated"
+        - name: "ov.feature.vault_api_v2.deactivated"
+    sloGuards:
+      - metric: "ov.core.vault.v2.error_rate"
+        window: "5m"
+        threshold: 0.02
+        action: disable_feature
+        cooldown: "30m"
+    compliance:
+      dataResidency: "EU"
+      tags: ["pii-safe"]
+    experiments:
+      enabled: false
+      variants: []
+    alerts:
+      - name: "vault_v2_error_spike"
+        metric: "ov.core.vault.v2.error_rate"
+        condition: "avg_over_5m > 0.03"
+        severity: high
+        route: "pagerduty:ov-core"
+
+  - id: vault_api_v1_legacy
+    description: Легаси‑реализация API v1; поддерживается для обратной совместимости.
+    owner: core-platform
+    lifecycle:
+      stage: deprecated
+      createdAt: "2023-03-15"
+      sunsetAt: "2025-12-31"
+      riskLevel: high
+    dependencies:
+      requires: []
+      conflicts: ["vault_api_v2"]
+    killSwitch:
+      enabled: true
+    rollout:
+      strategy: global
+      globalState: off         # выключено по умолчанию
+    parameters: []
+    limits: {}
+    rbac:
+      allowRoles: ["admin"]
+      denyRoles: []
+    telemetry:
+      emit: { onEvaluate: false, onActivate: false, onDeactivate: false }
+      events: []
+    sloGuards: []
+    compliance:
+      dataResidency: "EU"
+      tags: ["legacy"]
+    experiments:
+      enabled: false
+    alerts: []
+
+  - id: anomaly_detector
+    description: Модуль поведенческой аномалистики в хранилище (UEBA/поведенческие профили).
+    owner: security-core
+    links:
+      design: "https://internal/wiki/ov/anomaly_detector"
+      tracker: "JIRA-2288"
+    lifecycle:
+      stage: experiment
+      createdAt: "2025-07-10"
+      sunsetAt: null
+      riskLevel: high
+    dependencies:
+      requires: ["vault_api_v2"]
+      conflicts: []
+    killSwitch:
+      enabled: true
+      reasonMetric: "ov.security.anomaly_detector.kill_reason"
+    rollout:
+      strategy: attributes
+      attributes:
+        rules:
+          - when: "tenant.plan == 'enterprise' and region == 'EU'"
+            percentage: 50
+          - when: "user.flags.contains('risk-review')"
+            force: on
+    parameters:
+      - key: score_threshold
+        type: float
+        default: 0.8
+        min: 0.1
+        max: 0.99
+      - key: model_variant
+        type: string
+        default: "v2025_08_light"
+        enum: ["v2025_08_light","v2025_08_heavy"]
+      - key: telemetry_topic
+        type: string
+        default: "ov.security.anomaly.telemetry"
+        pattern: "^[a-z0-9_.-]+$"
+    limits:
+      rateLimit:
+        qps: 200
+        burst: 400
+    rbac:
+      allowRoles: ["security-analyst","platform-operator"]
+      denyRoles: []
+    telemetry:
+      emit:
+        onEvaluate: true
+        onActivate: true
+        onDeactivate: true
+      events:
+        - name: "ov.feature.anomaly_detector.activated"
+    sloGuards:
+      - metric: "ov.security.anomaly.fp_rate"
+        window: "15m"
+        threshold: 0.1
+        action: disable_feature
+        cooldown: "2h"
+    compliance:
+      dataResidency: "EU"
+      tags: ["security-sensitive"]
+    experiments:
+      enabled: true
+      variants:
+        - name: A
+          weight: 50
+          overrides:
+            parameters:
+              score_threshold: 0.75
+        - name: B
+          weight: 50
+          overrides:
+            parameters:
+              score_threshold: 0.85
+      successCriteria:
+        primaryMetric: "ov.security.anomaly.tp_rate"
+        goal: "increase"
+        minDetectableEffect: 0.03
+        guardrails:
+          - metric: "ov.security.anomaly.fp_rate"
+            limit: 0.12
+    alerts:
+      - name: "anomaly_fp_spike"
+        metric: "ov.security.anomaly.fp_rate"
+        condition: "avg_over_15m > 0.12"
+        severity: medium
+        route: "slack:#security-alerts"
+
+  - id: cold_storage_tiering
+    description: Автоматическое перекладывание неактивных объектов в холодные классы хранения.
+    owner: core-storage
+    lifecycle:
+      stage: active
+      createdAt: "2025-05-01"
+      sunsetAt: null
+      riskLevel: low
+    dependencies:
+      requires: ["vault_api_v2"]
+      conflicts: []
+    killSwitch:
+      enabled: true
+    rollout:
+      strategy: schedule
+      schedule:
+        windows:
+          - cron: "0 1 * * *"
+            duration: "3h"
+            mode: allow
+    parameters:
+      - key: idle_days_threshold
+        type: int
+        default: 30
+        min: 7
+        max: 365
+      - key: target_class
+        type: string
+        default: "GLACIER"
+        enum: ["NEARLINE","COLDLINE","GLACIER"]
+    limits: {}
+    rbac:
+      allowRoles: ["platform-operator","service-account:ov-core"]
+      denyRoles: []
+    telemetry:
+      emit:
+        onEvaluate: false
+        onActivate: true
+        onDeactivate: true
+      events:
+        - name: "ov.feature.cold_storage_tiering.moved"
+    sloGuards: []
+    compliance:
+      dataResidency: "EU"
+      tags: []
+    experiments:
+      enabled: false
+    alerts: []
+
+overrides:
+  # Глобальные точечные переопределения, применяются ПОСЛЕ правил features.rollout
+  - selector:
+      environment: prod
+      tenant: ent-acme
+      feature: vault_api_v2
+    forceState: on
+    notes: "Критически важный клиент; включаем полностью в проде."
+
+  - selector:
+      environment: prod
+      feature: anomaly_detector
+    forceState: off
+    until: "2025-09-15T00:00:00Z"
+    notes: "Временная пауза на период аудита качества модели."
+
+audit:
+  changeControl:
+    requiredApprovals:
+      count: 2
+      roles: ["platform-operator","security-analyst","product-owner"]
+    signing:
+      enabled: true
+      provider: "gpg"
+  trails:
+    emitTo:
+      - "ov.audit.features"
+    redact:
+      fields: ["user.id","device.id"]
+
+rbac:
+  roles:
+    - name: platform-operator
+      allow:
+        - "features:read"
+        - "features:write"
+        - "overrides:write"
+    - name: product-owner
+      allow:
+        - "features:read"
+        - "features:write"
+    - name: security-analyst
+      allow:
+        - "features:read"
+        - "guards:read"
+        - "guards:write"
+    - name: readonly
+      allow:
+        - "features:read"
+      deny: []

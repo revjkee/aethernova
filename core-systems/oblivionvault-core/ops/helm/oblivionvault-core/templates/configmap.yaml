@@ -1,0 +1,100 @@
+{{- /*
+  Industrial-grade ConfigMap template for oblivionvault-core
+  Features:
+   - Multiple ConfigMaps via Values.config.maps
+   - Deterministic naming, safe truncation
+   - Standard Kubernetes/Helm labels + extensible common/per-map labels & annotations
+   - Text data (data, tplData, files) and binary data (binaryData, binaryFiles)
+   - Correct immutable precedence (per-map > global > false) without losing explicit false
+   - Fail-fast on missing referenced files
+*/ -}}
+
+{{- $cfg := .Values.config | default dict -}}
+{{- $name := (default .Chart.Name .Values.nameOverride) -}}
+{{- $fullname := printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+
+{{- /* Render only if enabled (default true) and maps provided */ -}}
+{{- if and (ne ($cfg.enabled | default true) false) ($cfg.maps) -}}
+{{- range $i, $cm := $cfg.maps }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-%s" $fullname (required "config.maps[].name is required" $cm.name) | trunc 63 | trimSuffix "-" }}
+  labels:
+    app.kubernetes.io/name: {{ $name | quote }}
+    app.kubernetes.io/instance: {{ $.Release.Name | quote }}
+    app.kubernetes.io/managed-by: {{ $.Release.Service | quote }}
+    app.kubernetes.io/version: {{ $.Chart.AppVersion | quote }}
+    helm.sh/chart: "{{ $.Chart.Name }}-{{ $.Chart.Version }}"
+    app.kubernetes.io/component: {{ default "core" $cm.component | quote }}
+    app.kubernetes.io/part-of: "oblivionvault"
+{{- with $cfg.commonLabels }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+{{- with $cm.labels }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+  annotations:
+    kubernetes.io/description: {{ default "Configuration for oblivionvault-core" $cm.description | quote }}
+{{- with $cfg.commonAnnotations }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+{{- with $cm.annotations }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+  # To trigger rolling updates on workloads, reference a checksum of this config in the workload annotations.
+  # Example in Deployment template:
+  #   annotations:
+  #     checksum/config-{{ $cm.name }}: {{ `{{ include (print .Template.Name) . | sha256sum }}` }}
+{{- /* Immutable precedence: per-map > global > false, without losing explicit false */ -}}
+{{- $imm := (hasKey $cm "immutable") | ternary $cm.immutable ((hasKey $cfg "immutable") | ternary $cfg.immutable false) -}}
+immutable: {{ $imm }}
+
+{{- /* TEXT DATA SECTION */ -}}
+{{- if or $cm.data (or $cm.tplData $cm.files) }}
+data:
+  {{- /* Plain map data */ -}}
+  {{- with $cm.data }}
+{{ toYaml . | nindent 2 }}
+  {{- end }}
+  {{- /* Templated data using tpl: values can reference .Values, .Release, etc. */ -}}
+  {{- with $cm.tplData }}
+  {{- range $k, $v := . }}
+  {{ $k }}: |-
+{{ tpl $v $ | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  {{- /* Import text files from chart repo */ -}}
+  {{- range $f := $cm.files }}
+    {{- $path := required (printf "config.maps[%d].files[].path is required" $i) $f.path -}}
+    {{- $as := default (base $path) $f.as -}}
+    {{- $content := $.Files.Get $path | default "" -}}
+    {{- if not $content }}
+      {{- fail (printf "File not found for ConfigMap '%s': %s" $cm.name $path) -}}
+    {{- end }}
+  {{ $as }}: |-
+{{ $content | nindent 4 }}
+  {{- end }}
+{{- end }}
+
+{{- /* BINARY DATA SECTION */ -}}
+{{- if or $cm.binaryData $cm.binaryFiles }}
+binaryData:
+  {{- /* Plain binaryData map: values must be base64-encoded */ -}}
+  {{- with $cm.binaryData }}
+{{ toYaml . | nindent 2 }}
+  {{- end }}
+  {{- /* Import binary files and encode to base64 */ -}}
+  {{- range $bf := $cm.binaryFiles }}
+    {{- $bpath := required (printf "config.maps[%d].binaryFiles[].path is required" $i) $bf.path -}}
+    {{- $bas := default (base $bpath) $bf.as -}}
+    {{- $bcontent := $.Files.Get $bpath | default "" -}}
+    {{- if not $bcontent }}
+      {{- fail (printf "Binary file not found for ConfigMap '%s': %s" $cm.name $bpath) -}}
+    {{- end }}
+  {{ $bas }}: {{ $bcontent | b64enc }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

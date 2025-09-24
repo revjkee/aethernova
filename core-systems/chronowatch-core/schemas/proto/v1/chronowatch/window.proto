@@ -1,0 +1,205 @@
+syntax = "proto3";
+
+package chronowatch.v1;
+
+option optimize_for = SPEED;
+option cc_enable_arenas = true;
+
+option go_package = "github.com/chronowatch/chronowatch-core/schemas/proto/v1/chronowatch;chronowatch";
+option java_multiple_files = true;
+option java_package = "io.chronowatch.v1";
+option csharp_namespace = "ChronoWatch.V1";
+option ruby_package = "ChronoWatch::V1";
+option objc_class_prefix = "CWX";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// -----------------------------------------------------------------------------
+// SEMANTICS
+// Все вычисленные окна имеют полузакрытую семантику: [start, end)
+// start включительно, end исключительно, в таймзоне WindowSpec.timezone.
+// -----------------------------------------------------------------------------
+
+// Вид окна.
+enum WindowKind {
+  WINDOW_KIND_UNSPECIFIED = 0;
+  WINDOW_KIND_TUMBLING   = 1; // Неперекрывающиеся фиксированные окна (size).
+  WINDOW_KIND_SLIDING    = 2; // Перекрывающиеся окна (size, step).
+  WINDOW_KIND_SESSION    = 3; // Сессии с разрывом (gap).
+  WINDOW_KIND_CALENDAR   = 4; // Календарные/правиловые окна (cron/rrule).
+}
+
+// Политика выравнивания начала окна.
+enum AlignPolicy {
+  ALIGN_POLICY_UNSPECIFIED = 0;
+  // Выравнивание относительно UNIX epoch (1970-01-01T00:00:00Z) + offset.
+  ALIGN_TO_EPOCH = 1;
+  // Выравнивание относительно заданной anchor-точки (WindowSpec.anchor) + offset.
+  ALIGN_TO_ANCHOR = 2;
+}
+
+// Уровень строгости при вычислениях (например, проверка допустимых параметров).
+enum Strictness {
+  STRICTNESS_UNSPECIFIED = 0;
+  STRICTNESS_LENIENT     = 1; // Допускает автокоррекцию параметров (напр., step > size -> step=size).
+  STRICTNESS_STRICT      = 2; // Любое нарушение валидности -> ошибка.
+}
+
+// Описание окна. Определяет тип и параметры.
+message WindowSpec {
+  // Обязательный тип окна.
+  WindowKind kind = 1;
+
+  // IANA таймзона (например, "Europe/Stockholm").
+  // Для CALENDAR обязательна; для прочих — опциональна (по умолчанию UTC).
+  string timezone = 2;
+
+  // Политика выравнивания и исходная точка.
+  AlignPolicy align_policy = 3;
+
+  // Необязательная опорная точка времени для ALIGN_TO_ANCHOR.
+  // Если не задана, а align_policy=ALIGN_TO_ANCHOR — ошибка при STRICT режимах.
+  google.protobuf.Timestamp anchor = 4;
+
+  // Смещение относительно начала выравнивания (epoch/anchor). Может быть отрицательным/положительным.
+  google.protobuf.Duration offset = 5;
+
+  // Дополнительные атрибуты/лейблы (напр., имя задания, версия).
+  map<string, string> labels = 6;
+
+  // Произвольные метаданные.
+  google.protobuf.Struct metadata = 7;
+
+  // Строгость валидации параметров.
+  Strictness strictness = 8;
+
+  // Конкретные конфиги для разных типов окон. Ровно один.
+  oneof config {
+    TumblingWindow tumbling = 20;
+    SlidingWindow sliding   = 21;
+    SessionWindow session   = 22;
+    CalendarWindow calendar = 23;
+  }
+}
+
+// Tumbling: фиксированный размер окна.
+message TumblingWindow {
+  // Длительность окна. Обязательна и должна быть > 0.
+  google.protobuf.Duration size = 1;
+}
+
+// Sliding: фиксированный размер с шагом продвижения.
+message SlidingWindow {
+  // Длительность окна. > 0.
+  google.protobuf.Duration size = 1;
+  // Шаг сдвига. > 0. Как правило, step <= size (при STRICT — обязательно).
+  google.protobuf.Duration step = 2;
+}
+
+// Session: окно объединяется при разрыве не больше gap.
+message SessionWindow {
+  // Максимальный допустимый разрыв между событиями. > 0.
+  google.protobuf.Duration gap = 1;
+  // Необязательная максимальная длительность сессии для отсечки.
+  google.protobuf.Duration max_duration = 2;
+}
+
+// Calendar: окна по расписанию.
+// Поддерживает два способа задания: cron или rrule (oneof).
+message CalendarWindow {
+  // Длительность каждого окна (обязательна и > 0).
+  google.protobuf.Duration size = 1;
+
+  // Временные исключения/блэкауты (локальные для данного окна).
+  repeated TimeRange blackouts = 2;
+
+  oneof schedule {
+    CronSpec cron   = 10;
+    RRuleSpec rrule = 11;
+  }
+}
+
+// Простая cron-спецификация.
+// Семантика cron реализуется движком потребителя; здесь — лишь транспорт.
+message CronSpec {
+  // Строка cron (5 или 6 полей в зависимости от движка).
+  string expression = 1;
+  // Необязательный комментарий/описание.
+  string comment = 2;
+}
+
+// RRULE по RFC 5545 (iCalendar). Семантика определяется движком потребителя.
+message RRuleSpec {
+  // Полная строка RRULE, напр.: "FREQ=HOURLY;INTERVAL=1".
+  string rule = 1;
+  // Необязательные RDATE/EXDATE (ISO8601 с таймзоной WindowSpec.timezone).
+  repeated string rdate = 2;
+  repeated string exdate = 3;
+  // Необязательный комментарий.
+  string comment = 4;
+}
+
+// Интервал времени с полузакрытой семантикой: [start, end)
+message TimeRange {
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end   = 2;
+}
+
+// Окно, вычисленное из WindowSpec.
+message ComputedWindow {
+  // Индекс окна в последовательности (например, порядковый номер от anchor/epoch).
+  int64 index = 1;
+
+  // Вычисленный интервал [start, end).
+  TimeRange range = 2;
+
+  // Хэш/метка версии алгоритма вычисления и исходных параметров (для кэширования/idempotency).
+  string fingerprint = 3;
+
+  // Произвольные атрибуты окна (например, "period=2025-08-28T14:00Z").
+  map<string, string> attributes = 4;
+}
+
+// Запрос на вычисление окна, содержащего reference_time.
+message ComputeWindowRequest {
+  WindowSpec spec = 1;
+  // Временная точка, для которой требуется найти соответствующее окно.
+  google.protobuf.Timestamp reference_time = 2;
+}
+
+// Ответ: одно окно и диагностическая информация.
+message ComputeWindowResponse {
+  ComputedWindow window = 1;
+  // Предыдущее и следующее окна (для удобства навигации UI/ETL).
+  ComputedWindow previous = 2;
+  ComputedWindow next     = 3;
+}
+
+// Запрос на генерацию окон, пересекающих интервал [from, to).
+message ListWindowsRequest {
+  WindowSpec spec = 1;
+  google.protobuf.Timestamp from = 2;
+  google.protobuf.Timestamp to   = 3;
+
+  // Максимум элементов в ответе (страничная выборка).
+  int32 page_size = 4;
+  // Токен продолжения (если поддерживается реализацией).
+  string page_token = 5;
+}
+
+// Ответ со списком окон.
+message ListWindowsResponse {
+  repeated ComputedWindow windows = 1;
+  string next_page_token = 2;
+}
+
+// Сервис вычисления окон (опциональная серверная реализация для унификации клиентов).
+service WindowingService {
+  // Возвращает окно, содержащее reference_time (или ближайшее, если политики разрешают).
+  rpc ComputeWindow(ComputeWindowRequest) returns (ComputeWindowResponse);
+
+  // Возвращает окна, пересекающие [from, to). Может постранично отдавать результат.
+  rpc ListWindows(ListWindowsRequest) returns (ListWindowsResponse);
+}

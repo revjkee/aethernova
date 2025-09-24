@@ -1,0 +1,97 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cybersecurity-core-ingress
+  namespace: cybersecurity-core
+  labels:
+    app.kubernetes.io/name: cybersecurity-core
+    app.kubernetes.io/part-of: cybersecurity-platform
+    app.kubernetes.io/component: api-gateway
+    security.aethernova.io/tier: edge
+  annotations:
+    # ===== TLS / HTTPS =====
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # ===== Rate limiting (пер-IP) =====
+    nginx.ingress.kubernetes.io/limit-connections: "20"   # одновременные соединения с одного IP
+    nginx.ingress.kubernetes.io/limit-rps: "15"           # запросов в секунду с одного IP
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+
+    # ===== Размеры и буферы =====
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"     # максимальный размер запроса
+    nginx.ingress.kubernetes.io/client-header-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "8"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "8k"
+
+    # ===== Безопасные заголовки и допустимые методы (в location) =====
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      # Разрешаем только безопасные методы для API
+      if ($request_method !~ ^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$) { return 405; }
+
+      # Жёсткие security headers (подправьте CSP под ваш фронт; для чистого API строгая политика уместна)
+      add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Referrer-Policy "no-referrer" always;
+      add_header X-Frame-Options "DENY" always;
+      add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+
+      # Для API часто уместно запретить кэш
+      add_header Cache-Control "no-store" always;
+
+    # ===== WAF (ModSecurity / OWASP CRS) — требует включения на контроллере =====
+    # Включите на уровне контроллера: enable-modsecurity: "true", enable-owasp-modsecurity-crs: "true"
+    # Затем можно точечно на Ingress настраивать правила:
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/enable-owasp-modsecurity-crs: "true"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      # Пример «деликатных» исключений под API (раскомментируйте и подставьте реальные ID правил при ложных срабатываниях)
+      # SecRuleRemoveById 949110
+      # SecRuleRemoveById 980130
+
+    # ===== Белые списки источников (опционально). Укажите CIDR обратных прокси/WAF, если требуется жёсткая изоляция =====
+    # nginx.ingress.kubernetes.io/whitelist-source-range: "203.0.113.0/24,198.51.100.0/24"
+
+    # ===== mTLS (клиентские сертификаты) — опционально, раскомментируйте при необходимости =====
+    # nginx.ingress.kubernetes.io/auth-tls-secret: "cybersecurity-core/client-ca"   # <namespace>/<secret с CA>
+    # nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    # nginx.ingress.kubernetes.io/auth-tls-verify-depth: "2"
+    # nginx.ingress.kubernetes.io/auth-tls-error-page: "https://api.cybersecurity-core.example/403.html"
+    # nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream: "true"
+
+    # ===== Прочее =====
+    # Если бэкенд говорит по HTTPS, раскомментируйте:
+    # nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    # nginx.ingress.kubernetes.io/proxy-ssl-verify: "on"
+    # nginx.ingress.kubernetes.io/proxy-ssl-server-name: "on"
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.cybersecurity-core.example
+      secretName: cybersecurity-core-tls  # секрет с серверным сертификатом/ключом для host
+  rules:
+    - host: api.cybersecurity-core.example
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: cybersecurity-core-api
+                port:
+                  number: 8080
+
+          # Явный healthcheck путь без лишних фильтров
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: cybersecurity-core-api
+                port:
+                  number: 8080

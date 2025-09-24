@@ -1,0 +1,175 @@
+{{- /*
+Industrial Ingress template for Omnimind Core
+Features:
+- Conditional creation via .Values.ingress.enabled
+- Multiple hosts/paths, per-path backend override (service.name/port)
+- TLS + optional mTLS (nginx)
+- Canary Ingress (nginx) with header/cookie/weight strategies
+- Provider-specific annotations: nginx / traefik / alb (select .Values.ingress.provider)
+- Rate limits, timeouts, body size, sticky, grpc/http selection, rewrites
+- Extra annotations/labels blocks
+Assumptions:
+- A helper "omnimind-core.fullname" and "omnimind-core.labels" exist; adjust if different.
+*/ -}}
+{{- if .Values.ingress.enabled }}
+{{- $fullName := include "omnimind-core.fullname" . -}}
+{{- $labels := include "omnimind-core.labels" . | fromYaml | default dict -}}
+{{- $svcDefaultName := (printf "%s" $fullName) -}}
+{{- $svcDefaultPort := (dig "service" "port" 80 .Values) -}}
+{{- $provider := (default "nginx" .Values.ingress.provider) -}}
+{{- $className := .Values.ingress.className | default (ternary "nginx" "traefik" (eq $provider "nginx")) -}}
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- $labels | toYaml | nindent 4 }}
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: {{ $fullName }}
+    {{- with .Values.ingress.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- /* Common hardening / sane defaults */}}
+    {{- if eq $provider "nginx" }}
+    kubernetes.io/ingress.class: {{ $className }}
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ .Values.ingress.proxy.bodySize | default "8m" | quote }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ .Values.ingress.proxy.readTimeout | default "60s" | quote }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ .Values.ingress.proxy.sendTimeout | default "60s" | quote }}
+    nginx.ingress.kubernetes.io/proxy-buffer-size: {{ .Values.ingress.proxy.bufferSize | default "16k" | quote }}
+    nginx.ingress.kubernetes.io/ssl-redirect: {{ (default true .Values.ingress.tlsRedirect) | toString | quote }}
+    nginx.ingress.kubernetes.io/force-ssl-redirect: {{ (default true .Values.ingress.tlsRedirect) | toString | quote }}
+    nginx.ingress.kubernetes.io/limit-rps: {{ .Values.ingress.ratelimit.rps | default 100 | quote }}
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: {{ .Values.ingress.ratelimit.burstMultiplier | default 5 | quote }}
+    nginx.ingress.kubernetes.io/server-snippet: |
+      {{- with .Values.ingress.securityHeaders.serverSnippet }}
+      {{- . | nindent 6 }}
+      {{- else }}
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header X-Frame-Options "SAMEORIGIN" always;
+      add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+      add_header X-XSS-Protection "1; mode=block" always;
+      {{- if .Values.ingress.hsts.enabled }}
+      add_header Strict-Transport-Security "max-age={{ .Values.ingress.hsts.maxAge | default 31536000 }}; includeSubDomains{{ if .Values.ingress.hsts.preload }}; preload{{ end }}" always;
+      {{- end }}
+      {{- end }}
+    {{- if .Values.ingress.sticky.enabled }}
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: {{ .Values.ingress.sticky.cookieName | default "omnimind_affinity" | quote }}
+    nginx.ingress.kubernetes.io/session-cookie-max-age: {{ .Values.ingress.sticky.maxAge | default 86400 | quote }}
+    {{- end }}
+    {{- if .Values.ingress.grpc }}
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    {{- end }}
+    {{- if .Values.ingress.mtls.enabled }}
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: {{ .Values.ingress.mtls.verifyClient | default "on" | quote }}
+    nginx.ingress.kubernetes.io/auth-tls-secret: {{ printf "%s/%s" (include "omnimind-core.namespace" .) .Values.ingress.mtls.secretName | quote }}
+    nginx.ingress.kubernetes.io/auth-tls-verify-depth: {{ .Values.ingress.mtls.verifyDepth | default 1 | quote }}
+    {{- end }}
+    {{- if .Values.ingress.rewrite.target }}
+    nginx.ingress.kubernetes.io/rewrite-target: {{ .Values.ingress.rewrite.target | quote }}
+    {{- end }}
+    {{- end }}
+
+    {{- if eq $provider "traefik" }}
+    kubernetes.io/ingress.class: {{ $className }}
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ .Values.ingress.traefik.entrypoints | default "web,websecure" | quote }}
+    traefik.ingress.kubernetes.io/router.tls: {{ (default true .Values.ingress.tlsRedirect) | toString | quote }}
+    {{- if .Values.ingress.traefik.middlewares }}
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Values.ingress.traefik.middlewares | quote }}
+    {{- end }}
+    {{- end }}
+
+    {{- if eq $provider "alb" }}
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: {{ .Values.ingress.alb.scheme | default "internet-facing" | quote }}
+    alb.ingress.kubernetes.io/target-type: {{ .Values.ingress.alb.targetType | default "ip" | quote }}
+    alb.ingress.kubernetes.io/listen-ports: {{ .Values.ingress.alb.listenPorts | default "[{\"HTTP\":80},{\"HTTPS\":443}]" | quote }}
+    alb.ingress.kubernetes.io/backend-protocol: {{ if .Values.ingress.grpc }}"HTTP2"{{ else }}"HTTP"{{ end }}
+    alb.ingress.kubernetes.io/ssl-redirect: {{ (default 443 .Values.ingress.alb.sslRedirectPort) | quote }}
+    {{- end }}
+
+    {{- with .Values.ingress.extraAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ $className }}
+  {{- end }}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- range .Values.ingress.tls }}
+    - hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ .secretName | quote }}
+    {{- end }}
+  {{- end }}
+  rules:
+    {{- range $host := .Values.ingress.hosts }}
+    - host: {{ $host.host | quote }}
+      http:
+        paths:
+          {{- range $p := $host.paths }}
+          - path: {{ $p.path | default "/" | quote }}
+            pathType: {{ $p.pathType | default "Prefix" | quote }}
+            backend:
+              service:
+                name: {{ default $svcDefaultName (dig "service" "name" "" $p) | quote }}
+                port:
+                  number: {{ default $svcDefaultPort (dig "service" "port" nil $p) }}
+          {{- end }}
+    {{- end }}
+{{- if and (eq $provider "nginx") .Values.ingress.canary.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ printf "%s-canary" $fullName }}
+  labels:
+    {{- $labels | toYaml | nindent 4 }}
+    app.kubernetes.io/component: api
+    app.kubernetes.io/name: {{ $fullName }}
+    istio.io/rev: "n/a"
+    {{- with .Values.ingress.canary.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    kubernetes.io/ingress.class: {{ $className }}
+    nginx.ingress.kubernetes.io/canary: "true"
+    {{- if .Values.ingress.canary.weight }}
+    nginx.ingress.kubernetes.io/canary-weight: "{{ .Values.ingress.canary.weight }}"
+    {{- end }}
+    {{- if .Values.ingress.canary.header }}
+    nginx.ingress.kubernetes.io/canary-by-header: {{ .Values.ingress.canary.header | quote }}
+    nginx.ingress.kubernetes.io/canary-by-header-value: {{ .Values.ingress.canary.headerValue | default "always" | quote }}
+    {{- end }}
+    {{- if .Values.ingress.canary.cookie }}
+    nginx.ingress.kubernetes.io/canary-by-cookie: {{ .Values.ingress.canary.cookie | quote }}
+    {{- end }}
+    {{- with .Values.ingress.canary.extraAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ $className }}
+  {{- end }}
+  rules:
+    {{- range $host := .Values.ingress.hosts }}
+    - host: {{ $host.host | quote }}
+      http:
+        paths:
+          {{- range $p := $host.paths }}
+          - path: {{ $p.path | default "/" | quote }}
+            pathType: {{ $p.pathType | default "Prefix" | quote }}
+            backend:
+              service:
+                name: {{ default (printf "%s" $svcDefaultName) (dig "canaryService" "name" (dig "service" "name" "" $p) .Values.ingress.canary) | quote }}
+                port:
+                  number: {{ default $svcDefaultPort (dig "canaryService" "port" (dig "service" "port" nil $p) .Values.ingress.canary) }}
+          {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,431 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.aethernova.com/engine-core/v1/economy.effect.schema.json",
+  "title": "Aethernova Engine | Economy Effect",
+  "description": "Описывает атомарный экономический эффект: выпуск/сжигание/комиссия/награда/разблокировка/возврат и пр., с условиями применения, стратегией расчёта и аудитом.",
+  "type": "object",
+  "unevaluatedProperties": false,
+  "required": ["schemaVersion", "id", "type", "status", "scope", "strategy", "accounting", "audit"],
+  "properties": {
+    "schemaVersion": {
+      "description": "Версия прикладной схемы объекта (SemVer).",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "id": { "$ref": "#/$defs/Identifier", "description": "Уникальный ID эффекта (ULID/UUIDv4)." },
+    "parentId": { "oneOf": [ { "$ref": "#/$defs/Identifier" }, { "type": "null" } ], "default": null },
+    "createdAt": { "$ref": "#/$defs/Timestamp" },
+    "effectiveFrom": { "$ref": "#/$defs/Timestamp", "description": "Момент начала действия (включительно)." },
+    "expiresAt": { "oneOf": [ { "$ref": "#/$defs/Timestamp" }, { "type": "null" } ], "default": null },
+    "priority": { "type": "integer", "minimum": 0, "maximum": 1000000, "default": 100 },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "active", "paused", "retired"],
+      "description": "Жизненный цикл эффекта."
+    },
+    "type": {
+      "type": "string",
+      "description": "Класс экономического эффекта.",
+      "enum": [
+        "mint", "burn", "transfer_fee", "protocol_fee", "staking_reward",
+        "liquidity_incentive", "airdrop", "rebate", "cashback", "refund",
+        "penalty", "slashing", "lock", "unlock", "vesting_unlock",
+        "rebase", "price_oracle_adjustment", "governance_reward", "subscription_charge"
+      ]
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_.:-]+$" },
+      "maxItems": 64,
+      "uniqueItems": true,
+      "default": []
+    },
+    "labels": { "$ref": "#/$defs/Labels" },
+
+    "scope": {
+      "type": "object",
+      "description": "Зона действия эффекта.",
+      "unevaluatedProperties": false,
+      "required": ["appliesTo"],
+      "properties": {
+        "appliesTo": {
+          "type": "string",
+          "enum": ["all", "account", "role", "segment", "token", "nftCollection", "contract", "marketPair", "country", "region"]
+        },
+        "selector": {
+          "description": "Конкретизация в зависимости от appliesTo.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "unevaluatedProperties": false,
+              "properties": {
+                "ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 1000, "uniqueItems": true },
+                "role": { "type": "string", "maxLength": 128 },
+                "segmentId": { "type": "string", "maxLength": 128 },
+                "token": { "$ref": "#/$defs/AssetRef" },
+                "marketPair": {
+                  "type": "object",
+                  "unevaluatedProperties": false,
+                  "required": ["base", "quote"],
+                  "properties": { "base": { "$ref": "#/$defs/AssetRef" }, "quote": { "$ref": "#/$defs/AssetRef" } }
+                },
+                "countryCode": { "type": "string", "pattern": "^[A-Z]{2}$" },
+                "regionCode": { "type": "string", "maxLength": 64 }
+              }
+            }
+          ],
+          "default": null
+        }
+      }
+    },
+
+    "conditions": {
+      "type": "object",
+      "description": "Набор условий применения.",
+      "unevaluatedProperties": false,
+      "properties": {
+        "thresholds": {
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "minTxAmount": { "$ref": "#/$defs/Money" },
+            "maxTxAmount": { "$ref": "#/$defs/Money" },
+            "minAccountBalance": { "$ref": "#/$defs/Money" },
+            "maxAccountBalance": { "$ref": "#/$defs/Money" },
+            "dailyVolumeLimit": { "$ref": "#/$defs/Money" },
+            "txCountPerDay": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+          }
+        },
+        "segments": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 128 },
+          "maxItems": 128,
+          "uniqueItems": true
+        },
+        "schedule": {
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "timezone": { "type": "string", "maxLength": 64 },
+            "cron": { "type": "string", "maxLength": 128, "description": "CRON‑выражение (Quartz‑совместимое)." },
+            "window": {
+              "type": "object",
+              "unevaluatedProperties": false,
+              "properties": {
+                "start": { "$ref": "#/$defs/Timestamp" },
+                "end": { "oneOf": [ { "$ref": "#/$defs/Timestamp" }, { "type": "null" } ], "default": null }
+              }
+            }
+          }
+        },
+        "expr": {
+          "type": "object",
+          "description": "Безопасное булево выражение (например, CEL‑подобное).",
+          "unevaluatedProperties": false,
+          "properties": {
+            "language": { "type": "string", "enum": ["cel", "none"], "default": "none" },
+            "source": { "type": "string", "maxLength": 4000, "description": "Напр.: tx.asset == scope.token && tx.amount >= conditions.thresholds.minTxAmount" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "thresholds": { "required": ["minTxAmount", "maxTxAmount"] } }, "required": ["thresholds"] },
+          "then": {
+            "properties": {
+              "thresholds": {
+                "properties": {
+                  "maxTxAmount": {
+                    "type": "object",
+                    "properties": {
+                      "value": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]{1,18})?$" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+
+    "strategy": {
+      "description": "Правило расчета эффекта.",
+      "oneOf": [
+        {
+          "title": "fixed",
+          "type": "object",
+          "unevaluatedProperties": false,
+          "required": ["kind", "amount"],
+          "properties": {
+            "kind": { "const": "fixed" },
+            "amount": { "$ref": "#/$defs/Money" }
+          }
+        },
+        {
+          "title": "percent",
+          "type": "object",
+          "unevaluatedProperties": false,
+          "required": ["kind", "rateBps", "asset"],
+          "properties": {
+            "kind": { "const": "percent" },
+            "rateBps": { "$ref": "#/$defs/PercentBps" },
+            "minAmount": { "oneOf": [ { "$ref": "#/$defs/Money" }, { "type": "null" } ], "default": null },
+            "maxAmount": { "oneOf": [ { "$ref": "#/$defs/Money" }, { "type": "null" } ], "default": null },
+            "asset": { "$ref": "#/$defs/AssetRef", "description": "В какой валюте начисляется результат." }
+          }
+        },
+        {
+          "title": "tiered",
+          "type": "object",
+          "unevaluatedProperties": false,
+          "required": ["kind", "asset", "tiers"],
+          "properties": {
+            "kind": { "const": "tiered" },
+            "asset": { "$ref": "#/$defs/AssetRef" },
+            "tiers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "unevaluatedProperties": false,
+                "required": ["threshold", "rateBps"],
+                "properties": {
+                  "threshold": { "$ref": "#/$defs/Money", "description": "Нижняя граница объёма для применения уровня." },
+                  "rateBps": { "$ref": "#/$defs/PercentBps" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "title": "curve",
+          "type": "object",
+          "unevaluatedProperties": false,
+          "required": ["kind", "asset", "model"],
+          "properties": {
+            "kind": { "const": "curve" },
+            "asset": { "$ref": "#/$defs/AssetRef" },
+            "model": {
+              "type": "object",
+              "unevaluatedProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": { "type": "string", "enum": ["linear", "piecewise"] },
+                "linear": {
+                  "type": "object",
+                  "unevaluatedProperties": false,
+                  "properties": {
+                    "k": { "type": "number" },
+                    "b": { "type": "number" },
+                    "min": { "type": "number" },
+                    "max": { "type": "number" }
+                  }
+                },
+                "piecewise": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 128,
+                  "items": {
+                    "type": "object",
+                    "unevaluatedProperties": false,
+                    "required": ["x", "y"],
+                    "properties": {
+                      "x": { "type": "number" },
+                      "y": { "type": "number" }
+                    }
+                  }
+                }
+              },
+              "allOf": [
+                {
+                  "if": { "properties": { "type": { "const": "linear" } } },
+                  "then": { "required": ["linear"] }
+                },
+                {
+                  "if": { "properties": { "type": { "const": "piecewise" } } },
+                  "then": { "required": ["piecewise"] }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+
+    "limits": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "properties": {
+        "perTxMax": { "$ref": "#/$defs/Money" },
+        "perDayMax": { "$ref": "#/$defs/Money" },
+        "perAccountDailyCount": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+      }
+    },
+
+    "accounting": {
+      "type": "object",
+      "description": "Идемпотентность и обратимость.",
+      "unevaluatedProperties": false,
+      "required": ["idempotencyKey", "reversible"],
+      "properties": {
+        "idempotencyKey": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.:-]{8,128}$"
+        },
+        "reversible": { "type": "boolean" },
+        "reversalWindowSec": { "type": "integer", "minimum": 0, "maximum": 31536000, "default": 0 },
+        "causalRefs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Identifier" },
+          "maxItems": 64,
+          "uniqueItems": true,
+          "default": []
+        }
+      }
+    },
+
+    "audit": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": ["riskLevel", "approvals"],
+      "properties": {
+        "riskLevel": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "changeReason": { "type": "string", "maxLength": 1024 },
+        "initiator": { "type": "string", "maxLength": 256 },
+        "approvals": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "unevaluatedProperties": false,
+            "required": ["by", "at"],
+            "properties": {
+              "by": { "type": "string", "maxLength": 256 },
+              "at": { "$ref": "#/$defs/Timestamp" },
+              "signature": { "$ref": "#/$defs/Signature" }
+            }
+          }
+        }
+      }
+    }
+  },
+
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "percent" } } },
+      "then": { "required": ["strategy"] }
+    },
+    {
+      "if": { "properties": { "expiresAt": { "type": "string" } } },
+      "then": {
+        "properties": {
+          "effectiveFrom": { "type": "string" }
+        }
+      }
+    }
+  ],
+
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "description": "ULID/UUIDv4.",
+      "pattern": "^(?:[0-9A-Fa-f-]{36}|[0-9A-HJKMNP-TV-Z]{26})$"
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Labels": {
+      "type": "object",
+      "propertyNames": { "type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_.:-]+$" },
+      "additionalProperties": { "type": "string", "maxLength": 256 },
+      "maxProperties": 128,
+      "default": {}
+    },
+    "PercentBps": {
+      "type": "integer",
+      "description": "Процент в базисных пунктах (0..10000 = 0..100%).",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "ChainRef": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": ["network", "chainId"],
+      "properties": {
+        "network": { "type": "string", "enum": ["EVM", "TON", "SOL", "BTC", "OTHER"] },
+        "chainId": { "oneOf": [ { "type": "integer", "minimum": 0 }, { "type": "string", "minLength": 1, "maxLength": 64 } ] }
+      }
+    },
+    "AssetRef": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": ["standard", "symbol"],
+      "properties": {
+        "standard": { "type": "string", "enum": ["REVA-20", "ERC-20", "ERC-721", "ERC-1155", "TON-jetton", "NATIVE"] },
+        "symbol": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[A-Z0-9.-]{1,32}$" },
+        "address": { "oneOf": [ { "type": "string", "maxLength": 128 }, { "type": "null" } ], "default": null },
+        "decimals": { "type": "integer", "minimum": 0, "maximum": 36, "default": 18 },
+        "chain": { "$ref": "#/$defs/ChainRef" }
+      }
+    },
+    "Money": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": ["asset", "value"],
+      "properties": {
+        "asset": { "$ref": "#/$defs/AssetRef" },
+        "value": {
+          "type": "string",
+          "description": "Десятичная строка, до 18 знаков после запятой.",
+          "pattern": "^(?:0|[1-9]\\d*)(?:\\.[0-9]{1,18})?$"
+        }
+      }
+    },
+    "Signature": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": ["alg", "sig"],
+      "properties": {
+        "alg": { "type": "string", "enum": ["ed25519", "secp256k1", "rsa-pss-256", "none"] },
+        "sig": { "type": "string", "maxLength": 2048 },
+        "pub": { "type": "string", "maxLength": 2048 }
+      }
+    }
+  },
+
+  "examples": [
+    {
+      "schemaVersion": "1.0.0",
+      "id": "01J3Y0Y4H0S8W8V7X3Z4K2TQ7Q",
+      "createdAt": "2025-08-12T12:00:00Z",
+      "effectiveFrom": "2025-08-15T00:00:00Z",
+      "priority": 50,
+      "status": "active",
+      "type": "transfer_fee",
+      "scope": {
+        "appliesTo": "marketPair",
+        "selector": {
+          "marketPair": {
+            "base": { "standard": "REVA-20", "symbol": "REVA", "address": "0xabc...", "decimals": 18, "chain": { "network": "EVM", "chainId": 8453 } },
+            "quote": { "standard": "ERC-20", "symbol": "USDC", "address": "0xA0b8...", "decimals": 6, "chain": { "network": "EVM", "chainId": 8453 } }
+          }
+        }
+      },
+      "strategy": {
+        "kind": "percent",
+        "rateBps": 25,
+        "asset": { "standard": "REVA-20", "symbol": "REVA", "address": "0xabc...", "decimals": 18, "chain": { "network": "EVM", "chainId": 8453 } },
+        "minAmount": { "asset": { "standard": "REVA-20", "symbol": "REVA", "address": "0xabc...", "decimals": 18, "chain": { "network": "EVM", "chainId": 8453 } }, "value": "0.0001" }
+      },
+      "limits": { "perTxMax": { "asset": { "standard": "REVA-20", "symbol": "REVA", "address": "0xabc...", "decimals": 18, "chain": { "network": "EVM", "chainId": 8453 } }, "value": "10" } },
+      "accounting": { "idempotencyKey": "fee-v1-global-25bps", "reversible": false, "reversalWindowSec": 0, "causalRefs": [] },
+      "audit": { "riskLevel": "medium", "approvals": [ { "by": "protocol-council", "at": "2025-08-12T12:10:00Z", "signature": { "alg": "ed25519", "sig": "b64...", "pub": "b64..." } } ] }
+    }
+  ]
+}

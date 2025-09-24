@@ -1,0 +1,117 @@
+# Managed by Ansible — Omnimind Core Alertmanager self-inhibitor
+# Назначение: подавлять «шум» и симптоматические алерты при наличии более приоритетных причинных событий.
+# Использование: включите как фрагмент (например, через templates+include_files) в основную конфигурацию Alertmanager.
+#
+# Требования к меткам алертов (рекомендуется):
+#   - cluster, namespace, service, instance
+#   - severity in {critical, warning, info}
+#   - alertname осмысленно отражает первопричину/симптом
+#
+# Совместимость: Alertmanager >= 0.22 (matchers со строковым синтаксисом).
+
+inhibit_rules:
+
+  ###########################################################################
+  # 1) Иерархия приоритетов внутри сервиса:
+  #    critical глушит warning|info, warning глушит info,
+  #    если совпадают cluster/namespace/service/instance.
+  ###########################################################################
+  - source_matchers:
+      - severity = critical
+    target_matchers:
+      - severity =~ warning|info
+    equal: [cluster, namespace, service, instance]
+
+  - source_matchers:
+      - severity = warning
+    target_matchers:
+      - severity = info
+    equal: [cluster, namespace, service, instance]
+
+  ###########################################################################
+  # 2) Первопричина сервиса:
+  #    *Down/*Unavailable/*Degraded подавляет симптоматику:
+  #    5xx/SLO/latency/HPA/Throttle и прочее, чтобы не дублировать корневую аварию.
+  ###########################################################################
+  - source_matchers:
+      - alertname =~ .*(Down|Unavailable|Degraded)$
+      - severity =~ critical|warning
+    target_matchers:
+      - alertname =~ .*((5xx|Error|SLO|Latency|Budget|Timeout|Throttle|Saturation|Backoff|Queue)).*
+    equal: [cluster, namespace, service]
+
+  ###########################################################################
+  # 3) Уровень узла:
+  #    NodeDown/NodeNotReady подавляет Pod.*NotReady/Container.*Restart.* внутри того же узла.
+  ###########################################################################
+  - source_matchers:
+      - alertname =~ Node(Down|NotReady)
+      - severity =~ critical|warning
+    target_matchers:
+      - alertname =~ (Pod(.*)NotReady|Container(.*)Restart|Kubelet(.*)Unhealthy)
+    equal: [cluster, node]
+
+  ###########################################################################
+  # 4) Плановые окна обслуживания (maintenance):
+  #    Любой алерт с меткой maintenance=true подавляет сигналы того же объекта.
+  #    Рекомендуется выставлять метку через rules или silence API на время работ.
+  ###########################################################################
+  - source_matchers:
+      - maintenance = true
+    target_matchers:
+      - severity =~ critical|warning|info
+    equal: [cluster, namespace, service, instance]
+
+  ###########################################################################
+  # 5) Сетевые/ingress-аварии:
+  #    Падение ингрега/шлюза глушит ошибочную симптоматику всех приложений за ним.
+  ###########################################################################
+  - source_matchers:
+      - alertname =~ (IngressGatewayDown|EdgeProxyDown|LBUnhealthy|DNSOutage)
+      - severity =~ critical|warning
+    target_matchers:
+      - alertname =~ .*
+    equal: [cluster, zone]
+
+  ###########################################################################
+  # 6) Хранилище/БД как первопричина:
+  #    Аварии БД/кластера очередей подавляют каскад ошибок приложений, завязанных на них.
+  #    Требуется консистентная метка backend (например, db=orders, mq=kafka-a).
+  ###########################################################################
+  - source_matchers:
+      - alertname =~ (PostgresDown|MySQLDown|MongoDown|KafkaClusterDown|RedisDown|EtcdClusterDegraded)
+      - severity =~ critical|warning
+    target_matchers:
+      - alertname =~ .*
+    equal: [cluster, backend]
+
+  ###########################################################################
+  # 7) Масштабное событие кластера:
+  #    Контрольная плоскость неисправна — глушим шум от «листьев», пока восстанавливаем control plane.
+  ###########################################################################
+  - source_matchers:
+      - alertname =~ (KubeAPIDown|KubeControllerManagerDown|KubeSchedulerDown|EtcdInsufficientMembers)
+      - severity =~ critical|warning
+    target_matchers:
+      - alertname =~ .*
+    equal: [cluster]
+
+  ###########################################################################
+  # 8) Дублирующие экспортёры/инстансы:
+  #    Один и тот же алерт с разных инстансов target глушится по instance-id/target.
+  ###########################################################################
+  - source_matchers:
+      - alertname = DuplicateTarget
+    target_matchers:
+      - alertname = TargetDown
+    equal: [cluster, job, target]
+
+  ###########################################################################
+  # 9) HPA как следствие:
+  #    Если сервис фактически недоступен (Down/Unavailable), не шумим про HPA NearMax/Saturation.
+  ###########################################################################
+  - source_matchers:
+      - alertname =~ .*(Down|Unavailable)$
+    target_matchers:
+      - alertname =~ (HPANearMaxCapacity|CpuSaturation|MemorySaturation)
+    equal: [cluster, namespace, service]

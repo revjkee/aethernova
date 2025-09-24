@@ -1,0 +1,83 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: veilmind-api-hpa
+  namespace: default
+  labels:
+    app.kubernetes.io/name: veilmind-api
+    app.kubernetes.io/part-of: veilmind-core
+    app.kubernetes.io/component: api
+  annotations:
+    # Требуется metrics-server для CPU/Memory. Для кастомных метрик — Prometheus Adapter (или иной custom-metrics API).
+    veilmind.io/scaling-notes: "CPU utilization + memory average; stabilized scale-down; bounded scale-up."
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: veilmind-api               # ИМЯ Deployment, который масштабируем
+  minReplicas: 3                      # Базовая устойчивость (ZK: выдержка AZ/узла)
+  maxReplicas: 50                     # Верхняя граница, чтобы не «затопить» кластер
+
+  # Метрики: контейнерные (точнее при sidecar'ах)
+  metrics:
+    # 1) CPU: доля от container.resources.requests.cpu (рекомендуется запрос >= 100m)
+    - type: ContainerResource
+      containerResource:
+        name: cpu
+        container: api               # ИМЯ контейнера внутри Pod
+        target:
+          type: Utilization
+          averageUtilization: 60     # целевая загрузка CPU в %
+    # 2) Memory: абсолютное значение среднего по Pod (учитывает рабочий набор)
+    - type: ContainerResource
+      containerResource:
+        name: memory
+        container: api
+        target:
+          type: AverageValue
+          averageValue: 800Mi        # таргет памяти на Pod
+
+    # Пример кастомной метрики per‑pod (требуется custom-metrics API). Оставлено как шаблон.
+    # - type: Pods
+    #   pods:
+    #     metric:
+    #       name: http_requests_per_second   # пример метрики из адаптера
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "20"               # 20 rps на Pod
+
+    # Пример object‑метрики (например, нагрузка на ingress). Требуется external/custom metrics.
+    # - type: Object
+    #   object:
+    #     describedObject:
+    #       apiVersion: networking.k8s.io/v1
+    #       kind: Ingress
+    #       name: veilmind
+    #     metric:
+    #       name: nginx_ingress_controller_requests
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "200"
+
+  # Поведение масштабирования: быстрый безопасный scale‑up, консервативный scale‑down.
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0     # без задержки на рост
+      selectPolicy: Max                  # выбирать максимально агрессивную из политик ниже
+      policies:
+        - type: Percent
+          value: 100                    # не более +100% за окно
+          periodSeconds: 60
+        - type: Pods
+          value: 10                     # и не более +10 Pod за окно
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300    # 5 минут усреднения перед снижением
+      selectPolicy: Max                  # выбрать наибольшее допустимое снижение (ниже ограничено)
+      policies:
+        - type: Percent
+          value: 50                      # не более -50% за окно
+          periodSeconds: 60
+        - type: Pods
+          value: 5                       # и не более -5 Pod за окно
+          periodSeconds: 60

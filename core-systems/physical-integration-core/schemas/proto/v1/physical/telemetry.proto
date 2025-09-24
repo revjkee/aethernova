@@ -1,0 +1,360 @@
+syntax = "proto3";
+
+package physical.v1;
+
+option csharp_namespace = "Aethernova.Physical.V1";
+option go_package        = "github.com/aethernova/physical-integration-core/gen/physical/v1;physicalv1";
+option java_multiple_files = true;
+option java_package        = "io.aethernova.physical.v1";
+option objc_class_prefix   = "PIC";
+option optimize_for        = SPEED;
+
+// Встроенные типы времени/продолжительности
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// -----------------------------------------------------------------------------
+// БАЗОВЫЕ ЕНУМЫ И ОБЩИЕ ТИПЫ
+// -----------------------------------------------------------------------------
+
+// Класс данных в сообщении телеметрии
+enum DataClass {
+  DATA_CLASS_UNSPECIFIED = 0;
+  DATA_CLASS_MEASUREMENT = 1;
+  DATA_CLASS_HEALTH      = 2;
+  DATA_CLASS_METRIC      = 3;
+  DATA_CLASS_EVENT       = 4;
+  DATA_CLASS_CONTROL     = 5; // для серверных команд (в ServerMessage)
+}
+
+// Тип сенсора (для маршрутизации и валидации)
+enum SensorKind {
+  SENSOR_KIND_UNSPECIFIED = 0;
+  SENSOR_TEMPERATURE      = 1;
+  SENSOR_PRESSURE         = 2;
+  SENSOR_ACCEL            = 3;
+  SENSOR_GYRO             = 4;
+  SENSOR_MAGNET           = 5;
+  SENSOR_LIDAR            = 6;
+  SENSOR_POWER            = 7;
+  SENSOR_NETWORK          = 8;
+  SENSOR_CUSTOM           = 32; // расширяемая зона
+}
+
+// Единицы измерения: рекомендуется UCUM (https://ucum.org). Чтобы не «цементировать» все коды,
+// допускаем свободную строку unit_ucum + семантику конкретного измерения.
+enum MetricType {
+  METRIC_TYPE_UNSPECIFIED = 0;
+  METRIC_GAUGE            = 1;
+  METRIC_COUNTER          = 2;
+  METRIC_HISTOGRAM        = 3;
+  METRIC_SUMMARY          = 4;
+}
+
+// Уровень качества/достоверности выборки
+enum Quality {
+  QUALITY_UNSPECIFIED = 0;
+  QUALITY_GOOD        = 1;
+  QUALITY_DEGRADED    = 2;
+  QUALITY_BAD         = 3;
+}
+
+// Уровень важности событий
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO        = 1;
+  SEVERITY_WARNING     = 2;
+  SEVERITY_ERROR       = 3;
+  SEVERITY_CRITICAL    = 4;
+}
+
+// Состояние здоровья устройства/агента
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTH_OK                 = 1;
+  HEALTH_DEGRADED           = 2;
+  HEALTH_FAILING            = 3;
+}
+
+// Подпись источника/устройства
+message Identity {
+  string tenant_id       = 1;  // опционально: многотенантность
+  string site_id         = 2;  // объект/цех/лаборатория
+  string device_id       = 3;  // уникальный ID устройства
+  string model           = 4;  // модель сенсора/устройства
+  string hw_revision     = 5;  // аппаратная ревизия
+  string fw_version      = 6;  // прошивка
+  string agent_version   = 7;  // версия агента телеметрии
+  map<string, string> labels = 12; // доп. метки для маршрутизации/поиска
+  // reserved для будущего расширения без ломки бинарной совместимости
+  reserved 8, 9, 10, 11, 13, 14, 15;
+}
+
+// Универсальный ключ-значение для метаданных/атрибутов
+message Attribute {
+  string key   = 1;
+  string value = 2;
+}
+
+// -----------------------------------------------------------------------------
+// ПОЛЕЗНАЯ НАГРУЗКА И ИЗМЕРЕНИЯ
+// -----------------------------------------------------------------------------
+
+message Temperature {
+  double value        = 1;   // в градусах Цельсия
+  string unit_ucum    = 2;   // "Cel" (UCUM)
+  Quality quality     = 3;
+  double bias_applied = 4;   // применённый bias (если калибровка на борту)
+  double scale_applied= 5;   // применённый scale
+  // reserved для эволюции
+  reserved 6, 7, 8;
+}
+
+message Pressure {
+  double value      = 1;     // кПа
+  string unit_ucum  = 2;     // "kPa"
+  Quality quality   = 3;
+  // reserved
+  reserved 4, 5, 6;
+}
+
+// Векторные измерения
+message Vector3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message Accel {
+  Vector3 value          = 1; // м/с^2
+  string unit_ucum       = 2; // "m/s2"
+  Quality quality        = 3;
+  Vector3 bias_applied   = 4;
+  // Матрица кросс-осевой компенсации в ряд-майор 3x3
+  repeated double cross_axis_matrix = 5 [packed = true]; // длина 9
+}
+
+message Gyro {
+  Vector3 value        = 1;   // град/с
+  string unit_ucum     = 2;   // "deg/s"
+  Quality quality      = 3;
+  Vector3 bias_applied = 4;
+}
+
+message Magnet {
+  Vector3 value      = 1;     // микротесла
+  string unit_ucum   = 2;     // "uT"
+  Quality quality    = 3;
+}
+
+message LidarScan {
+  // Упорядоченные по углу дальности (м). Для компактности float.
+  repeated float ranges_m     = 1 [packed = true];
+  float angle_start_rad       = 2;
+  float angle_step_rad        = 3;
+  uint32 beams                = 4;
+  Quality quality             = 5;
+  // При необходимости — компрессия на транспортном уровне (например, гзип кадра)
+  // или сегментация на несколько Telemetry.
+}
+
+// Питание/энергетика
+message PowerSample {
+  double voltage_v    = 1;
+  double current_a    = 2;
+  double power_w      = 3;
+  Quality quality     = 4;
+}
+
+// Сетевые показатели
+message NetworkSample {
+  double rtt_ms       = 1;
+  double loss_ratio   = 2;
+  double throughput_mbps = 3;
+  Quality quality     = 4;
+}
+
+// Универсальная метрика (для оперативных показателей агента/приложений)
+message Metric {
+  string   name              = 1;   // e.g. "calibration_apply_latency_ms"
+  MetricType type            = 2;
+  double   value             = 3;   // GAUGE/COUNTER основное значение
+  string   unit_ucum         = 4;   // "ms", "1", "Cel", ...
+  map<string, string> labels = 5;   // labelset
+  // Histogram/summary поля (опционально)
+  repeated double buckets_upper_bound = 10 [packed = true];
+  repeated uint64 buckets_count       = 11 [packed = true];
+  double   sample_sum                 = 12;
+  uint64   sample_count               = 13;
+  // reserved
+  reserved 6,7,8,9,14,15;
+}
+
+// События с уровнем важности
+message Event {
+  Severity severity  = 1;
+  string   code      = 2; // машинно-читаемый код
+  string   message   = 3; // человеко‑читаемое сообщение
+  map<string, string> context = 4;
+  // reserved
+  reserved 5, 6, 7;
+}
+
+// Здоровье устройства/агента
+message Health {
+  HealthStatus status = 1;
+  double cpu_utilization_percent = 2;
+  double mem_utilization_percent = 3;
+  double disk_utilization_percent = 4;
+  double battery_soc_percent = 5; // если есть
+  // Температура корпуса/SoC:
+  double board_temp_c = 6;
+  // reserved
+  reserved 7, 8, 9, 10;
+}
+
+// -----------------------------------------------------------------------------
+// ОСНОВНОЕ СООБЩЕНИЕ ТЕЛЕМЕТРИИ И БАТЧИРОВАНИЕ
+// -----------------------------------------------------------------------------
+
+message Telemetry {
+  // Глобальные поля
+  google.protobuf.Timestamp ts   = 1; // время измерения на источнике
+  uint64 sequence                = 2; // монотонный seq источника (для ack/retx)
+  SensorKind kind                = 3; // тип сенсора, помогает маршрутизации
+  DataClass class                = 4; // класс полезной нагрузки (measurement/health/metric/event)
+  // Атрибуты для тонкой фильтрации/обогащения
+  map<string, string> attributes = 5;
+
+  // Полезная нагрузка
+  oneof payload {
+    Temperature temperature = 10;
+    Pressure    pressure    = 11;
+    Accel       accel       = 12;
+    Gyro        gyro        = 13;
+    Magnet      magnet      = 14;
+    LidarScan   lidar       = 15;
+    PowerSample power       = 16;
+    NetworkSample network   = 17;
+    Metric      metric      = 18;
+    Event       event       = 19;
+    Health      health      = 20;
+  }
+
+  // reserved под будущее расширение
+  reserved 6,7,8,9, 21,22,23,24,25,26,27,28,29;
+}
+
+// Контейнер батча для эффективной передачи
+message TelemetryBatch {
+  Identity identity                = 1; // кто отправил
+  google.protobuf.Timestamp sent_at = 2; // когда отправлено
+  string calibration_revision      = 3; // активная ревизия калибровки
+  repeated Attribute meta          = 4; // произвольные метаданные сессии
+  // Непосредственно события/измерения
+  repeated Telemetry items         = 10;
+  // Транспортные флаги
+  bool compressed                  = 20; // признак сжатия уровня транспорта (например, gzip на body)
+  string compression               = 21; // "gzip","zstd",...
+  // reserved
+  reserved 5,6,7,8,9, 11,12,13,14,15,16,17,18,19, 22,23,24,25;
+}
+
+// Сердцебиение/keepalive на клиенте
+message Heartbeat {
+  Identity identity                = 1;
+  google.protobuf.Timestamp ts     = 2;
+  uint64 last_sequence             = 3;
+}
+
+// Подтверждение приёма
+message Ack {
+  string device_id = 1;
+  uint64 ack_sequence = 2; // последний принятый seq (включительно)
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    CODE_OK          = 1;
+    CODE_RETRY       = 2; // сервер просит повторить (может указать диапазон)
+    CODE_ERROR       = 3;
+  }
+  Code code = 3;
+  string error_message = 4;
+  // Запрос ретрансляции (опционально)
+  uint64 resend_from_sequence = 5; // начиная с (включительно)
+  // reserved
+  reserved 6,7,8,9,10;
+}
+
+// Команды управления потоком/конфигурацией от сервера к клиенту
+message Control {
+  message ChangeRate {
+    string stream = 1;                // имя/тип потока (e.g. "telemetry")
+    uint32 target_hz = 2;             // целевая частота
+    google.protobuf.Duration ttl = 3; // срок действия
+  }
+  message RequestResend {
+    uint64 from_sequence = 1;
+    uint64 to_sequence   = 2; // 0 = до текущего
+  }
+  message UpdateConfig {
+    string config_uri = 1; // где взять новую конфигурацию/калибровку (e.g. s3://…)
+    string sha256     = 2; // контрольная сумма
+  }
+  oneof command {
+    ChangeRate change_rate   = 1;
+    RequestResend resend     = 2;
+    UpdateConfig update_cfg  = 3;
+  }
+}
+
+// Обёртки сообщений для двунаправленного стрима
+message ClientMessage {
+  oneof kind {
+    TelemetryBatch batch = 1;
+    Heartbeat      hb    = 2;
+  }
+}
+
+message ServerMessage {
+  oneof kind {
+    Ack     ack     = 1;
+    Control control = 2;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// gRPC‑СЕРВИСЫ
+// -----------------------------------------------------------------------------
+
+service TelemetryIngress {
+  // Основной двунаправленный канал: клиент отправляет батчи и heartbeats,
+  // сервер подтверждает, управляет частотой и может запрашивать ретрансляцию.
+  rpc Stream (stream ClientMessage) returns (stream ServerMessage);
+
+  // Однонаправленная загрузка батча (альтернатива стриму для edge‑кейсов).
+  rpc Ingest (TelemetryBatch) returns (Ack);
+}
+
+// Опциональный сервис для инспекции/диагностики канала (не обязателен для продакшна).
+service TelemetryIntrospection {
+  // Возврат активной схемы и политики (например, для агента на борту)
+  rpc GetPolicy (Identity) returns (Policy);
+
+  // Запросить последние принятые последовательности по устройству.
+  rpc GetWatermark (Identity) returns (Watermark);
+}
+
+// Политики/водяные знаки — вспомогательные типы
+message Policy {
+  string schema_version              = 1; // "physical.v1/telemetry.proto@<git-rev>"
+  map<string, string> ingest_limits = 2; // e.g. "max_batch_bytes":"1048576"
+  map<string, string> labels        = 3; // общие метки к приклеиванию
+  // reserved
+  reserved 4,5,6;
+}
+
+message Watermark {
+  string device_id    = 1;
+  uint64 ack_sequence = 2;
+  google.protobuf.Timestamp updated_at = 3;
+}

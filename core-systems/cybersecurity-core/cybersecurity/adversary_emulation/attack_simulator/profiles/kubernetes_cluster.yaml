@@ -1,0 +1,437 @@
+apiVersion: adversary.simulator.aethernova/v1
+kind: AttackProfile
+metadata:
+  id: "k8s-cluster-composite-v1"
+  name: "Kubernetes Cluster – Composite Adversary Emulation (Safe-by-default)"
+  version: "1.0.0"
+  owner: "cybersecurity-core/adversary_emulation"
+  created: "2025-09-05"
+  labels:
+    platform: "kubernetes"
+    mitre_matrix: "containers"
+    safety_default: "server-side-dry-run"
+  annotations:
+    # MITRE ATT&CK (Containers/Enterprise) references:
+    # T1610 Deploy Container — https://attack.mitre.org/techniques/T1610/
+    # T1611 Escape to Host — https://attack.mitre.org/techniques/T1611/
+    # T1613 Container and Resource Discovery — https://attack.mitre.org/techniques/T1613/
+    # T1543.005 Create or Modify System Process: Container Service (DaemonSet) — https://attack.mitre.org/techniques/T1543/005/
+    # T1496 Resource Hijacking (cryptomining, etc.) — https://attack.mitre.org/techniques/T1496/
+    # T1041 Exfiltration Over C2 Channel (поведенческий шаблон) — https://attack.mitre.org/techniques/T1041/
+    # Containers matrix overview — https://attack.mitre.org/matrices/enterprise/containers/
+    #
+    # Kubernetes references:
+    # Audit logging — https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/
+    # API Concepts (dryRun=All guarantees) — https://kubernetes.io/docs/reference/using-api/api-concepts/
+    # kubectl usage & --dry-run — https://kubernetes.io/docs/reference/kubectl/conventions/
+    # Server-Side Apply — https://kubernetes.io/docs/reference/using-api/server-side-apply/
+    # RBAC — https://kubernetes.io/docs/reference/access-authn-authz/rbac/
+    # Kubelet authZ/authN — https://kubernetes.io/docs/reference/access-authn-authz/kubelet-authn-authz/
+    # Ports & Protocols (10250 Kubelet API) — https://kubernetes.io/docs/reference/networking/ports-and-protocols/
+    # NetworkPolicy (default deny egress/ingress) — https://kubernetes.io/docs/concepts/services-networking/network-policies/
+
+safety:
+  require_confirmation_for_apply: true
+  dangerous_actions: false             # По умолчанию ТОЛЬКО dry-run (без изменений)
+  dry_run_strategy: "server"           # server-side dry-run гарантирует отсутствие побочных эффектов
+  allowed_namespaces:
+    - "attack-sim"
+    - "security-lab"
+  deny_on_production_label: true       # запрещает выполнение, если у кластера/namespace метка env=prod
+  max_runtime_seconds: 1800
+  rate_limits:
+    kubectl_calls_per_minute: 60
+  cleanup:
+    auto_cleanup_after_apply: true
+    grace_period_seconds: 10
+
+environment:
+  cluster_context: "{{ env.KUBECONFIG_CONTEXT | default('kind-attack-sim') }}"
+  namespace: "{{ env.K8S_NAMESPACE | default('attack-sim') }}"
+  image_registry: "{{ env.IMAGE_REGISTRY | default('registry.k8s.io') }}"
+  benign_test_image: "{{ env.BENIGN_IMAGE | default('registry.k8s.io/pause:3.9') }}"
+  service_account_name: "attack-sim-sa"
+  labels:
+    app: "attack-sim"
+    owner: "cybersecurity-core"
+    purpose: "telemetry-only"
+  resources:
+    cpu: "50m"
+    memory: "64Mi"
+
+prechecks:
+  - id: "precheck-audit-enabled"
+    description: "Проверка включенного Kubernetes Audit"
+    check:
+      type: "shell"
+      tool: "kubectl"
+      args: ["get", "apiserver", "-n", "kube-system", "-o", "yaml"]
+    expect:
+      notes: "В управляемых кластерах провайдер может скрывать манифест apiserver; при отсутствии — проверить внешней документацией/конфигурацией."
+    references:
+      - "https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/"
+
+  - id: "precheck-namespace"
+    description: "Проверка/создание namespace (dry-run при dangerous_actions=false)"
+    manifest:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ .environment.namespace }}"
+        labels: { env: "lab", app: "attack-sim" }
+    exec:
+      tool: "kubectl"
+      action: "apply"
+      flags:
+        server_side_apply: true
+        dry_run: "{{ not .safety.dangerous_actions }}"
+        force_conflicts: true
+
+  - id: "precheck-rbac"
+    description: "Минимальный serviceAccount + Role/RoleBinding для чтения core/list/watch (namespace-scoped)"
+    manifests:
+      - apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: "{{ .environment.service_account_name }}"
+          namespace: "{{ .environment.namespace }}"
+          labels: *labels
+      - apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata:
+          name: "attack-sim-reader"
+          namespace: "{{ .environment.namespace }}"
+        rules:
+          - apiGroups: [""]
+            resources: ["pods","pods/log","namespaces","configmaps"]
+            verbs: ["get","list","watch"]
+          - apiGroups: ["apps"]
+            resources: ["deployments","daemonsets","replicasets","statefulsets"]
+            verbs: ["get","list","watch"]
+      - apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata:
+          name: "attack-sim-reader-binding"
+          namespace: "{{ .environment.namespace }}"
+        subjects:
+          - kind: ServiceAccount
+            name: "{{ .environment.service_account_name }}"
+            namespace: "{{ .environment.namespace }}"
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: Role
+          name: "attack-sim-reader"
+    exec:
+      tool: "kubectl"
+      action: "apply"
+      flags:
+        server_side_apply: true
+        dry_run: "{{ not .safety.dangerous_actions }}"
+    references:
+      - "https://kubernetes.io/docs/reference/access-authn-authz/rbac/"
+      - "https://kubernetes.io/docs/concepts/security/rbac-good-practices/"
+
+stages:
+  - id: "stage-1-discovery"
+    name: "Discovery (T1613) — безопасный read-only сбор контекста"
+    tactic: "Discovery"
+    techniques: ["T1613"]
+    steps:
+      - id: "disc-1"
+        description: "Список узлов, версий, API-ресурсов (kubectl get/ api-resources)"
+        run:
+          - ["kubectl","--context","{{ .environment.cluster_context }}","get","nodes","-o","wide"]
+          - ["kubectl","--context","{{ .environment.cluster_context }}","api-resources","--verbs=list","-o","name"]
+        expected_artifacts:
+          audit_events:
+            - verb: "list"
+              resource: "nodes"
+              stage: "RequestReceived"
+          notes: "События в Kubernetes Audit Logs должны отражать list/get операции."
+        references:
+          - "https://attack.mitre.org/techniques/T1613/"
+          - "https://kubernetes.io/docs/tasks/debug/"
+
+      - id: "disc-2"
+        description: "Read-only инвентаризация в namespace"
+        run:
+          - ["kubectl","-n","{{ .environment.namespace }}","get","pods","-o","json"]
+          - ["kubectl","-n","{{ .environment.namespace }}","get","deploy,ds,sts,rs","-o","wide"]
+        expected_artifacts:
+          audit_events:
+            - verb: "get"
+              resource: "pods"
+        references:
+          - "https://attack.mitre.org/techniques/T1613/"
+
+  - id: "stage-2-execution"
+    name: "Execution (T1610) — безопасная имитация развёртывания контейнера"
+    tactic: "Execution"
+    techniques: ["T1610"]
+    steps:
+      - id: "exec-1-job-dry-run"
+        description: "Создание безвредной Job (server-side dry-run) для генерации валидных аудитов"
+        manifest:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "attack-sim-job"
+            namespace: "{{ .environment.namespace }}"
+            labels: &labels
+              app: "attack-sim"
+              stage: "execution"
+          spec:
+            backoffLimit: 0
+            template:
+              metadata:
+                labels: *labels
+              spec:
+                serviceAccountName: "{{ .environment.service_account_name }}"
+                restartPolicy: Never
+                containers:
+                  - name: sim
+                    image: "{{ .environment.benign_test_image }}"
+                    command: ["sh","-c","echo attack-sim && sleep 1"]
+                    resources:
+                      requests: { cpu: "{{ .environment.resources.cpu }}", memory: "{{ .environment.resources.memory }}" }
+                      limits:   { cpu: "{{ .environment.resources.cpu }}", memory: "{{ .environment.resources.memory }}" }
+        exec:
+          tool: "kubectl"
+          action: "apply"
+          flags:
+            server_side_apply: true
+            dry_run: "{{ not .safety.dangerous_actions }}"
+        expected_artifacts:
+          audit_events:
+            - verb: "create"
+              resource: "jobs"
+          notes: "При dry-run объект не сохраняется (API guarantees)."
+        references:
+          - "https://attack.mitre.org/techniques/T1610/"
+          - "https://kubernetes.io/docs/reference/using-api/api-concepts/"
+          - "https://kubernetes.io/docs/reference/kubectl/conventions/"
+
+      - id: "exec-2-job-apply-optional"
+        description: "Фактическое создание Job (ТОЛЬКО при dangerous_actions=true)"
+        condition: "{{ .safety.dangerous_actions }}"
+        reuse_manifest_from: "exec-1-job-dry-run"
+        exec:
+          tool: "kubectl"
+          action: "apply"
+          flags:
+            server_side_apply: true
+            dry_run: false
+
+  - id: "stage-3-persistence"
+    name: "Persistence (T1543.005) — DaemonSet/CronJob, безопасная имитация"
+    tactic: "Persistence"
+    techniques: ["T1543.005"]
+    steps:
+      - id: "pers-1-daemonset-dry-run"
+        description: "DaemonSet (dry-run) для телеметрии создания контроллера на всех нодах"
+        manifest:
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: "attack-sim-ds"
+            namespace: "{{ .environment.namespace }}"
+            labels: *labels
+          spec:
+            selector: { matchLabels: *labels }
+            template:
+              metadata: { labels: *labels }
+              spec:
+                serviceAccountName: "{{ .environment.service_account_name }}"
+                containers:
+                  - name: sim
+                    image: "{{ .environment.benign_test_image }}"
+                    command: ["sh","-c","echo daemonset-telemetry && sleep 10"]
+                    resources:
+                      requests: { cpu: "{{ .environment.resources.cpu }}", memory: "{{ .environment.resources.memory }}" }
+                      limits:   { cpu: "{{ .environment.resources.cpu }}", memory: "{{ .environment.resources.memory }}" }
+        exec:
+          tool: "kubectl"
+          action: "apply"
+          flags:
+            server_side_apply: true
+            dry_run: "{{ not .safety.dangerous_actions }}"
+        expected_artifacts:
+          audit_events:
+            - verb: "create"
+              resource: "daemonsets"
+        references:
+          - "https://attack.mitre.org/techniques/T1543/005/"
+
+      - id: "pers-2-cronjob-dry-run"
+        description: "CronJob (dry-run) как имитация периодической активности"
+        manifest:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: "attack-sim-cj"
+            namespace: "{{ .environment.namespace }}"
+            labels: *labels
+          spec:
+            schedule: "*/30 * * * *"
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    serviceAccountName: "{{ .environment.service_account_name }}"
+                    restartPolicy: Never
+                    containers:
+                      - name: sim
+                        image: "{{ .environment.benign_test_image }}"
+                        command: ["sh","-c","date && echo cron-telemetry && sleep 1"]
+                        resources:
+                          requests: { cpu: "{{ .environment.resources.cpu }}", memory: "{{ .environment.resources.memory }}" }
+                          limits:   { cpu: "{{ .environment.resources.cpu }}", memory: "{{ .environment.resources.memory }}" }
+        exec:
+          tool: "kubectl"
+          action: "apply"
+          flags:
+            server_side_apply: true
+            dry_run: "{{ not .safety.dangerous_actions }}"
+        references:
+          - "https://attack.mitre.org/techniques/T1543/005/"
+
+  - id: "stage-4-resource-hijacking-sim"
+    name: "Resource Hijacking (T1496) — безопасная имитация"
+    tactic: "Impact"
+    techniques: ["T1496"]
+    steps:
+      - id: "rh-1-deployment-dry-run"
+        description: "Deployment (dry-run) с метками как индикатор потенциального майнинга; без реальной нагрузки"
+        manifest:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "attack-sim-rh"
+            namespace: "{{ .environment.namespace }}"
+            labels:
+              <<: *labels
+              sim.behavior: "crypto-mining-pattern"
+          spec:
+            replicas: 1
+            selector: { matchLabels: *labels }
+            template:
+              metadata: { labels: *labels }
+              spec:
+                serviceAccountName: "{{ .environment.service_account_name }}"
+                containers:
+                  - name: sim
+                    image: "{{ .environment.benign_test_image }}"
+                    command: ["sh","-c","echo pretend-heavy && sleep 5"]
+                    resources:
+                      requests: { cpu: "10m", memory: "16Mi" }
+                      limits:   { cpu: "20m", memory: "32Mi" }
+        exec:
+          tool: "kubectl"
+          action: "apply"
+          flags:
+            server_side_apply: true
+            dry_run: "{{ not .safety.dangerous_actions }}"
+        references:
+          - "https://attack.mitre.org/techniques/T1496/"
+
+  - id: "stage-5-exfiltration-sim"
+    name: "Exfiltration Over C2 (T1041) — поведенческая имитация через сетевые политики и маркеры"
+    tactic: "Exfiltration"
+    techniques: ["T1041"]
+    steps:
+      - id: "exf-1-networkpolicy-default-deny-egress-dry-run"
+        description: "Создать (dry-run) NetworkPolicy default-deny egress — для теста детектов обхода/попыток"
+        manifest:
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: "np-default-deny-egress"
+            namespace: "{{ .environment.namespace }}"
+            labels: *labels
+          spec:
+            podSelector: {}
+            policyTypes: ["Egress"]
+        exec:
+          tool: "kubectl"
+          action: "apply"
+          flags:
+            server_side_apply: true
+            dry_run: "{{ not .safety.dangerous_actions }}"
+        references:
+          - "https://kubernetes.io/docs/concepts/services-networking/network-policies/"
+      - id: "exf-2-configmap-marker-dry-run"
+        description: "Создать маркер-ConfigMap (dry-run) как индикатор попытки экспорта (без данных)"
+        manifest:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "attack-sim-exf-marker"
+            namespace: "{{ .environment.namespace }}"
+            labels:
+              <<: *labels
+              sim.tactic: "exfiltration"
+          data:
+            marker: "no-data-exfiltrated"
+        exec:
+          tool: "kubectl"
+          action: "apply"
+          flags:
+            server_side_apply: true
+            dry_run: "{{ not .safety.dangerous_actions }}"
+        references:
+          - "https://attack.mitre.org/techniques/T1041/"
+
+  - id: "stage-6-kubelet-surface-check"
+    name: "Kubelet surface — ожидаемая телеметрия и порты"
+    notes: "Шаг не выполняет операции; фиксирует ожидания по логам/портам для правил детекта."
+    expectations:
+      ports:
+        - port: 10250
+          purpose: "Kubelet API"
+          references:
+            - "https://kubernetes.io/docs/reference/networking/ports-and-protocols/"
+            - "https://kubernetes.io/docs/reference/access-authn-authz/kubelet-authn-authz/"
+      detections:
+        - source: "Kubernetes Audit Logs, Kubelet logs"
+          description: "Необычные обращения к kubelet API, вызовы из Pod-сети, попытки exec/metrics без авторизации"
+          references:
+            - "https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/"
+
+detections_and_artifacts:
+  audit_log_expectations:
+    - description: "create (dry-run) Job/DaemonSet/CronJob/NetworkPolicy"
+      verbs: ["create"]
+      resources: ["jobs","daemonsets","cronjobs","networkpolicies"]
+      notes: "При server-side dry-run объект не сохраняется, но проходит валидацию admission; события могут логироваться в зависимости от политики аудита."
+      references:
+        - "https://kubernetes.io/docs/reference/using-api/api-concepts/"
+        - "https://kubernetes.io/docs/tasks/debug/debug-cluster/audit/"
+  kube_events:
+    - reason: "DryRun"
+      note: "Некоторые контроллеры могут не создавать Events при dry-run; ориентируйтесь на Audit."
+  labels_to_watch:
+    - "app=attack-sim"
+    - "sim.behavior=crypto-mining-pattern"
+    - "stage=execution"
+
+rollbacks:
+  # Для всех ресурсов используются server-side apply + имя и метки — удаление безопасно.
+  enabled: true
+  rules:
+    - selector:
+        namespace: "{{ .environment.namespace }}"
+        labels:
+          app: "attack-sim"
+      actions:
+        - tool: "kubectl"
+          action: "delete"
+          kinds: ["job","cronjob","daemonset","deployment","configmap","networkpolicy"]
+          flags:
+            ignore_not_found: true
+            wait: true
+            timeout_seconds: 20
+
+notes:
+  - "По умолчанию профиль не модифицирует кластер (server-side dry-run). Для фактического развёртывания отдельных шагов установите safety.dangerous_actions=true и подтвердите выполнение."
+  - "RBAC выдаётся минимальный (read-only) в пределах namespace; расширение прав — ТОЛЬКО в изолированном стенде."
+  - "Используйте NetworkPolicy default-deny, чтобы тестировать корректность телеметрии эксфильтрации без генерации реального трафика."

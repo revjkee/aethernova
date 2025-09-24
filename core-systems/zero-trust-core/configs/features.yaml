@@ -1,0 +1,329 @@
+# zero-trust-core/configs/features.yaml
+schema_version: 1.2
+meta:
+  service: zero-trust-core
+  description: >
+    Единый реестр фич и политик Zero Trust. Безопасные дефолты, контролируемые выкаты,
+    атомарные «килл‑свитчи», таргетинг по окружениям/тенантам/рискам/устройствам.
+  owners:
+    - team: "platform-security"
+      contacts: ["sec-oncall@corp.local", "slack:#sec-core"]
+  change_control:
+    require_code_review: true
+    required_approvers: ["platform-security", "compliance"]
+    ticket_regex: "^SEC-[0-9]+$"
+  rollout_policies:
+    default_strategy: "progressive"   # progressive | instant
+    default_wave_minutes: 30
+    default_guardrails:
+      max_error_budget_bps: 50       # базовые перешивки на 10k rps = 0.5%
+      auto_rollback: true
+      observe_minutes_before_next_wave: 15
+
+defaults: &defaults
+  state: "off"                       # on | off | shadow (логировать, но не применять)
+  kill_switch: false                 # аварийное отключение поверх всего
+  description: ""
+  tags: []
+  depends_on: []                     # список ключей, которые должны быть включены
+  constraints:
+    # Базовые ограничения — применяются даже когда flag on
+    allow_in_envs: ["prod", "staging", "dev"]
+    risk_score_max: 0.35             # 0..1 (чем выше — рискованнее)
+    device_posture:                  # мягкая проверка — см. hard_requirements ниже
+      min_os_level:
+        ios: "15.0"
+        android: "12"
+        macos: "12.6"
+        windows: "10.0.19045"
+  hard_requirements:
+    mfa_required: false
+    mtls_required: false
+    compliant_device_only: false     # требовать MDM/Attestation
+  schedule: null                     # cron-like: "0 3 * * *" или ISO8601 окно
+  expires: null                      # RFC3339, после даты принудительно off
+  variants: null                     # для A/B: {A: 50, B: 50}
+  evaluation_order: 1000             # чем меньше — тем выше приоритет
+  telemetry:
+    emit_decisions: true
+    pii_masking: "strict"            # off | basic | strict
+
+environments:
+  prod:
+    evaluation:
+      order_bias: -100               # смещение приоритета для прод
+    overrides: {}
+  staging:
+    evaluation:
+      order_bias: -50
+    overrides: {}
+  dev:
+    evaluation:
+      order_bias: 0
+    overrides: {}
+
+audiences:
+  # Предопределенные аудитории таргетинга
+  high_risk: { risk_score_min: 0.35 }
+  internal_admins: { principal_groups: ["admins", "sec-core"] }
+  mobile_only: { device_types: ["ios", "android"] }
+  web_only: { client_types: ["browser"] }
+
+flags:
+  # ===================== КИЛЛ-СВИТЧИ =====================
+  core_global_kill:
+    <<: *defaults
+    description: "Глобальный аварийный выключатель Zero Trust ядра"
+    state: "off"
+    kill_switch: true
+    evaluation_order: 1
+
+  auth_global_kill:
+    <<: *defaults
+    description: "Аварийный выключатель подсистем аутентификации/авторизации"
+    state: "off"
+    kill_switch: true
+    evaluation_order: 2
+
+  # ===================== БАЗОВЫЕ ТРЕБОВАНИЯ ZT =====================
+  zt_require_mtls:
+    <<: *defaults
+    description: "Требовать mTLS на всех входящих транспортных каналах"
+    state: "on"
+    hard_requirements:
+      mtls_required: true
+    constraints:
+      allow_in_envs: ["prod", "staging"]
+    evaluation_order: 10
+
+  zt_require_mfa_step_up:
+    <<: *defaults
+    description: "Step-up MFA при действиях повышенного риска"
+    state: "on"
+    hard_requirements:
+      mfa_required: true
+    schedule: null
+    evaluation_order: 20
+
+  zt_enforce_device_posture:
+    <<: *defaults
+    description: "Жесткое требование соответствия устройства (MDM/Attestation)"
+    state: "on"
+    hard_requirements:
+      compliant_device_only: true
+    constraints:
+      device_posture:
+        min_os_level:
+          ios: "16.0"
+          android: "13"
+          macos: "13.0"
+          windows: "10.0.19045"
+    evaluation_order: 25
+
+  # ===================== АУТЕНТИФИКАЦИЯ/ТОКЕНЫ =====================
+  tokens_jwt_iss_aud_enforce:
+    <<: *defaults
+    description: "Строгое соответствие iss/aud в JWT, deny-by-default"
+    state: "on"
+    depends_on: ["zt_require_mtls"]
+    tags: ["jwt", "authn", "compliance"]
+    evaluation_order: 100
+
+  tokens_jwt_jti_replay_cache:
+    <<: *defaults
+    description: "Кэш детекции повторного воспроизведения JWT по jti"
+    state: "on"
+    telemetry: { emit_decisions: true, pii_masking: "strict" }
+    evaluation_order: 110
+
+  tokens_ocsp_must_staple:
+    <<: *defaults
+    description: "Требовать OCSP stapling для внешних TLS пиров"
+    state: "on"
+    constraints: {}
+    evaluation_order: 120
+
+  tokens_crl_fallback:
+    <<: *defaults
+    description: "CRL‑фоллбек при недоступности OCSP (soft-fail=off в prod)"
+    state: "on"
+    evaluation_order: 121
+    environments:
+      prod:
+        overrides:
+          tokens_crl_fallback:
+            telemetry: { emit_decisions: true }
+            # soft-fail управляется в сервисе проверок, флаг только включает CRL путь
+
+  # ===================== АВТОРИЗАЦИЯ (RBAC/ABAC/PBAC) =====================
+  authz_rbac_v2:
+    <<: *defaults
+    description: "Новый движок RBAC v2 с deny‑overrides и иерархиями"
+    state: "on"
+    evaluation_order: 200
+
+  authz_resource_patterns_glob:
+    <<: *defaults
+    description: "Сопоставление ресурсов по расширенным шаблонам (glob)"
+    state: "on"
+    evaluation_order: 210
+
+  authz_context_time_ip:
+    <<: *defaults
+    description: "Контекстные условия времени/IP для правил доступа"
+    state: "on"
+    evaluation_order: 220
+
+  # ===================== СЕТЕВАЯ ПОВЕРХНОСТЬ =====================
+  net_strict_cors_ws:
+    <<: *defaults
+    description: "Строгий CORS/WS origin allow‑list"
+    state: "on"
+    evaluation_order: 300
+    variants: null
+    constraints: {}
+    telemetry: { emit_decisions: true, pii_masking: "basic" }
+
+  net_ip_allowlist_admin:
+    <<: *defaults
+    description: "Allow‑list для административных эндпоинтов"
+    state: "on"
+    evaluation_order: 310
+
+  # ===================== БЕЗОПАСНАЯ КРИПТОГРАФИЯ =====================
+  kms_hsm_only_signing_keys:
+    <<: *defaults
+    description: "Только HSM‑backed ключи для подписания"
+    state: "on"
+    depends_on: ["zt_require_mtls"]
+    evaluation_order: 400
+
+  kms_key_rotation_auto:
+    <<: *defaults
+    description: "Автоматическая ротация ключей с grace‑периодом верификации"
+    state: "on"
+    evaluation_order: 410
+
+  # ===================== ДЕТЕКЦИЯ АНОМАЛИЙ/ЗАЩИТЫ =====================
+  td_anomaly_realtime:
+    <<: *defaults
+    description: "Онлайн‑детектор аномалий (EWMA/MAD/Mahalanobis)"
+    state: "on"
+    evaluation_order: 500
+    tags: ["threat-detection"]
+
+  shield_ratelimit_edge:
+    <<: *defaults
+    description: "RPS‑лимиты на edge‑шлюзах с деградацией до сервиса"
+    state: "on"
+    evaluation_order: 510
+
+  shield_waf_strict:
+    <<: *defaults
+    description: "Строгий режим WAF для высокорисковых аудиторий"
+    state: "shadow"            # наблюдаем влияние до принудительного включения
+    evaluation_order: 520
+    constraints:
+      risk_score_max: 1.0
+    variants: null
+
+  # ===================== ДАННЫЕ/ЛОГИРОВАНИЕ =====================
+  pii_masking_strict_logs:
+    <<: *defaults
+    description: "Строгое маскирование PII в журналах"
+    state: "on"
+    evaluation_order: 600
+    telemetry: { emit_decisions: true, pii_masking: "strict" }
+
+  audit_decisions_extended:
+    <<: *defaults
+    description: "Расширенная запись решения авторизации (Decision)"
+    state: "on"
+    evaluation_order: 610
+
+rollouts:
+  # Прогрессивные выкаты в процентах пользователей/запросов
+  - key: shield_waf_strict
+    strategy: progressive
+    waves:
+      - percent: 5
+        audience: "high_risk"
+        min_minutes: 30
+        guardrails: { max_error_budget_bps: 20, auto_rollback: true }
+      - percent: 25
+        audience: "internal_admins"
+        min_minutes: 60
+      - percent: 50
+        audience: "web_only"
+        min_minutes: 120
+      - percent: 100
+        audience: "*"
+        min_minutes: 180
+
+overrides:
+  # Переопределения по окружениям
+  env:
+    dev:
+      flags:
+        shield_waf_strict:
+          state: "off"
+        net_strict_cors_ws:
+          state: "on"
+        zt_require_mtls:
+          state: "off"   # только для локальных стендов с самоподписанными сертификатами
+    staging:
+      flags:
+        shield_waf_strict:
+          state: "shadow"
+        tokens_ocsp_must_staple:
+          state: "on"
+    prod:
+      flags:
+        core_global_kill:
+          state: "off"
+        zt_require_mtls:
+          state: "on"
+
+  # Переопределения по тенантам (customer/BU)
+  tenants:
+    acme:
+      flags:
+        authz_rbac_v2:
+          state: "on"
+        net_ip_allowlist_admin:
+          state: "on"
+    beta-customer:
+      flags:
+        shield_waf_strict:
+          state: "on"
+
+schedules:
+  # Окна включения/выключения (по UTC)
+  - key: zt_enforce_device_posture
+    windows:
+      - from: "2025-09-01T00:00:00Z"
+        to:   "2025-12-31T23:59:59Z"
+  - key: kms_key_rotation_auto
+    cron: "0 3 * * *"   # ежедневно в 03:00 UTC
+
+expirations:
+  - key: shield_waf_strict
+    expires: "2026-01-31T00:00:00Z"
+  - key: audit_decisions_extended
+    expires: "2027-01-01T00:00:00Z"
+
+validation:
+  # Правила валидации конфигурации при загрузке
+  require_owners: true
+  forbid_unknown_flags: true
+  deny_if_any_kill_switch_on: true
+  check_dependencies: true
+  reserved_prefixes: ["core_", "auth_", "zt_", "kms_", "net_", "td_", "shield_", "tokens_", "authz_", "pii_", "audit_"]
+  mandatory_in_prod: ["zt_require_mtls", "tokens_jwt_iss_aud_enforce", "kms_hsm_only_signing_keys", "pii_masking_strict_logs"]
+
+runtime_hints:
+  # Подсказки для клиента оценки флагов
+  consistency: "strong"       # strong | eventual
+  cache_ttl_seconds: 10
+  e2e_timeout_ms: 800
+  stale_ok_on_errors: true

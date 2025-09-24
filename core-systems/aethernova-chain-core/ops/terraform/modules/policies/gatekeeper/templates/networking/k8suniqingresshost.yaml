@@ -1,0 +1,140 @@
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8suniqueingresshost
+  annotations:
+    metadata.gatekeeper.sh/title: "Unique Ingress Host (Industrial)"
+    metadata.gatekeeper.sh/version: "1.1.0"
+    # Требуется синхронизация Ingress в data.inventory (см. Gatekeeper Sync/SyncSet)
+    metadata.gatekeeper.sh/requires-sync-data: |-
+      "[
+        [
+          { "groups": ["extensions"], "versions": ["v1beta1"], "kinds": ["Ingress"] },
+          { "groups": ["networking.k8s.io"], "versions": ["v1beta1","v1"], "kinds": ["Ingress"] }
+        ]
+      ]"
+    description: >-
+      Требует, чтобы все значения spec.rules[*].host у Ingress были уникальны во всём кластере.
+      Основано на официальном шаблоне Gatekeeper Library "Unique Ingress Host".
+      Для работы необходима репликация Ingress-объектов в инвентарь Gatekeeper.
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sUniqueIngressHost
+      validation:
+        # Параметры для тонкой настройки поведения политики
+        openAPIV3Schema:
+          type: object
+          properties:
+            parameters:
+              type: object
+              properties:
+                excludedNamespaces:
+                  description: "Список неймспейсов, которые исключаются из проверок."
+                  type: array
+                  items:
+                    type: string
+                additionalAllowedHosts:
+                  description: "Список хостов, которые считаются заведомо разрешёнными (не проверяются на уникальность)."
+                  type: array
+                  items:
+                    type: string
+                caseInsensitive:
+                  description: "Сравнение хостов без учёта регистра (по умолчанию true)."
+                  type: boolean
+                  default: true
+                ignoreWildcards:
+                  description: "Игнорировать хосты с подстановками, например *.example.com (по умолчанию false)."
+                  type: boolean
+                  default: false
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |-
+        package k8suniqueingresshost
+
+        # Совпадение текущего объекта с другим (для исключения самосравнения)
+        identical(obj, review) {
+          obj.metadata.namespace == review.object.metadata.namespace
+          obj.metadata.name == review.object.metadata.name
+        }
+
+        # Получение массива хостов у текущего Ingress
+        current_hosts := hosts_from_ingress(input.review.object)
+
+        hosts_from_ingress(obj) = out {
+          some i
+          rules := obj.spec.rules
+          out := [h | h := rules[i].host; h != ""]
+        } else = []  # если нет rules/host
+
+        # Проверка на wildcard
+        is_wildcard(h) {
+          contains(h, "*")
+        }
+
+        # Параметры с безопасными значениями по умолчанию
+        param_excluded_ns := {ns | ns := input.parameters.excludedNamespaces[_]} else := {}
+        param_allow := {h | h := input.parameters.additionalAllowedHosts[_]} else := {}
+        param_ci := input.parameters.caseInsensitive
+        param_ci_default := true
+        case_insensitive := (param_ci == true) or ( (param_ci == null) and param_ci_default )
+        ignore_wildcards := input.parameters.ignoreWildcards == true
+
+        normalize(h) = out {
+          case_insensitive
+          out := lower(h)
+        } else = h
+
+        # Источник инвентаря Gatekeeper (Ingress по всем API-версиям)
+        other_ingresses[obj] {
+          ns := data.inventory.namespace[_]
+          # В библиотеке Gatekeeper используется такой доступ к инвентарю:
+          # data.inventory.namespace[<ns>][<apiversion>]["Ingress"][<name>]
+          # Источник: Gatekeeper Library / Unique Ingress Host
+          apiver := other_apiver
+          regex.match("^(extensions/.+|networking\\.k8s\\.io/.+)$", apiver)
+          obj := ns[apiver]["Ingress"][name]
+          name := _
+          not identical(obj, input.review)
+        }
+
+        # Фильтр по excludedNamespaces
+        not_excluded(obj) {
+          ns := obj.metadata.namespace
+          not ns_included(ns, param_excluded_ns)
+        }
+        ns_included(ns, set) { set[ns] }
+
+        # Собрать все хосты из другого Ingress
+        other_hosts(obj) = out {
+          out := hosts_from_ingress(obj)
+        } else = []
+
+        # Условие: хост "интересен" для проверки
+        check_host(h) {
+          not param_allow[normalize(h)]
+          not (ignore_wildcards and is_wildcard(h))
+        }
+
+        # Основное правило нарушения:
+        # Для каждого хоста текущего Ingress ищем совпадение у любого другого Ingress во всех НС
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Ingress"
+          host := current_hosts[_]
+          check_host(host)
+
+          normalized := normalize(host)
+
+          some other
+          other := other_ingresses[other]
+          not_excluded(other)
+
+          other_host := other_hosts(other)[_]
+          normalized_other := normalize(other_host)
+
+          normalized_other == normalized
+
+          msg := sprintf("ingress host '%v' конфликтует с существующим Ingress %v/%v",
+                         [host, other.metadata.namespace, other.metadata.name])
+        }

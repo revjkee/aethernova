@@ -1,0 +1,143 @@
+---
+# =====================================================================
+# OmniMind Core — tasks/sysctl.yml
+# Применение системных параметров ядра из limits.sysctl (group_vars).
+# Требуется коллекция ansible.posix (ansible-galaxy collection install ansible.posix)
+# =====================================================================
+
+- name: "Guard | sysctl: feature flag enabled"
+  ansible.builtin.assert:
+    that:
+      - (feature_flags.configure_sysctl | default(true) | bool)
+    fail_msg: "feature_flags.configure_sysctl=false — применение sysctl отключено."
+    success_msg: "Sysctl тюнинг включен."
+  tags: [sysctl, hardening]
+
+- name: "Guard | sysctl: input dictionary provided"
+  ansible.builtin.assert:
+    that:
+      - limits is defined
+      - limits.sysctl is defined
+      - limits.sysctl | type_debug == 'dict'
+    fail_msg: "Ожидался словарь limits.sysctl в group_vars."
+    success_msg: "Найден словарь limits.sysctl."
+  tags: [sysctl, hardening]
+
+- name: "Detect environment | virtualization/container"
+  ansible.builtin.set_fact:
+    _omni_is_container: "{{ (ansible_virtualization_type | default('')) in ['docker','podman','lxc','containerd','systemd-nspawn'] }}"
+  tags: [sysctl]
+
+- name: "Define drop-in path for sysctl"
+  ansible.builtin.set_fact:
+    _omni_sysctl_dir: "/etc/sysctl.d"
+    _omni_sysctl_file: "/etc/sysctl.d/99-omnimind-core.conf"
+  tags: [sysctl]
+
+- name: "Ensure sysctl.d directory exists"
+  ansible.builtin.file:
+    path: "{{ _omni_sysctl_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags: [sysctl]
+
+# Отфильтруем записи: убираем пустые/none и ключи с недопустимыми символами.
+- name: "Prepare | sanitize sysctl entries"
+  ansible.builtin.set_fact:
+    _omni_sysctl_items: >-
+      {{
+        limits.sysctl
+        | dict2items
+        | selectattr('value', 'defined')
+        | rejectattr('value', 'equalto', None)
+        | selectattr('key', 'match', '^[a-z0-9_\\.]+$')
+        | list
+      }}
+  tags: [sysctl]
+
+# В контейнерах ряд параметров может быть запрещен — безопасно пропускаем.
+- name: "Prepare | container-safe filter"
+  ansible.builtin.set_fact:
+    _omni_sysctl_effective: >-
+      {% if _omni_is_container %}
+      {{
+        _omni_sysctl_items
+        | rejectattr('key', 'match', '^kernel\\.')
+        | rejectattr('key', 'match', '^vm\\.')
+        | rejectattr('key', 'match', '^fs\\.')
+        | list
+      }}
+      {% else %}
+      {{ _omni_sysctl_items }}
+      {% endif %}
+  tags: [sysctl]
+
+- name: "Debug | show ignored sysctl keys (container mode)"
+  ansible.builtin.debug:
+    msg:
+      ignored_keys: >-
+        {{
+          _omni_sysctl_items
+          | map(attribute='key')
+          | difference(_omni_sysctl_effective | map(attribute='key') | list)
+        }}
+  when: _omni_is_container
+  tags: [sysctl]
+  verbosity: 1
+
+# Применяем параметры. ansible.posix.sysctl одновременно пишет drop-in и ставит runtime-значение.
+- name: "Apply sysctl settings (runtime + persistent)"
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_set: true
+    reload: true
+    sysctl_file: "{{ _omni_sysctl_file }}"
+  loop: "{{ _omni_sysctl_effective }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+  register: _omni_sysctl_apply
+  failed_when: false      # не валим плей из-за одного неподдерживаемого параметра
+  tags: [sysctl]
+
+# Собираем ошибки (если были) и сообщаем единым блоком.
+- name: "Analyze sysctl application result"
+  ansible.builtin.set_fact:
+    _omni_sysctl_failed: >-
+      {{
+        (_omni_sysctl_apply.results | default([]))
+        | selectattr('failed', 'defined')
+        | selectattr('failed')
+        | list
+      }}
+  tags: [sysctl]
+
+- name: "Report | sysctl application summary"
+  ansible.builtin.debug:
+    msg:
+      changed: "{{ (_omni_sysctl_apply.results | selectattr('changed') | list | length) > 0 }}"
+      applied: "{{ _omni_sysctl_effective | map(attribute='key') | list }}"
+      failed_count: "{{ _omni_sysctl_failed | length }}"
+  tags: [sysctl]
+
+- name: "Fail if critical sysctl keys failed (non-container only)"
+  ansible.builtin.fail:
+    msg: >-
+      Критическая ошибка применения sysctl для ключей: {{
+        _omni_sysctl_failed | map(attribute='name') | list
+      }}. Проверьте права, ядро или совместимость параметров.
+  when:
+    - not _omni_is_container
+    - (_omni_sysctl_failed | length) > 0
+  tags: [sysctl]
+
+# Явная загрузка drop-in на системах без автоматического systemd-sysctl (редкие случаи).
+- name: "Force sysctl reload from drop-in (best-effort)"
+  ansible.builtin.shell: "sysctl --system >/dev/null 2>&1 || sysctl -p {{ _omni_sysctl_file }} >/dev/null 2>&1 || true"
+  args:
+    warn: false
+  changed_when: false
+  tags: [sysctl]

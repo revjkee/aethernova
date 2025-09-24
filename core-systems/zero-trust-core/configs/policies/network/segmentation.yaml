@@ -1,0 +1,396 @@
+# =============================================================================
+# Zero Trust Core — Network Segmentation Policy (production-grade)
+# Все переменные можно переопределять окружением: ${NAME:default}
+# =============================================================================
+apiVersion: zero-trust-core/v1
+kind: NetworkSegmentationPolicy
+metadata:
+  name: ${ZTC_SEGMENTATION_NAME:default-segmentation}
+  version: ${ZTC_SEGMENTATION_VERSION:1.0.0}
+  environment: ${SERVICE_ENV:prod}
+  region: ${SERVICE_REGION:eu-north-1}
+
+defaults:
+  # Жёсткая модель: запрещено всё, что не разрешено явно.
+  default_deny: true
+  # Обязательная криптографическая идентификация сервиса.
+  identity_required: true
+  # Требования к транспорту.
+  transport: &tls_strict
+    mtls_required: true
+    tls_min_version: TLSv1_2
+    allowed_ciphers:
+      - TLS_AES_256_GCM_SHA384
+      - TLS_CHACHA20_POLY1305_SHA256
+      - TLS_AES_128_GCM_SHA256
+    spiffe_trust_domain: ${SPIFFE_TRUST_DOMAIN:spiffe://corp.example}
+    spki_pins_b64: ${MTLS_SPKI_PINS_B64:}     # через запятую; опционально
+    sni_enforcement: true
+  # Базовые лимиты на соединения (защита от злоупотреблений).
+  rate_limits:
+    per_src_ip_per_min: 600
+    per_identity_per_min: 1200
+    connection_burst: 200
+
+# -----------------------------------------------------------------------------
+# Модель идентичности и селекторы
+# -----------------------------------------------------------------------------
+identity:
+  sources:
+    - type: spiffe
+      field: uri
+      required: true
+    - type: k8s_service_account
+      field: "k8s.sa"
+    - type: workload_labels
+      field: "k8s.labels"
+    - type: vm_tags
+      field: "vm.tags"
+  selectors:
+    # Удобные шаблоны для переиспользования
+    k8s: &sel_k8s
+      kind: "k8s"
+      namespace: ${K8S_NAMESPACE:prod}
+    tenant_label_key: "zt.tenant"
+    role_label_key: "zt.role"
+
+# -----------------------------------------------------------------------------
+# Зоны и уровни (tiers)
+# -----------------------------------------------------------------------------
+topology:
+  zones:
+    - id: internet
+      kind: external
+    - id: edge
+      kind: ingress
+    - id: dmz
+      kind: semi_trusted
+    - id: app
+      kind: trusted
+    - id: data
+      kind: restricted
+    - id: management
+      kind: restricted
+    - id: security
+      kind: restricted
+  # Якоря групп сервисов (для читабельности правил)
+  groups:
+    api_gateway: &grp_api
+      selector:
+        <<: *sel_k8s
+        labels:
+          "app.kubernetes.io/name": "api-gateway"
+          "zt.tier": "edge"
+    authn: &grp_authn
+      selector:
+        <<: *sel_k8s
+        labels: {"app": "authn", "zt.tier": "app"}
+    ui: &grp_ui
+      selector:
+        <<: *sel_k8s
+        labels: {"app": "ui", "zt.tier": "edge"}
+    worker: &grp_worker
+      selector:
+        <<: *sel_k8s
+        labels: {"app": "worker", "zt.tier": "app"}
+    db: &grp_db
+      selector:
+        <<: *sel_k8s
+        labels: {"app": "postgres", "zt.tier": "data"}
+    cache: &grp_cache
+      selector:
+        <<: *sel_k8s
+        labels: {"app": "redis", "zt.tier": "data"}
+    siem: &grp_siem
+      selector:
+        <<: *sel_k8s
+        labels: {"app": "siem-forwarder", "zt.tier": "security"}
+    otel: &grp_otel
+      selector:
+        <<: *sel_k8s
+        labels: {"app": "otel-collector", "zt.tier": "security"}
+    bastion: &grp_bastion
+      selector:
+        kind: "vm"
+        tags: {"role": "bastion"}
+    mgmt_api: &grp_mgmt
+      selector:
+        <<: *sel_k8s
+        labels: {"app": "mgmt-api", "zt.tier": "management"}
+
+# -----------------------------------------------------------------------------
+# Тенант‑изоляция
+# -----------------------------------------------------------------------------
+tenancy:
+  isolation_mode: strict           # strict|soft
+  # Правило межтенантного запрета по умолчанию
+  default_rule:
+    deny_cross_tenant: true
+  # Исключения (точечные) при необходимости
+  exceptions: []
+  labeling:
+    tenant_label_key: "zt.tenant"
+    propagate_to_headers:
+      - "x-tenant-id"
+
+# -----------------------------------------------------------------------------
+# Каталоги портов/протоколов для переиспользования
+# -----------------------------------------------------------------------------
+catalog:
+  ports:
+    http: &p_http {port: 80,  proto: tcp}
+    https: &p_https {port: 443, proto: tcp}
+    grpc: &p_grpc {port: 8443, proto: tcp}
+    postgres: &p_pg {port: 5432, proto: tcp}
+    redis: &p_redis {port: 6379, proto: tcp}
+    otlp_http: &p_otlp_http {port: 4318, proto: tcp}
+    otlp_grpc: &p_otlp_grpc {port: 4317, proto: tcp}
+
+# -----------------------------------------------------------------------------
+# Политики: ingress / east-west / egress
+# -----------------------------------------------------------------------------
+policies:
+
+  # ------------------------- Ingress (edge) -----------------------------------
+  - name: ingress-ui-from-internet
+    description: UI доступ только через API Gateway/Edge, с проверкой L7.
+    zone: edge
+    target: *grp_ui
+    transport: *tls_strict
+    l4:
+      allow:
+        - from:
+            zone: internet
+          to_port: *p_https
+          conditions:
+            sni: ["${UI_FQDN:ui.example.com}"]
+    l7:
+      kind: http
+      allow:
+        - paths:
+            - "/healthz"
+            - "/login"
+            - "/static/*"
+          methods: ["GET","HEAD"]
+        - paths:
+            - "/api/*"
+          methods: ["GET","POST","PUT","PATCH","DELETE"]
+          headers:
+            require:
+              - name: "x-zt-ctx"
+              - name: "authorization"
+          jwt:
+            required: true
+            allowed_algs: ["RS256","PS256","ES256","EdDSA"]
+            aud: ["${JWT_AUD:zero-trust-core}"]
+            iss: ["${JWT_ISS:https://id.example.com}"]
+
+  - name: ingress-api-via-gateway
+    description: Все публичные API только через gateway, прямых вызовов к app‑подам нет.
+    zone: edge
+    target: *grp_api
+    transport: *tls_strict
+    l4:
+      allow:
+        - from:
+            zone: internet
+          to_port: *p_https
+          conditions:
+            sni: ["${API_FQDN:api.example.com}"]
+    l7:
+      kind: http
+      allow:
+        - paths: ["/v1/*"]
+          methods: ["GET","POST","PUT","PATCH","DELETE"]
+          headers:
+            require:
+              - name: "x-correlation-id"
+          jwt:
+            required: true
+            enforce_tenant_header: "x-tenant-id"
+
+  # ------------------------- East-West (service-to-service) -------------------
+  - name: app-to-authn
+    description: Приложения обращаются к authn только по mTLS и gRPC/HTTPS.
+    zone: app
+    source:
+      selector: *grp_worker
+    target: *grp_authn
+    transport: *tls_strict
+    l4:
+      allow:
+        - to_port: *p_grpc
+          conditions:
+            spiffe_allowed:
+              - "${SPIFFE_TRUST_DOMAIN}/ns/${K8S_NAMESPACE:prod}/sa/authn-sa"
+    l7:
+      kind: http
+      allow:
+        - paths: ["/v1/token/verify","/v1/token/introspect"]
+          methods: ["POST"]
+      tenant_scoping:
+        header: "x-tenant-id"
+        require_match: true
+
+  - name: app-to-db
+    description: Доступ к Postgres только от приложений с нужной идентичностью и внутри тенанта.
+    zone: data
+    source:
+      selector: *grp_worker
+    target: *grp_db
+    transport: *tls_strict
+    l4:
+      allow:
+        - to_port: *p_pg
+          conditions:
+            spiffe_allowed:
+              - "${SPIFFE_TRUST_DOMAIN}/ns/${K8S_NAMESPACE:prod}/sa/worker-sa"
+            same_tenant: true
+    l7:
+      kind: sql
+      allow:
+        - statements: ["SELECT","INSERT","UPDATE"]
+      deny:
+        - statements: ["ALTER SYSTEM","COPY TO PROGRAM","CREATE EXTENSION"]
+      session:
+        require_sni: true
+        server_name: "${DB_FQDN:pg.prod.internal}"
+
+  - name: app-to-cache
+    description: Кэш только для сервисов приложения, без прямого доступа с edge.
+    zone: data
+    source:
+      selector: *grp_worker
+    target: *grp_cache
+    transport: *tls_strict
+    l4:
+      allow:
+        - to_port: *p_redis
+          conditions:
+            same_tenant: true
+            spiffe_allowed:
+              - "${SPIFFE_TRUST_DOMAIN}/ns/${K8S_NAMESPACE:prod}/sa/worker-sa}"
+
+  - name: telemetry-to-otel
+    description: Экспорт телеметрии только в локальный OTEL collector.
+    zone: security
+    source:
+      selector: *grp_worker
+    target: *grp_otel
+    transport: *tls_strict
+    l4:
+      allow:
+        - to_port: *p_otlp_http
+        - to_port: *p_otlp_grpc
+
+  - name: mgmt-from-bastion
+    description: Администрирование только с бастион‑хостов с AAL2 и mTLS пином.
+    zone: management
+    source:
+      selector: *grp_bastion
+    target: *grp_mgmt
+    transport:
+      <<: *tls_strict
+      spki_pins_b64: ${MGMT_SPKI_PINS_B64:}   # обязательно в прод
+    l4:
+      allow:
+        - to_port: *p_https
+    l7:
+      kind: http
+      allow:
+        - paths: ["/v1/*"]
+          methods: ["GET","POST","PUT","DELETE"]
+          headers:
+            require:
+              - name: "x-aal"
+                equals: "AAL2"
+
+  # ------------------------- Egress (внешние зависимости) ---------------------
+  - name: egress-allowlist
+    description: Разрешён только явный список внешних FQDN/SNI + DoH/DNS к корпоративным резолверам.
+    egress: true
+    source:
+      selector: *grp_api
+    transport: *tls_strict
+    l4:
+      allow:
+        - to_port: *p_https
+          conditions:
+            sni:
+              - "payments.example.com"
+              - "maps.googleapis.com"
+              - "${EXTERNAL_AUDIT_FQDN:siem.ingest.example}"
+            category:
+              - "payments"
+              - "productivity"
+    dns:
+      resolvers:
+        - "${DNS_RESOLVER_1:10.0.0.2}"
+        - "${DNS_RESOLVER_2:10.0.0.3}"
+      allow_doh: false
+      blocklists:
+        tlds: ["onion","local"]
+        fqdn: ["*.dynamic-dns.example","*.lan"]
+    dlp:
+      enabled: true
+      max_payload_mb: 50
+      block_if_secrets_detected: true
+
+# -----------------------------------------------------------------------------
+# Режимы развертывания и изменения
+# -----------------------------------------------------------------------------
+rollout:
+  mode: ${ZTC_ROLLOUT_MODE:enforce}     # enforce|monitor|shadow
+  canary:
+    enabled: ${ZTC_CANARY_ENABLED:true}
+    percent: ${ZTC_CANARY_PERCENT:10}
+    match:
+      tenants: ${ZTC_CANARY_TENANTS:}   # csv
+      namespaces: ${ZTC_CANARY_NAMESPACES:}
+  change_window:
+    allowed:
+      - days: ["Mon","Tue","Wed","Thu"]
+        time_utc: "18:00-22:00"
+    emergency_break_glass:
+      enabled: true
+      duration_min: 30
+      require_approvals: 2
+
+# -----------------------------------------------------------------------------
+# Логирование и аудит
+# -----------------------------------------------------------------------------
+observability:
+  logging:
+    level: ${ZTC_LOG_LEVEL:INFO}
+    json: true
+    redact_headers: ["authorization","cookie","set-cookie"]
+  audit:
+    sinks:
+      - type: webhook
+        enabled: ${ZTC_AUDIT_WEBHOOK:false}
+        url: ${ZTC_AUDIT_WEBHOOK_URL:https://siem.example/ztc}
+        hmac_header: "x-sig"
+        hmac_secret_b64: ${ZTC_AUDIT_HMAC_B64:}
+    include_events:
+      - "policy.applied"
+      - "connection.allowed"
+      - "connection.denied"
+      - "rollout.mode_change"
+
+# -----------------------------------------------------------------------------
+# Валидация и охранные условия
+# -----------------------------------------------------------------------------
+validation:
+  fail_on_unknown_keys: true
+  required:
+    - defaults
+    - identity
+    - topology
+    - policies
+  guards:
+    - assert: "${defaults.default_deny == true}"
+      message: "Политика должна быть default-deny."
+    - assert: "${identity.sources[0].type == 'spiffe'}"
+      message: "SPIFEE должен быть основным источником идентичности."
+    - assert: "${rollout.mode in ['enforce','monitor','shadow']}"
+      message: "Недопустимый режим развертывания."

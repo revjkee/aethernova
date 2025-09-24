@@ -1,0 +1,366 @@
+# zero-trust-core/configs/device_posture.yaml
+apiVersion: zerotrust.aethernova/v1
+kind: DevicePosturePolicy
+metadata:
+  name: default-device-posture
+  version: 1.0.0
+  owner: secops@example.com
+  updatedAt: "2025-08-20T00:00:00Z"
+  labels:
+    env: prod
+    product: zero-trust-core
+spec:
+  evaluation:
+    mode: enforce             # enforce | report
+    triggers:                 # когда пересчитывать posture
+      - on_connect            # при установке новой ZTNA-сессии / mTLS
+      - on_reauth             # при re-auth в течение сессии
+      - on_network_change     # смена сети/интерфейса/ASN/гео
+      - periodic
+    periodic:
+      interval: 10m           # как часто фоново перепроверять posture
+      jitter: 20%             # защита от лавины
+    cache:
+      ttl: 5m                 # кэш валидных результатов
+      maxStaleness: 30m       # при недоступности источников сигналов
+      failureMode: deny       # deny | allow_with_alert при истекшей валидности и недоступности источников
+    scoring:
+      # Минимальные баллы для прохождения «soft»-контролей; «hard» игнорируют скоринг и всегда блокируют
+      total: 100
+      passThreshold: 80
+      criticalFailWeight: 100 # любое нарушение hard-контроля эквивалентно 100 баллам штрафа
+    correlation:
+      # Подпись и целостность отчётов локального агента
+      localReport:
+        requireSignature: true
+        jwksUrl: https://ztc.example.com/jwks/device
+        clockSkew: 90s
+
+  targets:
+    # Кого и на каких устройствах проверяем
+    users:
+      includeGroups: [ "employees", "contractors" ]
+      excludeGroups: [ "breakglass" ]  # break-glass аккаунты регулируются отдельно
+    devices:
+      ownership: [ "corporate", "byod" ]
+      platforms: [ "windows", "macos", "linux", "ios", "android" ]
+      # Таргетинг по контексту подключения
+      context:
+        countriesAllow: [ "SE", "NO", "FI", "DE" ]
+        asnDeny: [ 12389, 9009 ]         # пример: запрещённые ASN
+        wifiSsidDenyRegex: "^(Cafe|Free|Guest).*"
+
+  connectors:
+    # Декларативные описания источников сигналов (учёт секретов через externalRef)
+    mdm:
+      - name: intune-prod
+        type: microsoft_intune
+        tenantId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        auth:
+          type: oauth_client_credentials
+          clientIdRef: secret://mdm/intune/client_id
+          clientSecretRef: secret://mdm/intune/client_secret
+        timeout: 5s
+      - name: jamf-prod
+        type: jamf_pro
+        baseUrl: https://jamf.example.com
+        auth:
+          type: oauth_client_credentials
+          clientIdRef: secret://mdm/jamf/client_id
+          clientSecretRef: secret://mdm/jamf/client_secret
+        timeout: 5s
+    edr:
+      - name: crowdstrike
+        type: falcon
+        cloud: eu-1
+        clientIdRef: secret://edr/cs/client_id
+        clientSecretRef: secret://edr/cs/client_secret
+        timeout: 5s
+      - name: sentinelone
+        type: sentinelone
+        baseUrl: https://sentinelone.example.com
+        apiTokenRef: secret://edr/s1/api_token
+        timeout: 5s
+    pki:
+      # Проверка клиентских mTLS сертификатов и статуса отзыва
+      trustStores:
+        - name: corp-root
+          caBundle: file:///etc/ztc/pki/ca-bundle.pem
+          crl:
+            mode: must_validate       # must_validate | best_effort
+            refresh: 15m
+          ocsp:
+            mode: prefer_ocsp         # prefer_ocsp | crl_only | off
+            responder: https://ocsp.example.com
+            timeout: 3s
+      clientCert:
+        require: true
+        ekuMustContain: [ "clientAuth" ]
+        subjectRegex: "^CN=DEV-[A-Z0-9]{6},O=Example(?:,|$)"
+        issuersAllow: [ "CN=Corp Device CA,O=Example", "CN=BYOD Device CA,O=Example" ]
+    attestation:
+      windows:
+        dhaRequired: true             # Device Health Attestation
+        secureBoot: required
+        virtualizationBasedSecurity: required
+        tpm:
+          require: true
+          minVersion: "2.0"
+          aikEkCaWhitelist:
+            - "CN=Microsoft TPM EK Intermediate"
+      macos:
+        platformAttestation: required # Apple Platform/MDM Attestation (если доступно)
+        secureBoot: required
+        fileVault: required
+      android:
+        playIntegrity:
+          deviceIntegrity: required
+          strongIntegrity: preferred
+          basicIntegrity: required
+        keyAttestation: preferred
+        bootloaderLocked: required
+      ios:
+        deviceCheckOrMDMAttestation: required
+        jailbreakDetected: must_be_false
+
+  profiles:
+    # Профили объединяют набор контролей и веса
+    - name: corporate_strict
+      appliesTo:
+        ownership: [ "corporate" ]
+      hardControls:
+        - id: os_min_versions
+          description: Минимальные версии ОС (корпоративные)
+          checks:
+            - source: local
+              signal: os.platform=windows
+              anyOf:
+                - { signal: os.version, op: semver_gte, value: "10.0.19045" }
+                - { signal: os.version, op: semver_gte, value: "11.0.22631" }
+            - source: local
+              signal: os.platform=macos
+              check: { signal: os.version, op: semver_gte, value: "13.6" }
+            - source: local
+              signal: os.platform=linux
+              check: { signal: os.kernel.version, op: semver_gte, value: "5.10.0" }
+        - id: patch_recency
+          description: Максимальный возраст критических патчей
+          checks:
+            - source: mdm:intune-prod
+              check: { signal: device.patchAgeCriticalDays, op: lte, value: 14 }
+        - id: disk_encryption
+          checks:
+            - source: local
+              anyOf:
+                - { signal: security.bitlocker.enabled, op: eq, value: true }
+                - { signal: security.filevault.enabled, op: eq, value: true }
+                - { signal: security.luks.enabled, op: eq, value: true }
+        - id: secure_boot_tpm
+          checks:
+            - source: attestation.windows
+              allOf:
+                - { signal: secureBoot, op: eq, value: true }
+                - { signal: tpm.present, op: eq, value: true }
+                - { signal: tpm.version, op: semver_gte, value: "2.0" }
+        - id: jailbreak_root
+          checks:
+            - source: local
+              noneOf:
+                - { signal: device.jailbreak, op: eq, value: true }
+                - { signal: device.root,      op: eq, value: true }
+        - id: edr_running_realtime
+          checks:
+            - source: edr:crowdstrike
+              allOf:
+                - { signal: sensor.online, op: eq, value: true }
+                - { signal: sensor.realtimeProtection, op: eq, value: true }
+        - id: firewall_on
+          checks:
+            - source: local
+              anyOf:
+                - { signal: security.firewall.enabled, op: eq, value: true }
+        - id: client_cert_valid
+          checks:
+            - source: pki
+              allOf:
+                - { signal: mTLS.present, op: eq, value: true }
+                - { signal: mTLS.eku.clientAuth, op: eq, value: true }
+                - { signal: mTLS.ocspStatus, op: in, value: [ "good", "unknown" ] }
+      softControls:
+        # Скоринговые факторы: каждый имеет weight (сколько «баллов» даёт или отнимает)
+        - id: screen_lock
+          weight: 10
+          checks:
+            - source: local
+              check: { signal: security.screenLock.enabled, op: eq, value: true }
+        - id: os_patch_staleness
+          weight: 20
+          checks:
+            - source: mdm:intune-prod
+              check: { signal: device.patchAgeDays, op: lte, value: 7 }
+        - id: wifi_ssid_policy
+          weight: 10
+          checks:
+            - source: local
+              noneOf:
+                - { signal: network.wifi.ssid, op: regex, value: "^(Cafe|Free|Guest).*" }
+        - id: storage_removable_locked
+          weight: 10
+          checks:
+            - source: local
+              check: { signal: security.removableMediaBlocked, op: eq, value: true }
+
+    - name: byod_balanced
+      appliesTo:
+        ownership: [ "byod" ]
+      hardControls:
+        - id: os_min_versions_byod
+          checks:
+            - source: local
+              anyOf:
+                - { signal: os.platform=ios,     check: { signal: os.version, op: semver_gte, value: "16.0" } }
+                - { signal: os.platform=android, check: { signal: os.version, op: semver_gte, value: "12" } }
+                - { signal: os.platform=macos,   check: { signal: os.version, op: semver_gte, value: "13.6" } }
+                - { signal: os.platform=windows, check: { signal: os.version, op: semver_gte, value: "10.0.19045" } }
+        - id: jailbreak_root_byod
+          checks:
+            - source: local
+              noneOf:
+                - { signal: device.jailbreak, op: eq, value: true }
+                - { signal: device.root,      op: eq, value: true }
+        - id: client_cert_or_passthrough
+          # BYOD допускает альтернативу: если нет mTLS-сертификата, потребуется step-up (FIDO2)
+          checks:
+            - source: pki
+              anyOf:
+                - { signal: mTLS.present, op: eq, value: true }
+                - { signal: stepUp.fido2Allowed, op: eq, value: true }
+      softControls:
+        - id: device_encryption_byod
+          weight: 20
+          checks:
+            - source: local
+              anyOf:
+                - { signal: security.filevault.enabled, op: eq, value: true }
+                - { signal: security.bitlocker.enabled, op: eq, value: true }
+                - { signal: security.luks.enabled, op: eq, value: true }
+
+  accessLevels:
+    # Привязка ресурсов к профилям и порогам
+    - name: high
+      description: Доступ к критичным системам (прод)
+      profiles: [ "corporate_strict" ]
+      require:
+        hardControls: all_pass
+        scoreMin: 90
+      session:
+        maxDuration: 8h
+        reauthInterval: 60m
+        continuousVerification: true
+    - name: medium
+      description: Некритичные внутренние API
+      profiles: [ "corporate_strict", "byod_balanced" ]
+      require:
+        hardControls: all_pass
+        scoreMin: 80
+      session:
+        maxDuration: 12h
+        reauthInterval: 120m
+        continuousVerification: true
+    - name: low
+      description: Низкорисковые ресурсы
+      profiles: [ "byod_balanced" ]
+      require:
+        hardControls: all_pass
+        scoreMin: 60
+      session:
+        maxDuration: 24h
+        reauthInterval: 240m
+        continuousVerification: false
+
+  decisions:
+    # Мэппинг результата оценки в действие
+    onPass:
+      action: allow
+    onSoftFail:
+      # провален скоринг, но все hard прошли
+      action: step_up
+      methods: [ "webauthn_platform", "webauthn_roaming" ]
+      bindToDevice: true
+      rememberDeviceTtl: 12h
+    onHardFail:
+      action: deny
+      reasonCodes:
+        - OS_OUTDATED
+        - DISK_NOT_ENCRYPTED
+        - SECURE_BOOT_OR_TPM_FAIL
+        - JAILBREAK_OR_ROOT
+        - EDR_NOT_RUNNING
+        - CERT_INVALID
+
+  exceptions:
+    # Временные исключения, оформленные через тикет; логируются и переоцениваются регулярно
+    requireTicket: true
+    items:
+      - id: ticket-12345
+        subject: "Инцидент: временно отключить EDR на r&d-хостах"
+        scope:
+          users: [ "group:rnd" ]
+          devices:
+            ownership: [ "corporate" ]
+            platforms: [ "linux" ]
+        controlsWaived: [ "edr_running_realtime" ]
+        expiresAt: "2025-09-15T00:00:00Z"
+        decision: step_up           # вместо deny
+        audit:
+          approvedBy: "ciso@example.com"
+          reason: "Переезд на новый агент"
+
+  signalsCatalog:
+    # Справочник стандартных сигналов и парсинга
+    - key: os.version
+      type: string
+      parser: semver
+      staleTtl: 10m
+    - key: device.patchAgeCriticalDays
+      type: integer
+      parser: int
+      staleTtl: 15m
+    - key: security.filevault.enabled
+      type: bool
+      staleTtl: 30m
+    - key: mTLS.ocspStatus
+      type: enum
+      values: [ good, revoked, unknown ]
+      staleTtl: 5m
+
+  telemetry:
+    export:
+      otlp:
+        endpoint: http://otel-collector.observability:4317
+        protocol: grpc
+        resource:
+          service.name: zero-trust-core
+          service.version: "1.0.0"
+    redact:
+      keys:
+        - "serialNumber"
+        - "wifi.ssid"
+        - "username"
+      regex: "(?i)(token|secret|cookie|authorization)"
+      replacement: "[REDACTED]"
+
+  privacy:
+    dataMinimization:
+      # какие поля храним в базе posture-решений
+      persistSignals:
+        allowList:
+          - os.platform
+          - os.version
+          - device.patchAgeCriticalDays
+          - security.diskEncryption
+          - attestation.summary
+      retention: 30d
+    userNotice:
+      url: https://intranet.example.com/ztc-privacy
+      version: "2025-01"

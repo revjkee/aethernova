@@ -1,0 +1,392 @@
+{{- /*
+cybersecurity-core/ops/helm/cybersecurity-core/templates/prometheus-rules.yaml
+Требуется Prometheus Operator (monitoring.coreos.com/v1).
+Включение: .Values.prometheusRules.enabled=true
+Опции: .Values.prometheusRules.{labels,annotations,team,runbookBaseURL}
+Опциональные группы: loki.enabled, otel.enabled, opensearch.enabled, ingressNginx.enabled, mongodbExporter.enabled
+Доп. группы: .Values.prometheusRules.extraGroups (список групп в формате PrometheusRule)
+*/ -}}
+{{- if .Values.prometheusRules.enabled }}
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "cybersecurity-core.fullname" . }}-rules
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "cybersecurity-core.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | default .Chart.Version }}
+    app.kubernetes.io/part-of: {{ include "cybersecurity-core.name" . }}
+    helm.sh/chart: {{ include "cybersecurity-core.chart" . }}
+    app.kubernetes.io/managed-by: {{ .Release.Service | default "Helm" }}
+    {{- with .Values.prometheusRules.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.prometheusRules.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    # -----------------------------
+    # Node / инфраструктура
+    # -----------------------------
+    - name: node.rules
+      interval: 1m
+      rules:
+        - alert: NodeDown
+          expr: up{job=~"node-exporter|node"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Узел недоступен
+            description: Узел {{`{{ $labels.instance }}`}} недоступен более 5 минут.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/node/NodeDown
+
+        - alert: NodeCPUHigh
+          expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > {{ .Values.prometheusRules.thresholds.nodeCPUHigh | default 90 }}
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Высокая загрузка CPU
+            description: Средняя загрузка CPU на {{`{{ $labels.instance }}`}} превышает предел.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/node/CPUHigh
+
+        - alert: NodeMemoryPressure
+          expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > {{ .Values.prometheusRules.thresholds.nodeMemHigh | default 90 }}
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Дефицит памяти
+            description: Использование памяти на {{`{{ $labels.instance }}`}} превышает заданный порог.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/node/MemHigh
+
+        - alert: NodeFilesystemSpaceFillingUp
+          expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[6h]) < 0
+          for: 15m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Диск скоро заполнится
+            description: На {{`{{ $labels.instance }}`}} файловая система {{`{{ $labels.mountpoint }}`}} может заполниться в ближайшее время.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/node/DiskFilling
+
+        - alert: NodeFilesystemAlmostOutOfSpace
+          expr: (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) * 100 < {{ .Values.prometheusRules.thresholds.nodeFSFreePct | default 10 }}
+          for: 10m
+          labels:
+            severity: critical
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Критически мало места на диске
+            description: Свободного места < {{ .Values.prometheusRules.thresholds.nodeFSFreePct | default 10 }}% на {{`{{ $labels.instance }}`}} ({{`{{ $labels.mountpoint }}`}}).
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/node/DiskLow
+
+        - alert: NodeNetworkErrors
+          expr: (rate(node_network_receive_errs_total[5m]) + rate(node_network_transmit_errs_total[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Ошибки сети на узле
+            description: Обнаружены сетевые ошибки на {{`{{ $labels.instance }}`}} интерфейс {{`{{ $labels.device }}`}}.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/node/NetErrors
+
+    # -----------------------------
+    # Kubernetes / ворклоады
+    # -----------------------------
+    - name: k8s.workload.rules
+      interval: 1m
+      rules:
+        - alert: KubePodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total[5m]) > {{ .Values.prometheusRules.thresholds.podRestarts5m | default 3 }}
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Перезапуски контейнера
+            description: Поды часто перезапускаются в {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}}.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/k8s/CrashLoop
+
+        - alert: KubePodNotReady
+          expr: sum by (namespace,pod) (kube_pod_status_ready{condition="true"}) == 0
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Pod не готов
+            description: Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} не готов более 10 минут.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/k8s/PodNotReady
+
+        - alert: KubeDeploymentReplicasMismatch
+          expr: kube_deployment_status_replicas_available / ignoring(replicaset) kube_deployment_spec_replicas < 1
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Реплики Deployment недоступны
+            description: В Deployment {{`{{ $labels.namespace }}`}}/{{`{{ $labels.deployment }}`}} доступных реплик меньше спецификации.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/k8s/DeployMismatch
+
+        - alert: KubeDaemonSetMissScheduled
+          expr: kube_daemonset_status_desired_number_scheduled - kube_daemonset_status_current_number_scheduled > 0
+          for: 15m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: DaemonSet не на всех узлах
+            description: DaemonSet {{`{{ $labels.namespace }}`}}/{{`{{ $labels.daemonset }}`}} не запущен на всех нужных узлах.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/k8s/DaemonSet
+
+        - alert: KubeStatefulSetDown
+          expr: kube_statefulset_status_replicas_ready < kube_statefulset_status_replicas
+          for: 15m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: StatefulSet не полностью готов
+            description: В StatefulSet {{`{{ $labels.namespace }}`}}/{{`{{ $labels.statefulset }}`}} не все реплики готовы.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/k8s/StatefulSet
+
+    # -----------------------------
+    # Ingress NGINX (опционально)
+    # -----------------------------
+    {{- if .Values.ingressNginx.enabled }}
+    - name: ingress.nginx.rules
+      interval: 1m
+      rules:
+        - alert: IngressHigh5xxRate
+          expr: |
+            sum by (ingress,namespace) (rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))
+              /
+            clamp_min(sum by (ingress,namespace) (rate(nginx_ingress_controller_requests[5m])), 1)
+              > {{ .Values.prometheusRules.thresholds.ingress5xxErrorRatio | default 0.05 }}
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Высокая доля 5xx через Ingress
+            description: Ошибки 5xx для {{`{{ $labels.namespace }}`}}/{{`{{ $labels.ingress }}`}} превышают порог.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/ingress/High5xx
+
+        - alert: IngressLatencyP99High
+          expr: |
+            histogram_quantile(0.99, sum by (le) (rate(nginx_ingress_controller_request_duration_seconds_bucket[5m])))
+              > {{ .Values.prometheusRules.thresholds.ingressP99Seconds | default 1.0 }}
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Высокая задержка p99 Ingress
+            description: p99 задержка запросов превышает {{ .Values.prometheusRules.thresholds.ingressP99Seconds | default 1.0 }}s.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/ingress/Latency
+    {{- end }}
+
+    # -----------------------------
+    # OpenTelemetry Collector (опционально)
+    # -----------------------------
+    {{- if .Values.otel.enabled }}
+    - name: otel.collector.rules
+      interval: 1m
+      rules:
+        - alert: OtelExporterFailures
+          expr: sum by (service_instance_id,exporter) (rate(otelcol_exporter_send_failed[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: OTEL экспортер возвращает ошибки
+            description: Услуга {{`{{ $labels.service_instance_id }}`}} экспортер {{`{{ $labels.exporter }}`}} фиксирует ошибки отправки.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/otel/ExporterFailed
+
+        - alert: OtelQueueSaturation
+          expr: max by (service_instance_id,exporter) (otelcol_exporter_queue_capacity - otelcol_exporter_queue_size) < 10
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Очередь OTEL близка к заполнению
+            description: Мало свободного места в очереди экспортера {{`{{ $labels.exporter }}`}}.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/otel/Queue
+
+        - alert: OtelReceiverRefused
+          expr: sum by (receiver,transport) (rate(otelcol_receiver_refused_spans[5m]) + rate(otelcol_receiver_refused_logs[5m]) + rate(otelcol_receiver_refused_metric_points[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: OTEL receiver отбрасывает данные
+            description: Приемник {{`{{ $labels.receiver }}`}} отбрасывает входящие данные.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/otel/ReceiverRefused
+    {{- end }}
+
+    # -----------------------------
+    # Loki (опционально)
+    # -----------------------------
+    {{- if .Values.loki.enabled }}
+    - name: loki.rules
+      interval: 1m
+      rules:
+        - alert: LokiHighErrorRate
+          expr: |
+            sum(rate(loki_request_errors_total[5m])) by (route)
+            /
+            clamp_min(sum(rate(loki_request_duration_seconds_count[5m])) by (route), 1)
+            > {{ .Values.prometheusRules.thresholds.lokiErrorRatio | default 0.05 }}
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Высокая ошибка запросов Loki
+            description: Доля ошибок запросов Loki по маршруту {{`{{ $labels.route }}`}} превышает порог.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/loki/Errors
+
+        - alert: LokiLatencyP99High
+          expr: |
+            histogram_quantile(0.99, sum by (le,route) (rate(loki_request_duration_seconds_bucket[5m])))
+              > {{ .Values.prometheusRules.thresholds.lokiP99Seconds | default 2.0 }}
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Высокая задержка Loki p99
+            description: p99 задержка запросов Loki по маршруту {{`{{ $labels.route }}`}} превышает порог.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/loki/Latency
+    {{- end }}
+
+    # -----------------------------
+    # OpenSearch (опционально)
+    # Требуется opensearch-exporter с метрикой opensearch_cluster_health_status:
+    # 0=green, 1=yellow, 2=red
+    # -----------------------------
+    {{- if .Values.opensearch.enabled }}
+    - name: opensearch.rules
+      interval: 1m
+      rules:
+        - alert: OpenSearchClusterRed
+          expr: opensearch_cluster_health_status == 2
+          for: 5m
+          labels:
+            severity: critical
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: OpenSearch кластер RED
+            description: Кластер OpenSearch в состоянии RED.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/opensearch/Red
+
+        - alert: OpenSearchClusterYellow
+          expr: opensearch_cluster_health_status == 1
+          for: 15m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: OpenSearch кластер YELLOW
+            description: Кластер OpenSearch в состоянии YELLOW более 15 минут.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/opensearch/Yellow
+    {{- end }}
+
+    # -----------------------------
+    # MongoDB Exporter (опционально)
+    # -----------------------------
+    {{- if .Values.mongodbExporter.enabled }}
+    - name: mongodb.rules
+      interval: 1m
+      rules:
+        - alert: MongoDBDown
+          expr: mongodb_up == 0
+          for: 5m
+          labels:
+            severity: critical
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: MongoDB недоступен
+            description: Экспортёр сообщает, что инстанс MongoDB {{`{{ $labels.instance }}`}} недоступен.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/mongodb/Down
+
+        - alert: MongoDBConnectionsHigh
+          expr: mongodb_connections{state="current"} > {{ .Values.prometheusRules.thresholds.mongoConnections | default 1000 }}
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+          annotations:
+            summary: Много соединений MongoDB
+            description: Текущее количество соединений превышает порог.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/mongodb/Connections
+    {{- end }}
+
+    # -----------------------------
+    # SLO burn-rate (опционально, если настроены метрики уровня ошибок)
+    # Используется общий http_requests_total с лейблом slo="<сервис>"
+    # -----------------------------
+    {{- if .Values.prometheusRules.slo.enabled }}
+    - name: slo.burnrate.rules
+      interval: 30s
+      rules:
+        # Быстрое окно (5m/1h)
+        - alert: SLOBurnRateFast
+          expr: |
+            (
+              sum(rate({{ .Values.prometheusRules.slo.metricName | default "http_requests_total" }}{status=~"5..",slo="{{ .Values.prometheusRules.slo.service | default "api" }}"}[5m]))
+              /
+              clamp_min(sum(rate({{ .Values.prometheusRules.slo.metricName | default "http_requests_total" }}{slo="{{ .Values.prometheusRules.slo.service | default "api" }}"}[5m])), 1)
+            ) > {{ .Values.prometheusRules.slo.fastBurnMultiplier | default 14.4 }} * {{ .Values.prometheusRules.slo.errorBudget | default 0.01 }}
+          for: 2m
+          labels:
+            severity: critical
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+            slo: "{{ .Values.prometheusRules.slo.service | default "api" }}"
+          annotations:
+            summary: Быстрый burn-rate SLO
+            description: Быстрый расход бюджета ошибок для SLO {{`{{ $labels.slo }}`}}.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/slo/BurnRate
+
+        # Медленное окно (30m/6h)
+        - alert: SLOBurnRateSlow
+          expr: |
+            (
+              sum(rate({{ .Values.prometheusRules.slo.metricName | default "http_requests_total" }}{status=~"5..",slo="{{ .Values.prometheusRules.slo.service | default "api" }}"}[30m]))
+              /
+              clamp_min(sum(rate({{ .Values.prometheusRules.slo.metricName | default "http_requests_total" }}{slo="{{ .Values.prometheusRules.slo.service | default "api" }}"}[30m])), 1)
+            ) > {{ .Values.prometheusRules.slo.slowBurnMultiplier | default 6.0 }} * {{ .Values.prometheusRules.slo.errorBudget | default 0.01 }}
+          for: 15m
+          labels:
+            severity: warning
+            team: {{ .Values.prometheusRules.team | default "secops" }}
+            slo: "{{ .Values.prometheusRules.slo.service | default "api" }}"
+          annotations:
+            summary: Медленный burn-rate SLO
+            description: Замедленный расход бюджета ошибок для SLO {{`{{ $labels.slo }}`}}.
+            runbook_url: {{ .Values.prometheusRules.runbookBaseURL | default "https://runbooks.local" }}/slo/BurnRate
+    {{- end }}
+
+    # -----------------------------
+    # Дополнительные группы через Values
+    # -----------------------------
+    {{- with .Values.prometheusRules.extraGroups }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+{{- end }}

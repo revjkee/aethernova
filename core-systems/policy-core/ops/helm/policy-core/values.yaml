@@ -1,0 +1,421 @@
+# file: policy-core/ops/helm/policy-core/values.yaml
+# Базовые параметры приложения
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/aethernova/policy-core
+  tag: ""                      # по умолчанию chart использует .Chart.AppVersion
+  digest: ""                   # предпочтительно фиксировать digest для воспроизводимости
+  pullPolicy: IfNotPresent
+  pullSecrets: []              # например: ["ghcr-creds"]
+
+controller:
+  kind: Deployment             # Deployment | StatefulSet (если нужен sticky/persistence)
+  replicaCount: 3
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+
+serviceAccount:
+  create: true
+  name: ""                     # если пусто — будет сгенерировано по fullname
+  annotations: {}
+  automountServiceAccountToken: false
+
+rbac:
+  create: true
+
+podAnnotations: {}
+podLabels:
+  app.kubernetes.io/component: api
+
+# Политика безопасности контейнера и пода
+podSecurityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+  fsGroupChangePolicy: "OnRootMismatch"
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop: ["ALL"]
+
+priorityClassName: ""
+terminationGracePeriodSeconds: 30
+
+# Ресурсы по умолчанию — подгоняйте под SLO/нагрузку
+resources:
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
+  limits:
+    cpu: "1000m"
+    memory: "1024Mi"
+
+# Пробы состояния
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 10
+  timeoutSeconds: 2
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 5
+  timeoutSeconds: 2
+  periodSeconds: 5
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 1
+  timeoutSeconds: 2
+  periodSeconds: 3
+  failureThreshold: 30
+
+# Сетевой сервис и Ingress
+service:
+  enabled: true
+  type: ClusterIP
+  annotations: {}
+  labels: {}
+  ports:
+    http:
+      port: 8080
+      targetPort: 8080
+    metrics:
+      port: 9090
+      targetPort: 9090
+
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+  hosts:
+    - host: policy.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          servicePort: http
+  tls:
+    - hosts: ["policy.example.com"]
+      secretName: policy-core-tls
+
+# Zero-Trust и mTLS (sidecar или ingress-mTLS)
+zeroTrust:
+  requireMTLS: true
+  clientCASecretName: "policy-core-ca"     # Secret с ca.crt
+  serverTLSSecretName: "policy-core-tls"   # Secret с tls.crt/tls.key
+  envoySidecar:
+    enabled: false                         # при true — добавляется Envoy для mTLS на pod
+    image: envoyproxy/envoy:v1.31.0
+    resources:
+      requests: { cpu: "50m", memory: "64Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }
+    configRef: ""                          # имя ConfigMap с bootstrap.yaml для Envoy
+
+# Конфигурация приложения и секреты
+env:
+  # Значения из .env.example; можно переопределять на уровне кластера
+  APP_ENV: "production"
+  TZ: "UTC"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  HTTP_PORT: "8080"
+  PROMETHEUS_PORT: "9090"
+  POLICY_ENGINE: "opa"                     # opa | casbin
+  POLICY_DEFAULT_ACTION: "deny"
+  OPA_MODE: "remote"
+  OPA_URL: "http://opa:8181"
+  OPA_DECISION_PATH: "/v1/data/policy/allow"
+  CASBIN_ADAPTER: "postgres"
+  DB_MIGRATE_ON_START: "true"
+
+envFrom:
+  configMaps: []                           # например: ["policy-core-config"]
+  secrets: []                              # например: ["policy-core-secrets"]
+
+secretRefs:
+  jwtKeysSecret: "policy-core-jwt"         # содержит pub.pem/priv.pem
+  vaultTokenSecret: "policy-core-vault"    # содержит token
+  opaTokenSecret: ""                       # содержит token для OPA при remote
+  s3CredsSecret: ""                        # AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
+
+extraEnv: []                                # список { name: ..., value: ... }
+extraEnvFrom: []                             # список объектов EnvFrom
+
+# Volumes для секретов/конфигов/данных
+volumes:
+  extra: []
+  mounts:
+    - name: tls
+      mountPath: /secrets/tls
+      readOnly: true
+      source:
+        secret:
+          name: policy-core-tls
+    - name: jwt
+      mountPath: /secrets/jwt
+      readOnly: true
+      source:
+        secret:
+          name: policy-core-jwt
+
+persistence:
+  enabled: false                            # включайте при POLICY_STORE_BACKEND=filesystem
+  accessModes: ["ReadWriteOnce"]
+  size: 1Gi
+  storageClassName: ""
+  annotations: {}
+  mountPath: /app/policies
+  existingClaim: ""                         # для заранее созданного PVC
+
+# Инициализация и миграции
+initContainers: []
+migrations:
+  enabled: true
+  # PostStart миграции внутри основного контейнера или отдельный Job-хук
+  mode: "postStart"                         # postStart | job
+  job:
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 600
+    resources:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits:   { cpu: "500m", memory: "256Mi" }
+
+# Sidecar-агенты
+opa:
+  enabled: false                            # embedded OPA sidecar с bundle или policy files
+  image: openpolicyagent/opa:0.66.0
+  args:
+    - "run"
+    - "--server"
+    - "--addr=:8181"
+    - "--diagnostic-addr=:8282"
+    # при работе с bundles:
+    # - "--bundle=https://bundles.example.com/policy/bundle.tar.gz"
+  resources:
+    requests: { cpu: "50m", memory: "64Mi" }
+    limits:   { cpu: "200m", memory: "256Mi" }
+
+otel:
+  enabled: true
+  exporterOtlpEndpoint: "http://otel-collector:4317"
+  tracesSampler: "parentbased_traceidratio"
+  tracesSamplerArg: "0.05"
+
+# Автомасштабирование (autoscaling/v2). Совместимо с HPA-манифестом chart'а.
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    # Встроенные ресурсы
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: "800Mi"
+    # Pods-метрика (через custom.metrics.k8s.io)
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_in_flight
+        target:
+          type: AverageValue
+          averageValue: "50"
+    # External-метрики (через external.metrics.k8s.io)
+    - type: External
+      external:
+        metric:
+          name: http_requests_per_second
+          selector:
+            matchLabels:
+              app: policy-core
+        target:
+          type: AverageValue
+          averageValue: "200"
+    - type: External
+      external:
+        metric:
+          name: queue_messages_ready
+          selector:
+            matchLabels:
+              vhost: policy
+              queue: policy_core_tasks
+        target:
+          type: AverageValue
+          averageValue: "100"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+      selectPolicy: Max
+
+# PDB для высокой доступности
+pdb:
+  enabled: true
+  minAvailable: 2
+
+# NetworkPolicy: deny-by-default + разрешённые egress/ingress
+networkPolicy:
+  enabled: true
+  policyType: ["Ingress", "Egress"]
+  ingress:
+    allowedNamespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: "policy"
+    allowedPodsSelector: {}                 # можно ограничить по app
+    ports:
+      - port: 8080
+        protocol: TCP
+      - port: 9090
+        protocol: TCP
+  egress:
+    allowDns: true
+    extraCidrs: []                          # например: ["10.0.0.0/8"]
+    allowSelectors:
+      - to:
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+        ports:
+          - port: 4317                      # OTEL
+            protocol: TCP
+      - to:
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: policy
+        ports:
+          - port: 5432                      # Postgres
+            protocol: TCP
+          - port: 5671                      # RabbitMQ TLS
+            protocol: TCP
+          - port: 8181                      # OPA remote
+            protocol: TCP
+
+# Prometheus мониторинг
+serviceMonitor:
+  enabled: true
+  namespace: "monitoring"
+  interval: 15s
+  scrapeTimeout: 5s
+  labels: {}
+  scheme: http
+  tlsConfig: {}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: policy-core
+  endpoints:
+    - port: metrics
+      path: /metrics
+
+prometheusRule:
+  enabled: true
+  namespace: "monitoring"
+  groups:
+    - name: policy-core.slo
+      rules:
+        - alert: PolicyCoreHighErrorRate
+          expr: sum(rate(http_requests_total{app="policy-core",status=~"5.."}[5m])) /
+                sum(rate(http_requests_total{app="policy-core"}[5m])) > 0.02
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Высокая доля 5xx у policy-core"
+            description: "Ошибка выше 2% за 10 минут"
+        - alert: PolicyCoreHighLatencyP95
+          expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{app="policy-core"}[5m])) by (le)) > 0.4
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Рост p95 latency у policy-core"
+            description: "p95 > 400ms за 10 минут"
+
+# Топология и размещение
+nodeSelector: {}
+tolerations: []
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["policy-core"]
+          topologyKey: "kubernetes.io/hostname"
+
+topologySpreadConstraints:
+  enabled: true
+  rules:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: policy-core
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: policy-core
+
+# Дополнительные контейнеры и аргументы
+extraArgs: []                               # аргументы основного контейнера
+extraContainerPorts: []                     # список доп. портов контейнера
+extraContainers: []                         # произвольные sidecar'ы
+extraVolumes: []                            # произвольные volumes
+extraVolumeMounts: []                       # произвольные mounts
+
+# Жизненный цикл
+lifecycle: {}                               # например: preStop hook с sleep 5
+
+# Логи и формат
+logging:
+  json: true
+  includeCaller: false
+
+# Gatekeeper/PSP аннотации (если требуется совместимость)
+podAnnotationsPSP: {}

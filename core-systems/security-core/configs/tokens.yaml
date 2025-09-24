@@ -1,0 +1,262 @@
+# ============================================================================
+# security-core :: tokens.yaml
+# Назначение: централизованная политика выпуска/проверки токенов.
+# Секретов НЕ содержит. Все приватные ключи/симметричные секреты — через Vault/KMS.
+# ============================================================================
+
+version: 1
+metadata:
+  service: security-core
+  owner: platform-security
+  contact: security@neurocity.local
+  updated_at: "2025-08-19T00:00:00Z"
+  compliance:
+    - GDPR
+    - ISO27001
+    - SOC2
+
+defaults:
+  clock_skew_seconds: 60                 # Допустимая рассинхронизация часов
+  jti_cache_ttl_seconds: 900             # TTL кэша уникальности JTI
+  audience_required: true
+  issuer: "https://auth.neurocity.local" # Базовый ISS
+  jwk_cache_ttl_seconds: 600             # Кэширование публичных ключей
+
+# ---------------------------------------------------------------------------
+# Источники ключей (подпись/шифрование). Никаких ключей в репозитории!
+# ---------------------------------------------------------------------------
+key_providers:
+  vault_jwt_rs256:
+    type: vault
+    endpoint: "https://vault.local:8200"
+    mount: "kv"
+    path: "neurocity/security-core/keys/jwt-rs256"   # где хранится {public.pem, private.pem}
+    rotate_interval_days: 30
+    read_role: "security-core-ro"
+    write_role: "security-core-rw"
+    fips_mode: false
+  vault_paseto_v4_local:
+    type: vault
+    endpoint: "https://vault.local:8200"
+    mount: "kv"
+    path: "neurocity/security-core/keys/paseto-v4-local" # симметричный ключ для PASETO local
+    rotate_interval_days: 30
+    read_role: "security-core-ro"
+    write_role: "security-core-rw"
+  aws_kms_access_tokens:
+    type: aws-kms
+    region: "eu-north-1"
+    key_arn: "arn:aws:kms:eu-north-1:000000000000:key/REPLACE_ME"
+    # Используется для подписи reference/opaque токенов (MAC) и обёртки секретов
+
+# ---------------------------------------------------------------------------
+# Скоупы и аудитории. Используйте короткие, проверяемые на стороне API.
+# ---------------------------------------------------------------------------
+scopes:
+  - id: "read:profile"
+    description: "Чтение профиля пользователя"
+  - id: "write:profile"
+    description: "Изменение профиля пользователя"
+  - id: "admin:*"
+    description: "Административные операции"
+
+audiences:
+  - id: "neurocity.api"
+    description: "Основной backend API"
+  - id: "neurocity.admin"
+    description: "Админ‑интерфейсы"
+  - id: "neurocity.relay"
+    description: "Сервисные вызовы между внутренними компонентами"
+
+# ---------------------------------------------------------------------------
+# Политики выпуска токенов: JWT, PASETO, opaque/reference.
+# ---------------------------------------------------------------------------
+policies:
+  access_jwt_rs256:
+    type: "jwt"
+    alg: "RS256"
+    key_provider_ref: "vault_jwt_rs256"
+    audience: ["neurocity.api"]
+    allowed_scopes: ["read:profile", "write:profile"]
+    ttl_seconds: 900                       # 15 минут
+    refreshable: false
+    include_claims:
+      - "sub"
+      - "scope"
+      - "aud"
+      - "iat"
+      - "exp"
+      - "jti"
+      - "client_id"
+      - "ip"                               # если включена ip_binding ниже
+    constraints:
+      ip_binding: false                    # Привязывать ли токен к IP
+      cnf_mtls:                            # Привязка к mTLS (RFC8705)
+        enabled: false
+        cert_thumbprint_claim: "x5t#S256"
+      one_time_use: false
+    revoke:
+      allow_revocation: true
+      jti_store: "redis"                   # где хранить отозванные JTI
+      reason_required: true
+  service_jwt_rs256_mtls:
+    type: "jwt"
+    alg: "RS256"
+    key_provider_ref: "vault_jwt_rs256"
+    audience: ["neurocity.relay"]
+    allowed_scopes: ["admin:*"]
+    ttl_seconds: 300
+    refreshable: false
+    include_claims: ["sub","aud","iat","exp","jti","cnf"]
+    constraints:
+      ip_binding: false
+      cnf_mtls:
+        enabled: true
+        cert_thumbprint_claim: "x5t#S256"
+      one_time_use: true
+    rotate:
+      kid_strategy: "rolling"               # kid меняется при ротации ключей
+  refresh_paseto_v4_local:
+    type: "paseto"
+    purpose: "local"                        # PASETO v4.local (симметричное шифрование)
+    key_provider_ref: "vault_paseto_v4_local"
+    ttl_seconds: 2592000                    # 30 дней
+    refreshable: false
+    include_claims: ["sub","iat","exp","jti","sid"]
+    constraints:
+      bind_fingerprint: true                # связать с fingerprint клиента (device binding)
+      rotate_on_use: true                   # при каждом обмене выпускается новый
+    exchange:
+      to_policy: "access_jwt_rs256"         # чем обмениваемся при /token
+  opaque_reference_access:
+    type: "opaque"
+    storage: "redis"                        # тело токена хранится сервер‑сайд
+    mac:
+      provider_ref: "aws_kms_access_tokens" # MAC подпись через KMS
+      alg: "HMAC-SHA256"
+    ttl_seconds: 600
+    refreshable: false
+    audience: ["neurocity.api"]
+    allowed_scopes: ["read:profile"]
+
+# ---------------------------------------------------------------------------
+# Источники идентичности (OIDC/JWKS) для валидации входящих токенов от внешних IdP.
+# ---------------------------------------------------------------------------
+issuers:
+  - id: "neurocity-internal"
+    iss: "https://auth.neurocity.local"
+    jwks:
+      type: "vault"                         # получить JWKS из Vault (публикуемый набор ключей)
+      path: "neurocity/security-core/jwks"
+      cache_ttl_seconds: 600
+    allowed_audiences: ["neurocity.api","neurocity.admin"]
+    clock_skew_seconds: 60
+  - id: "external-idp"
+    iss: "https://login.external-idp.example"
+    jwks:
+      type: "jwks_uri"
+      url: "https://login.external-idp.example/.well-known/jwks.json"
+      cache_ttl_seconds: 600
+    allowed_audiences: ["neurocity.api"]
+    clock_skew_seconds: 60
+
+# ---------------------------------------------------------------------------
+# Настройки проверки/интроспекции/отзыва.
+# ---------------------------------------------------------------------------
+introspection:
+  enabled: true
+  # Для opaque/reference токенов ответ формируется из server-side записи
+  cache:
+    enabled: true
+    ttl_seconds: 60
+  redact_sensitive_claims: true            # маскировать PII в ответах
+
+revocation:
+  # Централизованный список отозванных JTI и sid (refresh‑сессии)
+  jti_store: "redis"
+  sid_store: "redis"
+  event_hook:
+    enabled: true
+    url: "https://siem.neurocity.local/hooks/token-revoked"
+    method: "POST"
+    timeout_ms: 2000
+
+# ---------------------------------------------------------------------------
+# Анти‑абьюз: ограничения, DLP маскирование, троттлинг эндпоинтов /token, /introspect.
+# ---------------------------------------------------------------------------
+abuse_mitigation:
+  rate_limits:
+    token_issue_per_client_per_minute: 60
+    token_introspect_per_client_per_minute: 120
+    token_refresh_per_client_per_minute: 30
+  anomaly_detection:
+    enabled: true
+    score_threshold: 0.85
+  dlp:
+    mask_claims:
+      - "email"
+      - "phone"
+      - "ssn"
+      - "card"
+    mask_strategy: "partial"               # partial|full|null
+
+# ---------------------------------------------------------------------------
+# Кэш/хранилища служебных данных токенов.
+# ---------------------------------------------------------------------------
+stores:
+  redis:
+    url: "redis://redis.observability.svc.cluster.local:6379/2"
+    tls: false
+    key_prefix: "sec:tok:"
+    eviction_policy: "volatile-ttl"
+
+# ---------------------------------------------------------------------------
+# Политика refresh/exchange и правила «только по белому списку клиентов».
+# ---------------------------------------------------------------------------
+oauth2:
+  grant_types:
+    - "authorization_code"
+    - "client_credentials"
+    - "refresh_token"
+    - "token_exchange"                     # RFC 8693
+  clients:
+    - client_id: "security-core-web"
+      allowed_grants: ["authorization_code","refresh_token"]
+      allowed_policies:
+        access: "access_jwt_rs256"
+        refresh: "refresh_paseto_v4_local"
+      redirect_uris:
+        - "https://app.neurocity.local/auth/callback"
+      post_logout_redirect_uris:
+        - "https://app.neurocity.local/"
+      pkce_required: true
+      rotate_refresh_on_use: true
+      max_sessions_per_user: 5
+    - client_id: "security-core-service"
+      allowed_grants: ["client_credentials"]
+      allowed_policies:
+        access: "service_jwt_rs256_mtls"
+      mtls_required: true
+      allow_token_exchange:
+        to_audience: ["neurocity.relay"]
+
+# ---------------------------------------------------------------------------
+# Дополнительные инварианты проверки на стороне API‑шлюза (Zero‑Trust).
+# ---------------------------------------------------------------------------
+api_enforcement:
+  require_header:
+    - "X-Request-ID"
+  deny_legacy_algorithms: ["none","HS256"] # Запрещаем HS на внешнем периметре
+  max_token_size_bytes: 8192               # защита от DoS через сверхдлинные токены
+  leeway_expiration_seconds: 0
+
+# ---------------------------------------------------------------------------
+# Набор тестовых профилей для sandbox (отключены по умолчанию).
+# ---------------------------------------------------------------------------
+sandbox:
+  enabled: false
+  demo_users:
+    - sub: "00000000-0000-0000-0000-000000000001"
+      scopes: ["read:profile"]
+      audience: ["neurocity.api"]
+      ttl_seconds: 300

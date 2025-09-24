@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: Apache-2.0
+// engine-core/schemas/proto/v1/engine/ingest.proto
+//
+// Промышленный API для приёма данных/событий (ingest) с поддержкой:
+//  - single/batch ingest
+//  - bidi streaming ingest
+//  - идемпотентность и дедупликация
+//  - маршрутизация (topic/route/tenant/partition)
+//  - схемы и ревизии (schema_id/schema_rev), dry-run
+//  - ACK режимы (NONE/LEADER/COMMITTED), частичные статусы
+//  - компрессия/кодирование (gzip,zstd,avro,json,protobuf)
+//  - трейсинг и корреляция (request_id/trace_id)
+//  - расширенные ошибки через engine.v1.error.Error
+//
+// Требует: common.proto, error.proto
+
+syntax = "proto3";
+
+package engine.v1.engine;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "engine-core/schemas/proto/v1/common.proto";
+import "engine-core/schemas/proto/v1/error.proto";
+
+option go_package          = "github.com/yourorg/engine-core/gen/proto/engine/v1/engine;enginev1";
+option java_package        = "com.yourorg.engine.v1.engine";
+option java_multiple_files = true;
+option csharp_namespace    = "YourOrg.Engine.V1.Engine";
+option objc_class_prefix   = "ENG";
+option php_namespace       = "YourOrg\\Engine\\V1\\Engine";
+
+// -----------------------------
+// Справочные enum
+// -----------------------------
+
+// Режим подтверждения приёма.
+enum AckMode {
+  ACK_MODE_UNSPECIFIED = 0;
+  ACK_NONE = 1;         // немедленный ответ после базовой валидации
+  ACK_LEADER = 2;       // подтверждение при записи на лидера
+  ACK_COMMITTED = 3;    // подтверждение после коммита кворума/логов
+}
+
+// Режимы валидации входных данных.
+enum ValidationMode {
+  VALIDATION_MODE_UNSPECIFIED = 0;
+  VALIDATION_SCHEMA = 1;    // только проверка схемы/формата
+  VALIDATION_SEMANTIC = 2;  // расширенные доменные проверки
+  VALIDATION_STRICT = 3;    // схема+семантика+бизнес‑инварианты
+}
+
+// Кодеки/представления полезной нагрузки.
+enum PayloadEncoding {
+  PAYLOAD_ENCODING_UNSPECIFIED = 0;
+  ENCODING_JSON = 1;
+  ENCODING_PROTOBUF = 2;
+  ENCODING_AVRO = 3;
+  ENCODING_MSGPACK = 4;
+  ENCODING_RAW = 5;
+}
+
+// Компрессия полезной нагрузки.
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMP_NONE = 1;
+  COMP_GZIP = 2;
+  COMP_ZSTD = 3;
+}
+
+// Приоритет обработки (для очередей).
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  P_LOW = 1;
+  P_NORMAL = 2;
+  P_HIGH = 3;
+  P_CRITICAL = 4;
+}
+
+// Стратегия партиционирования.
+enum PartitionStrategy {
+  PARTITION_STRATEGY_UNSPECIFIED = 0;
+  PARTITION_BY_KEY_HASH = 1;   // по хэшу partition_key
+  PARTITION_EXPLICIT = 2;      // явный номер партиции
+}
+
+// Стратегия дедупликации.
+enum DedupeStrategy {
+  DEDUPE_STRATEGY_UNSPECIFIED = 0;
+  DEDUPE_NONE = 1;
+  DEDUPE_BY_IDEMPOTENCY_KEY = 2;
+  DEDUPE_BY_RECORD_ID = 3;
+  DEDUPE_BY_CHECKSUM = 4;
+}
+
+// -----------------------------
+// Модель данных
+// -----------------------------
+
+// Атрибуты маршрутизации и контекста.
+message Route {
+  string tenant_id = 1;                 // многоарендность
+  string topic = 2;                     // логическое направление
+  string route = 3;                     // дополнительный канал/маршрут
+  PartitionStrategy partition_strategy = 4;
+  // Если PARTITION_BY_KEY_HASH — берётся partition_key, иначе — explicit_partition.
+  string partition_key = 5;             // ключ для хэширования/упорядочивания
+  uint32 explicit_partition = 6;        // явный номер партиции
+  reserved 7 to 10;
+}
+
+// Метаданные схемы.
+message SchemaRef {
+  string schema_id = 1;     // глобальный id схемы (registry)
+  uint32 schema_rev = 2;    // ревизия
+  string content_type = 3;  // application/json, application/x-protobuf, avro/binary
+  reserved 4 to 10;
+}
+
+// Идентификация/идемпотентность/целостность.
+message IngestIdentity {
+  string idempotency_key = 1; // до 128 ASCII, уникальный ключ запроса/записи
+  engine.v1.common.Id record_id = 2; // внешний id записи (если есть)
+  string dedupe_id = 3;        // альтернативный идентификатор дедупликации
+  bytes checksum = 4;          // бинарная сумма (например, SHA‑256)
+  string checksum_alg = 5;     // "sha256", "xxhash64"
+  reserved 6 to 10;
+}
+
+// Полезная нагрузка одной записи.
+message IngestRecord {
+  Route route = 1;
+  SchemaRef schema = 2;
+  PayloadEncoding encoding = 3;
+  Compression compression = 4;
+  bytes payload = 5;                     // сжатое/кодированное содержимое
+  map<string, string> attributes = 6;    // произвольные ключи (до 8KB суммарно)
+  google.protobuf.Timestamp event_time = 7;   // время события (client/event)
+  google.protobuf.Timestamp observed_time = 8; // время наблюдения (server)
+  IngestIdentity identity = 9;
+  bool ordering_required = 10;           // требовать порядок внутри partition_key
+  Priority priority = 11;
+  // Доп. сведения для lineage/аудита
+  engine.v1.common.ResourceRef source = 12; // источник
+  reserved 13 to 20;
+}
+
+// Статус записи после ingest.
+message IngestRecordStatus {
+  engine.v1.common.Id record_id = 1;      // может быть вычислен системой
+  string idempotency_key = 2;
+  string storage_offset = 3;              // offset/sequence/LSN
+  uint32 partition = 4;
+  google.protobuf.Timestamp stored_at = 5;
+  // Если запись отклонена/частичный успех — detailed error
+  engine.v1.error.Error error = 6;
+  // Флаги результата
+  bool accepted = 7;
+  bool deduplicated = 8;                  // true, если запись распознана как дубликат
+  reserved 9 to 20;
+}
+
+// -----------------------------
+// Запросы/ответы
+// -----------------------------
+
+message IngestOptions {
+  AckMode ack_mode = 1;
+  ValidationMode validation = 2;
+  bool dry_run = 3;                         // без записи, только валидация
+  DedupeStrategy dedupe = 4;
+  google.protobuf.Duration timeout = 5;
+  uint32 max_in_flight = 6;                 // для потокового режима
+  // Трейсинг/корреляция
+  string request_id = 7;
+  string trace_id = 8;
+  string span_id = 9;
+  // Расширения (например, политика ретеншна для конкретной последовательности)
+  map<string, string> hints = 10;           // малые строковые подсказки
+  reserved 11 to 20;
+}
+
+message IngestSingleRequest {
+  IngestRecord record = 1;
+  IngestOptions options = 2;
+}
+
+message IngestSingleResponse {
+  IngestRecordStatus status = 1;
+}
+
+message IngestBatchRequest {
+  repeated IngestRecord records = 1;
+  IngestOptions options = 2;
+}
+
+message IngestBatchResponse {
+  repeated IngestRecordStatus statuses = 1; // размер = records.size()
+  // Сводная ошибка по запросу (например, инфраструктурная), помимо пер‑записных
+  engine.v1.error.Error error = 2;
+  reserved 3 to 10;
+}
+
+// Чанк запроса для bidi‑стрима.
+message IngestRequestChunk {
+  oneof kind {
+    IngestOptions options = 1;         // отправляется один раз в начале потока
+    IngestRecord record = 2;           // очередная запись
+    Flush flush = 3;                   // запросить flush/ack
+  }
+  reserved 4 to 10;
+}
+
+message Flush {
+  bool finalize = 1; // true => завершить поток после flush
+  reserved 2 to 10;
+}
+
+message IngestResponseChunk {
+  oneof kind {
+    IngestRecordStatus status = 1;   // результат по записи
+    Acknowledgement ack = 2;         // периодические подтверждения
+    engine.v1.error.Error error = 3; // ошибка уровня потока
+  }
+  reserved 4 to 10;
+}
+
+message Acknowledgement {
+  uint64 received = 1;  // сколько записей принято к обработке
+  uint64 stored = 2;    // сколько записей подтверждено к хранению
+  bool heartbeat = 3;   // сердцебиение для удержания соединения
+  reserved 4 to 10;
+}
+
+// -----------------------------
+// Сервис
+// -----------------------------
+
+service IngestService {
+  // Одиночная запись.
+  rpc IngestSingle(IngestSingleRequest) returns (IngestSingleResponse);
+
+  // Пакетная запись (частично успешная).
+  rpc IngestBatch(IngestBatchRequest) returns (IngestBatchResponse);
+
+  // Двунаправленная потоковая запись с периодическими ACK/статусами.
+  rpc IngestStream(stream IngestRequestChunk) returns (stream IngestResponseChunk);
+
+  // Простая проверка готовности ingest‑контура.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message HealthRequest {
+  // Ничего, зарезервировано под будущее.
+}
+
+message HealthResponse {
+  bool ready = 1;
+  string version = 2;
+  google.protobuf.Timestamp now = 3;
+  reserved 4 to 10;
+}
+
+// -----------------------------
+// Контракты/инварианты (комментарии для реализации)
+// -----------------------------
+//
+// 1) Идемпотентность:
+//    * При наличии options.dedupe != DEDUPE_NONE сервер обязан стабильно
+//      возвращать тот же IngestRecordStatus для повторов в пределах ttl хранения ключа.
+//    * Рекомендуется хранить idempotency_key >= 24 часа и не менее периода ретраев клиентов.
+//
+// 2) Дедупликация:
+//    * DEDUPE_BY_IDEMPOTENCY_KEY — ключ запроса уникален для данной записи.
+//    * DEDUPE_BY_RECORD_ID — уникальность по record.identity.record_id в границах topic/tenant.
+//    * DEDUPE_BY_CHECKSUM — уникальность по (route.topic, payload checksum).
+//
+// 3) Партиционирование и порядок:
+//    * ordering_required=true обязывает сервер сохранять относительный порядок
+//      для всех записей с одинаковым partition_key внутри одной партиции.
+//    * PARTITION_BY_KEY_HASH — стабильное хэш‑отображение (например, murmur/xxhash).
+//
+// 4) Валидация:
+//    * VALIDATION_SCHEMA — проверка schema_id/schema_rev + content_type/encoding + базовая форма.
+//    * VALIDATION_SEMANTIC — дополнительно доменные инварианты.
+//    * VALIDATION_STRICT — включает все проверки ECONOMY/SECURITY/ACL (при наличии интеграций).
+//
+// 5) ACK режимы:
+//    * ACK_NONE — ответ после валидации и приёма в очередь.
+//    * ACK_LEADER — после записи на лидера (fsync по возможности).
+//    * ACK_COMMITTED — после подтверждения кворума/репликаций; выше латентность.
+//
+// 6) Ограничения:
+//    * Максимальный размер payload — определяется сервером, рекомендовано документировать
+//      через ошибки RESOURCE_EXHAUSTED + RateLimitInfo.
+//
+// 7) Эволюция схем:
+//    * Поля помеченные reserved не переиспользовать.
+//    * Клиенты должны игнорировать незнакомые поля/варианты oneof.
+//
+// Конец файла.

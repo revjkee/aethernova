@@ -1,0 +1,505 @@
+syntax = "proto3";
+
+package cybersecurity.v1.iam;
+
+option go_package        = "github.com/aethernova/cybersecurity-core/schemas/gen/go/cybersecurity/v1/iam;iampb";
+option java_multiple_files = true;
+option java_package      = "com.aethernova.cybersecurity.v1.iam";
+option csharp_namespace  = "Aethernova.Cybersecurity.V1.Iam";
+option php_namespace     = "Aethernova\\Cybersecurity\\V1\\Iam";
+
+// Well-known types
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+// HTTP transcoding (optional; remove if не используется)
+import "google/api/annotations.proto";
+
+// -----------------------------------------------------------------------------
+// Общие перечисления
+// -----------------------------------------------------------------------------
+
+enum Effect {
+  EFFECT_UNSPECIFIED = 0;
+  EFFECT_ALLOW       = 1;
+  EFFECT_DENY        = 2;
+}
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  DECISION_PERMIT      = 1;
+  DECISION_DENY        = 2;
+  DECISION_NOT_APPLICABLE = 3;
+  DECISION_INDETERMINATE  = 4;
+}
+
+enum SubjectType {
+  SUBJECT_TYPE_UNSPECIFIED = 0;
+  SUBJECT_TYPE_USER        = 1;
+  SUBJECT_TYPE_SERVICE_ACCOUNT = 2;
+}
+
+enum UserStatus {
+  USER_STATUS_UNSPECIFIED = 0;
+  USER_STATUS_ACTIVE      = 1;
+  USER_STATUS_LOCKED      = 2;
+  USER_STATUS_SUSPENDED   = 3;
+  USER_STATUS_DELETED     = 4;
+}
+
+enum TokenType {
+  TOKEN_TYPE_UNSPECIFIED = 0;
+  TOKEN_TYPE_ACCESS      = 1;
+  TOKEN_TYPE_REFRESH     = 2;
+  TOKEN_TYPE_API_KEY     = 3;
+  TOKEN_TYPE_MTLS        = 4;
+}
+
+// -----------------------------------------------------------------------------
+// Общие сообщения
+// -----------------------------------------------------------------------------
+
+message CommonMetadata {
+  google.protobuf.Timestamp created_at = 1;
+  google.protobuf.Timestamp updated_at = 2;
+  string created_by = 3; // subject id
+  string updated_by = 4; // subject id
+  map<string, string> labels = 5;
+  // 6..9 зарезервированы для расширений аудита
+  reserved 6 to 9;
+}
+
+message Tenant {
+  string id = 1;   // UUID/ULID/KSUID
+  string name = 2;
+  map<string, string> labels = 3;
+  CommonMetadata meta = 10;
+  // reserved для будущих полей
+  reserved 4 to 9, 11 to 19;
+}
+
+message Principal {
+  SubjectType type = 1;
+  string id = 2;           // user_id или service_account_id
+  string tenant_id = 3;
+  map<String, string> attributes = 4;
+  // Дополнительные идентификаторы (email, subject, external_idp)
+  string subject = 5;      // OIDC sub/subject
+  string external_idp = 6; // oidc/saml/ldap
+  reserved 7 to 19;
+}
+
+// -----------------------------------------------------------------------------
+// Сущности IAM
+// -----------------------------------------------------------------------------
+
+message User {
+  string id = 1;
+  string tenant_id = 2;
+  string email = 3;
+  string display_name = 4;
+  UserStatus status = 5;
+  bool mfa_enabled = 6;
+  repeated string role_ids = 7;
+  map<string, string> attributes = 8; // произвольные атрибуты для ABAC
+  google.protobuf.Timestamp last_login_at = 9;
+  CommonMetadata meta = 15;
+  google.protobuf.Timestamp deleted_at = 16; // soft delete
+  reserved 10 to 14;
+}
+
+message ServiceAccount {
+  string id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  string description = 4;
+  UserStatus status = 5; // ACTIVE/SUSPENDED/DELETED
+  repeated string role_ids = 6;
+  repeated string scopes = 7;
+  Credentials credentials = 8;
+  CommonMetadata meta = 15;
+  reserved 9 to 14, 16 to 19;
+
+  message Credentials {
+    string key_id = 1;
+    google.protobuf.Timestamp created_at = 2;
+    google.protobuf.Timestamp expires_at = 3;
+    // секреты не передаются в явном виде
+    reserved 4 to 9;
+  }
+}
+
+message Role {
+  string id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  string description = 4;
+  bool is_system = 5; // защищенная роль
+  repeated Permission permissions = 6;
+  map<string, string> labels = 7;
+  CommonMetadata meta = 15;
+  reserved 8 to 14, 16 to 19;
+}
+
+message Permission {
+  // Универсальная модель действия над ресурсом
+  string resource_type = 1;      // e.g., "project", "dataset", "secret", "policy"
+  string action = 2;             // e.g., "read","write","delete","evaluate","assign"
+  string resource_id_pattern = 3; // glob/regex pattern, пусто -> любой
+  // Условие для ABAC (локальная фильтрация на этапе разрешений роли)
+  Condition condition = 4;
+  reserved 5 to 9;
+}
+
+message Policy {
+  string id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  string description = 4;
+  Effect effect = 5;                 // ALLOW/DENY
+  repeated string actions = 6;       // набор действий
+  repeated ResourceSelector resources = 7;
+  repeated PrincipalSelector principals = 8;
+  Condition condition = 9;           // глобальное условие политики (CEL/OPA)
+  int32 priority = 10;               // чем ниже число — тем выше приоритет
+  bool enabled = 11;
+  string version = 12;
+  CommonMetadata meta = 20;
+  reserved 13 to 19, 21 to 29;
+}
+
+message ResourceSelector {
+  string type = 1;                 // "project","secret","topic",...
+  // Один из способов сопоставления
+  oneof match {
+    string id = 2;                 // точное соответствие
+    string pattern = 3;            // glob/regex
+    map<string, string> labels = 4;// соответствие по меткам (все должны совпасть)
+    string expression = 5;         // CEL выражение над атрибутами ресурса
+  }
+  reserved 6 to 9;
+}
+
+message PrincipalSelector {
+  SubjectType type = 1;
+  oneof match {
+    string id = 2;                 // конкретный subject id
+    string role_id = 3;            // все субъекты с ролью
+    string expression = 4;         // CEL над атрибутами субъекта
+  }
+  reserved 5 to 9;
+}
+
+message Condition {
+  string description = 1;
+  oneof engine {
+    string cel = 2;            // CEL-выражение
+    string rego_module_id = 3; // ID внешней Rego-политики/пакета
+  }
+  map<string, string> params = 4; // параметры для движка
+  reserved 5 to 9;
+}
+
+// -----------------------------------------------------------------------------
+// Токены/сессии/решения
+// -----------------------------------------------------------------------------
+
+message Token {
+  TokenType type = 1;
+  string jti = 2;                         // уникальный ID токена
+  Principal subject = 3;
+  string issuer = 4;
+  repeated string audience = 5;
+  repeated string scope = 6;
+  google.protobuf.Timestamp issued_at = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  string session_id = 9;
+  reserved 10 to 19;
+}
+
+message Session {
+  string id = 1;
+  Principal subject = 2;
+  google.protobuf.Timestamp started_at = 3;
+  google.protobuf.Timestamp last_activity_at = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  string ip = 6;
+  string user_agent = 7;
+  bool mfa_verified = 8;
+  double risk_score = 9; // 0..100
+  reserved 10 to 19;
+}
+
+message ResourceRef {
+  string type = 1;
+  string id = 2;
+  string name = 3;
+  map<string, string> labels = 4;
+  google.protobuf.Struct attributes = 5;
+  reserved 6 to 9;
+}
+
+message AccessRequest {
+  string request_id = 1;
+  string tenant_id = 2;
+  Principal principal = 3;
+  ResourceRef resource = 4;
+  string action = 5;
+  google.protobuf.Struct context = 6; // произвольный контекст (IP, geolocation, device posture, ...)
+  google.protobuf.Timestamp request_time = 7;
+  string ip = 8;
+  string user_agent = 9;
+  reserved 10 to 19;
+}
+
+message AccessDecision {
+  Decision decision = 1;
+  string reason = 2;
+  repeated string matched_policy_ids = 3;
+  double risk_score = 4; // 0..100
+  map<string, string> obligations = 5; // e.g., {"mask":"email,pan","mfa":"required"}
+  google.protobuf.Timestamp evaluated_at = 6;
+  bool mfa_required = 7;
+  reserved 8 to 19;
+}
+
+// -----------------------------------------------------------------------------
+// Запросы/ответы и пагинация
+// -----------------------------------------------------------------------------
+
+message PageRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message PageResponse {
+  string next_page_token = 1;
+  int64 total_size = 2;
+}
+
+// Users
+message CreateUserRequest {
+  User user = 1;
+}
+message GetUserRequest { string id = 1; }
+message ListUsersRequest {
+  string tenant_id = 1;
+  PageRequest page = 2;
+  string filter = 3; // CEL по атрибутам/меткам
+}
+message ListUsersResponse {
+  repeated User users = 1;
+  PageResponse page = 2;
+}
+message UpdateUserRequest {
+  string id = 1;
+  User user = 2;
+  google.protobuf.FieldMask update_mask = 3;
+}
+message DeleteUserRequest {
+  string id = 1;
+  bool hard_delete = 2; // по умолчанию soft
+}
+
+// Service Accounts
+message CreateServiceAccountRequest { ServiceAccount sa = 1; }
+message GetServiceAccountRequest { string id = 1; }
+message ListServiceAccountsRequest {
+  string tenant_id = 1;
+  PageRequest page = 2;
+}
+message ListServiceAccountsResponse {
+  repeated ServiceAccount service_accounts = 1;
+  PageResponse page = 2;
+}
+message UpdateServiceAccountRequest {
+  string id = 1;
+  ServiceAccount sa = 2;
+  google.protobuf.FieldMask update_mask = 3;
+}
+message DeleteServiceAccountRequest {
+  string id = 1;
+  bool hard_delete = 2;
+}
+message RotateServiceAccountKeyRequest { string id = 1; }
+message RotateServiceAccountKeyResponse { ServiceAccount sa = 1; }
+
+// Roles
+message CreateRoleRequest { Role role = 1; }
+message GetRoleRequest { string id = 1; }
+message ListRolesRequest {
+  string tenant_id = 1;
+  PageRequest page = 2;
+}
+message ListRolesResponse {
+  repeated Role roles = 1;
+  PageResponse page = 2;
+}
+message UpdateRoleRequest {
+  string id = 1;
+  Role role = 2;
+  google.protobuf.FieldMask update_mask = 3;
+}
+message DeleteRoleRequest { string id = 1; }
+
+message AssignRoleRequest {
+  string principal_id = 1;
+  SubjectType principal_type = 2;
+  string role_id = 3;
+}
+message RevokeRoleRequest {
+  string principal_id = 1;
+  SubjectType principal_type = 2;
+  string role_id = 3;
+}
+
+// Policies
+message CreatePolicyRequest { Policy policy = 1; }
+message GetPolicyRequest { string id = 1; }
+message ListPoliciesRequest {
+  string tenant_id = 1;
+  PageRequest page = 2;
+  bool enabled_only = 3;
+}
+message ListPoliciesResponse {
+  repeated Policy policies = 1;
+  PageResponse page = 2;
+}
+message UpdatePolicyRequest {
+  string id = 1;
+  Policy policy = 2;
+  google.protobuf.FieldMask update_mask = 3;
+}
+message DeletePolicyRequest { string id = 1; }
+
+// PDP (policy decision point)
+message EvaluateAccessRequest { AccessRequest request = 1; }
+message EvaluateAccessResponse { AccessDecision decision = 1; }
+
+// Tokens
+message IssueTokenRequest {
+  Principal subject = 1;
+  TokenType type = 2;
+  google.protobuf.Duration ttl = 3;
+  repeated string scope = 4;
+  repeated string audience = 5;
+  string session_id = 6;
+  bool mfa_verified = 7;
+}
+message IssueTokenResponse {
+  string token = 1; // сериализованный токен (JWT/opaque)
+  Token meta = 2;   // метаданные токена
+}
+message IntrospectTokenRequest { string token = 1; }
+message IntrospectTokenResponse {
+  bool active = 1;
+  Token meta = 2;
+}
+message RevokeTokenRequest {
+  oneof target {
+    string jti = 1;
+    string token = 2;
+    string session_id = 3;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// IAM Service (gRPC + HTTP)
+// -----------------------------------------------------------------------------
+
+service IAMService {
+  // -------- Users --------
+  rpc CreateUser(CreateUserRequest) returns (User) {
+    option (google.api.http) = { post: "/v1/iam/users" body: "user" };
+  }
+  rpc GetUser(GetUserRequest) returns (User) {
+    option (google.api.http) = { get: "/v1/iam/users/{id}" };
+  }
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse) {
+    option (google.api.http) = { get: "/v1/iam/users" };
+  }
+  rpc UpdateUser(UpdateUserRequest) returns (User) {
+    option (google.api.http) = { patch: "/v1/iam/users/{id}" body: "user" };
+  }
+  rpc DeleteUser(DeleteUserRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { delete: "/v1/iam/users/{id}" };
+  }
+
+  // ---- Service Accounts ---
+  rpc CreateServiceAccount(CreateServiceAccountRequest) returns (ServiceAccount) {
+    option (google.api.http) = { post: "/v1/iam/serviceAccounts" body: "sa" };
+  }
+  rpc GetServiceAccount(GetServiceAccountRequest) returns (ServiceAccount) {
+    option (google.api.http) = { get: "/v1/iam/serviceAccounts/{id}" };
+  }
+  rpc ListServiceAccounts(ListServiceAccountsRequest) returns (ListServiceAccountsResponse) {
+    option (google.api.http) = { get: "/v1/iam/serviceAccounts" };
+  }
+  rpc UpdateServiceAccount(UpdateServiceAccountRequest) returns (ServiceAccount) {
+    option (google.api.http) = { patch: "/v1/iam/serviceAccounts/{id}" body: "sa" };
+  }
+  rpc DeleteServiceAccount(DeleteServiceAccountRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { delete: "/v1/iam/serviceAccounts/{id}" };
+  }
+  rpc RotateServiceAccountKey(RotateServiceAccountKeyRequest) returns (RotateServiceAccountKeyResponse) {
+    option (google.api.http) = { post: "/v1/iam/serviceAccounts/{id}:rotateKey" body: "*" };
+  }
+
+  // -------- Roles --------
+  rpc CreateRole(CreateRoleRequest) returns (Role) {
+    option (google.api.http) = { post: "/v1/iam/roles" body: "role" };
+  }
+  rpc GetRole(GetRoleRequest) returns (Role) {
+    option (google.api.http) = { get: "/v1/iam/roles/{id}" };
+  }
+  rpc ListRoles(ListRolesRequest) returns (ListRolesResponse) {
+    option (google.api.http) = { get: "/v1/iam/roles" };
+  }
+  rpc UpdateRole(UpdateRoleRequest) returns (Role) {
+    option (google.api.http) = { patch: "/v1/iam/roles/{id}" body: "role" };
+  }
+  rpc DeleteRole(DeleteRoleRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { delete: "/v1/iam/roles/{id}" };
+  }
+  rpc AssignRole(AssignRoleRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { post: "/v1/iam/roles:assign" body: "*" };
+  }
+  rpc RevokeRole(RevokeRoleRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { post: "/v1/iam/roles:revoke" body: "*" };
+  }
+
+  // ------- Policies -------
+  rpc CreatePolicy(CreatePolicyRequest) returns (Policy) {
+    option (google.api.http) = { post: "/v1/iam/policies" body: "policy" };
+  }
+  rpc GetPolicy(GetPolicyRequest) returns (Policy) {
+    option (google.api.http) = { get: "/v1/iam/policies/{id}" };
+  }
+  rpc ListPolicies(ListPoliciesRequest) returns (ListPoliciesResponse) {
+    option (google.api.http) = { get: "/v1/iam/policies" };
+  }
+  rpc UpdatePolicy(UpdatePolicyRequest) returns (Policy) {
+    option (google.api.http) = { patch: "/v1/iam/policies/{id}" body: "policy" };
+  }
+  rpc DeletePolicy(DeletePolicyRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { delete: "/v1/iam/policies/{id}" };
+  }
+
+  // ------- PDP / Access -------
+  rpc EvaluateAccess(EvaluateAccessRequest) returns (EvaluateAccessResponse) {
+    option (google.api.http) = { post: "/v1/iam:checkAccess" body: "request" };
+  }
+
+  // ------- Tokens -------
+  rpc IssueToken(IssueTokenRequest) returns (IssueTokenResponse) {
+    option (google.api.http) = { post: "/v1/iam:issueToken" body: "*" };
+  }
+  rpc IntrospectToken(IntrospectTokenRequest) returns (IntrospectTokenResponse) {
+    option (google.api.http) = { post: "/v1/iam:introspect" body: "*" };
+  }
+  rpc RevokeToken(RevokeTokenRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { post: "/v1/iam:revokeToken" body: "*" };
+  }
+}

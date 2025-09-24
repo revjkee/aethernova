@@ -1,0 +1,354 @@
+# file: zero-trust-core/configs/templates/session_policy.example.yaml
+apiVersion: ztc.aethernova.io/v1
+kind: SessionPolicy
+metadata:
+  name: default-session-policy
+  description: >
+    Базовая политика жизненного цикла сессий в модели Zero Trust:
+    риск-ориентированная аутентификация, step-up MFA, непрерывная оценка контекста,
+    привязка к устройству и сети, строгие таймауты и правила ротации токенов.
+  labels:
+    env: example
+    owner: platform-security
+  version: 1
+
+# Повторно используемые анкоры/пороги
+x-anchors:
+  risk-thresholds: &risk_thresholds
+    low: 0.0
+    medium: 0.35
+    high: 0.65
+    critical: 0.85
+  default-timeouts: &default_timeouts
+    idle: 15m         # неактивность
+    absolute: 12h     # абсолютное время жизни
+    max_renewals: 24  # максимум обновлений refresh перед принудительной реаутентификацией
+  strong-mfa: &strong_mfa
+    required: true
+    methods:
+      - type: webauthn_platform
+      - type: webauthn_cross_platform
+      - type: totp
+    disallowed_methods: [sms_otp]  # слабые каналы отключены
+    retries: 3
+    step_up_grace: 5m
+  cookie-hardening: &cookie_hardening
+    name: ztc_session
+    sameSite: Lax
+    httpOnly: true
+    secure: true
+    partitioned: false
+    domain: ${SESSION_COOKIE_DOMAIN:-localhost}
+    path: /
+  token-rotation: &token_rotation
+    refresh:
+      rotation: true
+      reuse_interval: 5s
+      absolute_lifetime: 90d
+      inactivity_lifetime: 30d
+    access:
+      ttl: 15m
+      dpop_required: false        # включите при наличии DPoP на клиентах
+      audience: ["ztc.api"]
+      scope_default: ["openid","profile"]
+      scope_max: ["openid","profile","email","ztc.admin.read"]
+  device-posture-min: &device_posture_min
+    os_min:
+      darwin: "12.0"
+      windows: "10.0.19045"
+      linux: "5.4.0"
+      ios: "16.0"
+      android: "12"
+    controls:
+      disk_encryption: required
+      screen_lock: required
+      firewall: required
+      av_realtime: recommended
+      mdm_enrolled: recommended
+    attestation:
+      apple: optional
+      android_play_integrity: optional
+      windows_atp: optional
+  allow-origins-dev: &allow_origins_dev
+    - http://localhost:8080
+    - http://127.0.0.1:8080
+
+spec:
+  precedence:
+    # Порядок применения наборов правил (первое совпадение с терминальным действием останавливает поиск)
+    - breakglass
+    - admins
+    - restricted_geo
+    - elevated_risk
+    - default
+
+  defaults:
+    session:
+      timeouts: *default_timeouts
+      cookie: *cookie_hardening
+      bind:
+        device:
+          mode: preferred       # none|preferred|required
+          requirements: *device_posture_min
+          # token_binding: dpop|mtls|none
+          token_binding: none
+        network:
+          sticky_ip_subnet: /24   # легкая привязка; резкая смена подсети => reauth
+          asn_stickiness: true
+        client_cert:
+          enabled: false
+          whitelist_thumbprints: []
+      reauth_triggers:
+        on_risk_increase_to: high
+        on_sensitive_resource_access: true
+        on_network_change: true
+        on_device_posture_downgrade: true
+      cap:                          # Continuous Access Evaluation
+        enabled: true
+        reevaluate_on:
+          - risk_change
+          - geo_change
+          - asn_change
+          - device_posture_change
+          - token_claims_change
+        revoke_on:
+          - signals.quarantine
+          - signals.credential_stuffing
+          - signals.token_leak
+    auth:
+      primary: oidc
+      mfa:
+        required: false
+        methods: [webauthn_platform, totp]
+    tokens: *token_rotation
+    cors:
+      enabled: true
+      allow_origins: *allow_origins_dev
+      allow_headers: ["Authorization","Content-Type","If-Match","X-Request-ID"]
+      allow_methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+      allow_credentials: true
+      max_age: 10m
+    audit:
+      level: info
+      redact_fields: ["password","secret","token","authorization","client_secret","refresh_token"]
+      reason_codes: true
+
+  risk:
+    provider:
+      type: composite            # пример: суммирование сигналов
+      sources:
+        # сигналы: вход с нового устройства, необычное время, репутация IP, скорости перебора, уязвимость устройства и пр.
+        - name: ip_reputation
+          weight: 0.25
+        - name: impossible_travel
+          weight: 0.20
+        - name: device_posture_gap
+          weight: 0.25
+        - name: behavioral_anomaly
+          weight: 0.30
+    thresholds: *risk_thresholds
+    actions:
+      # При превышении порога выбирается минимально достаточное действие
+      - when: "risk >= critical"
+        do: [deny]
+        reason: RISK_CRITICAL
+      - when: "risk >= high"
+        do: [step_up_mfa, limit_scope]
+        limit_scope_to: ["openid","profile"]        # урезаем до минимально необходимых
+        reason: RISK_HIGH
+      - when: "risk >= medium"
+        do: [step_up_mfa]
+        mfa: *strong_mfa
+        reason: RISK_MEDIUM
+
+  # Наборы правил. Каждый содержит условия и действие/параметры сессии.
+  ruleSets:
+
+    breakglass:
+      terminal: true
+      rules:
+        - name: breakglass-admin
+          when:
+            allOf:
+              - "user.labels contains 'breakglass'"
+              - "user.role in ['admin','sre']"
+          action:
+            allow: true
+            session:
+              timeouts:
+                idle: 10m
+                absolute: 2h
+              bind:
+                device:
+                  mode: none
+                network:
+                  sticky_ip_subnet: null
+              reauth_triggers:
+                on_sensitive_resource_access: true
+            auth:
+              mfa:
+                required: true
+                methods: [webauthn_platform, webauthn_cross_platform]
+            audit:
+              level: warn
+              reason: BREAKGLASS
+
+    admins:
+      rules:
+        - name: admin-from-trusted-geo
+          when:
+            allOf:
+              - "user.role == 'admin'"
+              - "geo.country in ['SE','FI','NO','DK']"
+              - "network.asn in [12552,3301,29518]" # пример ASN allowlist
+              - "vpn_or_tor == false"
+          action:
+            allow: true
+            auth:
+              mfa: *strong_mfa
+            session:
+              timeouts:
+                idle: 10m
+                absolute: 8h
+              bind:
+                device:
+                  mode: required
+                  requirements:
+                    <<: *device_posture_min
+                    controls:
+                      disk_encryption: required
+                      av_realtime: required
+                    attestation:
+                      apple: required_if(darwin)
+                      windows_atp: required_if(windows)
+                network:
+                  sticky_ip_subnet: /24
+            audit:
+              reason: ADMIN_TRUSTED_CONTEXT
+
+        - name: admin-from-untrusted-geo
+          when:
+            allOf:
+              - "user.role == 'admin'"
+              - "geo.country not in ['SE','FI','NO','DK']"
+          action:
+            # Строже: только read‑only и короткие TTL
+            allow: true
+            auth:
+              mfa: *strong_mfa
+            session:
+              timeouts:
+                idle: 5m
+                absolute: 2h
+              bind:
+                device:
+                  mode: required
+                network:
+                  sticky_ip_subnet: /32
+            tokens:
+              access:
+                ttl: 5m
+                scope_max: ["openid","profile","ztc.admin.read"]
+            audit:
+              reason: ADMIN_UNTRUSTED_GEO
+
+    restricted_geo:
+      terminal: true
+      rules:
+        - name: geo-blocked
+          when:
+            anyOf:
+              - "geo.country in ['RU','BY','KP','IR']"
+              - "vpn_or_tor == true"
+          action:
+            deny: true
+            audit:
+              reason: GEO_RESTRICTED
+
+    elevated_risk:
+      rules:
+        - name: force-step-up-on-sensitive-apps
+          when:
+            allOf:
+              - "resource.app in ['payments','pki','secrets']"
+              - "risk >= medium"
+          action:
+            allow: true
+            auth:
+              mfa: *strong_mfa
+            session:
+              reauth_triggers:
+                on_sensitive_resource_access: true
+            audit:
+              reason: SENSITIVE_APP_STEP_UP
+
+    default:
+      rules:
+        - name: baseline-employee
+          when:
+            allOf:
+              - "user.role in ['employee','contractor']"
+              - "device.is_corporate == true"
+          action:
+            allow: true
+            auth:
+              mfa:
+                required: false
+                methods: [webauthn_platform, totp]
+            session:
+              timeouts: *default_timeouts
+              bind:
+                device:
+                  mode: preferred
+                  requirements: *device_posture_min
+                network:
+                  sticky_ip_subnet: /24
+            tokens: *token_rotation
+            audit:
+              reason: BASELINE
+
+        - name: fallback-readonly
+          when:
+            anyOf:
+              - "true"   # последнее правило по умолчанию
+          action:
+            allow: true
+            tokens:
+              access:
+                ttl: 10m
+                scope_max: ["openid","profile"]
+            session:
+              timeouts:
+                idle: 5m
+                absolute: 2h
+            audit:
+              reason: FALLBACK_LIMITED
+
+  # Дополнительные механизмы завершения/продления сессий
+  lifecycle:
+    # Жесткие события для немедленного отзыва
+    revoke_on_events:
+      - credential_rotated
+      - user_disabled
+      - device_marked_compromised
+      - session_token_reuse_detected
+    # Условия безопасного продления сессии без ре‑логина
+    silent_renew:
+      enabled: true
+      require_visibility: false      # SPA может обновлять в бэкграунде
+      max_chain: 24                  # не больше, чем defaults.session.timeouts.max_renewals
+    grace_periods:
+      mfa_step_up: 5m
+
+  # Словарь причин и их человекочитаемые описания для аудита/метрик
+  reasons:
+    BREAKGLASS: "Режим аварийного доступа"
+    ADMIN_TRUSTED_CONTEXT: "Администратор из доверенного контекста"
+    ADMIN_UNTRUSTED_GEO: "Администратор вне доверенного периметра"
+    GEO_RESTRICTED: "Регион или VPN/Tor заблокирован"
+    SENSITIVE_APP_STEP_UP: "Повышение уровня аутентификации для чувствительного приложения"
+    BASELINE: "Базовая политика сотрудника"
+    FALLBACK_LIMITED: "Резервное ограниченное разрешение"
+    RISK_CRITICAL: "Критический риск — доступ запрещен"
+    RISK_HIGH: "Высокий риск — требуется step-up и ограничение прав"
+    RISK_MEDIUM: "Средний риск — требуется step-up"

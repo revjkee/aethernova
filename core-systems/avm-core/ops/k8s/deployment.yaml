@@ -1,0 +1,349 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: avm-core
+  namespace: avm-core
+  labels:
+    app.kubernetes.io/name: avm-core
+    app.kubernetes.io/part-of: core-systems
+    app.kubernetes.io/component: service
+    app.kubernetes.io/version: "0.1.0"
+    security.neurocity.io/tier: critical
+automountServiceAccountToken: false
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: avm-core
+  namespace: avm-core
+  labels:
+    app.kubernetes.io/name: avm-core
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: avm-core
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: avm-core
+  namespace: avm-core
+  labels:
+    app.kubernetes.io/name: avm-core
+    app.kubernetes.io/part-of: core-systems
+    app.kubernetes.io/component: service
+    app.kubernetes.io/version: "0.1.0"
+    observability.neurocity.io/tier: critical
+  annotations:
+    # Обновляйте эти checksum через CI (напр., kustomize/helm), чтобы триггерить rollout при смене конфигов.
+    config.checksum/configmap: "<sha256-of-avm-core-config>"
+    config.checksum/secret: "<sha256-of-avm-core-secrets>"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  minReadySeconds: 10
+  progressDeadlineSeconds: 300
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: avm-core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: avm-core
+        app.kubernetes.io/part-of: core-systems
+        app.kubernetes.io/component: service
+        app.kubernetes.io/version: "0.1.0"
+        tier: critical
+      annotations:
+        # Prometheus scrape
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        # AppArmor/Seccomp. AppArmor аннотации требуют включённого профиля на кластере.
+        container.apparmor.security.beta.kubernetes.io/app: "runtime/default"
+        seccomp.security.alpha.kubernetes.io/pod: "runtime/default"
+        # Синхронизация rollout c изменениями конфигов
+        config.checksum/configmap: "<sha256-of-avm-core-config>"
+        config.checksum/secret: "<sha256-of-avm-core-secrets>"
+    spec:
+      serviceAccountName: avm-core
+      enableServiceLinks: false
+      imagePullSecrets:
+        - name: regcred
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: avm-core
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: ["linux"]
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64","arm64"]
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: avm-core
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: avm-core
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: app
+          image: "registry.example.com/core-systems/avm-core@sha256:<digest>"
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config=/app/configs"
+            - "--port=8080"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Профиль и сервисные настройки (совместимо с avm_core.deps.Settings)
+            - name: AVM_ENV
+              value: "prod"
+            - name: AVM_SERVICE
+              value: "avm-core"
+            - name: AVM_LOG_LEVEL
+              value: "INFO"
+            - name: AVM_LOG_JSON
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: avm-core-config
+                  key: otel_endpoint
+                  optional: true
+            - name: AVM_OTEL_ENABLED
+              value: "1"
+            - name: AVM_HTTP_TIMEOUT
+              value: "10"
+            - name: AVM_HTTP_RETRIES
+              value: "2"
+            - name: AVM_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: avm-core-secrets
+                  key: redis_url
+                  optional: true
+            - name: AVM_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: avm-core-secrets
+                  key: database_url
+                  optional: true
+            - name: AVM_JWT_SIGNING_KEY_PEM
+              valueFrom:
+                secretKeyRef:
+                  name: avm-core-secrets
+                  key: jwt_signing_key_pem
+                  optional: true
+            # Downward API
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          envFrom:
+            - configMapRef:
+                name: avm-core-config
+                optional: true
+            - secretRef:
+                name: avm-core-secrets
+                optional: true
+          volumeMounts:
+            - name: config
+              mountPath: /app/configs
+              readOnly: true
+            - name: secrets
+              mountPath: /app/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+              readOnly: false
+            - name: run
+              mountPath: /var/run/avm
+              readOnly: false
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "150m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          startupProbe:
+            httpGet:
+              path: /healthz/startup
+              port: http
+            failureThreshold: 30
+            periodSeconds: 3
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-lc","sleep 5"]
+      volumes:
+        - name: config
+          configMap:
+            name: avm-core-config
+            optional: true
+        - name: secrets
+          secret:
+            secretName: avm-core-secrets
+            optional: true
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: "128Mi"
+        - name: run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: avm-core
+  namespace: avm-core
+  labels:
+    app.kubernetes.io/name: avm-core
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: avm-core
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: avm-core
+  namespace: avm-core
+  labels:
+    app.kubernetes.io/name: avm-core
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: avm-core
+  minReplicas: 3
+  maxReplicas: 10
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # При наличии пользовательских метрик Prometheus Adapter можно добавить ниже
+    # - type: Pods / External / Object ...
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: avm-core-deny-by-default
+  namespace: avm-core
+  labels:
+    app.kubernetes.io/name: avm-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: avm-core
+  policyTypes: ["Ingress","Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: avm-core
+        - podSelector: {}  # внутри того же namespace (ограничьте при необходимости)
+      ports:
+        - protocol: TCP
+          port: 80
+  egress:
+    - to:
+        - namespaceSelector: {}   # разрешите сервисам кластера
+      ports:
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0       # сузьте по egress‑маршрутам/внешним API
+      ports:
+        - protocol: TCP
+          port: 443

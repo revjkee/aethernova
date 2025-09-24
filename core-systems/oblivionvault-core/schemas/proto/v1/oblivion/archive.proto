@@ -1,0 +1,393 @@
+syntax = "proto3";
+
+package oblivion.v1.oblivion;
+
+option go_package = "github.com/aethernova/oblivionvault-core/gen/go/oblivion/v1;oblivionv1";
+option java_multiple_files = true;
+option java_package = "ai.aethernova.oblivion.v1";
+option csharp_namespace = "Aethernova.Oblivion.V1";
+option objc_class_prefix = "OV";
+option php_namespace = "Aethernova\\Oblivion\\V1";
+
+// ----------------------------------------------------------------------------
+// Well-known types
+// ----------------------------------------------------------------------------
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// ----------------------------------------------------------------------------
+// Enums
+// ----------------------------------------------------------------------------
+
+enum StatusCode {
+  STATUS_CODE_UNSPECIFIED = 0;
+  STATUS_CODE_OK          = 1;
+  STATUS_CODE_ACCEPTED    = 2;
+  STATUS_CODE_DENIED      = 3;
+  STATUS_CODE_NOT_FOUND   = 4;
+  STATUS_CODE_CONFLICT    = 5;
+  STATUS_CODE_INVALID     = 6;
+  STATUS_CODE_FAILED      = 7;
+}
+
+enum HashAlgo {
+  HASH_ALGO_UNSPECIFIED = 0;
+  HASH_ALGO_SHA256      = 1;
+  HASH_ALGO_SHA512      = 2;
+  HASH_ALGO_BLAKE3      = 3;
+}
+
+enum CompressionCodec {
+  COMPRESSION_CODEC_UNSPECIFIED = 0;
+  COMPRESSION_CODEC_NONE        = 1;
+  COMPRESSION_CODEC_GZIP        = 2;
+  COMPRESSION_CODEC_ZSTD        = 3;
+  COMPRESSION_CODEC_LZ4         = 4;
+}
+
+enum EncAlgo {
+  ENC_ALGO_UNSPECIFIED       = 0;
+  ENC_ALGO_AES_256_GCM       = 1;
+  ENC_ALGO_CHACHA20_POLY1305 = 2;
+}
+
+enum KmsProvider {
+  KMS_PROVIDER_UNSPECIFIED = 0;
+  KMS_PROVIDER_AWS_KMS     = 1;
+  KMS_PROVIDER_GCP_KMS     = 2;
+  KMS_PROVIDER_AZURE_KV    = 3;
+  KMS_PROVIDER_VAULT       = 4; // HashiCorp Vault Transit
+  KMS_PROVIDER_EXTERNAL    = 5; // внешняя HSM/KMS интеграция
+}
+
+enum StorageProvider {
+  STORAGE_PROVIDER_UNSPECIFIED = 0;
+  STORAGE_PROVIDER_AWS_S3      = 1;
+  STORAGE_PROVIDER_GCS         = 2;
+  STORAGE_PROVIDER_AZURE_BLOB  = 3;
+  STORAGE_PROVIDER_S3_COMPAT   = 4; // MinIO/Wasabi и др.
+  STORAGE_PROVIDER_POSIX       = 5;
+}
+
+enum StorageClass {
+  STORAGE_CLASS_UNSPECIFIED = 0;
+  STORAGE_CLASS_HOT         = 1; // S3 Standard/Hot tier
+  STORAGE_CLASS_COLD        = 2; // S3 Standard-IA/Coldline
+  STORAGE_CLASS_ARCHIVE     = 3; // S3 Glacier/Deep Archive
+}
+
+// ----------------------------------------------------------------------------
+// Common messages
+// ----------------------------------------------------------------------------
+
+message ResourceId {
+  string value = 1; // UUIDv4/ULID
+}
+
+message Labels {
+  map<string, string> entries = 1;
+}
+
+message Hash {
+  HashAlgo algo = 1;
+  bytes value   = 2; // сырое значение хеша
+}
+
+message Compression {
+  CompressionCodec codec = 1;
+  // Уровень компрессии. Диапазон зависит от кодека, -1 — по умолчанию.
+  int32 level            = 2;
+}
+
+message Encryption {
+  // Признак конвертного шифрования (DEK, завернутый KMS/KEK).
+  bool envelope = 1;
+
+  // Алгоритм шифрования данных.
+  EncAlgo algo = 2;
+
+  // Идентификатор используемого ключа (логический), например alias или key_id.
+  string key_id = 3;
+
+  // Провайдер (AWS KMS/GCP KMS/Azure/Vault/External).
+  KmsProvider kms_provider = 4;
+
+  // ARN/ресурс ключа (для провайдеров, где применимо).
+  string kms_resource = 5;
+
+  // Завернутый контент-ключ (DEK).
+  bytes wrapped_cek = 6;
+
+  // Нонс/IV.
+  bytes iv = 7;
+
+  // Аутентификационный тег AEAD (если применимо).
+  bytes tag = 8;
+
+  // Ограничение по kms:ViaService (для cloud-KMS), список FQDN сервисов.
+  repeated string via_service = 9;
+}
+
+message Retention {
+  // Минимальный возраст/время до удаления.
+  google.protobuf.Timestamp not_before_delete = 1;
+  google.protobuf.Duration  min_age           = 2;
+
+  // Legal Hold — блокирует деструктивные операции до снятия.
+  bool  legal_hold = 3;
+  // Ссылка на дело/инцидент.
+  string case_id   = 4;
+}
+
+message Location {
+  StorageProvider provider = 1;
+  string region            = 2; // например, eu-central-1
+  string endpoint          = 3; // для S3-совместимых/локальных
+  string bucket            = 4; // bucket/container или корневой каталог для POSIX
+  string path              = 5; // ключ/префикс (object key) или относительный путь
+  StorageClass class       = 6;
+  map<string, string> attributes = 7; // дополнительные атрибуты провайдера
+}
+
+message AuditContext {
+  string request_id = 1;
+  string actor_id   = 2;
+  repeated string actor_roles = 3;
+  Labels labels     = 4;
+}
+
+// ----------------------------------------------------------------------------
+// Archive domain
+// ----------------------------------------------------------------------------
+
+message ArchiveObject {
+  ResourceId archive_id  = 1;
+  string     tenant_id   = 2;
+  string     object_key  = 3; // логический ключ/имя объекта
+  string     version     = 4; // клиентская/системная версия
+  uint64     size        = 5; // размер исходных данных (байты)
+
+  Hash        hash        = 6; // хеш исходных данных (до шифрования)
+  Compression compression = 7;
+  Encryption  encryption  = 8;
+  Location    location    = 9;
+  Retention   retention   = 10;
+
+  Labels tags = 11;
+
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp updated_at = 13;
+
+  // Идемпотентный клиентский токен для Create.
+  string client_token = 14;
+
+  // Зарезервировано для будущих полей (сохранение совместимости).
+  reserved 15, 16;
+}
+
+message Chunk {
+  // Порядковый номер чанка, начиная с 0.
+  uint64 seq_no = 1;
+  bytes  data   = 2;
+  // CRC32C чанка (опционально, для раннего детекта ошибок транспортного уровня).
+  uint32 crc32c = 3;
+}
+
+// ----------------------------------------------------------------------------
+// Create (streaming upload)
+// ----------------------------------------------------------------------------
+
+message CreateArchiveMeta {
+  // Метаданные будущего архива; archive_id генерируется сервером.
+  ArchiveObject meta = 1;
+  // Максимальный допустимый размер (байты) для серверной валидации.
+  uint64 expected_size = 2;
+}
+
+message CreateArchiveMessage {
+  oneof payload {
+    CreateArchiveMeta meta = 1;
+    Chunk chunk            = 2;
+  }
+  AuditContext audit = 10;
+}
+
+message CreateArchiveReply {
+  StatusCode status = 1;
+  string     message = 2;
+  ArchiveObject object = 3;
+  // Итоговый хеш по данным, вычисленный сервером (после потока).
+  Hash computed_hash = 4;
+  uint64 bytes_received = 5;
+}
+
+// ----------------------------------------------------------------------------
+// Retrieve (download), GetMeta, List
+// ----------------------------------------------------------------------------
+
+message GetArchiveRequest {
+  ResourceId archive_id = 1;
+  AuditContext audit    = 10;
+}
+
+message RetrieveRequest {
+  ResourceId archive_id = 1;
+  // Диапазон байт для частичного скачивания (включительно).
+  uint64 offset = 2;
+  uint64 length = 3; // 0 — до конца
+  AuditContext audit = 10;
+}
+
+message ListArchivesFilter {
+  string tenant_id        = 1;
+  string object_key_prefix = 2;
+  google.protobuf.Timestamp created_after  = 3;
+  google.protobuf.Timestamp created_before = 4;
+  map<string, string> tag_eq = 5; // точные совпадения тегов
+  bool only_without_legal_hold = 6;
+}
+
+message ListArchivesRequest {
+  ListArchivesFilter filter = 1;
+  int32 page_size           = 2;
+  string page_token         = 3;
+  AuditContext audit        = 10;
+}
+
+message ListArchivesReply {
+  repeated ArchiveObject objects = 1;
+  string next_page_token         = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Delete / Erase (two-person rule)
+// ----------------------------------------------------------------------------
+
+message Approver {
+  string id   = 1;
+  string role = 2;
+  google.protobuf.Timestamp approved_at = 3;
+}
+
+message TwoPersonRule {
+  // Требуется ли двухперсонное подтверждение.
+  bool required       = 1;
+  // Кворум (минимум одобривших).
+  int32 quorum        = 2;
+  // Разрешенные роли для одобрения.
+  repeated string allowed_roles = 3;
+  // Нельзя ли self-approve (подтверждать свой собственный запрос).
+  bool forbid_self_approve = 4;
+  // Истекает ли окно для override/approval.
+  google.protobuf.Duration max_ttl = 5;
+  // Указанные фактические одобрения.
+  repeated Approver approvals = 6;
+  // Обоснование операции.
+  string justification = 7;
+}
+
+message DeleteArchiveRequest {
+  ResourceId archive_id = 1;
+  bool soft_delete      = 2; // логическое удаление (метаданные помечены)
+  AuditContext audit    = 10;
+  TwoPersonRule tpr     = 11;
+}
+
+message EraseArchiveRequest {
+  ResourceId archive_id = 1;
+  // Жесткое крипто-стирание (crypto-shred): аннулировать доступ к ключам.
+  bool crypto_shred     = 2;
+  // Жесткий hold запрещает override — на уровне политики сервера.
+  AuditContext audit    = 10;
+  TwoPersonRule tpr     = 11;
+}
+
+message OperationStatus {
+  StatusCode status = 1;
+  string message     = 2;
+  ResourceId archive_id = 3;
+}
+
+// ----------------------------------------------------------------------------
+// Legal Hold
+// ----------------------------------------------------------------------------
+
+message SetLegalHoldRequest {
+  ResourceId archive_id = 1;
+  bool hard_hold        = 2; // true: запрет override согласно политике
+  string case_id        = 3;
+  google.protobuf.Timestamp expires_at = 4; // опционально
+  AuditContext audit     = 10;
+  TwoPersonRule tpr      = 11;
+}
+
+message ReleaseLegalHoldRequest {
+  ResourceId archive_id = 1;
+  string reason         = 2;
+  AuditContext audit    = 10;
+  TwoPersonRule tpr     = 11;
+}
+
+// ----------------------------------------------------------------------------
+// Integrity & Key Management
+// ----------------------------------------------------------------------------
+
+message VerifyIntegrityRequest {
+  ResourceId archive_id = 1;
+  // Если указан, сервер пересчитает и сверит хешом с указанным.
+  Hash expected_hash     = 2;
+  // Доп. режим: только метаданные (быстро) или полная проверка (дорого).
+  bool full_check        = 3;
+  AuditContext audit     = 10;
+}
+
+message VerifyIntegrityReply {
+  StatusCode status = 1;
+  string message     = 2;
+  Hash actual_hash   = 3;
+  bool matches       = 4;
+}
+
+message RewrapKeysRequest {
+  ResourceId archive_id = 1;
+  // Новый логический ключ/alias.
+  string new_key_id      = 2;
+  KmsProvider kms_provider = 3;
+  string kms_resource      = 4; // ARN/resource id
+  // Временное окно недоступности.
+  google.protobuf.Duration maintenance_window = 5;
+  AuditContext audit      = 10;
+  TwoPersonRule tpr       = 11;
+}
+
+// ----------------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------------
+
+service ArchiveService {
+  // Потоковая загрузка: сначала CreateArchiveMeta, затем чанки.
+  rpc Create (stream CreateArchiveMessage) returns (CreateArchiveReply);
+
+  // Метаданные объекта.
+  rpc GetMeta (GetArchiveRequest) returns (ArchiveObject);
+
+  // Потоковая выгрузка данных.
+  rpc Retrieve (RetrieveRequest) returns (stream Chunk);
+
+  // Список с фильтрами и пагинацией.
+  rpc List (ListArchivesRequest) returns (ListArchivesReply);
+
+  // Логическое/физическое удаление (в зависимости от soft_delete).
+  rpc Delete (DeleteArchiveRequest) returns (OperationStatus);
+
+  // Крипто-стирание (crypto-shred) при необходимости.
+  rpc Erase (EraseArchiveRequest) returns (OperationStatus);
+
+  // Установка/снятие Legal Hold.
+  rpc SetLegalHold (SetLegalHoldRequest) returns (OperationStatus);
+  rpc ReleaseLegalHold (ReleaseLegalHoldRequest) returns (OperationStatus);
+
+  // Проверка целостности и ротация ключей (rewrap).
+  rpc VerifyIntegrity (VerifyIntegrityRequest) returns (VerifyIntegrityReply);
+  rpc RewrapKeys (RewrapKeysRequest) returns (OperationStatus);
+}

@@ -1,0 +1,409 @@
+# physical-integration-core/configs/templates/device_profile.example.yaml
+apiVersion: integration.aethernova.io/v1
+kind: DeviceProfile
+metadata:
+  name: "acme-thermo-xt200"
+  displayName: "ACME Thermo XT200"
+  vendor: "ACME Industrial"
+  model: "XT200"
+  hwRevision: "rev-C"
+  fwRevisionMin: "1.8.0"
+  fwRevisionMax: "2.x"
+  deviceClass: "thermostat"
+  assetTags: ["line:A", "cell:TEMP", "criticality:high"]
+  # Контроль совместимости ядра
+  compatibility:
+    minCoreVersion: "1.8.0"
+    maxCoreVersion: "2.x"
+  # Как интерпретировать идентификаторы устройства
+  identity:
+    idStrategy: "uuid-v4"            # serial|mac|uuid-v4|custom
+    idFields: ["deviceId"]           # поля ниже в section 'provisioning'
+  lifecycle:
+    allowedStates: ["provisioning","active","maintenance","quarantine","decommissioned"]
+    initialState: "provisioning"
+
+# ============================
+# Пресеты (DRY: якоря/алиасы)
+# ============================
+presets:
+  retry_backoff: &retry_backoff
+    policy: exponential
+    maxAttempts: 8
+    baseDelayMs: 200
+    maxDelayMs: 15000
+    jitter: full
+    retryableErrors: ["TIMEOUT","TEMPORARY_NETWORK","BROKER_OVERLOADED","THROTTLED"]
+
+  tls_strict: &tls_strict
+    tls:
+      enabled: true
+      minVersion: TLS1_2
+      ciphers:
+        - TLS_AES_256_GCM_SHA384
+        - TLS_AES_128_GCM_SHA256
+        - TLS_CHACHA20_POLY1305_SHA256
+      verifyPeer: true
+      clientAuth: required
+      caBundleRef: "secret://pki/roots-ca-bundle"
+      certRef: "secret://devices/{{deviceId}}/cert"
+      keyRef: "secret://devices/{{deviceId}}/key"
+
+  auth_oauth_jwt: &auth_oauth_jwt
+    auth:
+      mode: oauth2_jwt              # none|basic|apikey|mtls|oauth2_jwt
+      jwt:
+        issuer: "https://auth.neurocity.local"
+        audience: "pic.edgesvc"
+        jwksUri: "https://auth.neurocity.local/.well-known/jwks.json"
+        requiredClaims: ["sub","exp","iat"]
+        leewaySeconds: 30
+
+  msg_policies: &msg_policies
+    qos: at_least_once
+    compression: auto               # auto|none|gzip|zstd
+    encryption:
+      enabled: true
+      algo: AES256_GCM
+      keyRef: "secret://kms/edge-msg-key"
+    idempotency:
+      enabled: true
+      keyStrategy: composite
+      fields: ["deviceId","ts","seq"]
+      ttlSeconds: 86400
+    deduplication:
+      enabled: true
+      windowSeconds: 300
+    validation:
+      enabled: true
+      mode: strict
+      schemaRegistry: "http://schemaregistry.core.svc:8081"
+    dlq:
+      enabled: true
+      target: "dlq.protocols"
+      retentionHours: 168
+
+  observability: &observability
+    metrics:
+      enabled: true
+      intervalSeconds: 15
+      labels:
+        deviceClass: "thermostat"
+    tracing:
+      enabled: true
+      sampler: parentbased_traceidratio
+      ratio: 0.05
+      exporter: otlp
+      endpoint: "otel-collector.monitoring.svc:4317"
+    logging:
+      level: INFO
+      json: true
+      redaction:
+        enabled: true
+        patterns:
+          - '(?i)authorization:\s*bearer\s+[A-Za-z0-9\.\-_]+'
+          - '(?i)apikey[=:]\s*[A-Za-z0-9\-_]{16,}'
+
+# ============================
+# Provisioning / паспорт
+# ============================
+provisioning:
+  # Первичная регистрация
+  enrollment:
+    method: "csr"                    # csr|pre-shared|factory
+    csrEndpoint: "https://pki.neurocity.local/api/v1/csr"
+    # Атрибуты, попадающие в сертификат
+    subjectDN:
+      CN: "{{deviceId}}"
+      O: "ACME Industrial"
+      OU: "Thermo"
+    san:
+      dns: ["{{deviceId}}.devices.local"]
+      uri: ["spiffe://neurocity/pic/device/{{deviceId}}"]
+  identifiers:
+    deviceId: "auto:uuid-v4"
+    serialNumber: "XT200-{{rand:alnum:10}}"
+    macAddress: "unknown"            # опционально
+  ownership:
+    tenant: "default"
+    site: "plant-01"
+    area: "line-A"
+  attributes:
+    # Пользовательские статические атрибуты
+    firmwareChannel: "stable"
+    installDate: "2025-01-12"
+    warrantyMonths: 24
+
+# ============================
+# Безопасность
+# ============================
+security:
+  <<: *tls_strict
+  <<: *auth_oauth_jwt
+  secureBoot: true
+  hardwareRoT: true                  # аппаратный root-of-trust
+  attestation:
+    enabled: true
+    pcrPolicy:
+      pcr0: "sha256:xxxxxxxx"
+      pcr7: "sha256:yyyyyyyy"
+  accessControl:
+    default: deny
+    rules:
+      - subject: "svc:edge-ingestor"
+        allow:
+          telemetry: ["read"]
+          commands: ["publish"]
+      - subject: "svc:ops"
+        allow:
+          telemetry: ["read"]
+          commands: ["read","publish"]
+
+# ============================
+# Подключение (мульти‑протокол)
+# ============================
+connectivity:
+  preferredOrder: ["mqtt","opcua","http_webhook"]
+  mqtt:
+    enabled: true
+    broker:
+      hosts: ["mqtt-broker.edge.svc:8883"]
+      clientId: "xt200-{{deviceId}}"
+      keepAliveSeconds: 30
+      sessionExpirySeconds: 3600
+      connectTimeoutMs: 5000
+    security:
+      <<: *tls_strict
+      auth:
+        mode: oauth2_jwt
+        tokenProvider: "http://token-broker.svc:8080/token"
+        scopes: ["mqtt:publish","mqtt:subscribe"]
+    topics:
+      pub:
+        telemetry: "sensors/{{deviceId}}/telemetry"
+        events: "events/{{deviceId}}"
+        heartbeat: "status/{{deviceId}}/hb"
+      sub:
+        commands: "commands/{{deviceId}}"
+    runtime:
+      retries: *retry_backoff
+      <<: *msg_policies
+  opcua:
+    enabled: true
+    server:
+      endpoint: "opc.tcp://opcua-gateway.edge.svc:4840"
+      securityPolicy: "Basic256Sha256"
+      messageSecurityMode: "SignAndEncrypt"
+      userToken:
+        type: "certificate"
+    subscriptions:
+      - name: "process-vars"
+        publishingIntervalMs: 500
+        nodes:
+          - nodeId: "ns=2;s=XT200.TemperatureC"
+            samplingIntervalMs: 200
+            schemaRef: "sr://opcua.temperature.v1.json"
+          - nodeId: "ns=2;s=XT200.HumidityPct"
+            samplingIntervalMs: 500
+            schemaRef: "sr://opcua.humidity.v1.json"
+    runtime:
+      retries: *retry_backoff
+      <<: *msg_policies
+  modbus:
+    enabled: false
+  http_webhook:
+    enabled: true
+    server:
+      pathTelemetry: "/ingest/telemetry"
+      pathAlerts: "/ingest/alerts"
+      method: "POST"
+      timeoutMs: 10000
+    security:
+      <<: *tls_strict
+      auth:
+        mode: oauth2_jwt
+    runtime:
+      retries: *retry_backoff
+      <<: *msg_policies
+  grpc:
+    enabled: false
+  websocket:
+    enabled: false
+
+# ============================
+# Сенсоры и актуаторы
+# ============================
+capabilities:
+  sensors:
+    - id: "temp"
+      name: "Temperature"
+      unit: "C"                      # базовая единица
+      range: { min: -40, max: 125 }
+      resolution: 0.1
+      schemaRef: "sr://telemetry.temperature.v1.json"
+      normalization:
+        to: "K"                      # нормализация на шину
+        rule: "C_to_K"               # правило известное ядру
+      calibration:
+        mode: "two-point"
+        points:
+          - input: 0.0
+            output: 0.1
+          - input: 100.0
+            output: 100.2
+    - id: "hum"
+      name: "Humidity"
+      unit: "%"
+      range: { min: 0, max: 100 }
+      resolution: 0.5
+      schemaRef: "sr://telemetry.humidity.v1.json"
+      calibration: { mode: "none" }
+  actuators:
+    - id: "relay1"
+      name: "Heater Relay"
+      type: "digital"
+      states: ["ON","OFF"]
+      schemaRef: "sr://command.relay.v1.json"
+      safety:
+        requireAuthLevel: "ops"
+        confirmWindowSeconds: 5
+
+# ============================
+# Телеметрия и частоты публикаций
+# ============================
+telemetry:
+  publish:
+    intervalSeconds: 10
+    jitterPct: 10
+    maxBatch: 100
+    priority:
+      temp: high
+      hum: normal
+  topics:
+    normalized: "bus.telemetry.raw"     # внутренняя шина
+    alerts: "bus.alerts.raw"
+  message:
+    <<: *msg_policies
+
+# ============================
+# Команды и политика выполнения
+# ============================
+commands:
+  inboundTopic: "bus.commands"
+  execPolicy:
+    timeoutMs: 3000
+    concurrency: 1
+    queueDepth: 100
+    retries:
+      policy: exponential
+      maxAttempts: 3
+      baseDelayMs: 200
+  allow:
+    - name: "setpoint.write"
+      target: "temp"
+      schemaRef: "sr://command.setpoint.v1.json"
+      limits:
+        min: 10
+        max: 35
+        step: 0.5
+    - name: "relay.switch"
+      target: "relay1"
+      schemaRef: "sr://command.relay.v1.json"
+
+# ============================
+# Здоровье и SLA
+# ============================
+health:
+  heartbeat:
+    topic: "status/{{deviceId}}/hb"
+    intervalSeconds: 30
+    payload:
+      fw: "{{fwVersion}}"
+      ts: "{{now:rfc3339}}"
+  checks:
+    - name: "sensor-stall"
+      type: "no-data"
+      metric: "temp"
+      windowSeconds: 60
+      threshold: 0
+      action: "raise-alert"
+    - name: "temp-range"
+      type: "value-range"
+      metric: "temp"
+      min: -10
+      max: 90
+      action: "raise-alert"
+  sla:
+    availabilityPct: 99.5
+    maxLatencyMs: 500
+
+# ============================
+# Пороговые значения и алерты
+# ============================
+alerts:
+  routes:
+    - when: "severity>=warning"
+      to: ["amqp://alerts.normalized","kafka://alerts.stream"]
+  rules:
+    - name: "overheat"
+      metric: "temp"
+      condition: "value > 85"
+      severity: "critical"
+      cooldownSeconds: 60
+      message: "Device {{deviceId}} overheating: {{value}} C"
+    - name: "humidity-low"
+      metric: "hum"
+      condition: "value < 20"
+      severity: "warning"
+      cooldownSeconds: 120
+
+# ============================
+# OTA обновления
+# ============================
+ota:
+  strategy: "phased"                  # immediate|phased|canary
+  channels:
+    - name: "stable"
+      baseURL: "https://repo.neurocity.local/ota/xt200/stable/"
+      gpgKeyRef: "secret://ota/gpg-pubkey"
+      signatureRequired: true
+  rollout:
+    batchSizePct: 10
+    pauseBetweenBatchesMinutes: 30
+    canary:
+      percent: 2
+      abortOnAlertSeverity: "critical"
+  retry:
+    <<: *retry_backoff
+    maxAttempts: 5
+
+# ============================
+# Логирование, хранение, приватность
+# ============================
+data:
+  logging:
+    <<: *observability
+  retention:
+    rawDays: 7
+    normalizedDays: 30
+  privacy:
+    pii:
+      fields: []
+      policy: "no-pii"
+    masking:
+      rules: []
+
+# ============================
+# Ограничения/инварианты профиля
+# ============================
+constraints:
+  requireTls: true
+  requireAuth: true
+  forbidUnauthenticatedCommands: true
+  maxTelemetryIntervalSeconds: 60
+
+# ============================
+# Активный профиль сред (наследует из protocols.yaml при желании)
+# ============================
+profile:
+  name: "prod"

@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zt-core-pep-config
+  namespace: CHANGE_ME_NAMESPACE
+  labels:
+    app.kubernetes.io/name: zero-trust-core
+    app.kubernetes.io/component: pep
+    app.kubernetes.io/part-of: aethernova
+    app.kubernetes.io/version: "1.0.0"
+data:
+  pep.yaml: |
+    # Zero Trust PEP configuration (ingress/sidecar)
+    tls:
+      require_mtls: true
+      min_version: TLS1_3
+      # CA/серверные ключи монтируются из Secret в /etc/zt/ca и /etc/zt/tls
+      ca_bundle: /etc/zt/ca/ca.pem
+      server_cert: /etc/zt/tls/tls.crt
+      server_key: /etc/zt/tls/tls.key
+      # Включите OCSP/CRL на уровне ingress (не хранится здесь)
+    token:
+      accept: ["JWT", "PASETO"]
+      allowed_algs: ["PS256", "EdDSA"]
+      jwks_url: https://auth.CHANGE_ME_DOMAIN/.well-known/jwks.json
+      aud: ["core-systems", "internal"]
+      require_kid: true
+      cache_ttl_s: 300
+      leeway_s: 30
+    pop:
+      mtls_required: true
+      dpop:
+        enabled: true
+        iat_max_age_s: 120
+    pdp:
+      url: http://zt-opa:8181/v1/data/zt/allow
+      timeout_ms: 800
+      fail_closed: true
+      include_input_fields:
+        subject: ["iss","sub","aud","roles","jti","exp"]
+        tls: ["verified","mtls","spiffe_id"]
+        req: ["method","path","ip"]
+        ctx: ["tenant","env"]
+    quotas:
+      decision_rps: 200
+      client_rps: 1000
+    logging:
+      level: info
+      json: true
+      # Аудит перенаправляется в защищённый sink (например, syslog over TLS)
+      audit_sink: tcp+tls://logs.CHANGE_ME_DOMAIN:6514
+      redact_fields: ["token","cnf","jti","authorization","cookie"]
+    metrics:
+      prometheus_endpoint: ":9464"
+    tracing:
+      otlp:
+        endpoint: otel-collector.observability.svc.cluster.local:4317
+        insecure: false
+        service_name: zt-pep
+    security:
+      deny_by_default: true
+      max_body_mb: 10
+      header_size_kb: 24
+      ip_allowlist: []   # по умолчанию пусто (не ограничиваем, полагаемся на политики)
+      ip_denylist: []
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zt-core-opa-config
+  namespace: CHANGE_ME_NAMESPACE
+  labels:
+    app.kubernetes.io/name: zero-trust-core
+    app.kubernetes.io/component: pdp
+    app.kubernetes.io/part-of: aethernova
+    app.kubernetes.io/version: "1.0.0"
+data:
+  opa-config.yaml: |
+    # OPA in bundle mode. Секреты для аутентификации сервиса бандлов — через Secret/ENV.
+    services:
+      bundles:
+        url: https://bundles.CHANGE_ME_DOMAIN
+        credentials:
+          bearer:
+            token_from_env: BUNDLE_TOKEN   # поступает из Secret через env
+    bundles:
+      zt-bundle:
+        service: bundles
+        resource: bundles/zt-core/bundle.tar.gz
+        persist: true
+        polling:
+          min_delay_seconds: 30
+          max_delay_seconds: 120
+    decision_logs:
+      console: false
+      service: bundles
+      reporting:
+        min_delay_seconds: 10
+        max_delay_seconds: 30
+    status:
+      service: bundles
+    default_decision: /zt/allow
+    # Рекомендуется включить partial eval/compile на стороне сборки бандла
+    # и снабжать бандл тестами/верификацией до публикации.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zt-core-app-config
+  namespace: CHANGE_ME_NAMESPACE
+  labels:
+    app.kubernetes.io/name: zero-trust-core
+    app.kubernetes.io/component: config
+    app.kubernetes.io/part-of: aethernova
+    app.kubernetes.io/version: "1.0.0"
+data:
+  app.env: |
+    # Нефинансовые/несекретные переменные окружения приложения/PEP/PDP.
+    # Секреты (токены, ключи, приватные материалы) — ТОЛЬКО в Secret.
+    APP_ENV=prod
+    LOG_LEVEL=info
+    HEALTH_CPU_MAX_PCT=90
+    HEALTH_MEM_MAX_PCT=92
+    HEALTH_FS_MIN_FREE_PCT=10
+    HEALTH_HTTP_TIMEOUT_S=0.8
+    HEALTH_READINESS_CACHE_TTL=5
+    JWKS_URL=https://auth.CHANGE_ME_DOMAIN/.well-known/jwks.json
+    OPA_DECISION_URL=http://zt-opa:8181/v1/data/zt/allow
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability.svc.cluster.local:4317
+    PROMETHEUS_SCRAPE=true

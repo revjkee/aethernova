@@ -1,0 +1,147 @@
+{{- /*
+RBAC for Aethernova Chain Core
+Controls:
+  .Values.rbac.create        (bool)  — включить/выключить создание RBAC (Role/RoleBinding)
+  .Values.rbac.clusterWide   (bool)  — добавить ClusterRole/ClusterRoleBinding для кластерных операций (только при необходимости)
+  .Values.rbac.extraRules    ([]Rule) — дополнительные правила в Role (массива объектов правил RBAC)
+  .Values.serviceAccount.create (bool) — создавать ли ServiceAccount
+  .Values.serviceAccount.name    (string|nil) — имя SA (если пусто — автоимя)
+  .Values.serviceAccount.annotations (map) — аннотации SA
+  .Values.imagePullSecrets   ([]{name: ""}) — секреты для pull образов
+  .Values.podSecurityAccountName (string|nil) — если нужен отличный от SA аккаунт для PodSecurityPolicy или PSA аннотаций (необязательно)
+Name building:
+  fullname := "<release-name>-<chart-name>" (усечён до 63 символов)
+*/ -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- $fullname := printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- $saName := default (printf "%s-sa" $fullname) .Values.serviceAccount.name -}}
+
+{{- if .Values.serviceAccount.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $saName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+    app.kubernetes.io/component: "p2p-node"
+    app.kubernetes.io/part-of: "aethernova"
+    helm.sh/chart: "{{ .Chart.Name }}-{{ .Chart.Version }}"
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.rbac.create }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-role
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+    app.kubernetes.io/component: "p2p-node"
+    app.kubernetes.io/part-of: "aethernova"
+rules:
+  # Доступ к ConfigMap для конфигурации/лидера (в рамках ns)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Лидер-эллекция через Leases (coordination.k8s.io)
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # События (для корректной наблюдаемости и отладки)
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Чтение секретов (например, ключи P2P), без листинга
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  # Сервис-дискавери в пределах namespace
+  - apiGroups: [""]
+    resources: ["endpoints", "services", "pods"]
+    verbs: ["get", "list", "watch"]
+  {{- with .Values.rbac.extraRules }}
+  # Дополнительные правила из values.yaml
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-rolebinding
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+    app.kubernetes.io/component: "p2p-node"
+    app.kubernetes.io/part-of: "aethernova"
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-role
+{{- end }}
+
+{{- if and .Values.rbac.create .Values.rbac.clusterWide }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-clusterrole
+  labels:
+    app.kubernetes.io/name: {{ $name | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+    app.kubernetes.io/component: "p2p-node"
+    app.kubernetes.io/part-of: "aethernova"
+rules:
+  # Кластерный просмотр узлов/неймспейсов для кросс-namespace discovery (включайте ТОЛЬКО при необходимости)
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  # Доступ к endpointslices (ускоренный discovery) при наличии API
+  {{- if .Capabilities.APIVersions.Has "discovery.k8s.io/v1" }}
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-clusterrolebinding
+  labels:
+    app.kubernetes.io/name: {{ $name | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+    app.kubernetes.io/component: "p2p-node"
+    app.kubernetes.io/part-of: "aethernova"
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-clusterrole
+{{- end }}

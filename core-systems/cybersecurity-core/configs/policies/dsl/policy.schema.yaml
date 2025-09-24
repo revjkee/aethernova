@@ -1,0 +1,757 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "https://aethernova.org/schemas/cybersecurity-core/policy.schema.json"
+title: "Aethernova Cybersecurity-Core Policy DSL Schema"
+description: >
+  Политики доступа/контроля/комплаенса для cybersecurity-core.
+  Поддерживает ABAC/RBAC/ReBAC, исключения, комбинирующие алгоритмы,
+  выражения условий, обязательства (obligations), SLA и аудит.
+type: object
+additionalProperties: false
+properties:
+  apiVersion:
+    type: string
+    const: "policy.aethernova.io/v1beta3"
+  kind:
+    type: string
+    enum: ["PolicyBundle"]
+  metadata:
+    $ref: "#/$defs/metadata"
+  spec:
+    type: object
+    additionalProperties: false
+    properties:
+      defaultAlgorithm:
+        $ref: "#/$defs/combiningAlgorithm"
+      defaultEffect:
+        $ref: "#/$defs/effect"
+      strictMode:
+        type: boolean
+        default: true
+      variables:
+        description: "Глобальные переменные (immutable в рамках оценки)."
+        $ref: "#/$defs/variables"
+      macros:
+        description: "Определения переиспользуемых выражений/функций."
+        $ref: "#/$defs/macros"
+      libraries:
+        description: "Именованные библиотеки селекторов/паттернов/сеток CIDR и т.п."
+        $ref: "#/$defs/libraries"
+      policies:
+        type: array
+        minItems: 1
+        items: { $ref: "#/$defs/policy" }
+      x-extensions:
+        description: "Произвольные расширения вендора (не участвуют в решении)."
+        type: object
+        additionalProperties: true
+    required: ["policies"]
+required: ["apiVersion", "kind", "metadata", "spec"]
+
+$defs:
+  # ---------- Meta ----------
+  metadata:
+    type: object
+    additionalProperties: false
+    properties:
+      name:
+        $ref: "#/$defs/identifier"
+      description:
+        type: string
+        maxLength: 2000
+      owner:
+        type: string
+        format: email
+      created:
+        $ref: "#/$defs/rfc3339"
+      updated:
+        $ref: "#/$defs/rfc3339"
+      labels:
+        $ref: "#/$defs/labels"
+      annotations:
+        $ref: "#/$defs/annotations"
+      checksum:
+        type: string
+        description: "Контрольная сумма bundle (например, sha256:...)."
+        pattern: "^[a-z0-9]{64}$|^sha256:[a-f0-9]{64}$"
+    required: ["name"]
+
+  labels:
+    type: object
+    additionalProperties:
+      type: string
+      maxLength: 256
+    propertyNames:
+      pattern: "^[a-zA-Z0-9][-a-zA-Z0-9_.]{0,61}[a-zA-Z0-9]$"
+
+  annotations:
+    type: object
+    additionalProperties:
+      type: string
+      maxLength: 4000
+
+  identifier:
+    type: string
+    description: "Строковый ИД [a-zA-Z][a-zA-Z0-9_-]{2,63}"
+    pattern: "^[a-zA-Z][a-zA-Z0-9_-]{2,63}$"
+
+  rfc3339:
+    type: string
+    format: date-time
+
+  duration:
+    type: string
+    description: "ISO 8601 duration (PnDTnHnMnS)"
+    pattern: "^P(?!$)(\\d+Y)?(\\d+M)?(\\d+D)?(T(\\d+H)?(\\d+M)?(\\d+S)?)?$"
+
+  severity:
+    type: string
+    enum: ["CRITICAL","HIGH","MEDIUM","LOW","INFO"]
+
+  sensitivity:
+    type: string
+    enum: ["PUBLIC","INTERNAL","CONFIDENTIAL","RESTRICTED"]
+
+  effect:
+    type: string
+    enum: ["allow","deny","audit","quarantine"]
+
+  decision:
+    type: object
+    additionalProperties: false
+    properties:
+      effect: { $ref: "#/$defs/effect" }
+      score:
+        type: number
+        minimum: 0
+        maximum: 100
+      obligations:
+        type: array
+        items: { $ref: "#/$defs/obligation" }
+      rationale:
+        type: string
+        maxLength: 4000
+      matchedRules:
+        type: array
+        items: { $ref: "#/$defs/identifier" }
+    required: ["effect"]
+
+  combiningAlgorithm:
+    type: string
+    enum:
+      - deny-overrides
+      - permit-overrides
+      - first-applicable
+      - ordered-deny-overrides
+      - consensus-majority
+      - weighted-score
+
+  # ---------- Libraries / Variables / Macros ----------
+  variables:
+    type: object
+    additionalProperties:
+      oneOf:
+        - type: string
+        - type: number
+        - type: boolean
+        - type: array
+          items: { type: [ "string", "number", "boolean" ] }
+        - type: object
+
+  macros:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { $ref: "#/$defs/identifier" }
+        description: { type: string }
+        params:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              name: { $ref: "#/$defs/identifier" }
+              type: { type: string }
+              required: { type: boolean, default: false }
+            required: ["name","type"]
+        expr:
+          $ref: "#/$defs/expression"
+      required: ["name","expr"]
+
+  libraries:
+    type: object
+    additionalProperties: false
+    properties:
+      cidrSets:
+        type: object
+        additionalProperties:
+          type: array
+          items: { $ref: "#/$defs/cidr" }
+      regexes:
+        type: object
+        additionalProperties:
+          type: string
+          format: regex
+      lists:
+        type: object
+        additionalProperties:
+          type: array
+          items: { type: string }
+      schedules:
+        type: object
+        additionalProperties:
+          $ref: "#/$defs/schedule"
+    default: {}
+
+  # ---------- Core Entities ----------
+  subjectRef:
+    type: object
+    additionalProperties: false
+    properties:
+      type:
+        type: string
+        enum: ["user","service","machine","team"]
+      id: { type: string }
+      roles:
+        type: array
+        items: { type: string }
+      claims:
+        type: object
+        additionalProperties: [ { type: string }, { type: number }, { type: boolean } ]
+      labels: { $ref: "#/$defs/labels" }
+      tags:
+        type: array
+        items: { type: string }
+      riskLevel:
+        $ref: "#/$defs/severity"
+    required: ["type"]
+
+  resourceRef:
+    type: object
+    additionalProperties: false
+    properties:
+      type:
+        type: string
+        examples: ["secret","image","repo","k8s/pod","s3/object","db/table"]
+      id: { type: string }
+      path: { type: string }
+      owners:
+        type: array
+        items: { type: string }
+      labels: { $ref: "#/$defs/labels" }
+      sensitivity: { $ref: "#/$defs/sensitivity" }
+      dataClasses:
+        type: array
+        items: { type: string, enum: ["PII","PHI","PCI","IP","LOGS","META"] }
+    required: ["type"]
+
+  actionRef:
+    type: object
+    additionalProperties: false
+    properties:
+      verb:
+        type: string
+        enum: ["read","write","delete","execute","deploy","approve","rotate-key","escalate"]
+      scope:
+        type: string
+        enum: ["self","namespace","cluster","account","global"]
+    required: ["verb"]
+
+  environmentRef:
+    type: object
+    additionalProperties: false
+    properties:
+      time: { $ref: "#/$defs/rfc3339" }
+      schedule:
+        $ref: "#/$defs/schedule"
+      ip:
+        $ref: "#/$defs/cidr"
+      ipv6:
+        $ref: "#/$defs/cidr"
+      geo:
+        type: string
+        pattern: "^[A-Z]{2}$"
+      asn:
+        type: integer
+        minimum: 1
+      device:
+        type: object
+        additionalProperties: false
+        properties:
+          posture:
+            type: string
+            enum: ["trusted","untrusted","unknown"]
+          mfa: { type: boolean }
+          os:
+            type: string
+          integrityOk: { type: boolean }
+
+  requestContext:
+    type: object
+    additionalProperties: true
+    properties:
+      subject: { $ref: "#/$defs/subjectRef" }
+      resource: { $ref: "#/$defs/resourceRef" }
+      action: { $ref: "#/$defs/actionRef" }
+      environment: { $ref: "#/$defs/environmentRef" }
+
+  # ---------- Policy / Rule / Exception ----------
+  policy:
+    type: object
+    additionalProperties: false
+    properties:
+      id: { $ref: "#/$defs/identifier" }
+      version:
+        type: string
+        pattern: "^v\\d+(?:\\.\\d+){0,2}$"
+      status:
+        type: string
+        enum: ["active","draft","deprecated"]
+      description: { type: string }
+      algorithm: { $ref: "#/$defs/combiningAlgorithm" }
+      defaultEffect: { $ref: "#/$defs/effect" }
+      variables: { $ref: "#/$defs/variables" }
+      tags:
+        type: array
+        items: { type: string }
+      target:
+        description: "Высокоуровневый таргет — предварительная фильтрация запросов."
+        $ref: "#/$defs/target"
+      rules:
+        type: array
+        minItems: 1
+        items: { $ref: "#/$defs/rule" }
+      exceptions:
+        type: array
+        items: { $ref: "#/$defs/exception" }
+      obligations:
+        description: "Обязательства, применяемые к любому решению этой политики."
+        type: array
+        items: { $ref: "#/$defs/obligation" }
+      audit:
+        $ref: "#/$defs/audit"
+      x-extensions:
+        type: object
+        additionalProperties: true
+    required: ["id","status","rules"]
+
+  target:
+    type: object
+    additionalProperties: false
+    properties:
+      subjects:
+        type: array
+        items: { $ref: "#/$defs/subjectMatcher" }
+      resources:
+        type: array
+        items: { $ref: "#/$defs/resourceMatcher" }
+      actions:
+        type: array
+        items: { $ref: "#/$defs/actionMatcher" }
+      environments:
+        type: array
+        items: { $ref: "#/$defs/environmentMatcher" }
+
+  rule:
+    type: object
+    additionalProperties: false
+    properties:
+      id: { $ref: "#/$defs/identifier" }
+      description: { type: string }
+      weight:
+        type: number
+        minimum: 0
+        maximum: 1
+        default: 1
+      severity:
+        $ref: "#/$defs/severity"
+      effect:
+        $ref: "#/$defs/effect"
+      condition:
+        description: "Выражение, возвращающее true/false; поддерживает макросы."
+        $ref: "#/$defs/expression"
+      obligations:
+        type: array
+        items: { $ref: "#/$defs/obligation" }
+      sla:
+        $ref: "#/$defs/sla"
+      evidence:
+        $ref: "#/$defs/evidenceRequirement"
+      tags:
+        type: array
+        items: { type: string }
+    required: ["id","effect","condition"]
+
+  exception:
+    type: object
+    additionalProperties: false
+    properties:
+      id: { $ref: "#/$defs/identifier" }
+      description: { type: string }
+      appliesToRules:
+        type: array
+        items: { $ref: "#/$defs/identifier" }
+      scope:
+        $ref: "#/$defs/exceptionScope"
+      owner: { type: string, format: email }
+      ticket: { type: string }
+      justification: { type: string, minLength: 10 }
+      residualRisk: { $ref: "#/$defs/severity" }
+      expires: { $ref: "#/$defs/rfc3339" }
+      approvals:
+        type: array
+        minItems: 1
+        items: { type: string, format: email }
+    required: ["id","appliesToRules","owner","ticket","justification","expires"]
+
+  exceptionScope:
+    type: object
+    additionalProperties: false
+    properties:
+      subjects:
+        type: array
+        items: { $ref: "#/$defs/subjectMatcher" }
+      resources:
+        type: array
+        items: { $ref: "#/$defs/resourceMatcher" }
+      actions:
+        type: array
+        items: { $ref: "#/$defs/actionMatcher" }
+      environments:
+        type: array
+        items: { $ref: "#/$defs/environmentMatcher" }
+    minProperties: 1
+
+  # ---------- Matchers ----------
+  subjectMatcher:
+    type: object
+    additionalProperties: false
+    properties:
+      type: { enum: ["user","service","machine","team","*"] }
+      ids:  { type: array, items: { type: string } }
+      roles: { type: array, items: { type: string } }
+      labels: { $ref: "#/$defs/labelSelector" }
+      tags: { type: array, items: { type: string } }
+    minProperties: 1
+
+  resourceMatcher:
+    type: object
+    additionalProperties: false
+    properties:
+      types: { type: array, items: { type: string } }
+      ids:   { type: array, items: { type: string } }
+      paths: { type: array, items: { type: string } }
+      labels: { $ref: "#/$defs/labelSelector" }
+      sensitivity: { type: array, items: { $ref: "#/$defs/sensitivity" } }
+      dataClasses: { type: array, items: { type: string } }
+    minProperties: 1
+
+  actionMatcher:
+    type: object
+    additionalProperties: false
+    properties:
+      verbs: { type: array, items: { type: string } }
+      scopes: { type: array, items: { type: string } }
+    minProperties: 1
+
+  environmentMatcher:
+    type: object
+    additionalProperties: false
+    properties:
+      cidr: { $ref: "#/$defs/cidr" }
+      geo: { type: array, items: { type: string, pattern: "^[A-Z]{2}$" } }
+      schedule: { $ref: "#/$defs/schedule" }
+      devicePosture: { type: array, items: { enum: ["trusted","untrusted","unknown"] } }
+    minProperties: 1
+
+  labelSelector:
+    type: object
+    additionalProperties: false
+    properties:
+      match:
+        type: object
+        additionalProperties: { type: string }
+      matchAny:
+        type: array
+        items:
+          type: object
+          additionalProperties: { type: string }
+      matchNone:
+        type: object
+        additionalProperties: { type: string }
+
+  # ---------- Expressions ----------
+  expression:
+    description: >
+      Булево выражение. Поддерживает логические операторы, сравнения,
+      строки/числа/булевы/списки, CIDR/время/регэксп, доступ к контексту.
+    oneOf:
+      - $ref: "#/$defs/logicNode"
+      - $ref: "#/$defs/comparisonNode"
+      - $ref: "#/$defs/functionNode"
+      - $ref: "#/$defs/refNode"
+
+  refNode:
+    type: object
+    additionalProperties: false
+    properties:
+      ref:
+        type: string
+        description: "JSON Pointer к данным контекста/переменным, напр. /subject/claims/email_verified"
+    required: ["ref"]
+
+  logicNode:
+    type: object
+    additionalProperties: false
+    properties:
+      all:
+        type: array
+        minItems: 1
+        items: { $ref: "#/$defs/expression" }
+      any:
+        type: array
+        minItems: 1
+        items: { $ref: "#/$defs/expression" }
+      not:
+        $ref: "#/$defs/expression"
+    oneOf:
+      - required: ["all"]
+      - required: ["any"]
+      - required: ["not"]
+
+  comparisonNode:
+    type: object
+    additionalProperties: false
+    properties:
+      eq:  { $ref: "#/$defs/valuePair" }
+      ne:  { $ref: "#/$defs/valuePair" }
+      gt:  { $ref: "#/$defs/valuePair" }
+      gte: { $ref: "#/$defs/valuePair" }
+      lt:  { $ref: "#/$defs/valuePair" }
+      lte: { $ref: "#/$defs/valuePair" }
+      in:
+        type: object
+        additionalProperties: false
+        properties:
+          value: { $ref: "#/$defs/value" }
+          set:
+            type: array
+            items: { $ref: "#/$defs/value" }
+        required: ["value","set"]
+      contains:
+        type: object
+        additionalProperties: false
+        properties:
+          set:
+            type: array
+            items: { $ref: "#/$defs/value" }
+          value: { $ref: "#/$defs/value" }
+        required: ["set","value"]
+      regex:
+        type: object
+        additionalProperties: false
+        properties:
+          value: { type: string }
+          pattern: { type: string, format: regex }
+        required: ["value","pattern"]
+      cidr_contains:
+        type: object
+        additionalProperties: false
+        properties:
+          cidr: { $ref: "#/$defs/cidr" }
+          ip:   { type: string }
+        required: ["cidr","ip"]
+      time_between:
+        type: object
+        additionalProperties: false
+        properties:
+          time: { $ref: "#/$defs/rfc3339" }
+          start: { type: string, pattern: "^(?:[01]\\d|2[0-3]):[0-5]\\d$" }
+          end:   { type: string, pattern: "^(?:[01]\\d|2[0-3]):[0-5]\\d$" }
+          tz:    { type: string }
+        required: ["time","start","end"]
+      weekday_in:
+        type: object
+        additionalProperties: false
+        properties:
+          time: { $ref: "#/$defs/rfc3339" }
+          days:
+            type: array
+            items: { type: string, enum: ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] }
+        required: ["time","days"]
+    minProperties: 1
+    maxProperties: 1
+
+  functionNode:
+    type: object
+    additionalProperties: false
+    properties:
+      call:
+        type: string
+        description: "Имя макроса/функции из spec.macros[].name"
+      args:
+        type: array
+        items: { $ref: "#/$defs/value" }
+    required: ["call"]
+
+  valuePair:
+    type: object
+    additionalProperties: false
+    properties:
+      left:  { $ref: "#/$defs/value" }
+      right: { $ref: "#/$defs/value" }
+    required: ["left","right"]
+
+  value:
+    oneOf:
+      - type: string
+      - type: number
+      - type: boolean
+      - type: array
+        items: { type: [ "string","number","boolean" ] }
+      - $ref: "#/$defs/refNode"
+
+  cidr:
+    type: string
+    description: "IPv4/IPv6 CIDR"
+    pattern: "^((\\d{1,3}\\.){3}\\d{1,3}\\/([0-9]|[12][0-9]|3[0-2]))|(([0-9a-fA-F:]+)\\/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))$"
+
+  schedule:
+    type: object
+    additionalProperties: false
+    properties:
+      timezone: { type: string }
+      windows:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          properties:
+            days:
+              type: array
+              items: { type: string, enum: ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] }
+            start: { type: string, pattern: "^(?:[01]\\d|2[0-3]):[0-5]\\d$" }
+            end:   { type: string, pattern: "^(?:[01]\\d|2[0-3]):[0-5]\\d$" }
+          required: ["days","start","end"]
+    required: ["windows"]
+
+  # ---------- Obligations / SLA / Audit ----------
+  obligation:
+    type: object
+    additionalProperties: false
+    properties:
+      type:
+        type: string
+        enum:
+          - notify
+          - require-mfa
+          - require-approval
+          - block
+          - redact
+          - mask
+          - quarantine
+          - revoke-token
+          - rotate-key
+          - webhook
+          - run-playbook
+          - log
+      params:
+        type: object
+        additionalProperties: true
+      onEffects:
+        type: array
+        items: { $ref: "#/$defs/effect" }
+        default: ["deny","quarantine","audit"]
+      severity:
+        $ref: "#/$defs/severity"
+    required: ["type"]
+
+  sla:
+    type: object
+    additionalProperties: false
+    properties:
+      fixWithin: { $ref: "#/$defs/duration" }
+      notify:
+        type: array
+        items: { type: string, enum: ["slack","email","pagerduty","webhook"] }
+      escalationAfter: { $ref: "#/$defs/duration" }
+
+  evidenceRequirement:
+    type: object
+    additionalProperties: false
+    properties:
+      required: { type: boolean, default: false }
+      types:
+        type: array
+        items: { type: string, enum: ["poa-mitigation","compensating-control","pen-test","vendor-advisory"] }
+      attachmentsAllowed: { type: boolean, default: true }
+
+  audit:
+    type: object
+    additionalProperties: false
+    properties:
+      enabled: { type: boolean, default: true }
+      redactSecrets: { type: boolean, default: true }
+      sink:
+        type: array
+        items:
+          type: string
+          enum: ["stdout","file","siem","opensearch","splunk","http-webhook"]
+      fields:
+        type: array
+        items: { type: string }
+      retentionDays:
+        type: integer
+        minimum: 1
+        maximum: 3650
+
+  # ---------- Examples ----------
+  exampleBundle:
+    examples:
+      - apiVersion: "policy.aethernova.io/v1beta3"
+        kind: "PolicyBundle"
+        metadata:
+          name: "core-access"
+          owner: "secops@example.com"
+        spec:
+          defaultAlgorithm: "deny-overrides"
+          defaultEffect: "deny"
+          variables:
+            business_hours:
+              timezone: "Europe/Stockholm"
+          policies:
+            - id: "p-deny-prod-writes-from-untrusted"
+              status: "active"
+              algorithm: "deny-overrides"
+              target:
+                resources:
+                  - types: ["k8s/pod","repo"]
+                    labels:
+                      match:
+                        env: "prod"
+              rules:
+                - id: "r1"
+                  effect: "deny"
+                  description: "Запрещаем запись вне доверенной сети и вне рабочего времени"
+                  condition:
+                    all:
+                      - any:
+                          - cidr_contains: { cidr: "10.0.0.0/8", ip: { ref: "/environment/ip" } }
+                          - cidr_contains: { cidr: "fd00::/8",     ip: { ref: "/environment/ipv6" } }
+                      - time_between:
+                          time: { ref: "/environment/time" }
+                          start: "08:00"
+                          end:   "20:00"
+                          tz:    "Europe/Stockholm"
+              exceptions:
+                - id: "e1"
+                  appliesToRules: ["r1"]
+                  owner: "lead@example.com"
+                  ticket: "SEC-123"
+                  justification: "Инцидентный хотфикс"
+                  residualRisk: "HIGH"
+                  expires: "2025-10-01T00:00:00Z"
+                  scope:
+                    subjects:
+                      - roles: ["sre-oncall"]

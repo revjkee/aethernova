@@ -1,0 +1,278 @@
+# policy-core/ops/k8s/overlays/staging/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Базовые ресурсы (Deployment/Service/Ingress/HPA/PDB/RBAC и т.п.)
+resources:
+  - ../../base
+
+namespace: policy-core-staging
+namePrefix: staging-
+nameSuffix: ""
+
+commonLabels:
+  app.kubernetes.io/name: policy-core
+  app.kubernetes.io/instance: policy-core-staging
+  app.kubernetes.io/part-of: neurocity
+  app.kubernetes.io/component: api
+  app.kubernetes.io/managed-by: kustomize
+  env: staging
+
+commonAnnotations:
+  deploy.aethernova.io/owner: platform-ops
+  deploy.aethernova.io/tier: backend
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+generatorOptions:
+  # Хэши имён включены: обеспечивает автоматический rollout при изменении данных
+  # и безопасный кэш. Лейблы добавляются ко всем генерируемым объектам.
+  labels:
+    env: staging
+    app.kubernetes.io/name: policy-core
+
+configMapGenerator:
+  - name: policy-core-config
+    behavior: replace
+    envs:
+      - ../config/staging.env
+    literals:
+      - APP_ENV=staging
+      - LOG_LEVEL=INFO
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://staging-jaeger-collector.observability:4318
+
+secretGenerator:
+  - name: policy-core-secrets
+    behavior: replace
+    envs:
+      - ../secrets/staging.env
+    # type по умолчанию Opaque; для CSI/SOPS используйте внешний провайдер
+    type: Opaque
+
+images:
+  - name: ghcr.io/aethernova/policy-core
+    newName: ghcr.io/aethernova/policy-core
+    newTag: v1.3.0-staging
+
+replicas:
+  - name: policy-core
+    count: 3
+
+# Inline-patches для точной настройки staging
+patches:
+  # DEPLOYMENT: безопасность, лимиты, пробы, аффинити, аннотации, OTEL
+  - target:
+      kind: Deployment
+      name: policy-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: policy-core
+      spec:
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 50%
+        template:
+          metadata:
+            annotations:
+              checksum/config: "$(CONFIG_HASH)" # заполняется внешним пайплайном при необходимости
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "8080"
+              prometheus.io/path: "/metrics"
+          spec:
+            priorityClassName: medium-priority
+            serviceAccountName: policy-core
+            automountServiceAccountToken: false
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 10001
+              runAsGroup: 10001
+              fsGroup: 10001
+              seccompProfile:
+                type: RuntimeDefault
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: kubernetes.io/hostname
+                whenUnsatisfiable: ScheduleAnyway
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: policy-core
+            affinity:
+              podAntiAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 100
+                    podAffinityTerm:
+                      topologyKey: kubernetes.io/hostname
+                      labelSelector:
+                        matchLabels:
+                          app.kubernetes.io/name: policy-core
+            nodeSelector:
+              kubernetes.io/os: linux
+            tolerations:
+              - key: "workload-class"
+                operator: "Equal"
+                value: "general"
+                effect: "NoSchedule"
+                # при отсутствии — игнорируется
+            containers:
+              - name: policy-core
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: APP_ENV
+                    value: "staging"
+                  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+                    valueFrom:
+                      configMapKeyRef:
+                        name: policy-core-config
+                        key: OTEL_EXPORTER_OTLP_ENDPOINT
+                envFrom:
+                  - configMapRef:
+                      name: policy-core-config
+                  - secretRef:
+                      name: policy-core-secrets
+                ports:
+                  - name: http
+                    containerPort: 8080
+                    protocol: TCP
+                resources:
+                  requests:
+                    cpu: "250m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "1"
+                    memory: "1Gi"
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: [ "ALL" ]
+                livenessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 8080
+                  initialDelaySeconds: 15
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /readyz
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  failureThreshold: 6
+                startupProbe:
+                  httpGet:
+                    path: /startupz
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  failureThreshold: 30
+                volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+                  - name: cache
+                    mountPath: /home/app/.cache
+            volumes:
+              - name: tmp
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 128Mi
+              - name: cache
+                emptyDir: {}
+
+  # SERVICE: аннотации под scrape и стабильный тип
+  - target:
+      kind: Service
+      name: policy-core
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: policy-core
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "8080"
+          prometheus.io/path: "/metrics"
+      spec:
+        type: ClusterIP
+        ports:
+          - name: http
+            port: 80
+            targetPort: 8080
+
+  # INGRESS: staging-домен и TLS
+  - target:
+      kind: Ingress
+      name: policy-core
+    patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: policy-core
+        annotations:
+          kubernetes.io/ingress.class: "nginx"
+          nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+          nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+      spec:
+        tls:
+          - hosts: [ "policy-core.staging.neurocity.local" ]
+            secretName: policy-core-staging-tls
+        rules:
+          - host: policy-core.staging.neurocity.local
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: staging-policy-core
+                      port:
+                        number: 80
+
+  # HPA: целевые метрики и границы
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: policy-core
+    patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: policy-core
+      spec:
+        minReplicas: 3
+        maxReplicas: 10
+        metrics:
+          - type: Resource
+            resource:
+              name: cpu
+              target:
+                type: Utilization
+                averageUtilization: 70
+          - type: Resource
+            resource:
+              name: memory
+              target:
+                type: Utilization
+                averageUtilization: 75
+
+  # PDB: отказоустойчивость при обновлении
+  - target:
+      kind: PodDisruptionBudget
+      name: policy-core
+    patch: |-
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: policy-core
+      spec:
+        minAvailable: 1
+        selector:
+          matchLabels:
+            app.kubernetes.io/name: policy-core

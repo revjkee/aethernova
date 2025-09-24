@@ -1,0 +1,355 @@
+syntax = "proto3";
+
+package aethernova.oblivion.v1;
+
+option go_package = "github.com/aethernova/oblivionvault-core/gen/proto/aethernova/oblivion/v1;oblivionv1";
+option java_multiple_files = true;
+option java_package = "com.aethernova.oblivion.v1";
+option csharp_namespace = "Aethernova.Oblivion.V1";
+option php_namespace = "Aethernova\\Oblivion\\V1";
+option ruby_package = "Aethernova::Oblivion::V1";
+option objc_class_prefix = "AVO";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/wrappers.proto";
+
+// -----------------------------------------------------------------------------
+// Common primitives
+// -----------------------------------------------------------------------------
+
+// Unstructured key/value metadata for labels.
+message Labels {
+  map<string, string> items = 1;
+}
+
+// Request-level metadata for tracing, tenancy and audit.
+message RequestMeta {
+  // Correlation identifiers
+  string request_id = 1;                // client-generated UUID
+  string correlation_id = 2;            // propagate across services
+
+  // Multi-tenancy and actor identity
+  string tenant_id = 3;                 // required in multi-tenant mode
+  string actor = 4;                     // user/service principal name or id
+  string actor_role = 5;                // role at request time (e.g., admin, writer)
+
+  // Origin diagnostics (best-effort)
+  string originating_service = 6;       // caller service name
+  string originating_ip = 7;            // x-forwarded-for resolved ip
+  string user_agent = 8;                // client UA
+
+  // Time hints (best-effort)
+  google.protobuf.Timestamp sent_at = 9;
+
+  // Reserved for future extensions
+  reserved 20 to 29;
+}
+
+// NameSelector chooses a resource by one of fields.
+// Exactly one must be set for disambiguation.
+message NameSelector {
+  oneof selector {
+    string id = 1;                      // system unique id
+    string name = 2;                    // human-readable key (e.g., "ns/path/key")
+    string alias = 3;                   // optional alias
+  }
+}
+
+// Pagination and sorting options.
+message PageOptions {
+  int32 page_size = 1;                  // max items to return
+  string page_token = 2;                // server-issued token for next page
+}
+
+message SortOption {
+  string field = 1;                     // e.g., "created_at", "name"
+  Direction direction = 2;
+
+  enum Direction {
+    DIRECTION_UNSPECIFIED = 0;
+    ASC = 1;
+    DESC = 2;
+  }
+}
+
+// Time range filter [from, to).
+message TimeRange {
+  google.protobuf.Timestamp from = 1;
+  google.protobuf.Timestamp to = 2;
+}
+
+// Tag/Label selectors for filtering list queries.
+message TagSelector {
+  repeated string any = 1;              // match if contains ANY of tags
+  repeated string all = 2;              // match if contains ALL tags
+  repeated string none = 3;             // exclude if contains ANY of tags
+}
+
+message LabelSelector {
+  Labels equals = 1;                    // exact match: label==value
+  repeated string keys_any = 2;         // has any of keys
+  repeated string keys_all = 3;         // has all keys
+}
+
+// Data content and write-time options.
+message SecretPayload {
+  // Raw secret bytes. If client already encrypts, set client_encrypted=true.
+  bytes value = 1;
+
+  // Optional metadata to attach.
+  Labels metadata = 2;
+
+  // Optional content hints.
+  SecretType type = 3;                  // helps validation/display
+  Compression compression = 4;
+
+  // Client-side crypto hinting.
+  bool client_encrypted = 5;            // true if value is client-encrypted
+  Labels encryption_context = 6;        // AAD/context for KMS/HSM
+
+  enum SecretType {
+    SECRET_TYPE_UNSPECIFIED = 0;
+    GENERIC = 1;
+    CREDENTIAL = 2;
+    BINARY = 3;
+    CERTIFICATE = 4;
+  }
+
+  enum Compression {
+    COMPRESSION_UNSPECIFIED = 0;
+    NONE = 1;
+    GZIP = 2;
+    ZSTD = 3;
+  }
+
+  // Reserved for future payload fields.
+  reserved 20 to 29;
+}
+
+// Optional constraints and policies evaluated server-side.
+message WritePolicy {
+  // Soft-delete protection toggle at write time.
+  google.protobuf.BoolValue delete_protection = 1;
+
+  // Server TTL enforcement: secret becomes inaccessible after TTL.
+  google.protobuf.Duration ttl = 2;
+
+  // Versioning: start new version on update (default true).
+  google.protobuf.BoolValue new_version = 3;
+
+  // Require reason for audit trails (if server enforces).
+  string reason = 4;
+
+  reserved 20 to 29;
+}
+
+// -----------------------------------------------------------------------------
+// Requests for Secret CRUD and lifecycle
+// -----------------------------------------------------------------------------
+
+// Create a new secret (or upsert if allowed).
+message CreateSecretRequest {
+  RequestMeta meta = 1;
+
+  // Target location
+  string name = 21;                     // canonical key path (unique within tenant)
+  string namespace = 22;                // optional logical namespace
+
+  // Content and policies
+  SecretPayload payload = 41;
+  WritePolicy policy = 42;
+
+  // Organization aids
+  repeated string tags = 61;
+  Labels labels = 62;
+
+  // Upsert behavior
+  google.protobuf.BoolValue upsert = 81;        // default false
+
+  // Reserved for compatibility
+  reserved 100 to 119;
+}
+
+// Update an existing secret. Uses FieldMask to patch selective fields.
+message UpdateSecretRequest {
+  RequestMeta meta = 1;
+
+  // Choose target by id/name/alias
+  NameSelector target = 21;
+
+  // Fields to update (paths relative to Secret resource model):
+  // e.g. ["payload.value","labels.items","tags"]
+  google.protobuf.FieldMask update_mask = 41;
+
+  // New values for fields contained in update_mask.
+  SecretPayload payload = 42;
+  Labels labels = 43;
+  repeated string tags = 44;
+
+  // Policies influencing update behavior.
+  WritePolicy policy = 61;
+
+  reserved 100 to 119;
+}
+
+// Get an existing secret (optionally a specific version).
+message GetSecretRequest {
+  RequestMeta meta = 1;
+  NameSelector target = 21;
+
+  // Version selection: 0 or unset means "latest".
+  google.protobuf.Int32Value version = 41;
+
+  // Hints controlling server response size/content.
+  google.protobuf.BoolValue include_metadata = 61;  // default true
+  google.protobuf.BoolValue include_history = 62;   // default false (summary only)
+
+  reserved 100 to 119;
+}
+
+// List secrets with filtering/pagination/sorting.
+message ListSecretsRequest {
+  RequestMeta meta = 1;
+
+  // Scope
+  string namespace = 21;                 // optional namespace filter
+
+  // Filters
+  repeated string name_prefix = 41;      // e.g. "prod/", "apps/app1/"
+  TagSelector tags = 42;
+  LabelSelector labels = 43;
+  TimeRange created_between = 44;
+  TimeRange updated_between = 45;
+  string query = 46;                     // full-text or server-defined query
+
+  // Options
+  PageOptions page = 61;
+  SortOption sort = 62;
+  google.protobuf.BoolValue include_deleted = 63; // include soft-deleted entries
+
+  reserved 100 to 119;
+}
+
+// Soft or hard delete a secret.
+message DeleteSecretRequest {
+  RequestMeta meta = 1;
+  NameSelector target = 21;
+
+  // Delete mode: if soft_delete absent or true => soft delete, else hard.
+  google.protobuf.BoolValue soft_delete = 41;    // default true
+  string reason = 42;                            // audit reason
+
+  reserved 100 to 119;
+}
+
+// Restore a soft-deleted secret (optionally a specific version).
+message RestoreSecretRequest {
+  RequestMeta meta = 1;
+  NameSelector target = 21;
+
+  google.protobuf.Int32Value version = 41;       // optional
+  string reason = 42;                            // audit reason
+
+  reserved 100 to 119;
+}
+
+// Create a new version while rotating encryption keys server-side.
+message RotateKeyRequest {
+  RequestMeta meta = 1;
+
+  // Scope and strategy
+  oneof rotation_scope {
+    string namespace = 21;                       // rotate all in namespace
+    NameSelector target = 22;                    // rotate specific secret
+  }
+
+  // Re-encryption options
+  google.protobuf.BoolValue reencrypt_existing = 41; // default true
+  google.protobuf.Int32Value batch_size = 42;        // per-transaction
+  google.protobuf.Duration deadline = 43;            // optional deadline
+
+  // KMS selection override (server may ignore)
+  string kms_key_id = 61;                            // key alias/arn/etc.
+  string kms_profile = 62;                           // named profile
+
+  reserved 100 to 119;
+}
+
+// -----------------------------------------------------------------------------
+// Operational requests
+// -----------------------------------------------------------------------------
+
+// Health probes for liveness/readiness/startup.
+message HealthCheckRequest {
+  RequestMeta meta = 1;
+
+  Probe probe = 21;
+  enum Probe {
+    PROBE_UNSPECIFIED = 0;
+    LIVENESS = 1;
+    READINESS = 2;
+    STARTUP = 3;
+  }
+
+  reserved 100 to 119;
+}
+
+// System status snapshot controls (server returns aggregated status).
+message StatusRequest {
+  RequestMeta meta = 1;
+
+  // Include optional sections to reduce payload size.
+  google.protobuf.BoolValue include_storage = 21;
+  google.protobuf.BoolValue include_kms = 22;
+  google.protobuf.BoolValue include_cache = 23;
+  google.protobuf.BoolValue include_metrics = 24;
+
+  reserved 100 to 119;
+}
+
+// Trigger backup with optional overrides of server defaults.
+message BackupRequest {
+  RequestMeta meta = 1;
+
+  google.protobuf.BoolValue verify = 21;           // verify checksum after backup
+  string snapshot_id = 22;                         // custom snapshot id
+  google.protobuf.BoolValue incremental = 23;      // if supported
+
+  // Optional destination overrides
+  oneof destination {
+    FileTarget file = 41;
+    S3Target s3 = 42;
+  }
+
+  message FileTarget {
+    string path = 1;                               // directory or file
+  }
+
+  message S3Target {
+    string bucket = 1;
+    string prefix = 2;
+    string region = 3;
+    string kms_key_id = 4;
+    google.protobuf.BoolValue force_path_style = 5;
+    string endpoint = 6;                           // custom S3-compatible endpoint
+  }
+
+  reserved 100 to 119;
+}
+
+// Restore from a backup URI or snapshot id.
+message RestoreBackupRequest {
+  RequestMeta meta = 1;
+
+  oneof source {
+    string backup_uri = 21;                        // e.g., "s3://bucket/prefix/..." or "file:///..."
+    string snapshot_id = 22;
+  }
+
+  google.protobuf.BoolValue dry_run = 41;          // validate only
+  google.protobuf.BoolValue overwrite = 42;        // allow overwrite where safe
+
+  reserved 100 to 119;
+}

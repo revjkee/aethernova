@@ -1,0 +1,90 @@
+version: "1.0"
+
+metadata:
+  name: hr-intake-pipeline
+  description: >
+    Полноценный YAML-пайплайн приёма резюме с AI-анализом навыков,
+    семантическим сопоставлением и маршрутизацией в ATS/HRMS.
+  owner: teslaai.genesis.hr
+  pipeline_type: semantic_intake
+  namespace: hr-ai-core
+  tags:
+    - ai
+    - hr
+    - recruitment
+    - zero-trust
+    - production-grade
+
+components:
+  - id: validate_cv_input
+    type: validation
+    class: hr_ai.intake.validators.InputValidator
+    params:
+      required_fields: ["full_name", "email", "resume_text", "skills"]
+      max_length: 5000
+      enforce_zero_trust: true
+    on_failure: terminate
+
+  - id: parse_cv
+    type: transformer
+    class: hr_ai.intake.cv_parser.CVParser
+    input: validate_cv_input
+    output: parsed_cv
+
+  - id: match_skills
+    type: enrichment
+    class: hr_ai.intake.skill_matcher.SkillMatcher
+    input: parsed_cv
+    output: skill_match_result
+    params:
+      taxonomy: "teslaai-core/skills/ontology-v3.json"
+
+  - id: semantic_match
+    type: ai_matcher
+    class: hr_ai.intake.semantic_matcher.SemanticMatcher
+    input:
+      candidates: parsed_cv
+      targets: predefined_roles
+    output: semantic_scores
+    params:
+      threshold: 0.65
+      model: "sentence-transformers/all-MiniLM-L6-v2"
+
+  - id: decision_logic
+    type: router
+    class: hr_ai.decision.IntakeDecisionEngine
+    input:
+      skills: skill_match_result
+      semantic: semantic_scores
+    output: intake_result
+    params:
+      routing_matrix: "hr_ai/config/intake_rules.yaml"
+      scoring_policy: hybrid_weighted
+
+  - id: audit_log
+    type: logger
+    class: hr_ai.logging.audit_logger.AuditLogger
+    input: intake_result
+    params:
+      store: true
+      redact: ["email", "phone"]
+      compliance: "GDPR"
+
+  - id: persist
+    type: storage
+    class: hr_ai.storage.db_writer.DBWriter
+    input: intake_result
+    params:
+      target_table: "intake_processed"
+      encryption: "AES-256"
+      seal: true
+
+entrypoint: validate_cv_input
+exitpoint: persist
+
+security:
+  sandbox: true
+  validate_intent: true
+  anomaly_detection: true
+  enforce_zero_trust: true
+  isolate_execution: true

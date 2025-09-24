@@ -1,0 +1,131 @@
+{{- /*
+  physical-integration-core :: ConfigMaps
+  - Основной ConfigMap: управляется .Values.config
+  - Дополнительные: .Values.extraConfigMaps[]
+  Требует _helpers.tpl с:
+    - "physical-integration-core.name"
+    - "physical-integration-core.fullname"
+    - "physical-integration-core.labels"
+    - "physical-integration-core.annotations"
+*/ -}}
+
+{{- $root := . -}}
+
+{{- if .Values.config.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "physical-integration-core.fullname" . }}-config
+  labels:
+    {{- include "physical-integration-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config
+  annotations:
+    {{- include "physical-integration-core.annotations" . | nindent 4 }}
+    # Контент‑хеш для перезапуска подов при изменении конфигурации
+    checksum/config: {{- /* детерминированный хеш по всем секциям */}}
+      {{- $buf := dict -}}
+      {{- if .Values.config.data }}{{- $_ := set $buf "data" (.Values.config.data | toYaml) -}}{{- end -}}
+      {{- if .Values.config.binaryData }}{{- $_ := set $buf "binaryData" (.Values.config.binaryData | toYaml) -}}{{- end -}}
+      {{- if .Values.config.files }}{{- $_ := set $buf "files" (.Values.config.files | toYaml) -}}{{- end -}}
+      {{- if .Values.config.fromFiles }}{{- $_ := set $buf "fromFiles" (.Values.config.fromFiles | toYaml) -}}{{- end -}}
+      {{- printf "%v" ($buf | toYaml) | sha256sum | quote }}
+
+data:
+  {{- /* .Values.config.data: простые ключ/значение */}}
+  {{- range $k, $v := ( .Values.config.data | default dict ) | toYaml | fromYaml }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+
+  {{- /* .Values.config.files: карта имяФайла: содержимое (поддерживает tpl) */}}
+  {{- range $fname, $content := ( .Values.config.files | default dict ) }}
+  {{ $fname }}: |
+    {{- tpl $content $root | nindent 4 }}
+  {{- end }}
+
+  {{- /* .Values.config.fromFiles: список объектов {name, path, optional, tpl} */}}
+  {{- range $i, $it := ( .Values.config.fromFiles | default list ) }}
+  {{- $name := required (printf ".Values.config.fromFiles[%d].name is required" $i) $it.name }}
+  {{- $path := required (printf ".Values.config.fromFiles[%d].path is required" $i) $it.path }}
+  {{- $raw  := "" -}}
+  {{- if $root.Files.Get $path -}}
+    {{- $raw = $root.Files.Get $path -}}
+  {{- else -}}
+    {{- if not ($it.optional | default false) -}}
+      {{- fail (printf "File not found: %s (fromFiles[%d])" $path $i) -}}
+    {{- else -}}
+      {{- $raw = "" -}}
+    {{- end -}}
+  {{- end }}
+  {{ $name }}: |
+    {{- if $it.tpl | default true -}}
+      {{- tpl $raw $root | nindent 4 }}
+    {{- else -}}
+      {{- $raw | nindent 4 }}
+    {{- end }}
+  {{- end }}
+
+binaryData:
+  {{- /* .Values.config.binaryData: карта ключ: base64(…) */}}
+  {{- range $k, $v := ( .Values.config.binaryData | default dict ) | toYaml | fromYaml }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+---
+{{- end }}
+
+{{- /* Дополнительные ConfigMap’ы: .Values.extraConfigMaps[] */ -}}
+{{- range $idx, $cm := ( .Values.extraConfigMaps | default list ) }}
+{{- $ctx := dict "root" $root "cm" $cm "idx" $idx -}}
+{{- if ($cm.enabled | default true) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-%s" (include "physical-integration-core.fullname" $root) ($cm.name | default (printf "extra-%d" $idx)) | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "physical-integration-core.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: config
+    app.kubernetes.io/part-of: {{ include "physical-integration-core.name" $root }}
+  annotations:
+    {{- include "physical-integration-core.annotations" $root | nindent 4 }}
+    checksum/config: {{- $buf := dict -}}
+      {{- if $cm.data }}{{- $_ := set $buf "data" ($cm.data | toYaml) -}}{{- end -}}
+      {{- if $cm.binaryData }}{{- $_ := set $buf "binaryData" ($cm.binaryData | toYaml) -}}{{- end -}}
+      {{- if $cm.files }}{{- $_ := set $buf "files" ($cm.files | toYaml) -}}{{- end -}}
+      {{- if $cm.fromFiles }}{{- $_ := set $buf "fromFiles" ($cm.fromFiles | toYaml) -}}{{- end -}}
+      {{- printf "%v" ($buf | toYaml) | sha256sum | quote }}
+
+data:
+  {{- range $k, $v := ( $cm.data | default dict ) | toYaml | fromYaml }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+  {{- range $fname, $content := ( $cm.files | default dict ) }}
+  {{ $fname }}: |
+    {{- tpl $content $root | nindent 4 }}
+  {{- end }}
+  {{- range $i, $it := ( $cm.fromFiles | default list ) }}
+  {{- $name := required (printf ".Values.extraConfigMaps[%d].fromFiles[%d].name is required" $idx $i) $it.name }}
+  {{- $path := required (printf ".Values.extraConfigMaps[%d].fromFiles[%d].path is required" $idx $i) $it.path }}
+  {{- $raw  := "" -}}
+  {{- if $root.Files.Get $path -}}
+    {{- $raw = $root.Files.Get $path -}}
+  {{- else -}}
+    {{- if not ($it.optional | default false) -}}
+      {{- fail (printf "File not found: %s (extraConfigMaps[%d].fromFiles[%d])" $path $idx $i) -}}
+    {{- else -}}
+      {{- $raw = "" -}}
+    {{- end -}}
+  {{- end }}
+  {{ $name }}: |
+    {{- if $it.tpl | default true -}}
+      {{- tpl $raw $root | nindent 4 }}
+    {{- else -}}
+      {{- $raw | nindent 4 }}
+    {{- end }}
+  {{- end }}
+
+binaryData:
+  {{- range $k, $v := ( $cm.binaryData | default dict ) | toYaml | fromYaml }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+---
+{{- end }}
+{{- end }}

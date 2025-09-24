@@ -1,0 +1,112 @@
+# aethernova-chain-core/ops/terraform/modules/policies/kyverno/policies/clusterpolicies/supply-chain/verify-image-signatures-cosign.yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: supply-chain-verify-image-signatures-cosign
+  annotations:
+    policies.kyverno.io/title: "Verify image signatures with Cosign (keyless)"
+    policies.kyverno.io/category: "Supply Chain Security"
+    policies.kyverno.io/severity: "high"
+    policies.kyverno.io/subject: "Cosign, Sigstore, Rekor, OIDC"
+    policies.kyverno.io/description: >
+      Запрещает запуск Pod'ов, если образы не имеют валидной подписи
+      в формате Sigstore/Cosign (keyless), проверяемой Kyverno через Rekor.
+      Политика в режиме Enforce; включает автогенерацию правил для контроллеров.
+    # Автогенерация правил для Deployment/StatefulSet/DaemonSet/Job/CronJob
+    policies.kyverno.io/autogen-controllers: All
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 25
+
+  rules:
+    - name: verify-cosign-keyless-aethernova
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kyverno
+                - gatekeeper-system
+                - monitoring
+      verifyImages:
+        # Применять ко всем контейнерам; при необходимости сузьте паттерны.
+        - imageReferences:
+            - "*"
+          # Требовать успешную верификацию каждой подходящей картинки
+          required: true
+          # Принудительно использовать digest вместо тега (защита от подмены)
+          verifyDigest: true
+          # Вписывать digest при отсутствии (выполняется на стадии mutation)
+          mutateDigest: true
+
+          # Keyless-аттесторы Sigstore/Cosign через OIDC + Rekor
+          attestors:
+            # Можно потребовать N из M аттесторов: count: 1
+            - entries:
+                # 1) Keyless: GitHub Actions OIDC (организация/репозитории Aethernova)
+                - keyless:
+                    # Вариант со строгим subject. Замените на ваши repo/workflow при необходимости.
+                    # Для гибкости допустимо использовать шаблон регулярного выражения в subject (см. docs).
+                    subject: "https://github.com/aethernova/.github/workflows/.*@refs/heads/.*"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+                # 2) Доп. удостоверяющий центр (например, корпоративный IdP через Fulcio/или GitHub OIDC для тегов релиза)
+                - keyless:
+                    subject: "https://github.com/aethernova/.*@refs/tags/.*"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+
+          # Необязательная валидация аннотаций подписи Cosign (должны быть добавлены при 'cosign sign -a key=value')
+          annotations:
+            # Пример: помеченный канал релиза и SHA коммита
+            - key: "aethernova.channel"
+              value: "stable"
+            - key: "git.sha"
+              pattern: "^[0-9a-f]{40}$"
+
+    # (Опционально) Блокируйте незнакомые реестры и требуйте подписи только из доверенных реестров
+    - name: verify-cosign-allowlisted-registries
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kyverno
+                - gatekeeper-system
+                - monitoring
+      verifyImages:
+        - imageReferences:
+            # Разрешённые пространства имён образов; при необходимости расширьте список
+            - "ghcr.io/aethernova/*"
+            - "registry.gitlab.com/aethernova/*"
+            - "harbor.aethernova.local/*"
+          required: true
+          verifyDigest: true
+          mutateDigest: true
+          attestors:
+            - entries:
+                # Keyless подписи той же цепочки доверия (OIDC + Rekor)
+                - keyless:
+                    subject: "https://github.com/aethernova/.+"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+          # При необходимости потребуйте наличие конкретного набора аннотаций подписи
+          annotations:
+            - key: "build.system"
+              value: "github-actions"
+            - key: "sbom"
+              pattern: "^(cyclonedx|spdx)$"

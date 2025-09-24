@@ -1,0 +1,314 @@
+# omnimind-core/ops/otel/collector-config.yaml
+# OpenTelemetry Collector (contrib) — production-grade конфигурация.
+# Требуемые компоненты: otel-collector-contrib image.
+
+######################################################################
+# Параметризация (env) — задайте через Deployment:
+#   OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_INSECURE
+#   PROM_RW_ENDPOINT, LOKI_ENDPOINT
+#   CLUSTER_NAME, NAMESPACE, ENV
+#   MEMORY_LIMIT_MIB, MEMORY_SPIKE_MIB, MEMORY_CHECK_INTERVAL
+######################################################################
+
+receivers:
+  # Универсальный прием OTLP от сервисов (SDK автоконфиг)
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 64
+        max_concurrent_streams: 1024
+      http:
+        endpoint: 0.0.0.0:4318
+        read_timeout: 30s
+        write_timeout: 30s
+        idle_timeout: 120s
+        include_metadata: true
+
+  # Сбор системных метрик с узлов
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu: {}
+      disk: {}
+      filesystem: {}
+      load: {}
+      memory: {}
+      network: {}
+      process:
+        mute_process_name_error: true
+
+  # Метрики kubelet (pod/container level). Требует serviceAccount с правами.
+  kubeletstats:
+    collection_interval: 30s
+    api_config:
+      auth_type: serviceAccount
+    metrics:
+      k8s.container.cpu_limit_utilization: {}
+      k8s.container.memory_limit_utilization: {}
+      k8s.pod.cpu_request_utilization: {}
+      k8s.pod.memory_request_utilization: {}
+    endpoint: https://${env:KUBE_NODE_IP}:10250
+    insecure_skip_verify: true
+
+  # Prometheus scrape для приложений
+  prometheus:
+    config:
+      global:
+        scrape_interval: 30s
+        scrape_timeout: 10s
+      scrape_configs:
+        - job_name: 'omnimind-api'
+          honor_labels: true
+          kubernetes_sd_configs:
+            - role: pod
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              action: keep
+              regex: "true"
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+              action: replace
+              target_label: __meta_kubernetes_pod_annotation_prometheus_io_port
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+              action: replace
+              target_label: __metrics_path__
+              regex: "(.+)"
+            - action: replace
+              target_label: job
+              replacement: omnimind-api
+        - job_name: 'otel-collector'
+          static_configs:
+            - targets: ['0.0.0.0:8888']  # self-metrics
+
+  # Сбор логов контейнеров через CRI логи (требует том с /var/log/containers)
+  filelog:
+    include:
+      - /var/log/containers/*.log
+    start_at: beginning
+    include_file_path: true
+    include_file_name: false
+    operators:
+      - type: json_parser
+        parse_from: attributes["log"]
+        on_error: drop
+      - type: move
+        from: attributes.log
+        to: body
+      - type: timestamp
+        parse_from: attributes.time
+        layout: RFC3339
+
+processors:
+  # Ограничение памяти коллектора
+  memory_limiter:
+    check_interval: ${env:MEMORY_CHECK_INTERVAL:2s}
+    limit_mib: ${env:MEMORY_LIMIT_MIB:1024}
+    spike_limit_mib: ${env:MEMORY_SPIKE_MIB:256}
+
+  batch:
+    timeout: 2s
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+
+  # Аннотации Kubernetes (namespace/pod/labels) к телеметрии
+  k8sattributes:
+    auth_type: serviceAccount
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.node.name
+        - k8s.pod.start_time
+        - k8s.container.name
+      labels:
+        - tag_name: app.kubernetes.io/name
+          key: app.kubernetes.io/name
+          from: pod
+        - tag_name: app.kubernetes.io/component
+          key: app.kubernetes.io/component
+          from: pod
+        - tag_name: app.kubernetes.io/part-of
+          key: app.kubernetes.io/part-of
+          from: pod
+    filter:
+      node_from_env_var: KUBE_NODE_NAME
+
+  # Обогащение ресурсных атрибутов
+  resource:
+    attributes:
+      - action: upsert
+        key: service.namespace
+        value: ${env:NAMESPACE:default}
+      - action: upsert
+        key: deployment.environment
+        value: ${env:ENV:prod}
+      - action: upsert
+        key: k8s.cluster.name
+        value: ${env:CLUSTER_NAME:cluster}
+      - action: upsert
+        key: telemetry.distro.name
+        value: "otel-collector-contrib"
+
+  # Нормализация атрибутов (пример: выравнивание имен)
+  attributes:
+    actions:
+      - key: http.target
+        action: delete
+      - key: url.path
+        from_attribute: http.target
+        action: insert
+      - key: net.peer.ip
+        action: delete
+
+  # Отфильтровать шум (health, readiness)
+  filter/traces:
+    spans:
+      exclude:
+        match_type: regexp
+        attributes:
+          - key: http.target
+            value: ^/(healthz|livez|readyz|metrics)$
+
+  # Простейшая политика семплирования на уровне head-sampling
+  probabilistic_sampler:
+    hash_seed: 42
+    sampling_percentage: ${env:TRACE_SAMPLING:20}
+
+  # spanmetrics коннектор — RED-метрики из трейсов
+  spanmetrics:
+    metrics_exporter: prometheusremotewrite
+    latency_histogram:
+      boundaries: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s]
+    dimensions:
+      - service.name
+      - http.method
+      - http.route
+      - k8s.namespace.name
+    exemplars:
+      enabled: true
+
+  # Трансформации (пример: приведение статусов)
+  transform/traces:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(status.code, 2) where attributes["error"] == true
+
+exporters:
+  # Универсальный OTLP (Apm backend: Tempo/Jaeger, Prometheus OTLP, etc.)
+  otlp:
+    endpoint: ${env:OTEL_EXPORTER_OTLP_ENDPOINT:otel-collector:4317}
+    tls:
+      insecure: ${env:OTEL_EXPORTER_OTLP_INSECURE:true}
+    sending_queue:
+      enabled: true
+      num_consumers: 8
+      queue_size: 20000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  # Prometheus Remote Write (метрики + spanmetrics)
+  prometheusremotewrite:
+    endpoint: ${env:PROM_RW_ENDPOINT:http://prometheus-k8s.monitoring:9090/api/v1/write}
+    tls:
+      insecure: true
+    external_labels:
+      cluster: ${env:CLUSTER_NAME:cluster}
+      env: ${env:ENV:prod}
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Loki для логов
+  loki:
+    endpoint: ${env:LOKI_ENDPOINT:http://loki.monitoring:3100/loki/api/v1/push}
+    labels:
+      resource:
+        k8s.namespace.name: "namespace"
+        k8s.pod.name: "pod"
+        k8s.container.name: "container"
+        app.kubernetes.io/name: "app"
+      attributes:
+        level: "level"
+        http.method: "method"
+        http.status_code: "status"
+    tenant_id: ${env:LOKI_TENANT:omnimind}
+    tls:
+      insecure: true
+
+  # Для диагностики (не включайте в проде)
+  debug:
+    verbosity: basic
+
+connectors:
+  # Роутинг по атрибуту service.name (пример)
+  routing:
+    default_pipelines: [traces/otlp]
+    attribute_source: resource
+    from_attribute: service.name
+    table:
+      - value: omnimind-worker
+        pipelines: [traces/otlp]
+      - value: omnimind-api
+        pipelines: [traces/otlp]
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888
+
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    # ---------- Traces ----------
+    traces/ingest:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resource, attributes, filter/traces, probabilistic_sampler, batch]
+      exporters: [routing]
+
+    traces/otlp:
+      receivers: [routing]
+      processors: [spanmetrics, batch]
+      exporters: [otlp]
+
+    # ---------- Metrics ----------
+    metrics/system:
+      receivers: [hostmetrics, kubeletstats]
+      processors: [memory_limiter, k8sattributes, resource, batch]
+      exporters: [prometheusremotewrite]
+
+    metrics/app:
+      receivers: [prometheus]
+      processors: [memory_limiter, k8sattributes, resource, batch]
+      exporters: [prometheusremotewrite]
+
+    metrics/spanmetrics:
+      receivers: [spanmetrics]
+      processors: [batch]
+      exporters: [prometheusremotewrite]
+
+    # ---------- Logs ----------
+    logs/containers:
+      receivers: [filelog]
+      processors: [memory_limiter, k8sattributes, resource, batch]
+      exporters: [loki]
+
+    # Отладка (отключить в прод)
+    logs/debug:
+      receivers: [filelog]
+      processors: [batch]
+      exporters: [debug]

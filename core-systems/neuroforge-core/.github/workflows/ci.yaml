@@ -1,0 +1,307 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+# Отменяем параллельные запуски для одной ветки/PR
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  PYTHONUNBUFFERED: "1"
+  # Для Poetry: локальные venv внутри проекта
+  POETRY_VIRTUALENVS_CREATE: "true"
+  POETRY_VIRTUALENVS_IN_PROJECT: "true"
+
+jobs:
+  lint:
+    name: Lint (pre-commit / ruff,black)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Cache pre-commit
+        id: cache-precommit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: precommit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install tooling (pre-commit fallback)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f ".pre-commit-config.yaml" ]; then
+            python -m pip install pre-commit
+          else
+            python -m pip install ruff==0.5.* black==24.* flake8==7.*
+          fi
+        shell: bash
+
+      - name: Run pre-commit (if configured)
+        if: hashFiles('.pre-commit-config.yaml') != ''
+        run: pre-commit run --all-files --show-diff-on-failure
+        shell: bash
+
+      - name: Ruff / Black fallback
+        if: hashFiles('.pre-commit-config.yaml') == ''
+        run: |
+          ruff --version
+          ruff check .
+          black --check .
+        shell: bash
+
+  test:
+    name: Tests (matrix)
+    needs: [ lint ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        python-version: [ "3.10", "3.11", "3.12" ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Detect dependency manager
+        id: depmgr
+        run: |
+          if [ -f "pyproject.toml" ]; then
+            echo "use_poetry=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_poetry=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Cache Poetry
+        if: steps.depmgr.outputs.use_poetry == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pypoetry
+            ./.venv
+          key: poetry-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('poetry.lock', 'pyproject.toml') }}
+          restore-keys: |
+            poetry-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Install Poetry
+        if: steps.depmgr.outputs.use_poetry == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==1.8.*"
+        shell: bash
+
+      - name: Install deps (Poetry)
+        if: steps.depmgr.outputs.use_poetry == 'true'
+        run: |
+          poetry --version
+          poetry install --no-interaction --with dev
+        shell: bash
+
+      - name: Install deps (pip)
+        if: steps.depmgr.outputs.use_poetry != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "requirements-dev.txt" ]; then
+            python -m pip install -r requirements-dev.txt
+          elif [ -f "requirements.txt" ]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "No requirements*.txt found; installing pytest baseline"
+            python -m pip install pytest pytest-cov
+          fi
+        shell: bash
+
+      - name: Run tests
+        run: |
+          PYTEST="pytest -q --maxfail=1 --disable-warnings --cov --cov-report=xml"
+          if [ "${{ steps.depmgr.outputs.use_poetry }}" = "true" ]; then
+            poetry run ${PYTEST}
+          else
+            ${PYTEST}
+          fi
+        shell: bash
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ runner.os }}-py${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            .coverage*
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload to Codecov (if token present)
+        if: env.CODECOV_TOKEN != '' && runner.os == 'Linux'
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          bash <(curl -s https://codecov.io/bash) -Z || echo "Codecov upload skipped"
+        shell: bash
+
+  security:
+    name: Security (pip-audit)
+    needs: [ test ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install Poetry (optional)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "pyproject.toml" ]; then
+            python -m pip install "poetry==1.8.*"
+          fi
+        shell: bash
+      - name: Export requirements (Poetry)
+        if: hashFiles('pyproject.toml') != ''
+        run: |
+          poetry export --without-hashes -f requirements.txt -o requirements-lock.txt
+        shell: bash
+      - name: Prepare requirements (pip)
+        if: hashFiles('pyproject.toml') == '' && hashFiles('requirements*.txt') != ''
+        run: |
+          cp requirements*.txt requirements-lock.txt || true
+        shell: bash
+      - name: Install pip-audit
+        run: python -m pip install pip-audit
+        shell: bash
+      - name: Run pip-audit
+        run: |
+          if [ -f requirements-lock.txt ]; then
+            pip-audit -r requirements-lock.txt
+          else
+            pip-audit
+          fi
+        shell: bash
+
+  build:
+    name: Build (wheel/sdist + twine check)
+    needs: [ test ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Detect dependency manager
+        id: depmgr
+        run: |
+          if [ -f "pyproject.toml" ]; then
+            echo "use_poetry=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_poetry=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+      - name: Install Poetry / build deps
+        if: steps.depmgr.outputs.use_poetry == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==1.8.*" build twine
+        shell: bash
+      - name: Install build deps (pip)
+        if: steps.depmgr.outputs.use_poetry != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+        shell: bash
+      - name: Build artifacts
+        run: |
+          if [ "${{ steps.depmgr.outputs.use_poetry }}" = "true" ]; then
+            poetry build
+          else
+            python -m build
+          fi
+        shell: bash
+      - name: Twine check
+        run: python -m twine check dist/*
+        shell: bash
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          retention-days: 14
+
+  codeql:
+    name: CodeQL (Python)
+    needs: [ lint ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+
+  publish:
+    name: Publish to PyPI (on release)
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: [ build ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/p/neuroforge-core
+    permissions:
+      id-token: write   # OIDC for trusted publishing
+      contents: read
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Publish (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

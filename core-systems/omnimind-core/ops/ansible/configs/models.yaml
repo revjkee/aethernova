@@ -1,0 +1,375 @@
+# ======================================================================
+# OmniMind Core — унифицированная конфигурация моделей и маршрутизации
+# Назначение: единый источник правды для приложения/шлюза inference.
+# Поддержка: мульти-провайдер, многомодельность, канареечные релизы,
+#            failover, квоты, кеш, модерация, телеметрия.
+# Применение: как шаблон Ansible (jinja) через template/copy.
+# ======================================================================
+
+apiVersion: omnimind.ai/v1
+kind: ModelRouterConfig
+
+metadata:
+  name: models
+  env: "{{ omnimind_core_env.name | default('prod') }}"
+  region: "{{ omnimind_core_env.region | default('eu-central') }}"
+  labels:
+    app.kubernetes.io/part-of: omnimind-core
+    app.kubernetes.io/component: inference
+
+spec:
+  # ------------------------------ #
+  # Глобальные параметры клиента
+  # ------------------------------ #
+  globals:
+    timeouts:
+      connect_ms: {{ omnimind_core_app_config.timeouts.connect_ms | default(2000) }}
+      read_ms: {{ omnimind_core_app_config.timeouts.read_timeout_ms | default(5000) }}
+      total_ms: {{ (omnimind_core_app_config.timeouts.read_timeout_ms | default(5000)) + 2000 }}
+    retries:
+      total: 3
+      backoff: exponential
+      jitter: full
+      base_delay_ms: 200
+      max_delay_ms: 2000
+      retry_on:
+        - 408
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+    http:
+      proxy:
+        http: "{{ omnimind_core_network.http_proxy | default('') }}"
+        https: "{{ omnimind_core_network.https_proxy | default('') }}"
+        no_proxy: "{{ omnimind_core_network.no_proxy | default('127.0.0.1,localhost') }}"
+      default_headers: {}
+    observability:
+      tracing: {{ omnimind_core_observability.tracing.enabled | default(true) }}
+      metrics: true
+      metric_labels:
+        service: "{{ omnimind_core_service.name | default('omnimind-core') }}"
+        env: "{{ omnimind_core_env.name | default('prod') }}"
+        region: "{{ omnimind_core_env.region | default('eu-central') }}"
+
+  # ------------------------------ #
+  # Секреты/эндпоинты (из Vault/vars)
+  # ------------------------------ #
+  secrets:
+    openai_api_key: "{{ vault_openai_api_key | default('') }}"
+    openai_base_url: "{{ openai_base_url | default('https://api.openai.com/v1') }}"
+    openai_organization: "{{ openai_org | default('') }}"
+
+    azure_openai_api_key: "{{ vault_azure_openai_api_key | default('') }}"
+    azure_openai_endpoint: "{{ azure_openai_endpoint | default('') }}"
+    azure_openai_api_version: "{{ azure_openai_api_version | default('2024-02-15-preview') }}"
+
+    anthropic_api_key: "{{ vault_anthropic_api_key | default('') }}"
+    anthropic_base_url: "{{ anthropic_base_url | default('https://api.anthropic.com') }}"
+
+    hf_token: "{{ vault_hf_token | default('') }}"
+    hf_inference_api: "{{ hf_inference_api | default('https://api-inference.huggingface.co/models') }}"
+
+    ollama_base_url: "{{ ollama_host | default('http://ollama:11434') }}"
+    vllm_base_url: "{{ vllm_base_url | default('http://vllm:8000') }}"
+
+  # ------------------------------ #
+  # Провайдеры и доступные модели
+  # Примечание: числовые лимиты/окна контекста зависят от провайдера
+  # и могут корректироваться приложением динамически.
+  # ------------------------------ #
+  providers:
+
+    openai:
+      enabled: {{ openai_enabled | default(true) }}
+      base_url: "{{ secrets.openai_base_url }}"
+      api_key: "{{ secrets.openai_api_key }}"
+      organization: "{{ secrets.openai_organization | default(omit) }}"
+      models:
+        chat:
+          - id: "gpt-4o-mini"
+            vision: true
+            tools: true
+            max_input_tokens: 128000
+            max_output_tokens: 16384
+            preferred: true
+          - id: "gpt-4o"
+            vision: true
+            tools: true
+            canary: true
+        embeddings:
+          - id: "text-embedding-3-large"
+            dimensions: auto
+          - id: "text-embedding-3-small"
+            dimensions: auto
+        moderation:
+          - id: "omni-moderation-latest"
+            purpose: safety
+
+    azure_openai:
+      enabled: {{ azure_openai_enabled | default(false) }}
+      endpoint: "{{ secrets.azure_openai_endpoint }}"
+      api_key: "{{ secrets.azure_openai_api_key }}"
+      api_version: "{{ secrets.azure_openai_api_version }}"
+      # Мэппинг логических имен на deployment ID
+      deployments:
+        chat:
+          - name: "gpt-4o-mini"
+            deployment_id: "{{ azure_openai_deploy_gpt4o_mini | default('gpt4o-mini') }}"
+            tools: true
+        embeddings:
+          - name: "text-embedding-3-large"
+            deployment_id: "{{ azure_openai_deploy_emb_large | default('emb3l') }}"
+
+    anthropic:
+      enabled: {{ anthropic_enabled | default(false) }}
+      base_url: "{{ secrets.anthropic_base_url }}"
+      api_key: "{{ secrets.anthropic_api_key }}"
+      models:
+        chat:
+          - id: "claude-3-5-sonnet"
+            tools: true
+            max_input_tokens: 200000
+            max_output_tokens: 8192
+          - id: "claude-3-haiku"
+            low_latency: true
+
+    huggingface:
+      enabled: {{ hf_enabled | default(false) }}
+      token: "{{ secrets.hf_token }}"
+      inference_api: "{{ secrets.hf_inference_api }}"
+      models:
+        embeddings:
+          - id: "sentence-transformers/all-MiniLM-L6-v2"
+            dimensions: auto
+        rerank:
+          - id: "mixedbread-ai/mxbai-rerank-xsmall-v1"
+            dimensions: auto
+
+    ollama:
+      enabled: {{ ollama_enabled | default(false) }}
+      base_url: "{{ secrets.ollama_base_url }}"
+      models:
+        chat:
+          - id: "llama3:8b-instruct"
+            low_latency: true
+        embeddings:
+          - id: "nomic-embed-text"
+
+    vllm:
+      enabled: {{ vllm_enabled | default(false) }}
+      base_url: "{{ secrets.vllm_base_url }}"
+      models:
+        chat:
+          - id: "{{ vllm_model_chat | default('qwen2.5-7b-instruct') }}"
+        embeddings:
+          - id: "{{ vllm_model_emb | default('bge-base-en-v1.5') }}"
+
+  # ------------------------------ #
+  # Маршрутизация по задачам/тирам
+  # Слои: quality (лучшее качество), latency (минимальная задержка),
+  # cost (дешевле). Переключение по SLO, весам и fallback.
+  # ------------------------------ #
+  routing:
+
+    chat:
+      default:
+        tiers:
+          - name: quality
+            timeout_ms: 20000
+            pool:
+              - provider: openai
+                model: gpt-4o-mini
+                weight: 85
+              - provider: azure_openai
+                model: gpt-4o-mini
+                weight: 15
+            failover: latency
+          - name: latency
+            timeout_ms: 8000
+            pool:
+              - provider: openai
+                model: gpt-4o-mini
+                weight: 100
+            failover: cost
+          - name: cost
+            timeout_ms: 15000
+            pool:
+              - provider: ollama
+                model: llama3:8b-instruct
+                weight: 100
+        # Для vision-запросов используем только модели, помеченные vision=true
+        constraints:
+          require_vision_if_image: true
+          allow_tools: true
+
+      # Пример отдельного профиля для асинхронных оффлайн задач
+      batch:
+        tiers:
+          - name: cost
+            timeout_ms: 60000
+            pool:
+              - provider: vllm
+                model: "{{ vllm_model_chat | default('qwen2.5-7b-instruct') }}"
+                weight: 100
+
+    embeddings:
+      default:
+        dim: auto
+        pool:
+          - provider: openai
+            model: text-embedding-3-small
+            weight: 70
+          - provider: openai
+            model: text-embedding-3-large
+            weight: 30
+        failover_pool:
+          - provider: huggingface
+            model: sentence-transformers/all-MiniLM-L6-v2
+            weight: 100
+
+    rerank:
+      default:
+        pool:
+          - provider: huggingface
+            model: mixedbread-ai/mxbai-rerank-xsmall-v1
+            weight: 100
+
+  # ------------------------------ #
+  # Квоты и конкурентность
+  # ------------------------------ #
+  quotas:
+    defaults:
+      rpm: 6000            # запросов в минуту
+      tpm: 600000          # токенов в минуту (если поддерживается)
+      concurrency: 64
+      spike_multiplier: 1.5 # временный всплеск
+      window_seconds: 60
+    tenants:
+      # Переопределения на команду/продукт/клиента
+      "{{ omnimind_core_env.name }}":
+        rpm: 12000
+        concurrency: 128
+      # "team-ml":
+      #   rpm: 2000
+
+  # ------------------------------ #
+  # Кеширование результатов inference
+  # ------------------------------ #
+  cache:
+    enabled: true
+    provider: redis
+    redis:
+      url: "{{ redis_url | default('redis://redis:6379/2') }}"
+      tls: {{ redis_tls | default(false) }}
+      key_namespace: "omni:infer:"
+      key_strategy: normalized_prompt_v1
+      ttl_seconds:
+        chat: 3600
+        embeddings: 2592000   # 30 дней
+        rerank: 86400
+      max_bytes: "512Mi"
+    rules:
+      - task: embeddings
+        cache_bypass_if:
+          - prompt_length_gt: 8192
+      - task: chat
+        cache_bypass_if:
+          - has_tools: true
+          - contains_files: true
+
+  # ------------------------------ #
+  # Политики безопасности/модерации/PII
+  # ------------------------------ #
+  safety:
+    moderation:
+      enabled: true
+      provider: openai
+      model: "omni-moderation-latest"
+      action:
+        on_block: "filter"      # filter|truncate|reject
+        on_suspect: "review"    # review|log|allow
+    pii:
+      redact:
+        enabled: true
+        # Базовые паттерны для скрытия PII при логировании/кеше
+        patterns:
+          - name: email
+            regex: '(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}'
+            replacement: "<email>"
+          - name: phone
+            regex: '(?i)\+?\d[\d\-\s\(\)]{7,}\d'
+            replacement: "<phone>"
+          - name: card
+            regex: '(?i)\b(?:\d[ -]*?){13,19}\b'
+            replacement: "<card>"
+      max_prompt_chars: 100000
+    jailbreak_detection:
+      enabled: true
+      threshold: 0.85
+
+  # ------------------------------ #
+  # Шаблоны промптов (registry)
+  # ------------------------------ #
+  prompts:
+    templates:
+      retrieval_qa:
+        input_variables: ["context", "question", "format"]
+        template: |
+          You are a precise assistant.
+          Use ONLY the provided context to answer.
+          If the answer is not in the context, say you don't know.
+          Context:
+          {{ context }}
+
+          Question:
+          {{ question }}
+
+          Output format:
+          {{ format | default("concise") }}
+      classify_tone:
+        input_variables: ["text"]
+        template: |
+          Classify the tone of the following text into one of: neutral, positive, negative.
+          Text:
+          {{ text }}
+
+  # ------------------------------ #
+  # Политика версионирования и канареек
+  # ------------------------------ #
+  rollout:
+    canary:
+      enabled: true
+      stickiness: "header:X-Request-Id"
+      buckets:
+        - name: "small"
+          weight: 5
+        - name: "default"
+          weight: 95
+    abort_conditions:
+      - p95_latency_ms_gt: 20000
+      - error_rate_gt: 0.05
+
+  # ------------------------------ #
+  # Валидация входных параметров (предикаты на шлюзе)
+  # ------------------------------ #
+  validation:
+    chat:
+      max_input_tokens: 200000
+      max_output_tokens: 32768
+      allow_tools: true
+      allow_vision: true
+    embeddings:
+      max_batch: 512
+      max_text_len: 100000
+
+  # ------------------------------ #
+  # Диагностика/инструменты поддержки
+  # ------------------------------ #
+  support:
+    contact: "platform-ops@omni.example"
+    runbook_url: "https://runbooks.example/omnimind-core-inference"
+    dashboards:
+      - "prometheus://omni/inference"
+      - "grafana://omni/ai-router"

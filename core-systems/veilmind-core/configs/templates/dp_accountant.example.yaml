@@ -1,0 +1,306 @@
+# File: veilmind-core/configs/templates/dp_accountant.example.yaml
+# Industrial-grade Differential Privacy Accountant configuration template
+# Используйте как основу: скопируйте в configs/dp_accountant.yaml и отредактируйте.
+
+version: "1"
+
+metadata:
+  project: "veilmind-core"
+  environment: "${ENV:-prod}"
+  owner_team: "privacy-eng"
+  # Жесткая схема именования событий DP-учета во всём проекте
+  naming:
+    event_id_format: "dp::{tenant}::{dataset}::{pipeline}::{mechanism}::{uuid}"
+
+################################################################################
+# ГЛОБАЛЬНЫЕ ПАРАМЕТРЫ DP
+################################################################################
+privacy:
+  # Базовая модель учета — по умолчанию RDP (Rényi DP) с редукцией в (ε, δ)
+  accountant:
+    preferred: "RDP"           # RDP | Moments | PLD
+    fallback_chain: ["PLD", "Moments"]  # при невозможности применить основной
+    # Глобальные допущения для редукции RDP -> (ε, δ)
+    rdp_orders: [1.25,1.5,2,3,5,10,20,32,64,128,256]
+    delta: 1.0e-6              # базовая δ для редукции (может быть перегружена локально)
+    # Ограничения применимости
+    constraints:
+      require_poisson_subsampling: true     # для DP‑SGD/анализов с подвыборкой
+      require_gaussian_for_rdp: true       # RDP корректно для Gaussian/Poisson subsampled
+
+  # Глобальные бюджеты и окна
+  budgets:
+    # Абсолютный верхний предел на участника/тенанта/датасет
+    hard_caps:
+      epsilon: 8.0
+      delta: 1.0e-6
+    # Роллинг‑окна для SLO по приватности
+    windows:
+      - name: "daily"
+        duration: "24h"
+        epsilon_limit: 1.0
+        delta_limit: 1.0e-7
+      - name: "monthly"
+        duration: "30d"
+        epsilon_limit: 4.0
+        delta_limit: 1.0e-6
+    # Поведение при исчерпании
+    enforcement:
+      reject_if_exceeded: true     # жесткая блокировка
+      dry_run: false               # только логировать (для стейджинга можно true)
+      grace_ratio: 0.0             # 0 — без «овердрафта»
+      on_violation:                # действия при нарушении
+        - type: "audit_log"
+        - type: "alert"
+        - type: "lock_pipeline"
+
+################################################################################
+# ИСТОЧНИКИ ДАННЫХ И МОДЕЛЬ УЧАСТИЯ
+################################################################################
+datasets:
+  - name: "analytics_events"
+    description: "Агрегированные пользовательские события (включает счетчики)"
+    participation: "event_level"        # user_level | event_level | group_level
+    max_contributions_per_user: 10      # K в рамках окна (bounded DP)
+    delta_override: 1.0e-8
+  - name: "ml_training_logs"
+    description: "Обучающие записи для DP‑SGD обучения моделей"
+    participation: "user_level"
+    max_contributions_per_user: 1
+    delta_override: 1.0e-6
+
+################################################################################
+# МЕХАНИЗМЫ И ПОЛИТИКИ ШУМА
+################################################################################
+mechanisms:
+  # Лапласовский механизм для сумм/средних (ε‑DP)
+  - name: "laplace_count_v1"
+    type: "LAPLACE"
+    params:
+      sensitivity: 1.0                # L1‑чувствительность
+      epsilon: 0.5
+    accounting:
+      model: "PLD"                    # точный PLD для сумм композиций
+      composition: "basic"            # basic | advanced | optimal
+
+  # Гауссовский механизм (RDP -> (ε, δ))
+  - name: "gaussian_agg_v1"
+    type: "GAUSSIAN"
+    params:
+      l2_sensitivity: 1.0
+      sigma: 1.2                      # std dev
+    accounting:
+      model: "RDP"
+      rdp_orders: [1.5,2,3,5,10,20,64]
+      delta: 1.0e-8
+
+  # DP‑SGD для обучения моделей
+  - name: "dpsgd_v1"
+    type: "DP_SGD"
+    params:
+      sampling_probability: 0.01       # q
+      noise_multiplier: 1.1            # σ
+      steps: 60000
+      clipping_norm: 1.0               # L2‑клиппинг
+    accounting:
+      model: "RDP"
+      rdp_orders: "auto"               # авто‑поиск минимального ε по сетке
+      delta: 1.0e-6
+
+  # Частота/сумма событий с приватным счетчиком
+  - name: "count_sketch_gauss_v1"
+    type: "COUNT"
+    params:
+      l2_sensitivity: 1.0
+      sigma: 0.9
+    accounting:
+      model: "RDP"
+      delta: 1.0e-8
+
+################################################################################
+# ПАЙПЛАЙНЫ И КОМПОЗИЦИЯ (куда применяются механизмы)
+################################################################################
+pipelines:
+  - name: "public_metrics_daily"
+    dataset: "analytics_events"
+    description: "Публикация ежедневных агрегатов (счетчики, уникальные)"
+    composition:
+      # Список шагов и механизмы с кратностями; поддерживается параллельная композиция
+      steps:
+        - mechanism: "laplace_count_v1"
+          repeats: 20                    # 20 метрик/запросов в сутки
+        - mechanism: "gaussian_agg_v1"
+          repeats: 5
+      policy:
+        composition_rule: "advanced"     # advanced/optimal для ε с учетом δ
+        per_user_cap: 10                 # повторяет dataset K, можно сузить
+        window: "daily"                  # применить дневной лимит
+    sla:
+      epsilon_max: 1.0
+      delta_max: 1.0e-8
+      alert_on_burn:
+        fast_window: "1h"
+        slow_window: "24h"
+        multiple_of_slo: [6.0, 2.0]      # как в SRE‑burn rate
+
+  - name: "model_training_main"
+    dataset: "ml_training_logs"
+    description: "Обучение основной модели с DP‑SGD"
+    composition:
+      steps:
+        - mechanism: "dpsgd_v1"
+          repeats: 1
+      policy:
+        composition_rule: "rdp_optimal"
+        per_user_cap: 1
+        window: "monthly"
+    sla:
+      epsilon_max: 3.5
+      delta_max: 1.0e-6
+      alert_on_burn:
+        fast_window: "6h"
+        slow_window: "7d"
+        multiple_of_slo: [8.0, 2.5]
+
+################################################################################
+# ТЕНАНТ‑СПЕЦИФИКА (пер‑клиентские бюджеты)
+################################################################################
+tenants:
+  - id: "tenant-a"
+    budgets:
+      daily:
+        epsilon: 0.8
+        delta: 1.0e-8
+      monthly:
+        epsilon: 3.0
+        delta: 1.0e-6
+    allow_pipelines: ["public_metrics_daily", "model_training_main"]
+  - id: "tenant-b"
+    budgets:
+      daily:
+        epsilon: 0.5
+        delta: 1.0e-8
+      monthly:
+        epsilon: 2.0
+        delta: 1.0e-6
+    allow_pipelines: ["public_metrics_daily"]
+
+################################################################################
+# ГЕНЕРАЦИЯ ШУМА И КРИПТОБЕЗОПАСНОСТЬ
+################################################################################
+noise:
+  rng:
+    type: "CSPRNG"                       # криптографически стойкий PRNG
+    impl: "system"                       # system | openssl | aesctr_drbg
+    reseed_interval: "1h"
+  seeding:
+    # Предпочтительно сид из KMS/HSM (пер‑инстанс); среды указывают детали
+    source: "KMS"                        # KMS | HSM | STATIC | NONE
+    kms_key_id: "${DP_KMS_KEY_ID:-}"
+    hsm_slot: "${HSM_SLOT:-}"
+    # Для dev‑окружений можно задать STATIC_SEED, в prod — запрещено
+    static_seed_env: "${DP_STATIC_SEED:-}"
+    allow_static_in_prod: false
+  audit_fingerprint:
+    enabled: true
+    hmac_key_env: "${DP_HMAC_KEY:-}"     # для целостности записей учета
+
+################################################################################
+# АЛЕРТЫ, АУДИТ, ЛОГИРОВАНИЕ
+################################################################################
+monitoring:
+  export_metrics:
+    prometheus:
+      enabled: true
+      namespace: "veilmind_dp"
+      labels:
+        project: "veilmind-core"
+  alerts:
+    # Пороги оперативных нарушений помимо SLO
+    rules:
+      - name: "budget_near_exhaustion_daily"
+        condition: "epsilon_remaining_ratio < 0.1"
+        for: "30m"
+        severity: "high"
+      - name: "budget_exhausted_hard"
+        condition: "epsilon_remaining <= 0 or delta_remaining <= 0"
+        for: "0m"
+        severity: "critical"
+      - name: "suspicious_spike"
+        condition: "epsilon_increment_p95_over_1h > 3.0 * baseline"
+        for: "15m"
+        severity: "medium"
+  logging:
+    level: "INFO"
+    redact_sensitive: true
+    sink: "stdout"   # syslog|stdout|file
+    json: true
+
+audit:
+  enabled: true
+  store:
+    type: "postgres"
+    dsn_env: "${DP_AUDIT_PG_DSN:-}"
+    retention: "365d"
+    partition_by: "month"
+  fields:
+    include:
+      - "event_id"
+      - "tenant"
+      - "dataset"
+      - "pipeline"
+      - "mechanism"
+      - "epsilon_inc"
+      - "delta_inc"
+      - "epsilon_cum"
+      - "delta_cum"
+      - "timestamp"
+      - "actor"       # сервис/пользователь
+    exclude_pii: true
+
+################################################################################
+# РАНТАЙМ И ИНТЕГРАЦИИ
+################################################################################
+runtime:
+  # Политика применения: где считать и хранить состояние бюджета
+  state_store:
+    type: "postgres"                     # postgres | redis | memory
+    dsn_env: "${DP_STATE_PG_DSN:-}"
+    table_prefix: "dpacct_"
+    consistency: "serializable"          # для транзакций учета
+  # Идемпотентность: защита от двойного списания при ретраях
+  idempotency:
+    enabled: true
+    key_ttl: "24h"
+  # Контроль доступа
+  authz:
+    allowlist_pipelines:
+      - "public_metrics_daily"
+      - "model_training_main"
+    mTLS_required: true
+  # Ограничение скорости выдачи бюджетов (защита от бурстов)
+  rate_limits:
+    global: "1000/min"
+    per_tenant: "200/min"
+
+################################################################################
+# ПРИМЕРЫ ЗАПРОСОВ К АККАУНТИНГУ (для интеграторов)
+################################################################################
+examples:
+  # Пример расчета суммарного ε/δ для пайплайна за сутки (dry‑run)
+  queries:
+    - name: "estimate_public_metrics_daily"
+      dry_run: true
+      tenant: "tenant-a"
+      pipeline: "public_metrics_daily"
+      window: "daily"
+      expected_output:
+        epsilon_total_max: 1.0
+        delta_total_max: 1.0e-8
+    - name: "charge_dpsgd_training"
+      dry_run: false
+      tenant: "tenant-a"
+      pipeline: "model_training_main"
+      window: "monthly"
+      # Списание будет выполнено только при достаточном остатке бюджета
+      on_insufficient: "reject"          # reject | warn

@@ -1,0 +1,519 @@
+# oblivionvault-core/configs/security.yaml
+# Security Baseline for OblivionVault-Core
+# schema: ovault.security/1.2
+version: "1.2.0"
+service: "oblivionvault-core"
+owner:
+  team: "platform-security"
+  contacts:
+    - type: slack
+      channel: "#sec-incidents"
+    - type: email
+      value: "security@oblivionvault.example"
+    - type: pagerduty
+      service: "oblivionvault-security"
+last_updated: "2025-08-25T00:00:00Z"
+
+metadata:
+  labels:
+    confidentiality: "high"
+    integrity: "high"
+    availability: "high"
+  compliance:
+    - iso27001:a.5..a.18
+    - soc2:security,availability,confidentiality
+    - gdpr:art5,art25,art32,art33
+    - hipaa:security-rule
+    - nist800-53:moderate
+  threat_model:
+    method: "STRIDE+ATT&CK"
+    baseline_mitre_tactics:
+      - TA0001 # Initial Access
+      - TA0004 # Privilege Escalation
+      - TA0006 # Credential Access
+      - TA0007 # Discovery
+      - TA0009 # Collection
+      - TA0011 # Command and Control
+
+defaults: &defaults
+  zero_trust:
+    enforce: true
+    network:
+      inbound_default: "deny"
+      outbound_default: "deny"
+      segmentation:
+        policy: "workload-identity"
+        boundaries:
+          - name: "control-plane"
+            allow_to: ["observability", "secrets", "identity"]
+          - name: "data-plane"
+            allow_to: ["storage", "cache"]
+      mtls:
+        required: true
+        min_tls: "1.3"
+        cipher_suites:
+          - "TLS_AES_256_GCM_SHA384"
+          - "TLS_CHACHA20_POLY1305_SHA256"
+        session_resumption: "disabled"
+    device_posture:
+      require_ssm_compliance: true
+      allowed_os:
+        - "AmazonLinux2023"
+        - "Ubuntu22.04"
+      kernel_hardening:
+        selinux: "enforcing"
+        aslr: true
+
+  identity_access:
+    authn:
+      primary: "oauth2_oidc"
+      oidc:
+        issuer: "https://idp.oblivionvault.example"
+        jwks_cache_ttl: "5m"
+        clock_skew: "60s"
+      mfa:
+        required: true
+        methods: ["totp", "webauthn"]
+    authz:
+      model: "rbac+abac"
+      rbac:
+        roles:
+          - id: "admin"
+            description: "Full administrative access"
+            permissions: ["*"]
+          - id: "operator"
+            description: "Operate and observe"
+            permissions: ["read:*", "operate:*", "exec:runbooks"]
+          - id: "developer"
+            description: "Develop and read non-prod data"
+            permissions: ["read:*", "deploy:nonprod", "feature_flags:toggle_nonprod"]
+          - id: "service"
+            description: "Machine-to-machine"
+            permissions: ["svc:invoke", "svc:read", "secrets:get", "kms:encrypt", "kms:decrypt"]
+      abac:
+        attributes:
+          - name: "env"
+            allowed: ["dev", "stage", "prod"]
+          - name: "data_class"
+            allowed: ["public", "internal", "confidential", "restricted"]
+        deny_by_default: true
+    session:
+      ttl: "12h"
+      idle_timeout: "30m"
+      same_site: "Lax"
+      cookie_secure: true
+      cookie_http_only: true
+      rotation: "24h"
+
+  crypto:
+    kms:
+      default_key_arn: "arn:aws:kms:region:account:key/placeholder"
+      enforce_envelope_encryption: true
+    e2e_encryption:
+      at_rest: "AES-256-GCM"
+      in_transit: "TLS1.3"
+    hashing:
+      password:
+        algo: "argon2id"
+        params:
+          memory_kib: 262144
+          iterations: 3
+          parallelism: 2
+          salt_len: 16
+          tag_len: 32
+      api_keys:
+        algo: "SHA-256"
+    jwt:
+      issuer: "https://idp.oblivionvault.example"
+      audiences: ["oblivionvault-core", "oblivionvault-admin"]
+      alg: "RS256"
+      exp: "15m"
+      nbf_skew: "30s"
+      refresh:
+        enabled: true
+        ttl: "12h"
+        rotation: "on_use"
+
+  secrets_management:
+    provider: "aws_secrets_manager"
+    cache_ttl: "300s"
+    rotation:
+      enabled: true
+      window: "24h"
+      min_interval: "30d"
+    access_policies:
+      - secret: "db/primary"
+        roles: ["service", "admin"]
+      - secret: "jwt/signing"
+        roles: ["admin"]
+    detection:
+      ci_secret_scanning: true
+      runtime_leak_watch: true
+    masking:
+      logs: true
+      observability: true
+
+  transport_security:
+    tls_termination: "edge"
+    hsts:
+      enabled: true
+      max_age: 31536000
+      include_subdomains: true
+      preload: true
+    cors:
+      enabled: true
+      allowed_origins: ["https://app.oblivionvault.example"]
+      allowed_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+      allowed_headers: ["Authorization", "Content-Type", "X-Request-ID"]
+      expose_headers: ["X-Request-ID"]
+      max_age: 3600
+      credentials: false
+    csp:
+      enabled: true
+      policy: "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://api.oblivionvault.example; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; font-src 'self';"
+    x_frame_options: "DENY"
+    referrer_policy: "no-referrer"
+    x_content_type_options: "nosniff"
+
+  app_security:
+    input_validation:
+      strict_json: true
+      max_request_size_mb: 10
+      schema_validation: true
+      file_uploads:
+        enabled: true
+        mime_allowlist: ["image/png", "image/jpeg", "application/pdf"]
+        max_file_size_mb: 25
+        av_scan: true
+    rate_limit:
+      global:
+        rpm: 1200
+        burst: 300
+      per_ip:
+        rpm: 300
+        burst: 100
+      per_token:
+        rpm: 600
+        burst: 150
+    ddos:
+      waf: "enabled"
+      captcha_challenge_on_anomaly: true
+      ip_reputation_feeds:
+        - "aws.managed.ipreputation"
+        - "projectdiscovery.feeds"
+    bot_mitigation:
+      enabled: true
+      heuristics: true
+      allow_good_bots: ["Googlebot", "Bingbot"]
+    csrf:
+      cookie_name: "__Host-csrf"
+      header_name: "X-CSRF-Token"
+      same_site: "Strict"
+
+  password_policy:
+    min_length: 12
+    require_upper: true
+    require_lower: true
+    require_digit: true
+    require_symbol: true
+    disallow_common_1k: true
+    max_password_age_days: 365
+    history: 10
+    lockout:
+      threshold: 10
+      window: "15m"
+      cooloff: "30m"
+
+  logging_observability:
+    level: "INFO"
+    redact_fields: ["password", "token", "authorization", "cookie", "set-cookie", "x-api-key"]
+    trace:
+      enabled: true
+      propagation: "w3c"
+      sample_rate: 0.05
+    metrics:
+      enabled: true
+      sink: "prometheus"
+    audit:
+      enabled: true
+      sink: "siem"
+      immutable_storage: true
+      schema: "ovault.audit/1.0"
+      events:
+        - auth.success
+        - auth.failure
+        - auth.mfa_challenge
+        - access.denied
+        - token.issued
+        - token.revoked
+        - secrets.access
+        - secrets.rotation
+        - data.export
+        - data.delete
+        - config.change
+        - rbac.change
+
+  alerts_incident_response:
+    severity_thresholds:
+      p1:
+        trigger:
+          - "data.exfiltration.detected"
+          - "keys.compromise"
+          - "ransomware.signal"
+        sla_ack: "5m"
+        sla_resolve: "4h"
+      p2:
+        trigger:
+          - "auth.bruteforce"
+          - "service.mttr.breach"
+        sla_ack: "15m"
+        sla_resolve: "24h"
+      p3:
+        trigger:
+          - "config.drift"
+          - "vuln.high.detected"
+        sla_ack: "1h"
+        sla_resolve: "3d"
+    channels:
+      - type: slack
+        channel: "#sec-incidents"
+      - type: pagerduty
+        escalation_policy: "primary"
+      - type: email
+        to: ["soc@oblivionvault.example"]
+    runbooks:
+      - id: "rb-ir-001"
+        name: "Key compromise / rotate & revoke"
+        url: "https://runbooks.oblivionvault.example/rb-ir-001"
+      - id: "rb-ir-002"
+        name: "Data breach triage"
+        url: "https://runbooks.oblivionvault.example/rb-ir-002"
+
+  supply_chain_security:
+    dependencies:
+      allow_licenses: ["MIT", "Apache-2.0", "BSD-3-Clause"]
+      deny_licenses: ["GPL-3.0-only"]
+      pinned_lockfiles: true
+      integrity_check: "sigstore"
+    images:
+      base_images_allowlist:
+        - "ghcr.io/oblivionvault/secure-al2023:latest"
+        - "gcr.io/distroless/cc"
+      require_image_signatures: true
+      scan_on_build: true
+      block_critical_vulns: true
+      max_cvss_allowed: 7.0
+    cicd:
+      require_code_review: true
+      required_reviewers: 2
+      require_signed_commits: true
+      protected_branches: ["main", "release/*"]
+      secrets_scan: true
+      iam_least_privilege: true
+
+  k8s_security:
+    pod_security_standards: "restricted"
+    admission:
+      validate_images_signed: true
+      block_privileged: true
+      drop_capabilities: ["ALL"]
+      seccomp_profile: "RuntimeDefault"
+      read_only_root_fs: true
+      run_as_non_root: true
+    network_policies:
+      default_deny_all: true
+      allow_egress_dns: true
+    service_accounts:
+      automount_token: false
+      bound_service_account_token_volume: true
+    etcd:
+      encryption_at_rest: true
+    secrets:
+      store: "external-secrets"
+      rotation_days: 30
+
+  data_security:
+    classification:
+      levels:
+        public:
+          export_allowed: true
+        internal:
+          export_allowed: true
+        confidential:
+          export_allowed: false
+          masking_required: true
+        restricted:
+          export_allowed: false
+          masking_required: true
+          dedicated_keys: true
+    pii:
+      discovery_scheduled: "daily"
+      dlp_ruleset: "ovault.dlp/v1"
+    retention:
+      logs_days: 90
+      metrics_days: 400
+      backups_days: 35
+    backups:
+      encryption: "KMS"
+      immutability: true
+      restore_drills_quarterly: true
+
+  testing_assurance:
+    sast:
+      tool: "codeql"
+      min_gate: "no_critical"
+    dast:
+      tool: "owasp-zap"
+      min_gate: "no_high"
+    sca:
+      tool: "trivy"
+      min_gate: "no_high"
+    pentest:
+      cadence: "semiannual"
+      scope: ["api", "web", "infra"]
+
+environments:
+  prod:
+    <<: *defaults
+    logging_observability:
+      <<: *{defaults}.logging_observability # NOTE: YAML не поддерживает такую ссылку, см. ниже блок prod_overrides
+    # Переопределения для prod приведены ниже в совместимом формате.
+
+  stage:
+    <<: *defaults
+    transport_security:
+      cors:
+        allowed_origins:
+          - "https://stage.oblivionvault.example"
+    logging_observability:
+      level: "DEBUG"
+      trace:
+        enabled: true
+        sample_rate: 0.1
+    testing_assurance:
+      dast:
+        min_gate: "no_high"
+      sast:
+        min_gate: "no_high"
+
+  dev:
+    <<: *defaults
+    zero_trust:
+      enforce: true
+    identity_access:
+      authn:
+        mfa:
+          required: false
+    transport_security:
+      cors:
+        allowed_origins:
+          - "http://localhost:3000"
+          - "http://127.0.0.1:3000"
+    app_security:
+      rate_limit:
+        global:
+          rpm: 3000
+          burst: 600
+    logging_observability:
+      level: "DEBUG"
+      trace:
+        enabled: true
+        sample_rate: 0.2
+    testing_assurance:
+      sast:
+        min_gate: "no_critical"
+      dast:
+        min_gate: "no_critical"
+      sca:
+        min_gate: "no_critical"
+
+# ВНИМАНИЕ: YAML не поддерживает "сквозные" ссылки вида *{defaults}.logging_observability.
+# Поэтому прод-оверрайды задаём явно здесь:
+prod_overrides:
+  logging_observability:
+    level: "INFO"
+    trace:
+      enabled: true
+      sample_rate: 0.02
+  transport_security:
+    hsts:
+      max_age: 63072000
+  app_security:
+    rate_limit:
+      global:
+        rpm: 900
+        burst: 200
+      per_ip:
+        rpm: 240
+        burst: 80
+
+# Пример подключения внешних интеграций
+integrations:
+  siem:
+    type: "opensearch-siem"
+    endpoint: "https://siem.oblivionvault.example"
+    auth: "iam"
+  waf:
+    provider: "aws_wafv2"
+    ruleset: "managed+custom"
+  idp:
+    provider: "keycloak"
+    realm: "oblivionvault"
+    discovery_url: "https://idp.oblivionvault.example/.well-known/openid-configuration"
+
+# Регистры и контрольные списки
+registries:
+  api_clients:
+    - name: "webapp"
+      id: "ovault-web"
+      scopes: ["openid", "profile", "email"]
+      redirect_uris:
+        - "https://app.oblivionvault.example/callback"
+      pkce_required: true
+    - name: "admin"
+      id: "ovault-admin"
+      scopes: ["openid", "profile", "email", "admin"]
+      redirect_uris:
+        - "https://admin.oblivionvault.example/callback"
+      pkce_required: true
+  webhooks:
+    - name: "payments"
+      url: "https://api.oblivionvault.example/webhooks/payments"
+      signing:
+        alg: "HMAC-SHA256"
+        header: "X-Signature"
+        tolerance: "5m"
+      ip_allowlist: ["3.5.140.0/22", "52.196.0.0/14"]
+  ip_allowlists:
+    admin_panel:
+      - "10.0.0.0/8"
+      - "192.168.0.0/16"
+
+# Контроль дрейфа конфигурации
+drift_control:
+  enabled: true
+  tools: ["terraform", "k8s-admission", "config-audit"]
+  block_on_drift_in_prod: true
+
+# Политика ротации ключей
+key_rotation:
+  kms:
+    interval_days: 90
+    notify_before_days: 14
+  jwt_signing:
+    interval_days: 30
+    overlap_grace: "72h"
+  db_credentials:
+    interval_days: 30
+  webhook_secrets:
+    interval_days: 45
+
+# План непрерывности (ссылки)
+business_continuity:
+  rto: "2h"
+  rpo: "15m"
+  docs:
+    - "https://docs.oblivionvault.example/bcp"
+    - "https://docs.oblivionvault.example/dr"
+
+# Конец файла

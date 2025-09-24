@@ -1,0 +1,440 @@
+apiVersion: "aethernova.cybersecurity-core.policies/v1"
+kind: PolicySet
+metadata:
+  name: baseline-security-controls
+  version: "1.0.0"
+  owner: secops@your-org.example
+  labels:
+    project: cybersecurity-core
+    tier: baseline
+  annotations:
+    description: "Baseline guardrails for workloads and cloud resources across K8s, AWS, GCP, Azure."
+
+spec:
+  schemaVersion: "1.1.0"
+
+  defaults:
+    mode: enforce                 # audit | enforce
+    severity: high                # info | low | medium | high | critical
+    risk:
+      base: 6                     # базовая оценка риска по шкале 0..10
+      decay_days: 14              # снижение при отсутствии повторных инцидентов
+    evidence:
+      capture: true               # собирать доказательства (фрагмент объекта/ивента)
+      redactions:
+        - "metadata.annotations.*token*"
+        - "data.secrets.*"
+    actions:
+      on_violation:
+        - type: annotate          # добавит аннотацию в объект/алерт
+        - type: notify
+          sinks: [secops, oncall]
+        - type: gate              # deny для admission или policy-as-code пайплайна
+      on_resolve:
+        - type: notify
+          sinks: [secops]
+    exception_policy:
+      require_reason: true
+      require_owner: true
+      max_ttl: "30d"              # максимальная длительность исключения
+      audit_overrides: true       # даже при enforce исключенные объекты аудируются
+
+  datasources:
+    - name: kube
+      type: kubernetes
+    - name: aws_ctl
+      type: aws_cloudtrail
+    - name: gcp_asset
+      type: gcp_asset_inventory
+    - name: azure_activity
+      type: azure_activity_log
+
+  targets:
+    - type: kubernetes
+      selectors:
+        clusterLabels:
+          env: [prod, staging]
+    - type: aws
+      selectors:
+        accounts: ["111111111111","222222222222"]
+        regions: ["eu-north-1","eu-west-1"]
+    - type: gcp
+      selectors:
+        projects: ["your-gcp-project"]
+        locations: ["europe-west1","europe-north1"]
+    - type: azure
+      selectors:
+        subscriptions: ["00000000-0000-0000-0000-000000000000"]
+        locations: ["westeurope","northeurope"]
+
+  variables:
+    allowed_registries:
+      - "registry.your-org.example"
+      - "gcr.io/your-project"
+      - "mcr.microsoft.com"
+      - "public.ecr.aws/your-namespace"
+    blocked_host_paths:
+      - "/"
+      - "/proc"
+      - "/sys"
+      - "/var/run/docker.sock"
+    allowed_sa:
+      - "cybersecurity-core-sa"
+    allowed_ingress_cidrs:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+
+  macros:
+    - name: k8s_is_nonroot
+      engine: cel
+      expr: "has(object.spec.template) && all(object.spec.template.spec.containers, c, c.securityContext.runAsNonRoot == true)"
+    - name: k8s_has_limits
+      engine: cel
+      expr: "has(object.spec.template) && all(object.spec.template.spec.containers, c, has(c.resources) && has(c.resources.limits) && has(c.resources.requests))"
+    - name: image_from_allowed_registry
+      engine: cel
+      expr: "all(object.spec.template.spec.containers, c, startsWith(c.image, v.allowed_registries[0]) || startsWith(c.image, v.allowed_registries[1]) || startsWith(c.image, v.allowed_registries[2]) || startsWith(c.image, v.allowed_registries[3]))"
+
+  exceptions:
+    - id: EX-ops-debug-window
+      reason: "Временное исключение для отладки в namespace ops-debug"
+      owner: "platform-ops@your-org.example"
+      expiresAt: "2025-12-31T23:59:59Z"
+      scope:
+        target: kubernetes
+        namespaceSelector:
+          include: ["ops-debug"]
+      policies: ["K8S-001","K8S-002"]
+
+  policies:
+
+    # ------------------------- Kubernetes -------------------------
+
+    - id: K8S-001
+      title: "Запрет привилегированных контейнеров и повышения привилегий"
+      category: "k8s.workload"
+      severity: critical
+      mode: enforce
+      enabled: true
+      where: 'target.type == "kubernetes"'
+      match:
+        kinds: ["Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+        namespaceSelector:
+          exclude: ["kube-system","gatekeeper-system"]
+      rule:
+        engine: cel
+        expr: >
+          has(object.spec.template) &&
+          all(object.spec.template.spec.containers, c,
+              (!has(c.securityContext.privileged) || c.securityContext.privileged == false) &&
+              (has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false))
+      remediation:
+        type: patch
+        patches:
+          - op: add
+            path: /spec/template/spec/containers/*/securityContext/allowPrivilegeEscalation
+            value: false
+          - op: add
+            path: /spec/template/spec/containers/*/securityContext/privileged
+            value: false
+      compliance:
+        cis_kubernetes: ["5.2.1","5.2.2"]
+        nist_800_53: ["AC-6","CM-7"]
+        iso_27001: ["A.8.28","A.8.16"]
+
+    - id: K8S-002
+      title: "Только нерутовые контейнеры, readOnlyRootFilesystem, drop ALL caps"
+      category: "k8s.workload"
+      severity: high
+      mode: enforce
+      enabled: true
+      where: 'target.type == "kubernetes"'
+      rule:
+        engine: cel
+        expr: >
+          has(object.spec.template) &&
+          all(object.spec.template.spec.containers, c,
+              has(c.securityContext.runAsNonRoot) && c.securityContext.runAsNonRoot == true &&
+              has(c.securityContext.readOnlyRootFilesystem) && c.securityContext.readOnlyRootFilesystem == true &&
+              has(c.securityContext.capabilities.drop) && "ALL" in c.securityContext.capabilities.drop)
+      remediation:
+        type: patch
+        patches:
+          - op: add
+            path: /spec/template/spec/containers/*/securityContext/runAsNonRoot
+            value: true
+          - op: add
+            path: /spec/template/spec/containers/*/securityContext/readOnlyRootFilesystem
+            value: true
+          - op: add
+            path: /spec/template/spec/containers/*/securityContext/capabilities/drop/-
+            value: "ALL"
+      compliance:
+        cis_kubernetes: ["5.2.5","5.2.8"]
+        nist_800_53: ["SI-7","CM-6"]
+
+    - id: K8S-003
+      title: "HostPath монтирования из запрещенных путей"
+      category: "k8s.storage"
+      severity: high
+      mode: enforce
+      enabled: true
+      where: 'target.type == "kubernetes"'
+      rule:
+        engine: cel
+        expr: >
+          has(object.spec.template) &&
+          any(object.spec.template.spec.volumes, v, has(v.hostPath) &&
+              v.hostPath.path in vars.blocked_host_paths)
+      actions:
+        on_violation:
+          - type: gate
+          - type: notify
+            sinks: [secops, oncall]
+      compliance:
+        cis_kubernetes: ["5.2.9"]
+
+    - id: K8S-004
+      title: "Пинning образов по digest и разрешенные реестры"
+      category: "k8s.supply-chain"
+      severity: high
+      mode: enforce
+      enabled: true
+      where: 'target.type == "kubernetes"'
+      rule:
+        engine: cel
+        expr: >
+          has(object.spec.template) &&
+          all(object.spec.template.spec.containers, c,
+              image_from_allowed_registry(object) &&
+              contains(c.image, "@sha256:"))
+      remediation:
+        type: deny
+        message: "Образы должны быть из разрешенных реестров и закреплены по digest."
+      compliance:
+        nist_800_190: ["SC-IMAGE-1","SC-IMAGE-4"]
+
+    - id: K8S-005
+      title: "Обязательные requests/limits для CPU/Memory"
+      category: "k8s.resources"
+      severity: medium
+      mode: enforce
+      enabled: true
+      where: 'target.type == "kubernetes"'
+      rule:
+        engine: cel
+        expr: "k8s_has_limits(object)"
+      remediation:
+        type: patch
+        patches:
+          - op: add
+            path: /spec/template/spec/containers/*/resources/requests/cpu
+            value: "250m"
+          - op: add
+            path: /spec/template/spec/containers/*/resources/requests/memory
+            value: "512Mi"
+          - op: add
+            path: /spec/template/spec/containers/*/resources/limits/cpu
+            value: "1"
+          - op: add
+            path: /spec/template/spec/containers/*/resources/limits/memory
+            value: "1Gi"
+      compliance:
+        cis_kubernetes: ["5.1.1"]
+
+    - id: K8S-006
+      title: "Сервис-аккаунт: запрет автоподстановки токена и ограниченный список SA"
+      category: "k8s.identity"
+      severity: medium
+      mode: enforce
+      enabled: true
+      where: 'target.type == "kubernetes"'
+      rule:
+        engine: cel
+        expr: >
+          has(object.spec.template) &&
+          object.spec.template.spec.automountServiceAccountToken == false &&
+          (has(object.spec.template.spec.serviceAccountName) ? object.spec.template.spec.serviceAccountName in vars.allowed_sa : true)
+      remediation:
+        type: patch
+        patches:
+          - op: add
+            path: /spec/template/spec/automountServiceAccountToken
+            value: false
+      compliance:
+        cis_kubernetes: ["5.1.6"]
+
+    # ------------------------- AWS -------------------------
+
+    - id: AWS-001
+      title: "S3: запрет публичного доступа и требование SSE-KMS"
+      category: "aws.s3"
+      severity: critical
+      mode: enforce
+      enabled: true
+      where: 'target.type == "aws"'
+      match:
+        services: ["s3"]
+      rule:
+        engine: jq
+        expr: >
+          (.PublicAccessBlockConfiguration.BlockPublicAcls == true and
+           .PublicAccessBlockConfiguration.BlockPublicPolicy == true and
+           .PublicAccessBlockConfiguration.IgnorePublicAcls == true and
+           .PublicAccessBlockConfiguration.RestrictPublicBuckets == true) and
+          (.BucketEncryption.ServerSideEncryptionConfiguration[]?.ApplyServerSideEncryptionByDefault.SSEAlgorithm == "aws:kms")
+      remediation:
+        type: notify
+        message: "Включите Block Public Access и шифрование SSE-KMS на бакете."
+      compliance:
+        cis_aws: ["2.1.1","2.1.4"]
+        nist_800_53: ["SC-12","SC-28"]
+
+    - id: AWS-002
+      title: "Security Group: запрет 0.0.0.0/0 на 22/tcp"
+      category: "aws.network"
+      severity: high
+      mode: enforce
+      enabled: true
+      where: 'target.type == "aws"'
+      match:
+        services: ["ec2"]
+      rule:
+        engine: jq
+        expr: >
+          any(.IpPermissions[]?; .FromPort == 22 and .ToPort == 22 and any(.IpRanges[]?; .CidrIp == "0.0.0.0/0")) | not
+      remediation:
+        type: ticket
+        system: jira
+        payload:
+          project: SEC
+          summary: "Закрыть публичный SSH в SG"
+          priority: High
+      compliance:
+        cis_aws: ["4.1"]
+
+    # ------------------------- GCP -------------------------
+
+    - id: GCP-001
+      title: "IAM: запрет wildcard * в binding"
+      category: "gcp.iam"
+      severity: high
+      mode: enforce
+      enabled: true
+      where: 'target.type == "gcp"'
+      match:
+        services: ["cloudresourcemanager"]
+      rule:
+        engine: jq
+        expr: >
+          any(.bindings[]?; any(.members[]?; . == "*" or . == "allUsers" or . == "allAuthenticatedUsers")) | not
+      remediation:
+        type: notify
+        message: "Удалите allUsers/allAuthenticatedUsers/* из IAM binding."
+      compliance:
+        cis_gcp: ["1.1"]
+
+    - id: GCP-002
+      title: "GCS: требование Uniform Bucket-Level Access и CMEK"
+      category: "gcp.storage"
+      severity: high
+      mode: enforce
+      enabled: true
+      where: 'target.type == "gcp"'
+      match:
+        services: ["storage"]
+      rule:
+        engine: jq
+        expr: >
+          .iamConfiguration.uniformBucketLevelAccess.enabled == true and
+          (.encryption.defaultKmsKeyName | length) > 0
+      remediation:
+        type: notify
+        message: "Включите UBLA и CMEK для бакета."
+      compliance:
+        cis_gcp: ["5.1","5.4"]
+
+    # ------------------------- Azure -------------------------
+
+    - id: AZ-001
+      title: "Azure Storage Account: запрет публичного Blob доступа, TLS 1.2+, включить версии"
+      category: "azure.storage"
+      severity: high
+      mode: enforce
+      enabled: true
+      where: 'target.type == "azure"'
+      match:
+        services: ["storage"]
+      rule:
+        engine: jq
+        expr: >
+          .properties.supportsHttpsTrafficOnly == true and
+          .properties.minimumTlsVersion >= "TLS1_2" and
+          .properties.allowBlobPublicAccess == false and
+          .properties.blobRestorePolicy.blobRestoreEnabled == true
+      remediation:
+        type: notify
+        message: "Включите HTTPS only, TLS1.2+, disable public blob, включите версии и политики восстановления."
+      compliance:
+        cis_azure: ["3.1","3.2"]
+
+  # Тестовые кейсы для локальной проверки движка (опционально)
+  tests:
+    - name: should_deny_privileged_container
+      target: kubernetes
+      object:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: bad-deploy
+          namespace: prod-apps
+        spec:
+          template:
+            spec:
+              containers:
+                - name: c1
+                  image: registry.your-org.example/app@sha256:abc
+                  securityContext:
+                    privileged: true
+                    allowPrivilegeEscalation: true
+      expect:
+        violations_include: ["K8S-001","K8S-002"]
+
+    - name: should_allow_pinned_images_from_approved_registry
+      target: kubernetes
+      object:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: good-deploy
+        spec:
+          template:
+            spec:
+              containers:
+                - name: c1
+                  image: registry.your-org.example/app@sha256:def
+                  securityContext:
+                    runAsNonRoot: true
+                    readOnlyRootFilesystem: true
+                    capabilities:
+                      drop: ["ALL"]
+                  resources:
+                    requests: { cpu: "250m", memory: "512Mi" }
+                    limits: { cpu: "1", memory: "1Gi" }
+      expect:
+        violations_exclude: ["K8S-004","K8S-005"]
+
+signing:
+  codeowners:
+    - team: "security-engineering"
+      emails: ["sec-eng@your-org.example"]
+  attestors:
+    - name: "release-ci"
+      type: "slsa-provenance"
+      predicateType: "https://slsa.dev/provenance/v1"
+  signatures:
+    - signer: "secops-lead"
+      method: "pgp"
+      key_fingerprint: "CHANGE_ME_FINGERPRINT"
+      createdAt: "2025-09-02T00:00:00Z"

@@ -1,0 +1,165 @@
+# ledger-core/ops/k8s/overlays/dev/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ledger-dev
+namePrefix: dev-
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/environment: dev
+  environment: dev
+
+commonAnnotations:
+  environment: dev
+  # Можно заполнить из CI
+  org.opencontainers.image.revision: "sha-dev"
+  org.opencontainers.image.version: "dev"
+
+# В DEV держим 1 реплику для экономии ресурсов
+replicas:
+  - name: ledger-core
+    count: 1
+
+# Обновляем образ (пример; CI может переопределить newTag/newName)
+images:
+  - name: ghcr.io/org/repo/ledger-core
+    newName: ghcr.io/org/repo/ledger-core
+    newTag: dev-latest
+
+# Генерация DEV-конфигов и секрета с фиксированными именами
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    managed-by: kustomize
+    environment: dev
+  annotations:
+    environment: dev
+
+configMapGenerator:
+  - name: ledger-core-config
+    behavior: merge
+    literals:
+      - db_host=postgres.dev.svc.cluster.local
+      - db_port=5432
+      - enable_hash_chain=false
+      - max_batch=200
+      - decimal_mode=minor_units
+      # Доп. DEV-настройки (читаются через envFrom опционального ConfigMap)
+  - name: ledger-core-config-optional
+    behavior: merge
+    literals:
+      - LOG_LEVEL=debug
+      - HTTP_REQUEST_LOGGING=true
+
+secretGenerator:
+  - name: ledger-core-secrets
+    type: Opaque
+    behavior: merge
+    literals:
+      # DEV DSN (без TLS); в CI/секрет‑менеджере переопределяйте безопасным значением
+      - db_dsn=postgres://ledger:ledger@postgres.dev.svc.cluster.local:5432/ledger?sslmode=disable
+
+# Точечные патчи для базового Deployment (ресурсы, лог‑уровень, политика pull, селекторы)
+patches:
+  # 1) Понизить ресурсы, включить debug, выставить IfNotPresent, добавить nodeSelector/tolerations
+  - target:
+      version: v1
+      kind: Deployment
+      name: ledger-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ledger-core
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              nodepool: dev
+            tolerations:
+              - key: "workload"
+                operator: "Equal"
+                value: "dev"
+                effect: "NoSchedule"
+            containers:
+              - name: api
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: LEDGER_ENABLE_HASH_CHAIN
+                    valueFrom:
+                      configMapKeyRef:
+                        name: ledger-core-config
+                        key: enable_hash_chain
+                  - name: LEDGER_MAX_BATCH
+                    valueFrom:
+                      configMapKeyRef:
+                        name: ledger-core-config
+                        key: max_batch
+                  - name: LEDGER_DECIMAL_MODE
+                    valueFrom:
+                      configMapKeyRef:
+                        name: ledger-core-config
+                        key: decimal_mode
+                  - name: LEDGER_API_HTTP_ADDR
+                    value: "0.0.0.0:8080"
+                  - name: LEDGER_API_GRPC_ADDR
+                    value: "0.0.0.0:9090"
+                  - name: LOG_LEVEL
+                    valueFrom:
+                      configMapKeyRef:
+                        name: ledger-core-config-optional
+                        key: LOG_LEVEL
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+                  limits:
+                    cpu: "500m"
+                    memory: 512Mi
+          metadata:
+            annotations:
+              # Под dev-аннотации для трассировки/ревертов
+              environment: dev
+
+  # 2) Корректировка init‑контейнера миграций: меньшие лимиты и DEV‑таймаут ожидания БД
+  - target:
+      version: v1
+      kind: Deployment
+      name: ledger-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ledger-core
+      spec:
+        template:
+          spec:
+            initContainers:
+              - name: wait-db-and-migrate
+                env:
+                  - name: LEDGER_DB_DSN
+                    valueFrom:
+                      secretKeyRef:
+                        name: ledger-core-secrets
+                        key: db_dsn
+                resources:
+                  requests:
+                    cpu: 25m
+                    memory: 48Mi
+                  limits:
+                    cpu: 200m
+                    memory: 128Mi
+                command:
+                  - /bin/sh
+                  - -ec
+                  - |
+                    echo "Waiting for DEV DB (up to 90s)..."
+                    timeout 90 sh -c 'until nc -z ${LEDGER_DB_HOST:-postgres.dev.svc.cluster.local} ${LEDGER_DB_PORT:-5432}; do sleep 2; done'
+                    echo "Running DEV migrations..."
+                    ledger-core migrate up --dsn "$LEDGER_DB_DSN"
+
+# Применяемые настройки Kustomize для стратегий мерджа
+configurations: []

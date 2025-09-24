@@ -1,0 +1,596 @@
+syntax = "proto3";
+
+/*
+ * Aethernova / NeuroCity — security-core PKI schema (industrial-grade)
+ * File: security-core/schemas/proto/v1/security/pki.proto
+ *
+ * Scope:
+ *  - X.509 certificates (RFC 5280) — raw DER + parsed summary
+ *  - CSR (PKCS#10), CRL, OCSP (RFC 6960), CT/SCT (RFC 6962)
+ *  - Validation policies, revocation reasons, key usages, SAN/GeneralName
+ *  - Hardware attestation envelope (TPM/SGX/SEV/HSM/SE, generic CBOR/DER)
+ *  - gRPC services: CAService, OCSPService, TransparencyService
+ *
+ * Security:
+ *  - NEVER transports private keys.
+ *  - Raw DER preserved; normalized fields are non-authoritative.
+ *  - OIDs as dotted strings; extensions as DER.
+ *
+ * Versioning:
+ *  - proto package v1; reserved fields for forward-compat.
+ */
+
+package aethernova.security.v1;
+
+option cc_enable_arenas = true;
+option java_multiple_files = true;
+option java_package = "ai.aethernova.security.v1";
+option java_outer_classname = "PkiProto";
+option go_package = "github.com/aethernova/security-core/proto/v1/security;pki";
+option csharp_namespace = "Aethernova.Security.V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/wrappers.proto";
+import "google/protobuf/empty.proto";
+
+// --------------------------- Core primitives ---------------------------
+
+// OID in dotted-decimal form, e.g. "1.2.840.113549.1.1.10".
+message Oid {
+  string value = 1; // Required, validated as dotted-decimal.
+}
+
+// Hash algorithms aligned with common PKI practice.
+enum HashAlgorithm {
+  HASH_ALG_UNSPECIFIED = 0;
+  HASH_ALG_SHA256 = 1;
+  HASH_ALG_SHA384 = 2;
+  HASH_ALG_SHA512 = 3;
+  HASH_ALG_SHA3_256 = 10;
+  HASH_ALG_SHA3_384 = 11;
+  HASH_ALG_SHA3_512 = 12;
+}
+
+// Public key algorithm families.
+enum PublicKeyAlgorithm {
+  PK_ALG_UNSPECIFIED = 0;
+  PK_ALG_RSA = 1;
+  PK_ALG_ECDSA = 2;
+  PK_ALG_ED25519 = 3;
+  PK_ALG_ED448 = 4;
+  PK_ALG_X25519 = 5; // for KEM/KeyAgreement; not used for signatures
+  PK_ALG_X448 = 6;
+}
+
+// Named curves for EC/ECDSA.
+enum EcNamedCurve {
+  EC_NAMED_CURVE_UNSPECIFIED = 0;
+  EC_NIST_P256 = 1;  // secp256r1
+  EC_NIST_P384 = 2;  // secp384r1
+  EC_NIST_P521 = 3;  // secp521r1
+  EC_BRAINPOOL_P256R1 = 10;
+  EC_BRAINPOOL_P384R1 = 11;
+  EC_BRAINPOOL_P512R1 = 12;
+}
+
+// RSA-PSS parameters (RFC 8017).
+message RsaPssParams {
+  HashAlgorithm hash_alg = 1; // e.g. SHA-256
+  HashAlgorithm mgf1_hash_alg = 2; // usually equals hash_alg
+  uint32 salt_length = 3; // bytes
+  uint32 trailer_field = 4; // usually 1
+}
+
+// AlgorithmIdentifier analogue.
+message AlgorithmIdentifier {
+  Oid oid = 1;                // Algorithm OID
+  oneof params {
+    google.protobuf.Empty null_params = 2; // for ASN.1 NULL
+    RsaPssParams rsa_pss = 3;
+    EcNamedCurve ec_named_curve = 4;
+    google.protobuf.Any other = 10; // future/custom params
+  }
+}
+
+// SubjectPublicKeyInfo (RFC 5280) — canonical representation preferred.
+// Provide either spki_der or a parsed form via oneof parsed_*.
+message SubjectPublicKeyInfo {
+  oneof representation {
+    bytes spki_der = 1; // Full ASN.1 DER of SPKI
+    ParsedPublicKey parsed = 2;
+  }
+}
+
+// Parsed public key forms (non-authoritative helper).
+message ParsedPublicKey {
+  PublicKeyAlgorithm algorithm = 1;
+  oneof key {
+    RsaPublicKey rsa = 2;
+    EcPublicKey ecdsa = 3;
+    bytes ed25519 = 4; // 32 bytes
+    bytes ed448 = 5;   // 57 bytes
+    bytes x25519 = 6;  // 32 bytes
+    bytes x448 = 7;    // 56 bytes
+  }
+}
+
+message RsaPublicKey {
+  bytes modulus = 1;   // big-endian unsigned
+  uint32 exponent = 2; // usually 65537
+}
+
+message EcPublicKey {
+  EcNamedCurve curve = 1;
+  // Uncompressed (0x04 || X || Y) as per SEC1, or raw Q per RFC 5480.
+  bytes uncompressed_point = 2;
+}
+
+// X.509 Distinguished Name — minimal normalized representation.
+message PkixName {
+  repeated Rdn rdn_sequence = 1;
+}
+
+message Rdn {
+  repeated AttributeTypeAndValue atvs = 1;
+}
+
+message AttributeTypeAndValue {
+  Oid type = 1;    // e.g., 2.5.4.3 (CN), 2.5.4.10 (O), etc.
+  string value = 2; // UTF-8 string form; original stringPrep not preserved
+}
+
+// GeneralName (RFC 5280 §4.2.1.6).
+message GeneralName {
+  oneof name {
+    string rfc822_name = 1;  // email
+    string dns_name = 2;
+    bytes x400_address = 3;  // DER
+    PkixName directory_name = 4;
+    string edi_party_name = 5; // string form of EDI party name
+    string uniform_resource_identifier = 6;
+    bytes ip_address = 7;    // 4 or 16 bytes; optional mask unsupported
+    Oid registered_id = 8;
+    // otherName: TYPE-ID + value (DER)
+    OtherName other_name = 9;
+  }
+}
+
+message OtherName {
+  Oid type_id = 1;
+  bytes value_der = 2;
+}
+
+// X.509 extension holder.
+message X509Extension {
+  Oid extn_id = 1;
+  bool critical = 2;
+  bytes extn_value_der = 3; // Raw OCTET STRING.contents
+}
+
+// KeyUsage as list of flags (RFC 5280 §4.2.1.3).
+enum KeyUsage {
+  KU_UNSPECIFIED = 0;
+  KU_DIGITAL_SIGNATURE = 1;
+  KU_NON_REPUDIATION = 2; // contentCommitment
+  KU_KEY_ENCIPHERMENT = 3;
+  KU_DATA_ENCIPHERMENT = 4;
+  KU_KEY_AGREEMENT = 5;
+  KU_KEY_CERT_SIGN = 6;
+  KU_CRL_SIGN = 7;
+  KU_ENCIPHER_ONLY = 8;
+  KU_DECIPHER_ONLY = 9;
+}
+
+// Extended Key Usage — represented as OIDs.
+message ExtendedKeyUsage {
+  repeated Oid oids = 1; // e.g., 1.3.6.1.5.5.7.3.1 (serverAuth)
+}
+
+// Certificate Policies (RFC 5280 §4.2.1.4).
+message PolicyInformation {
+  Oid policy_identifier = 1;
+  repeated PolicyQualifierInfo policy_qualifiers = 2;
+}
+
+message PolicyQualifierInfo {
+  Oid policy_qualifier_id = 1; // id-qt-cps or id-qt-unotice
+  oneof qualifier {
+    string cps_uri = 2; // id-qt-cps (1.3.6.1.5.5.7.2.1)
+    UserNotice user_notice = 3; // id-qt-unotice (1.3.6.1.5.5.7.2.2)
+    bytes other_der = 10;
+  }
+}
+
+message UserNotice {
+  string explicit_text = 1;
+  string organization = 2;
+  repeated string notice_numbers = 3;
+}
+
+// Revocation reason (RFC 5280 §5.3.1).
+enum RevocationReason {
+  REVOCATION_REASON_UNSPECIFIED = 0;
+  REVOCATION_UNSPECIFIED = 1;
+  KEY_COMPROMISE = 2;
+  CA_COMPROMISE = 3;
+  AFFILIATION_CHANGED = 4;
+  SUPERSEDED = 5;
+  CESSATION_OF_OPERATION = 6;
+  CERTIFICATE_HOLD = 7;
+  REMOVE_FROM_CRL = 8;
+  PRIVILEGE_WITHDRAWN = 9;
+  AA_COMPROMISE = 10;
+}
+
+// Status used by OCSP-like responses.
+enum CertificateStatus {
+  CERT_STATUS_UNSPECIFIED = 0;
+  GOOD = 1;
+  REVOKED = 2;
+  UNKNOWN = 3;
+  EXPIRED = 4; // derived status
+}
+
+// Signed blob wrapper (algorithm + signature bytes over content).
+message Signature {
+  AlgorithmIdentifier algorithm = 1;
+  bytes signature = 2; // raw signature bytes
+  HashAlgorithm hash_alg_hint = 3; // optional hint for detached hashing
+}
+
+// Generic signed container.
+message SignedBlob {
+  bytes content = 1; // detached or encapsulated, per context
+  Signature signature = 2;
+  repeated X509Extension signed_attributes = 3; // optional CMS-like attrs
+}
+
+// --------------------------- X.509 artifacts ---------------------------
+
+// X.509 Certificate with raw DER and parsed summary (non-authoritative).
+message Certificate {
+  bytes der = 1; // Full certificate DER (authoritative)
+  // Non-authoritative parsed summary to speed up lookups:
+  bytes serial = 10; // big-endian integer
+  PkixName issuer = 11;
+  PkixName subject = 12;
+  google.protobuf.Timestamp not_before = 13;
+  google.protobuf.Timestamp not_after = 14;
+  SubjectPublicKeyInfo spki = 15;
+  AlgorithmIdentifier signature_algorithm = 16;
+  bytes authority_key_identifier = 17; // AKI, if present
+  bytes subject_key_identifier = 18;   // SKI, if present
+  repeated KeyUsage key_usage = 19;
+  ExtendedKeyUsage extended_key_usage = 20;
+  repeated GeneralName subject_alt_names = 21; // SAN, if present
+  bool is_ca = 22;
+  google.protobuf.Int32Value path_len_constraint = 23; // if CA
+  repeated PolicyInformation policies = 24;
+  repeated X509Extension extensions = 25;
+
+  // Convenience fingerprints (not normative):
+  bytes sha256_fingerprint = 30;
+  bytes sha1_fingerprint = 31; // legacy
+}
+
+// Chain where [0] is end-entity, last is trust anchor or highest intermediate.
+message CertificateChain {
+  repeated Certificate certificates = 1;
+}
+
+// PKCS#10 Certificate Signing Request.
+message Csr {
+  bytes der = 1; // CSR DER (CertificationRequest)
+  // Optional parsed summary:
+  PkixName subject = 10;
+  SubjectPublicKeyInfo spki = 11;
+  repeated X509Extension requested_extensions = 12;
+  AlgorithmIdentifier signature_algorithm = 13;
+}
+
+// X.509 CRL (RFC 5280 §5).
+message Crl {
+  bytes der = 1; // full DER of TBSCertList
+  PkixName issuer = 10;
+  google.protobuf.Timestamp this_update = 11;
+  google.protobuf.Timestamp next_update = 12;
+  repeated RevokedCert revoked_certs = 13;
+  repeated X509Extension extensions = 14;
+}
+
+message RevokedCert {
+  bytes serial = 1;
+  google.protobuf.Timestamp revocation_date = 2;
+  RevocationReason reason = 3;
+  repeated X509Extension extensions = 10;
+}
+
+// OCSP (RFC 6960) containers. Prefer raw DER plus parsed statuses.
+message OcspRequest {
+  bytes der = 1;
+  repeated OcspCertID certs = 2; // parsed subset
+}
+
+message OcspResponse {
+  bytes der = 1;
+  repeated OcspSingleResponse single_responses = 2; // parsed subset
+}
+
+message OcspCertID {
+  HashAlgorithm hash_algorithm = 1; // for issuerNameHash/issuerKeyHash
+  bytes issuer_name_hash = 2;
+  bytes issuer_key_hash = 3;
+  bytes serial = 4;
+}
+
+message OcspSingleResponse {
+  OcspCertID cert_id = 1;
+  CertificateStatus status = 2;
+  google.protobuf.Timestamp this_update = 3;
+  google.protobuf.Timestamp next_update = 4;
+  google.protobuf.Timestamp revocation_time = 5; // if REVOKED
+  RevocationReason revocation_reason = 6;        // if REVOKED
+}
+
+// Certificate Transparency (RFC 6962) — SCT representation.
+message SignedCertificateTimestamp {
+  uint32 version = 1; // v1 == 0
+  bytes log_id = 2;   // 32 bytes SHA-256 log ID
+  google.protobuf.Timestamp timestamp = 3;
+  bytes extensions = 4; // opaque
+  Signature signature = 5;
+}
+
+message SctBundle {
+  repeated SignedCertificateTimestamp scts = 1;
+}
+
+// --------------------------- Selection & policy ---------------------------
+
+// Selector to identify a certificate in storage or API calls.
+message CertSelector {
+  oneof selector {
+    bytes sha256_fingerprint = 1;
+    SerialAndIssuer serial_and_issuer = 2;
+    bytes subject_key_identifier = 3; // SKI
+  }
+}
+
+message SerialAndIssuer {
+  bytes serial = 1;
+  // One of these issuer hints should be provided:
+  bytes issuer_spki_sha256 = 2; // hash of issuer SPKI
+  bytes issuer_name_sha256 = 3; // hash of canonical issuer name
+}
+
+// Revocation request metadata.
+message RevocationRequestMeta {
+  RevocationReason reason = 1;
+  google.protobuf.Timestamp revocation_time = 2; // default: now
+  string comment = 3; // audit/comment only
+  bool hard_fail = 4; // if true, require strict CA-side checks
+}
+
+// Revocation record (CA audit/log projection).
+message RevocationRecord {
+  CertSelector selector = 1;
+  RevocationReason reason = 2;
+  google.protobuf.Timestamp effective_time = 3;
+  string actor = 4; // who initiated (subject to CA authn)
+}
+
+// Validation/verification policy knobs.
+enum RevocationCheckingMode {
+  RCM_UNSPECIFIED = 0;
+  RCM_OCSP_REQUIRED = 1;
+  RCM_CRL_REQUIRED = 2;
+  RCM_OCSP_OR_CRL = 3;
+  RCM_SOFT_FAIL = 4; // network/temporal failures tolerated
+}
+
+message NameConstraints {
+  repeated GeneralName permitted_subtrees = 1;
+  repeated GeneralName excluded_subtrees = 2;
+}
+
+message ValidationPolicy {
+  // Trust anchors are provided as full DER certs; callers may also supply
+  // OS/HSM trust stores out of band.
+  repeated Certificate trust_anchors = 1;
+
+  RevocationCheckingMode revocation_mode = 2;
+  google.protobuf.Duration max_chain_depth = 3; // optional logical cap
+  bool require_ct = 4; // require SCTs for EE certs
+  NameConstraints name_constraints = 5; // optional additional constraints
+  repeated Oid required_eku = 6; // e.g., serverAuth for TLS
+  bool allow_sha1 = 7; // legacy escape hatch
+  bool enforce_basic_constraints = 8;
+}
+
+// Validation result with diagnostics.
+message ValidationResult {
+  bool valid = 1;
+  CertificateStatus derived_status = 2; // GOOD/REVOKED/EXPIRED/UNKNOWN
+  string summary = 3;
+  repeated string errors = 4;
+  repeated string warnings = 5;
+  CertificateChain verified_chain = 6;
+  repeated SignedCertificateTimestamp scts = 7;
+}
+
+// --------------------------- Attestation envelope ---------------------------
+
+enum AttestationType {
+  ATTESTATION_TYPE_UNSPECIFIED = 0;
+  ATTESTATION_TPM = 1;
+  ATTESTATION_INTEL_SGX = 2;
+  ATTESTATION_AMD_SEV = 3;
+  ATTESTATION_HSM = 4;
+  ATTESTATION_APPLE_SE = 5;
+  ATTESTATION_ANDROID_KEYSTORE = 6;
+  ATTESTATION_OTHER = 100;
+}
+
+// Generic attestation evidence container; opaque to PKI layer.
+message AttestationEvidence {
+  AttestationType type = 1;
+  string format = 2;     // e.g., "TPM2/CBOR", "SGX/JSON", "COSE"
+  bytes evidence = 3;    // raw blob
+  bytes endorsements = 4; // optional endorsements/certs/AKs
+  repeated X509Extension metadata = 10; // optional
+}
+
+// --------------------------- CA/OCSP/CT services ---------------------------
+
+// CAService API
+service CAService {
+  // Direct CSR submission (PKCS#10 DER) with optional attestation and profile.
+  rpc SubmitCsr(SubmitCsrRequest) returns (SubmitCsrResponse);
+
+  // Issue certificate from provided TBS-like template (advanced/automated).
+  rpc IssueCertificate(IssueCertificateRequest) returns (IssueCertificateResponse);
+
+  // Fetch by selector.
+  rpc GetCertificate(GetCertificateRequest) returns (Certificate);
+
+  // List with filters/pagination.
+  rpc ListCertificates(ListCertificatesRequest) returns (ListCertificatesResponse);
+
+  // Revoke certificate.
+  rpc RevokeCertificate(RevokeCertificateRequest) returns (RevokeCertificateResponse);
+
+  // Latest CRL for an issuer.
+  rpc GetCrl(GetCrlRequest) returns (Crl);
+
+  // Return validated chain for a given selector under a policy.
+  rpc GetChain(GetChainRequest) returns (CertificateChain);
+
+  // Verify a certificate (and optional chain) against a policy.
+  rpc VerifyCertificate(VerifyCertificateRequest) returns (VerifyCertificateResponse);
+}
+
+message SubmitCsrRequest {
+  Csr csr = 1;
+  string profile = 2; // CA-defined issuance profile name
+  AttestationEvidence attestation = 3; // optional HW-backed binding
+  // Optional requested validity caps (CA may override):
+  google.protobuf.Timestamp not_before = 10;
+  google.protobuf.Timestamp not_after = 11;
+  // Optional extra extensions to merge (CA discretion):
+  repeated X509Extension extra_extensions = 12;
+}
+
+message SubmitCsrResponse {
+  Certificate certificate = 1;
+  CertificateChain chain = 2;
+  SctBundle sct_bundle = 3; // if CT enabled
+}
+
+message IssueCertificateRequest {
+  // Provide a pre-validated SPKI and subject; CA uses its policy to issue.
+  PkixName subject = 1;
+  SubjectPublicKeyInfo spki = 2;
+  repeated X509Extension extensions = 3;
+  string profile = 4;
+  google.protobuf.Timestamp not_before = 10;
+  google.protobuf.Timestamp not_after = 11;
+  AttestationEvidence attestation = 12;
+}
+
+message IssueCertificateResponse {
+  Certificate certificate = 1;
+  CertificateChain chain = 2;
+  SctBundle sct_bundle = 3;
+}
+
+message GetCertificateRequest { CertSelector selector = 1; }
+
+message ListCertificatesRequest {
+  // Optional filters:
+  string subject_cn_substring = 1;
+  bool only_ca = 2;
+  bool only_end_entity = 3;
+  Oid eku_filter = 4;
+  // Pagination:
+  uint32 page_size = 10;
+  string page_token = 11;
+}
+
+message ListCertificatesResponse {
+  repeated Certificate certificates = 1;
+  string next_page_token = 2;
+}
+
+message RevokeCertificateRequest {
+  CertSelector selector = 1;
+  RevocationRequestMeta meta = 2;
+}
+
+message RevokeCertificateResponse {
+  RevocationRecord record = 1;
+  Crl crl_snapshot = 2; // optional: snapshot of latest CRL post-revocation
+}
+
+message GetCrlRequest {
+  // Optionally specify issuer by AKI or name hash
+  bytes issuer_spki_sha256 = 1;
+  bytes issuer_name_sha256 = 2;
+}
+
+message GetChainRequest {
+  CertSelector selector = 1;
+  ValidationPolicy policy = 2;
+}
+
+message VerifyCertificateRequest {
+  Certificate certificate = 1;       // EE cert to verify
+  CertificateChain supplied_chain = 2; // optional intermediates
+  ValidationPolicy policy = 3;       // required
+  google.protobuf.Timestamp at_time = 4; // validation time; default: now
+}
+
+message VerifyCertificateResponse {
+  ValidationResult result = 1;
+}
+
+// OCSP service (status lookups).
+service OCSPService {
+  // Submit raw OCSP request DER, receive raw DER response and parsed statuses.
+  rpc GetStatus(OCSPStatusRequest) returns (OCSPStatusResponse);
+  // Batch: server-side builds OCSP from selectors.
+  rpc BatchStatus(BatchOCSPStatusRequest) returns (BatchOCSPStatusResponse);
+}
+
+message OCSPStatusRequest { OcspRequest request = 1; }
+
+message OCSPStatusResponse { OcspResponse response = 1; }
+
+message BatchOCSPStatusRequest { repeated CertSelector selectors = 1; }
+
+message BatchOCSPStatusResponse {
+  repeated OcspSingleResponse statuses = 1;
+}
+
+// Certificate Transparency — submitting (pre)certificates and fetching SCTs.
+service TransparencyService {
+  rpc SubmitPrecertificate(SubmitPrecertRequest) returns (SubmitPrecertResponse);
+  rpc GetSctBundle(GetSctBundleRequest) returns (SctBundle);
+}
+
+message SubmitPrecertRequest {
+  // Precertificate per RFC 6962 (usually DER with poison extension).
+  bytes precert_der = 1;
+}
+
+message SubmitPrecertResponse { SctBundle bundle = 1; }
+
+message GetSctBundleRequest { CertSelector selector = 1; }
+
+// --------------------------- Reserved for future use ---------------------------
+
+// Reserve field numbers for critical messages to allow future augmentation
+// without breaking wire compatibility.
+
+reserve 5000 to 5999; // global reserved range for future critical additions

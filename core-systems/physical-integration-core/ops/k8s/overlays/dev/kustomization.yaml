@@ -1,0 +1,361 @@
+# physical-integration-core/ops/k8s/overlays/dev/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: physical-integration-dev
+namePrefix: dev-
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/part-of: physical-integration-core
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/environment: dev
+  environment: dev
+
+commonAnnotations:
+  repo: https://example.com/aethernova/physical-integration-core
+  contact: devops@aethernova.example
+  rollout.note: "Dev overlay applied"
+  rollout.trigger/rollme: "dev-2025-08-22"
+
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    environment: dev
+
+configMapGenerator:
+  - name: pi-config
+    literals:
+      - PI_ENV=dev
+      - LOG_LEVEL=info
+      - TRACE_SAMPLING=0.05
+      - FEATURE_FLAGS=edge_cache,metrics,otel
+      - MQTT_BROKER_HOST=dev-pi-mqtt
+      - MQTT_BROKER_PORT=1883
+      - DB_HOST=dev-pi-timescaledb
+      - DB_NAME=pi
+      - DB_SSLMODE=disable
+
+secretGenerator:
+  - name: pi-secrets
+    type: Opaque
+    literals:
+      - DB_USER=pi_user
+      - DB_PASSWORD=dev_change_me
+      - MQTT_USERNAME=dev_client
+      - MQTT_PASSWORD=dev_change_me
+
+images:
+  - name: ghcr.io/aethernova/pi-connector
+    newName: ghcr.io/aethernova/pi-connector
+    newTag: "1.6.3-dev+sha.abcdef0"
+  - name: ghcr.io/aethernova/pi-gateway
+    newName: ghcr.io/aethernova/pi-gateway
+    newTag: "2.4.0-dev+sha.abcdef1"
+  - name: eclipse-mosquitto
+    newName: eclipse-mosquitto
+    newTag: "2.0.20"
+  - name: timescale/timescaledb-ha
+    newName: timescale/timescaledb-ha
+    newTag: "pg14.12-ts2.16.1"
+
+replicas:
+  - name: pi-connector
+    count: 2
+  - name: pi-gateway
+    count: 2
+  - name: pi-mqtt
+    count: 1
+  - name: pi-timescaledb
+    count: 1
+
+patches:
+  # Hardening + resources + probes + spreading for pi-connector
+  - target:
+      kind: Deployment
+      name: pi-connector
+    patch: |-
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          checksum/config: "pi-config"
+          checksum/secret: "pi-secrets"
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          fsGroup: 1001
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/automountServiceAccountToken
+        value: false
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          kubernetes.io/os: linux
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: pi-connector
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: pi-connector
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - key: "workload"
+            operator: "Equal"
+            value: "dev"
+            effect: "NoSchedule"
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      - op: add
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: pi-config
+          - secretRef:
+              name: pi-secrets
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 6
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+
+  # Hardening + resources + probes + spreading for pi-gateway
+  - target:
+      kind: Deployment
+      name: pi-gateway
+    patch: |-
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          checksum/config: "pi-config"
+          checksum/secret: "pi-secrets"
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          fsGroup: 1001
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/automountServiceAccountToken
+        value: false
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: pi-gateway
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: pi-gateway
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "150m"
+            memory: "192Mi"
+          limits:
+            cpu: "700m"
+            memory: "768Mi"
+      - op: add
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: pi-config
+          - secretRef:
+              name: pi-secrets
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 8
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+  # MQTT broker hardening + resources
+  - target:
+      kind: Deployment
+      name: pi-mqtt
+    patch: |-
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 1883
+          runAsGroup: 1883
+          fsGroup: 1883
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          tcpSocket:
+            port: 1883
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 6
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          tcpSocket:
+            port: 1883
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+
+  # TimescaleDB hardening + resources
+  - target:
+      kind: StatefulSet
+      name: pi-timescaledb
+    patch: |-
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 999
+          runAsGroup: 999
+          fsGroup: 999
+          fsGroupChangePolicy: "OnRootMismatch"
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "2Gi"
+      - op: add
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: pi-config
+          - secretRef:
+              name: pi-secrets
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          exec:
+            command: ["sh","-c","pg_isready -U $$DB_USER -d $$DB_NAME -h 127.0.0.1"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          exec:
+            command: ["sh","-c","pg_isready -U $$DB_USER -d $$DB_NAME -h 127.0.0.1"]
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3

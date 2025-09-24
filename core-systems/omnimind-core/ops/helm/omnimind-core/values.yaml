@@ -1,0 +1,405 @@
+# ops/helm/omnimind-core/values.yaml
+# Базовые значения для чарта omnimind-core. Подразумевается overlay-переопределение per-env.
+
+global:
+  nameOverride: ""
+  fullnameOverride: ""
+  imageRegistry: ""
+  imagePullSecrets: []              # e.g. - name: regcred
+  priorityClassName: ""             # e.g. system-cluster-critical
+  clusterDomain: cluster.local
+  timezone: UTC
+
+  # Общие переменные окружения для всех подов
+  env:
+    - name: TZ
+      value: "{{ .Values.global.timezone }}"
+  # Общие секреты (не логируются), монтируются как переменные
+  extraEnvFromSecrets: []           # e.g. - name: omnimind-secrets
+
+common:
+  image:
+    repository: ghcr.io/omnimind/core
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector: {}
+  volumes: []         # дополнительный список volumes на все поды
+  volumeMounts: []    # дополнительный список volumeMounts на все контейнеры
+
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: api.omnimind.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: [] # - secretName: omnimind-tls  hosts: [api.omnimind.local]
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  scheme: http
+  annotations: {}
+  relabelings: []
+
+networkPolicy:
+  enabled: true
+  # Разрешаем только необходимые исходящие направления; входящие — от Ingress/namespace
+  egress:
+    allowDNS: true
+    extraCIDRs: [] # e.g. - 10.0.0.0/8
+  ingress:
+    fromNamespaces: [] # e.g. - kube-system
+
+pdb:
+  api:
+    enabled: true
+    maxUnavailable: "25%"
+  worker:
+    enabled: true
+    minAvailable: 1
+
+otel:
+  enabled: false
+  otlpEndpoint: "http://otel-collector:4317"
+  env:
+    - name: OTEL_RESOURCE_ATTRIBUTES
+      value: "service.name=omnimind-core"
+    - name: OTEL_TRACES_EXPORTER
+      value: "otlp"
+    - name: OTEL_METRICS_EXPORTER
+      value: "none"
+
+vectorSidecar:
+  enabled: false
+  image:
+    repository: timberio/vector
+    tag: "0.40.0-debian"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+  config: |
+    data_dir = "/vector-data-dir"
+    [sources.k8s_stdout]
+      type = "kubernetes_logs"
+      pod_annotation_fields = "metadata"
+    [sinks.loki]
+      type = "loki"
+      inputs = ["k8s_stdout"]
+      endpoint = "http://loki:3100"
+      encoding.codec = "json"
+
+rbac:
+  create: true
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+
+database:
+  # Используется всеми компонентами
+  urlSecret:
+    name: omnimind-db
+    key: DATABASE_URL
+  migrations:
+    enabled: true
+    image:
+      repository: ghcr.io/omnimind/alembic
+      tag: "1.0.0"
+      pullPolicy: IfNotPresent
+    args: ["alembic", "upgrade", "head"]
+    backoffLimit: 3
+    annotations: {}
+    podSecurityContext: {}
+    containerSecurityContext: {}
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    init:
+      waitForDB: true
+      timeoutSeconds: 120
+
+redis:
+  enabled: false
+  urlSecret:
+    name: omnimind-redis
+    key: REDIS_URL
+
+kafka:
+  enabled: false
+  brokers: "kafka:9092"
+  sasl:
+    enabled: false
+    mechanism: SCRAM-SHA-256
+    usernameSecret: { name: "", key: "" }
+    passwordSecret: { name: "", key: "" }
+  tls:
+    enabled: false
+    secretName: ""
+
+minio:
+  enabled: false
+  endpoint: "http://minio:9000"
+  accessKeySecret: { name: "", key: "" }
+  secretKeySecret: { name: "", key: "" }
+  bucket: "omnimind"
+
+############################################
+# Компонент: API
+############################################
+api:
+  enabled: true
+  replicaCount: 3
+  image: {}   # переопределит common.image при необходимости
+  command: [] # e.g. ["uvicorn","omnimind.api.app:app","--host","0.0.0.0","--port","8080"]
+  args: []
+  env:
+    - name: APP_ENV
+      value: "prod"
+    - name: LOG_LEVEL
+      value: "info"
+  envFromSecrets: []  # e.g. - name: omnimind-api-secrets
+  ports:
+    http: 8080
+    metrics: 9090
+  service:
+    type: ClusterIP
+    annotations: {}
+    labels: {}
+  readinessProbe:
+    enabled: true
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 6
+  livenessProbe:
+    enabled: true
+    httpGet:
+      path: /livez
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 2
+    failureThreshold: 3
+  resources: {}  # при пустом используются common.resources
+  hpa:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 70
+  pdb:
+    enabled: true
+    maxUnavailable: "25%"
+  rolloutStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 25%
+  extraLabels: {}
+  extraAnnotations: {}
+  extraVolumes: []
+  extraVolumeMounts: []
+  initContainers: []
+  sidecars: []
+  serviceMonitor:
+    enabled: false
+    path: /metrics
+    port: metrics
+
+############################################
+# Компонент: Worker
+############################################
+worker:
+  enabled: true
+  replicaCount: 2
+  queue: "default"
+  command: []   # e.g. ["python","-m","omnimind.worker","--queue","$(QUEUE)"]
+  args: []
+  env:
+    - name: APP_ENV
+      value: "prod"
+    - name: QUEUE
+      valueFrom:
+        configMapKeyRef:
+          name: omnimind-worker
+          key: queue
+  envFromSecrets: []
+  resources: {}
+  readinessProbe:
+    enabled: true
+    exec:
+      command: ["bash","-lc","/app/bin/ready.sh"]
+    initialDelaySeconds: 10
+    periodSeconds: 10
+  livenessProbe:
+    enabled: true
+    exec:
+      command: ["bash","-lc","/app/bin/alive.sh"]
+    initialDelaySeconds: 20
+    periodSeconds: 20
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    metrics:
+      - type: Pods
+        pods:
+          metric:
+            name: queue_pending_jobs
+          target:
+            type: AverageValue
+            averageValue: "10"
+  pdb:
+    enabled: true
+    minAvailable: 1
+  extraLabels: {}
+  extraAnnotations: {}
+  extraVolumes: []
+  extraVolumeMounts: []
+  initContainers: []
+  sidecars: []
+
+############################################
+# Конфигурация и секреты (пример)
+############################################
+config:
+  enabled: true
+  data:
+    APP_NAME: "omnimind-core"
+    FEATURE_X_ENABLED: "true"
+  # Можно вынести в отдельный шаблон ConfigMap при необходимости
+
+secrets:
+  create: false
+  data: {} # Зашифрованные значения через внешние секрет-менеджеры/SealedSecrets
+
+############################################
+# Персистентность (если нужна API/Worker)
+############################################
+persistence:
+  enabled: false
+  storageClass: ""
+  accessModes: ["ReadWriteOnce"]
+  size: 5Gi
+  annotations: {}
+  # Перечень PVC под разные компоненты (при необходимости)
+  claims: []
+  # Пример:
+  # claims:
+  #   - name: api-cache
+  #     size: 1Gi
+  #     mountPath: /cache
+
+############################################
+# Init hooks / post hooks
+############################################
+hooks:
+  preInstall:
+    # Ждем доступности БД, если нужно выполнить миграции до старта
+    waitForDB: true
+    timeoutSeconds: 120
+  postInstall:
+    # Можно включить начальное наполнение (job)
+    seedJob:
+      enabled: false
+      image:
+        repository: ghcr.io/omnimind/seed
+        tag: "1.0.0"
+        pullPolicy: IfNotPresent
+      args: ["bash","/scripts/seed_local.sh","--yes"]
+      backoffLimit: 1
+      envFromSecrets: []
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+
+############################################
+# Политики безопасности и ограничений
+############################################
+podSecurityStandards:
+  # Значения информативные — реальные PSP заменены на PSA/OPA/Gatekeeper
+  level: "baseline"
+
+limitRanges:
+  enabled: false
+  defaults:
+    cpu:
+      min: "100m"
+      max: "2000m"
+    memory:
+      min: "128Mi"
+      max: "4Gi"
+
+resourceQuotas:
+  enabled: false
+  hard:
+    requests.cpu: "4"
+    requests.memory: "8Gi"
+    limits.cpu: "8"
+    limits.memory: "16Gi"
+
+############################################
+# Логи и метрики
+############################################
+logging:
+  json: true
+  level: info
+
+metrics:
+  enabled: true
+  path: /metrics
+  port: 9090

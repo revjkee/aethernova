@@ -1,0 +1,358 @@
+# omnimind-core / ops / ansible / configs / policies / guardrails.yaml
+# Политики защиты и эксплуатационные ограничения (environment-agnostic).
+# Секретов нет. Значения, помеченные "override", допускают переопределение
+# через переменные окружения/инвентори/Helm values.
+
+version: 1
+metadata:
+  service: "omnimind-core"
+  owner: "platform-team"
+  environment: "${APP_ENV:-staging}"
+  region: "${REGION:-eu-central-1}"
+  revision: "v1"
+
+defaults:
+  enforce: true          # строгий режим: нарушения → 4xx/5xx по правилам
+  dryRun: false          # если true — только логирование нарушений
+  logSampling:
+    error: 1.0
+    warn: 0.5
+    info: 0.1
+
+authentication:
+  required: true
+  anonymous:
+    allowedPaths:
+      - "/healthz/live"
+      - "/healthz/ready"
+      - "/metrics"         # обычно ограничивается сетью
+    methods: ["GET"]
+    maxRps: 2
+  jwt:
+    clockSkewSec: 60
+    requiredClaims:
+      - "iss"
+      - "aud"
+      - "exp"
+      - "sub"
+    acceptedAlgs: ["HS256","RS256"]
+    maxTtlMinutes: 60
+    reuseRefreshTokens: false
+
+authorization:
+  model: "rbac"          # rbac|abac|opa
+  opa:
+    enabled: false
+    url: "http://opa:8181/v1/data/omnimind/allow"
+    timeoutMs: 200
+  rbac:
+    roles:
+      admin:
+        allow:
+          - "POST /api/v1/*"
+          - "PUT /api/v1/*"
+          - "PATCH /api/v1/*"
+          - "DELETE /api/v1/*"
+          - "GET /api/v1/*"
+      writer:
+        allow:
+          - "POST /api/v1/*"
+          - "PUT /api/v1/*"
+          - "PATCH /api/v1/*"
+          - "GET /api/v1/*"
+        deny:
+          - "DELETE /api/v1/*"
+      reader:
+        allow:
+          - "GET /api/v1/*"
+    defaultRole: "reader"
+
+rateLimit:
+  global:
+    windowSec: 60
+    limit: 1200
+    burst: 200
+    key: "ip"
+  perRoute:
+    - match: "POST /api/v1/ingest"
+      windowSec: 60
+      limit: 300
+      burst: 100
+      key: "api_key_or_user"
+    - match: "GET /api/v1/heavy"
+      windowSec: 60
+      limit: 120
+      burst: 40
+      key: "user"
+  penalties:
+    banOn:
+      consecutive429: 5
+      windowSec: 120
+    banDurationSec: 300
+
+quotas:
+  # Долгосрочные квоты по пользователю/ключу
+  daily:
+    limit: 100000
+    key: "user"
+  monthly:
+    limit: 2000000
+    key: "org"
+
+pagination:
+  maxPageSize: 1000
+  defaultPageSize: 100
+  maxLookbackDays: 365
+
+requestLimits:
+  maxHeadersBytes: 32768
+  maxRequestBodyBytes: 10485760         # 10 MiB
+  maxResponseBodyBytes: 52428800        # 50 MiB
+  json:
+    maxDepth: 64
+    maxArrayLength: 100000
+    rejectDuplicateKeys: true
+  form:
+    maxFields: 1000
+    maxFieldSizeBytes: 1048576
+  timeouts:
+    readHeaderMs: 2000
+    readMs: 30000
+    writeMs: 30000
+    idleMs: 15000
+  rejectUnknownContentType: true
+  allowedContentTypes:
+    - "application/json"
+    - "application/x-www-form-urlencoded"
+    - "multipart/form-data"
+
+idempotency:
+  enabled: true
+  header: "Idempotency-Key"
+  ttlMinutes: 120
+  storage: "redis"
+  methods: ["POST","PUT","PATCH","DELETE"]
+  dedupeStatusCode: 200
+
+uploads:
+  enabled: true
+  maxFiles: 10
+  maxFileBytes: 8388608              # 8 MiB
+  accept:
+    - ".json"
+    - ".csv"
+    - ".txt"
+  rejectContentTypes:
+    - "application/x-msdownload"
+    - "application/x-dosexec"
+  antivirus:
+    enabled: true
+    engine: "clamav"
+    timeoutMs: 5000
+  storage:
+    kind: "local"                    # local|s3|gcs
+    localPath: "/var/lib/omnimind/uploads"
+    s3:
+      bucket: "omnimind-uploads"
+      region: "eu-central-1"
+      sse: "AES256"
+
+inputValidation:
+  # Нормализация и схема для типовых полей запросов
+  trimStrings: true
+  collapseWhitespace: true
+  unicodeNormalize: "NFC"
+  rejectControlChars: true
+  disallowBareIdsInQuery: true
+  schemas:
+    - match: "POST /api/v1/items"
+      required:
+        - "name:string(1..120)"
+        - "amount:number(scale=12, min=-1e18, max=1e18)"
+        - "currency:string(enum=USD,EUR,GBP)"
+      optional:
+        - "description:string(0..500)"
+        - "metadata:object(maxKeys=50)"
+      forbidUnknownProps: true
+    - match: "GET /api/v1/items"
+      optional:
+        - "page:int(min=1,max=100000)"
+        - "page_size:int(min=1,max=1000)"
+        - "since:timestamp"
+      forbidUnknownProps: true
+
+injectionProtection:
+  sql:
+    enabled: true
+    denylistPatterns:
+      - "(?i)\\bunion\\b.*\\bselect\\b"
+      - "(?i)\\bdrop\\s+table\\b"
+      - "(?i)\\b;\\s*--"
+    maxInClause: 1000
+  pathTraversal:
+    enabled: true
+    denyPatterns:
+      - "\\.\\./"
+      - "%2e%2e%2f"
+  command:
+    enabled: true
+    allowlistBins: []
+  deserialization:
+    denyTypes:
+      - "java\\..*"
+      - "org.yaml.snakeyaml\\..*"
+
+costGuards:
+  # Защита от дорогих операций
+  heavyEndpoints:
+    - match: "GET /api/v1/heavy"
+      maxDurationMs: 5000
+      maxRows: 50000
+      concurrency: 8
+      sampleRate: 0.1
+  perUserConcurrency:
+    globalLimit: 64
+
+circuitBreaker:
+  enabled: true
+  windows:
+    - endpoint: "*"
+      slidingWindowSec: 60
+      failureRateThresholdPct: 50
+      minSamples: 50
+      openStateDurationSec: 30
+      halfOpenMaxRequests: 10
+
+retries:
+  # Клиентские/внутренние ретраи на безопасные операции (идемпотентные)
+  enabled: true
+  methods: ["GET","HEAD","OPTIONS"]
+  maxAttempts: 3
+  backoff:
+    baseMs: 100
+    maxMs: 1000
+    jitter: true
+  retryOnStatus: [502, 503, 504]
+
+observability:
+  correlationHeaders:
+    requestIdHeader: "X-Request-ID"
+    traceIdHeader: "traceparent"
+  redaction:
+    pii:
+      enabled: true
+      # Простые шаблоны, продвинутые — через процессинг логеров
+      patterns:
+        - "(?i)\\b\\d{12,19}\\b"   # карты (грубый шаблон)
+        - "(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}" # email
+      replacement: "[REDACTED]"
+    secrets:
+      keys:
+        - "password"
+        - "token"
+        - "secret"
+        - "authorization"
+  metrics:
+    exportRequestDurations: true
+    exportErrorRates: true
+  sampling:
+    logs:
+      slowRequestMs: 200
+      payloadOn4xx: false
+      payloadOn5xx: true
+
+audit:
+  enabled: true
+  record:
+    - "POST /api/v1/*"
+    - "PUT /api/v1/*"
+    - "PATCH /api/v1/*"
+    - "DELETE /api/v1/*"
+  store:
+    kind: "file"                    # file|kafka|db
+    filePath: "/var/log/omnimind/audit.log"
+  retentionDays: 90
+  integrity:
+    hashChain: true                 # хеш-цепочка записей аудита
+
+dataRetention:
+  defaultDays: 365
+  tables:
+    - name: "events"
+      days: 90
+    - name: "jobs"
+      days: 30
+  deletion:
+    batchSize: 1000
+    schedule: "0 3 * * *"          # cron UTC
+
+sla:
+  # Базовые SLO/SLA для мониторинга
+  availabilityPct: 99.9
+  p95LatencyMs:
+    GET: 150
+    POST: 250
+  errorBudgetAlerts:
+    fastBurnPctPerHour: 1.0
+    slowBurnPctPerDay: 2.0
+
+incidentResponse:
+  # Пороговые условия и реакция
+  triggers:
+    - name: "High 5xx rate"
+      condition: "rate_5xx_pct > 2 over 5m"
+      action: "page:oncall"
+    - name: "Latency regression"
+      condition: "p95_latency_ms > slo_p95 * 1.5 over 10m"
+      action: "page:oncall"
+  runbooks:
+    url: "https://runbooks.example.com/omnimind-core"
+  paging:
+    provider: "pagerduty"
+    serviceKeyRef: "PD_SERVICE_KEY_ENV"   # из окружения
+
+tenancy:
+  model: "org_user"                  # схема tenant keys
+  headers:
+    org: "X-Org-ID"
+    user: "X-User-ID"
+  isolation:
+    enforceOrgIds: true
+    crossOrgRequests: "deny"         # deny|allow|allow_with_admin
+
+ipFiltering:
+  allowCidrs:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+  denyCidrs: []
+  trustProxy: true
+
+featureFlags:
+  provider: "config"                 # config|unleash|launchdarkly
+  flags:
+    enableExperimentalAPI: false
+    readOnlyMode: false
+
+overrides:
+  # Пример точечных переопределений для конкретных маршрутов
+  - match: "POST /api/v1/ingest"
+    requestLimits:
+      maxRequestBodyBytes: 20971520  # 20 MiB
+    rateLimit:
+      windowSec: 60
+      limit: 600
+      burst: 200
+  - match: "GET /metrics"
+    authentication:
+      required: false
+    ipFiltering:
+      allowCidrs:
+        - "10.0.0.0/8"
+        - "192.168.0.0/16"
+    rateLimit:
+      windowSec: 60
+      limit: 6000
+      burst: 1000
+
+# Конец файла

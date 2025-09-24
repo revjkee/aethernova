@@ -1,0 +1,121 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: chronowatch-core
+  labels:
+    app.kubernetes.io/name: chronowatch-core
+    app.kubernetes.io/part-of: chronowatch
+    app.kubernetes.io/component: api
+    monitoring.aethernova.io/class: production
+spec:
+  # По умолчанию ServiceMonitor ищет Service в своём namespace.
+  # Для cross-namespace добавьте:
+  # namespaceSelector:
+  #   matchNames:
+  #     - chronowatch-prod
+  #     - chronowatch-staging
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chronowatch-core
+      app.kubernetes.io/component: api
+      monitoring.aethernova.io/scrape: "true"
+
+  # Пропагируем стабильные target labels из Service в метрики
+  targetLabels:
+    - app.kubernetes.io/name
+    - app.kubernetes.io/component
+    - app.kubernetes.io/instance
+    - app.kubernetes.io/version
+
+  # Основной эндпоинт с приложенческими метриками Prometheus
+  endpoints:
+    - port: http-metrics            # имя порта из Service
+      path: /metrics
+      scheme: http                  # смените на https при mTLS
+      interval: 15s
+      scrapeTimeout: 10s
+      honorLabels: true
+      # Ограничители для защиты TSDB от «взрыва» кардинальности
+      sampleLimit: 0                # 0 = без лимита по сэмплам; выставляйте >0 при всплесках
+      labelLimit: 65
+      labelNameLengthLimit: 1024
+      labelValueLengthLimit: 2048
+
+      # Опциональная авторизация (раскомментируйте при необходимости)
+      # bearerTokenSecret:
+      #   name: chronowatch-prom-scrape
+      #   key: token
+      # tlsConfig:
+      #   insecureSkipVerify: false
+      #   ca:
+      #     secret:
+      #       name: chronowatch-prom-ca
+      #       key: ca.crt
+      #   cert:
+      #     secret:
+      #       name: chronowatch-prom-client
+      #       key: tls.crt
+      #   keySecret:
+      #     name: chronowatch-prom-client
+      #     key: tls.key
+      #   serverName: chronowatch-core.metrics.svc
+
+      # Снижаем кардинальность и избавляемся от лишнего шума
+      metricRelabelings:
+        # 1) Оставляем только whitelisted префиксы метрик
+        - action: keep
+          sourceLabels: [__name__]
+          regex: '^(chronowatch_.*|process_.*|go_.*)$'
+        # 2) Удаляем quantile из summaries (оставляем count/sum)
+        - action: drop
+          sourceLabels: [__name__, quantile]
+          regex: '^(.*_summary);0\.\d+$'
+        # 3) Нормализуем label instance (опционально) — убираем порт
+        - action: replace
+          sourceLabels: [instance]
+          targetLabel: instance
+          regex: '^(.+?)(?::\d+)$'
+          replacement: '$1'
+        # 4) Отбрасываем особо «шумные» лейблы, если они присутствуют
+        - action: labeldrop
+          regex: '(pod_ip|container_id|session_id|trace_id|span_id)'
+
+      relabelings:
+        # Извлекаем namespace/pod из метаданных kubernetes
+        - action: replace
+          targetLabel: namespace
+          sourceLabels: [__meta_kubernetes_namespace]
+        - action: replace
+          targetLabel: pod
+          sourceLabels: [__meta_kubernetes_pod_name]
+        - action: replace
+          targetLabel: service
+          sourceLabels: [__meta_kubernetes_service_name]
+        # Отбрасываем headless endpoints без адресов
+        - action: drop
+          sourceLabels: [__address__]
+          regex: '^$'
+
+    # Технический эндпоинт для лёгкого мониторинга доступности
+    - port: http-metrics
+      path: /healthz
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 5s
+      honorLabels: true
+      # Конвертируем health-пробу в метрику gauge (blackbox-подобный паттерн)
+      relabelings:
+        - action: replace
+          targetLabel: probe
+          replacement: healthz
+      metricRelabelings:
+        - action: keep
+          sourceLabels: [__name__]
+          regex: '^(chronowatch_.*|process_start_time_seconds)$'
+
+  # Дополнительно: можно включить podTargetLabels, если в сервисе включён
+  # endpoints[].attachMetadata.node: true (в новых версиях)
+  podTargetLabels:
+    - app.kubernetes.io/version
+    - app.kubernetes.io/instance

@@ -1,0 +1,236 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "physical-integration-core.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "physical-integration-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: core
+    app.kubernetes.io/part-of: physical-integration-core
+  annotations:
+    {{- with .Values.deployment.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  replicas: {{ default 3 .Values.replicaCount }}
+  revisionHistoryLimit: {{ default 10 .Values.revisionHistoryLimit }}
+  {{- if .Values.strategy }}
+  strategy: {{- toYaml .Values.strategy | nindent 4 }}
+  {{- else }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 25%
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "physical-integration-core.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "physical-integration-core.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        prometheus.io/scrape: "{{ default true .Values.metrics.scrape }}"
+        prometheus.io/port: "{{ default 8080 .Values.metrics.port }}"
+        {{- if .Values.metrics.path }}
+        prometheus.io/path: "{{ .Values.metrics.path }}"
+        {{- end }}
+        # Чексамы для рестартов при изменениях конфигов/секретов
+        checksum/config: "{{ toYaml (default dict .Values.config) | sha256sum }}"
+        checksum/secrets: "{{ toYaml (default dict .Values.secrets) | sha256sum }}"
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "physical-integration-core.serviceAccountName" . }}
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range .Values.imagePullSecrets }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      automountServiceAccountToken: {{ default false .Values.automountServiceAccountToken }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ default 10001 .Values.podSecurityContext.runAsUser }}
+        runAsGroup: {{ default 10001 .Values.podSecurityContext.runAsGroup }}
+        fsGroup: {{ default 10001 .Values.podSecurityContext.fsGroup }}
+        fsGroupChangePolicy: {{ default "OnRootMismatch" .Values.podSecurityContext.fsGroupChangePolicy }}
+        seccompProfile:
+          type: {{ default "RuntimeDefault" .Values.podSecurityContext.seccompProfile.type }}
+      enableServiceLinks: {{ default false .Values.enableServiceLinks }}
+      {{- if .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml .Values.dnsConfig | nindent 8 }}
+      {{- end }}
+      {{- if .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml .Values.hostAliases | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ default 30 .Values.terminationGracePeriodSeconds }}
+
+      {{- if .Values.initContainers }}
+      initContainers:
+        {{- tpl (toYaml .Values.initContainers) . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: {{ include "physical-integration-core.name" . }}
+          {{- $img := .Values.image }}
+          image: "{{ $img.repository }}:{{ $img.tag | default .Chart.AppVersion }}{{- if $img.digest }}@{{ $img.digest }}{{- end }}"
+          imagePullPolicy: {{ default "IfNotPresent" $img.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ default 8080 .Values.containerPort }}
+              protocol: TCP
+            {{- if .Values.extraPorts }}
+            {{- toYaml .Values.extraPorts | nindent 12 }}
+            {{- end }}
+          {{- if .Values.command }}
+          command: {{- toYaml .Values.command | nindent 12 }}
+          {{- end }}
+          {{- if .Values.args }}
+          args: {{- toYaml .Values.args | nindent 12 }}
+          {{- end }}
+          env:
+            - name: ENV
+              value: {{ .Values.env | default "prod" | quote }}
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            {{- range $k, $v := (default dict .Values.extraEnv) }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- if or .Values.envFrom.configMaps .Values.envFrom.secrets }}
+          envFrom:
+            {{- range .Values.envFrom.configMaps }}
+            - configMapRef:
+                name: {{ . | quote }}
+            {{- end }}
+            {{- range .Values.envFrom.secrets }}
+            - secretRef:
+                name: {{ . | quote }}
+            {{- end }}
+          {{- end }}
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: {{ default true .Values.securityContext.readOnlyRootFilesystem }}
+            capabilities:
+              drop: [ "ALL" ]
+            {{- if .Values.securityContext.seccompProfile }}
+            seccompProfile:
+              type: {{ .Values.securityContext.seccompProfile.type | default "RuntimeDefault" }}
+            {{- end }}
+
+          resources:
+            {{- if .Values.resources }}
+            {{- toYaml .Values.resources | nindent 12 }}
+            {{- else }}
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+            {{- end }}
+
+          livenessProbe:
+            httpGet:
+              path: {{ default "/healthz" .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ default 20 .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ default 10 .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ default 2 .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ default 3 .Values.probes.liveness.failureThreshold }}
+
+          readinessProbe:
+            httpGet:
+              path: {{ default "/ready" .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ default 10 .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ default 5 .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ default 2 .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ default 3 .Values.probes.readiness.failureThreshold }}
+
+          startupProbe:
+            httpGet:
+              path: {{ default "/startup" .Values.probes.startup.path }}
+              port: http
+            initialDelaySeconds: {{ default 0 .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ default 5 .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ default 30 .Values.probes.startup.failureThreshold }}
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","sleep {{ default 10 .Values.lifecycle.preStopSleep }}"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.volumeMounts }}
+            {{- toYaml .Values.volumeMounts | nindent 12 }}
+            {{- end }}
+
+        {{- if .Values.sidecars }}
+        {{- tpl (toYaml .Values.sidecars) . | nindent 8 }}
+        {{- end }}
+
+      nodeSelector:
+        {{- toYaml (default dict .Values.nodeSelector) | nindent 8 }}
+      {{- if .Values.tolerations }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "physical-integration-core.selectorLabels" . | nindent 20 }}
+                topologyKey: "kubernetes.io/hostname"
+      {{- end }}
+
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+      {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "physical-integration-core.selectorLabels" . | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "physical-integration-core.selectorLabels" . | nindent 14 }}
+      {{- end }}
+
+      priorityClassName: {{ default "prod-critical" .Values.priorityClassName }}
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.volumes }}
+        {{- toYaml .Values.volumes | nindent 8 }}
+        {{- end }}

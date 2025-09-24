@@ -1,0 +1,158 @@
+{{- /*
+ServiceMonitor for Prometheus Operator (kube-prometheus-stack compatible).
+Controls via .Values.serviceMonitor.*. Safe defaults; all advanced knobs optional.
+*/ -}}
+{{- $sm := .Values.serviceMonitor | default dict -}}
+{{- if $sm.enabled }}
+
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ default (printf "%s-%s" .Release.Name "servicemonitor") $sm.nameOverride | trunc 63 | trimSuffix "-" }}
+  namespace: {{ default .Release.Namespace $sm.namespace | quote }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/part-of: "veilmind-core"
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $sm.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+spec:
+  # Namespace(s) where target Services live. Omit to restrict to current ns.
+  {{- with $sm.namespaceSelector }}
+  namespaceSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  # How to select target Services. Defaults match this chart's app/instance labels.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ default .Chart.Name (dig "selector" "matchLabels" "app.kubernetes.io/name" .Values.serviceMonitor nil) | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      {{- with (dig "selector" "matchLabels" . $sm) }}
+      {{- /* Merge user-provided labels */ -}}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+
+  {{- with $sm.targetLabels }}
+  targetLabels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $sm.podTargetLabels }}
+  podTargetLabels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  {{- /* Global scrape limits (optional) */ -}}
+  {{- if or $sm.sampleLimit $sm.labelLimit $sm.labelNameLengthLimit $sm.labelValueLengthLimit }}
+  sampleLimit: {{ default 0 $sm.sampleLimit }}
+  labelLimit: {{ default 0 $sm.labelLimit }}
+  labelNameLengthLimit: {{ default 0 $sm.labelNameLengthLimit }}
+  labelValueLengthLimit: {{ default 0 $sm.labelValueLengthLimit }}
+  {{- end }}
+
+  endpoints:
+    {{- $eps := $sm.endpoints | default list -}}
+    {{- if $eps }}
+    {{- range $i, $e := $eps }}
+    - port: {{ required (printf ".Values.serviceMonitor.endpoints[%d].port is required" $i) $e.port | quote }}
+      {{- if $e.path }}
+      path: {{ $e.path | quote }}
+      {{- else }}
+      path: "/metrics"
+      {{- end }}
+      {{- if $e.scheme }}scheme: {{ $e.scheme | quote }}{{- else }}scheme: "http"{{- end }}
+      {{- if $e.interval }}interval: {{ $e.interval | quote }}{{- else }}interval: "30s"{{- end }}
+      {{- if $e.scrapeTimeout }}scrapeTimeout: {{ $e.scrapeTimeout | quote }}{{- else }}scrapeTimeout: "10s"{{- end }}
+      honorLabels: {{ default false $e.honorLabels }}
+      followRedirects: {{ default true $e.followRedirects }}
+      {{- with $e.params }}
+      params:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- /* Optional auth */ -}}
+      {{- with $e.bearerTokenSecret }}
+      bearerTokenSecret:
+        name: {{ .name | quote }}
+        key: {{ default "token" .key | quote }}
+      {{- end }}
+      {{- with $e.basicAuth }}
+      basicAuth:
+        username:
+          name: {{ required "basicAuth.username.name required" .username.name | quote }}
+          key: {{ default "username" .username.key | quote }}
+        password:
+          name: {{ required "basicAuth.password.name required" .password.name | quote }}
+          key: {{ default "password" .password.key | quote }}
+      {{- end }}
+
+      {{- with $e.tls }}
+      {{- if .enabled }}
+      scheme: "https"
+      tlsConfig:
+        {{- if hasKey . "insecureSkipVerify" }}
+        insecureSkipVerify: {{ .insecureSkipVerify }}
+        {{- end }}
+        {{- with .serverName }}
+        serverName: {{ . | quote }}
+        {{- end }}
+        {{- with .ca }}
+        {{- if .secret }}
+        ca:
+          secret:
+            name: {{ .secret.name | quote }}
+            key: {{ .secret.key | quote }}
+        {{- end }}
+        {{- if .configMap }}
+        ca:
+          configMap:
+            name: {{ .configMap.name | quote }}
+            key: {{ .configMap.key | quote }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
+
+      {{- with $e.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $e.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with $e.sampleLimit }}sampleLimit: {{ . }}{{- end }}
+      {{- with $e.labelLimit }}labelLimit: {{ . }}{{- end }}
+      {{- with $e.labelNameLengthLimit }}labelNameLengthLimit: {{ . }}{{- end }}
+      {{- with $e.labelValueLengthLimit }}labelValueLengthLimit: {{ . }}{{- end }}
+
+      {{- with $e.attachMetadata }}
+      attachMetadata:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- else }}
+    # Default endpoint if none provided via values
+    - port: "http"
+      path: "/metrics"
+      scheme: "http"
+      interval: "30s"
+      scrapeTimeout: "10s"
+      honorLabels: false
+      followRedirects: true
+      # Example metric relabeling to drop highly-cardinal metrics:
+      metricRelabelings:
+        - action: drop
+          sourceLabels: ["__name__"]
+          regex: "go_memstats_.*|process_open_fds"
+    {{- end }}
+
+{{- end }}

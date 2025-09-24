@@ -1,0 +1,284 @@
+# datafabric-core / ops/docker/docker-compose.yaml
+# Compose спецификация v3.9 (Docker Compose v2)
+version: "3.9"
+
+x-common-env: &common-env
+  TZ: UTC
+
+x-secure: &secure
+  security_opt:
+    - no-new-privileges:true
+  read_only: false     # включите true для статичных сервисов
+  tmpfs:
+    - /tmp
+
+x-health-retry: &health-retry
+  interval: 5s
+  timeout: 3s
+  retries: 20
+  start_period: 10s
+
+networks:
+  dfnet:
+    name: datafabric-net
+    driver: bridge
+
+volumes:
+  pg_data:
+  redis_data:
+  kafka_data:
+  minio_data:
+  minio_config:
+  grafana_data:
+
+services:
+
+  # ---------------------------
+  # PostgreSQL 16 (основная БД)
+  # ---------------------------
+  postgres:
+    image: docker.io/postgres:16-alpine
+    container_name: df-postgres
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      <<: *common-env
+      POSTGRES_DB: ${POSTGRES_DB:-datafabric}
+      POSTGRES_USER: ${POSTGRES_USER:-datafabric}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "wal_level=replica"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-datafabric} -d ${POSTGRES_DB:-datafabric}"]
+      <<: *health-retry
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks: [dfnet]
+    <<: *secure
+
+  # ---------------------------
+  # Redis 7 (кэш/кью)
+  # ---------------------------
+  redis:
+    image: docker.io/redis:7-alpine
+    container_name: df-redis
+    restart: unless-stopped
+    environment: *common-env
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *health-retry
+    volumes:
+      - redis_data:/data
+    networks: [dfnet]
+    <<: *secure
+
+  # ---------------------------
+  # Kafka (KRaft, без ZooKeeper)
+  # ---------------------------
+  kafka:
+    image: docker.io/bitnami/kafka:3.7
+    container_name: df-kafka
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      KAFKA_ENABLE_KRAFT: "yes"
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://${KAFKA_ADVERTISED_HOSTNAME:-127.0.0.1}:9092
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      <<: *health-retry
+    volumes:
+      - kafka_data:/bitnami/kafka
+    networks: [dfnet]
+    <<: *secure
+
+  # ---------------------------
+  # MinIO (S3-совместимое хранилище)
+  # ---------------------------
+  minio:
+    image: docker.io/minio/minio:RELEASE.2025-02-18T10-30-00Z
+    container_name: df-minio
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      <<: *common-env
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "${MINIO_PORT_API:-9000}:9000"
+      - "${MINIO_PORT_CONSOLE:-9001}:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "mc --version >/dev/null 2>&1 || (wget -qO- http://127.0.0.1:9000/minio/health/live >/dev/null)"]
+      <<: *health-retry
+    volumes:
+      - minio_data:/data
+      - minio_config:/root/.minio
+    networks: [dfnet]
+    <<: *secure
+
+  # ---------------------------
+  # Инициализация Kafka топиков
+  # ---------------------------
+  kafka-setup:
+    image: docker.io/bitnami/kafka:3.7
+    container_name: df-kafka-setup
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      BOOTSTRAP: ${KAFKA_BROKER:-127.0.0.1:9092}
+      TOPICS: ${KAFKA_TOPICS:-df.events,df.commands}
+    entrypoint: ["/bin/bash","-lc"]
+    command: >
+      '
+      IFS="," read -ra T <<< "$TOPICS";
+      for t in "${T[@]}"; do
+        kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --create --if-not-exists --topic "$t" --partitions 3 --replication-factor 1;
+      done
+      kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --list;
+      '
+    restart: "no"
+    networks: [dfnet]
+
+  # ---------------------------
+  # Инициализация MinIO бакета
+  # ---------------------------
+  minio-setup:
+    image: docker.io/minio/mc:RELEASE.2025-02-18T10-30-00Z
+    container_name: df-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file:
+      - ../../.env
+    environment:
+      <<: *common-env
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-datafabric}
+    entrypoint: ["/bin/sh","-lc"]
+    command: >
+      '
+      mc alias set local "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD";
+      mc mb -p "local/$MINIO_BUCKET" || true;
+      mc policy set download "local/$MINIO_BUCKET" || true;
+      mc ls local;
+      '
+    restart: "no"
+    networks: [dfnet]
+
+  # ----------------------------------------------------------------
+  # Приложение (заполните образ/команду под ваш рантайм/репозиторий)
+  # ----------------------------------------------------------------
+  # app:
+  #   image: ghcr.io/your-org/datafabric-core:${APP_TAG:-dev}
+  #   build:
+  #     context: ../../
+  #     dockerfile: Dockerfile
+  #     target: runtime
+  #   env_file:
+  #     - ../../.env
+  #   environment:
+  #     <<: *common-env
+  #     POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+  #     POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+  #     REDIS_HOST: ${REDIS_HOST:-redis}
+  #     REDIS_PORT: ${REDIS_PORT:-6379}
+  #     KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
+  #     MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+  #   depends_on:
+  #     postgres: { condition: service_healthy }
+  #     redis:    { condition: service_healthy }
+  #     kafka:    { condition: service_healthy }
+  #     minio:    { condition: service_healthy }
+  #     kafka-setup: { condition: service_completed_successfully }
+  #     minio-setup: { condition: service_completed_successfully }
+  #   ports:
+  #     - "8080:8080"
+  #   healthcheck:
+  #     test: ["CMD-SHELL","wget -qO- http://127.0.0.1:8080/health || exit 1"]
+  #     <<: *health-retry
+  #   networks: [dfnet]
+  #   <<: *secure
+
+  # ===========================
+  # Профиль: observability
+  # ===========================
+  prometheus:
+    profiles: ["observability"]
+    image: docker.io/prom/prometheus:v2.54.1
+    container_name: df-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    volumes:
+      - ../../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks: [dfnet]
+    <<: *secure
+
+  grafana:
+    profiles: ["observability"]
+    image: docker.io/grafana/grafana:11.1.4
+    container_name: df-grafana
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks: [dfnet]
+    <<: *secure
+
+  # ===========================
+  # Профиль: tracing
+  # ===========================
+  jaeger:
+    profiles: ["tracing"]
+    image: docker.io/jaegertracing/all-in-one:1.57
+    container_name: df-jaeger
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # Web UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    networks: [dfnet]
+    <<: *secure

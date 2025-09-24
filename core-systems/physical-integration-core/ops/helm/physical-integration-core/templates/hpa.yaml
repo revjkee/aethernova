@@ -1,0 +1,78 @@
+# physical-integration-core/ops/helm/physical-integration-core/templates/hpa.yaml
+{{- if .Values.autoscaling.enabled }}
+
+{{- /* -------- Validations -------- */ -}}
+{{- $min := (default 1 .Values.autoscaling.minReplicas | int) -}}
+{{- $max := (default 1 .Values.autoscaling.maxReplicas | int) -}}
+{{- if gt $min $max -}}
+{{- fail (printf "autoscaling.minReplicas (%d) cannot be greater than autoscaling.maxReplicas (%d)" $min $max) -}}
+{{- end }}
+
+{{- $targetApi  := (default "apps/v1" .Values.autoscaling.targetRef.apiVersion) -}}
+{{- $targetKind := (default "Deployment" .Values.autoscaling.targetRef.kind) -}}
+{{- $targetNameRaw := (default (include "physical-integration-core.fullname" .) .Values.autoscaling.targetRef.name) -}}
+{{- $targetName := tpl $targetNameRaw . -}}
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "physical-integration-core.fullname" . }}
+  labels:
+    {{- include "physical-integration-core.labels" . | nindent 4 }}
+  {{- with .Values.autoscaling.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  minReplicas: {{ $min }}
+  maxReplicas: {{ $max }}
+  scaleTargetRef:
+    apiVersion: {{ $targetApi }}
+    kind: {{ $targetKind }}
+    name: {{ $targetName }}
+
+  {{- /* -------- Metrics -------- */}}
+  {{- if .Values.autoscaling.metrics }}
+  metrics:
+    {{- /* Ожидается список объектов метрик в формате K8s autoscaling/v2 */}}
+    {{- range .Values.autoscaling.metrics }}
+    - {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- else }}
+  # Дефолтная метрика — CPU Utilization 70% (безопасный предиктивный старт)
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  {{- end }}
+
+  {{- /* -------- Behavior (scaleUp/scaleDown) -------- */}}
+  {{- if .Values.autoscaling.behavior }}
+  behavior:
+    {{- toYaml .Values.autoscaling.behavior | nindent 4 }}
+  {{- else }}
+  # Дефолтное поведение: агрессивный scaleUp, консервативный scaleDown
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+  {{- end }}
+
+{{- end }}

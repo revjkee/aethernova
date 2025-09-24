@@ -1,0 +1,416 @@
+version: 1
+app:
+  name: physical-integration-core
+  instance: ${HOSTNAME:-pod-0}
+  env: ${ENV:-prod}
+  region: ${REGION:-eu-central-1}
+  zone: ${ZONE:-a}
+  startup_timeout: 30s
+
+server:
+  http:
+    enabled: true
+    bind: 0.0.0.0
+    port: ${APP_HTTP_PORT:-8080}
+    read_timeout: 10s
+    write_timeout: 10s
+    idle_timeout: 60s
+    request_limits:
+      max_header_bytes: 1Mi
+      max_body_bytes: 8Mi
+  grpc:
+    enabled: true
+    bind: 0.0.0.0
+    port: ${APP_GRPC_PORT:-9091}
+    max_recv_msg_size: 16Mi
+    max_send_msg_size: 16Mi
+  metrics:
+    enabled: true
+    bind: 0.0.0.0
+    port: ${APP_METRICS_PORT:-9090}
+    path: /metrics
+  health:
+    liveness_path: /healthz
+    readiness_path: /ready
+    startup_path: /startup
+
+security:
+  tls:
+    enabled: ${TLS_ENABLED:-false}
+    cert_file: ${TLS_CERT_FILE:-}
+    key_file: ${TLS_KEY_FILE:-}
+    ca_file: ${TLS_CA_FILE:-}
+    client_auth: "RequireAndVerifyClientCert"
+  mtls:
+    enabled: ${MTLS_ENABLED:-false}
+    spiffe: ${SPIFFE_ENABLED:-false}
+  cors:
+    enabled: ${CORS_ENABLED:-false}
+    allowed_origins: ${CORS_ALLOWED_ORIGINS:-*}
+    allowed_methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    allowed_headers: [Authorization, Content-Type, X-Request-ID]
+  headers:
+    hsts: true
+    frame_options: "DENY"
+    content_type_options: "nosniff"
+    xss_protection: "1; mode=block"
+
+authz:
+  rbac:
+    # роли и привилегии для внутренних API
+    roles:
+      operator:
+        allow: ["devices:read", "pipelines:read"]
+      maintainer:
+        allow: ["devices:*", "pipelines:*", "connectors:*"]
+      auditor:
+        allow: ["audit:read", "metrics:read", "logs:read"]
+  authn:
+    # выбор провайдера: "none"|"jwt"|"oauth2"
+    provider: ${AUTH_PROVIDER:-jwt}
+    jwt:
+      issuer: ${JWT_ISSUER:-https://auth.local/}
+      audience: ${JWT_AUDIENCE:-physical-integration}
+      jwks_url: ${JWT_JWKS_URL:-https://auth.local/.well-known/jwks.json}
+      required: ${JWT_REQUIRED:-true}
+    oauth2:
+      introspection_url: ${OAUTH_INTROSPECTION_URL:-}
+      client_id: ${OAUTH_CLIENT_ID:-}
+      client_secret: ${OAUTH_CLIENT_SECRET:-}
+      cache_ttl: 60s
+
+observability:
+  logging:
+    level: ${LOG_LEVEL:-info}        # debug|info|warn|error
+    format: json
+    sample:
+      enabled: true
+      initial: 100
+      thereafter: 100
+    fields:
+      include_request_id: true
+      include_caller: false
+  tracing:
+    enabled: ${OTEL_TRACES_ENABLED:-true}
+    exporter: otlp
+    service_name: physical-integration-core
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector.observability:4317}
+    insecure: ${OTEL_EXPORTER_OTLP_INSECURE:-true}
+    sampler:
+      type: parentbased_traceidratio
+      ratio: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
+  metrics:
+    enabled: true
+    runtime: true
+    custom_prefix: "pic_"
+  audit:
+    enabled: true
+    sink: kafka
+    redact:
+      # ключи и пути, которые удаляются/хешируются в аудите
+      delete_keys: ["password", "token", "secret", "http.request.header.authorization"]
+      hash_keys: ["db.statement"]
+    retention_days: 30
+
+resilience:
+  timeouts:
+    default: 2s
+    connectors: 5s
+    storages: 3s
+    http_downstream: 5s
+  retry:
+    enabled: true
+    policy: exponential
+    initial_interval: 200ms
+    max_interval: 3s
+    max_elapsed_time: 10s
+    retryable_statuses: [408, 429, 500, 502, 503, 504]
+  circuit_breakers:
+    enabled: true
+    rules:
+      default:
+        failure_rate_threshold: 50
+        slow_call_rate_threshold: 50
+        slow_call_duration_threshold: 2s
+        sliding_window_size: 50
+        permitted_calls_in_half_open_state: 5
+        wait_duration_in_open_state: 10s
+  backpressure:
+    queue_capacity: 10000
+    drop_policy: "latest"            # latest|oldest|error
+  rate_limits:
+    enabled: true
+    global_rps: 2000
+    per_client_rps: 200
+
+idempotency:
+  enabled: true
+  store: redis
+  ttl: 10m
+
+storage:
+  postgres:
+    enabled: true
+    dsn: ${PG_DSN:-postgresql://user:pass@postgres.physical:5432/pic?sslmode=prefer}
+    max_open_conns: 50
+    max_idle_conns: 10
+    conn_max_lifetime: 30m
+    migrations:
+      enabled: true
+      schema: public
+  redis:
+    enabled: true
+    addr: ${REDIS_ADDR:-redis.observability:6379}
+    db: 0
+    tls: ${REDIS_TLS:-false}
+    pool_size: 50
+  s3:
+    enabled: true
+    endpoint: ${S3_ENDPOINT:-https://s3.amazonaws.com}
+    bucket_raw: ${S3_BUCKET_RAW:-pic-raw}
+    bucket_norm: ${S3_BUCKET_NORM:-pic-norm}
+    kms_key_arn: ${S3_KMS_ARN:-}
+    multipart_threshold_mb: 32
+
+bus:
+  kafka:
+    enabled: true
+    brokers: ${KAFKA_BROKERS:-kafka-0:9092,kafka-1:9092}
+    client_id: physical-integration-core
+    security:
+      sasl:
+        enabled: ${KAFKA_SASL_ENABLED:-false}
+        mechanism: ${KAFKA_SASL_MECH:-SCRAM-SHA-256}
+        username: ${KAFKA_SASL_USER:-}
+        password: ${KAFKA_SASL_PASS:-}
+      tls:
+        enabled: ${KAFKA_TLS_ENABLED:-false}
+        ca_file: ${KAFKA_CA_FILE:-}
+        cert_file: ${KAFKA_CERT_FILE:-}
+        key_file: ${KAFKA_KEY_FILE:-}
+    topics:
+      ingress_raw: "pic.ingress.raw"
+      ingress_norm: "pic.ingress.norm"
+      events: "pic.events"
+      audit: "pic.audit"
+      dlq: "pic.dlq"
+    producer:
+      acks: all
+      compression: zstd
+      linger_ms: 5
+      batch_bytes: 1048576
+      retries: 5
+    consumer:
+      group_id: "pic-core"
+      session_timeout_ms: 10000
+      max_poll_records: 500
+      fetch_max_bytes: 52428800
+
+connectors:
+  mqtt:
+    enabled: true
+    endpoints:
+      - name: field-mqtt-1
+        broker_url: ${MQTT_URL_1:-mqtt://emqx.mqtt:1883}
+        client_id: "pic-${HOSTNAME:-pod}"
+        username: ${MQTT_USER_1:-}
+        password: ${MQTT_PASS_1:-}
+        clean_session: true
+        keepalive_seconds: 30
+        tls:
+          enabled: ${MQTT_TLS_1:-false}
+          ca_file: ${MQTT_CA_1:-}
+          cert_file: ${MQTT_CERT_1:-}
+          key_file: ${MQTT_KEY_1:-}
+        subscriptions:
+          - topic: "factory/+/telemetry/#"
+            qos: 1
+          - topic: "edge/alerts/#"
+            qos: 1
+        publish:
+          default_qos: 1
+          default_retain: false
+        rate_limit_rps: 500
+  opcua:
+    enabled: false
+    sessions:
+      - name: opcua-sensor-hub
+        endpoint: "opc.tcp://opcua-server.sensors:4840"
+        security_policy: "Basic256Sha256"
+        message_signing: true
+        username: ${OPCUA_USER:-}
+        password: ${OPCUA_PASS:-}
+        sampling_interval_ms: 500
+        subscriptions:
+          - node_id: "ns=2;s=Machine/Telemetry/*"
+            queue_size: 256
+  modbus:
+    enabled: false
+    tcp_devices:
+      - name: chiller-1
+        host: 10.10.20.15
+        port: 502
+        unit_id: 1
+        poll_interval: 1s
+        registers:
+          - kind: holding
+            address: 40001
+            length: 2
+            name: outlet_temp_c
+            transform: "int16_to_float/10"
+  http_pull:
+    enabled: false
+    jobs:
+      - name: vendor-rest
+        url: "https://vendor.local/api/v1/metrics"
+        method: GET
+        interval: 15s
+        headers:
+          Authorization: "Bearer ${VENDOR_API_TOKEN:-}"
+        timeout: 3s
+
+pipelines:
+  # Определение входных маршрутов и нормализации
+  routes:
+    - name: mqtt-raw
+      from: mqtt:field-mqtt-1:factory/+/telemetry/#
+      decode: json
+      validate:
+        required: ["ts", "device_id", "payload"]
+        ts_field: "ts"
+        ts_tolerance: 10m
+      normalize:
+        device_id: "$.device_id"
+        ts: "$.ts"
+        metrics_map:
+          # Примеры проекций метрик
+          temperature_c: "$.payload.tempC"
+          pressure_kpa: "$.payload.pressure"
+        tags:
+          source: "mqtt"
+          topic: "${topic}"
+      enrich:
+        device_registry: true
+        geoip: false
+      redact:
+        delete_fields: ["payload.secret", "credentials"]
+      route_to:
+        - kafka:pic.ingress.raw
+        - otlp:metrics
+    - name: opcua-stream
+      when: ${OPCUA_ENABLED_ROUTE:-false}
+      from: opcua:opcua-sensor-hub
+      decode: opcua
+      normalize:
+        device_id: "$.node.deviceId"
+        ts: "$.sourceTimestamp"
+        metrics_map:
+          rpm: "$.value.rpm"
+          vibration: "$.value.vib"
+      route_to:
+        - kafka:pic.ingress.norm
+
+  processors:
+    # Общие процессоры на шине
+    deduplicate:
+      enabled: true
+      key: "${device_id}:${ts}:${hash(payload)}"
+      ttl: 5m
+    schema:
+      enabled: true
+      version: "1.0.0"
+      registry: ${SCHEMA_REGISTRY_URL:-}
+    unit_conversion:
+      enabled: true
+      rules:
+        - from: "kPa"
+          to: "Pa"
+          factor: 1000
+    anomaly_guard:
+      enabled: true
+      rules:
+        - metric: temperature_c
+          min: -60
+          max: 200
+          action: "clamp"
+        - metric: pressure_kpa
+          min: 0
+          max: 5000
+          action: "drop"
+
+device_registry:
+  source: postgres
+  table: devices
+  id_field: device_id
+  cache_ttl: 5m
+  fields:
+    model: model
+    firmware: fw_version
+    site: site
+    line: line
+    tags: tags
+
+outputs:
+  kafka:
+    enabled: true
+    topics:
+      raw: "pic.ingress.raw"
+      norm: "pic.ingress.norm"
+      events: "pic.events"
+  s3:
+    enabled: true
+    raw_prefix: "raw/year=%Y/month=%m/day=%d/"
+    norm_prefix: "norm/year=%Y/month=%m/day=%d/"
+    parquet:
+      enabled: true
+      row_group_mb: 64
+      compression: zstd
+  postgres:
+    enabled: true
+    tables:
+      telemetry_raw: telemetry_raw
+      telemetry_norm: telemetry_norm
+
+dlq:
+  enabled: true
+  sink: kafka
+  topic: "pic.dlq"
+  max_retries: 5
+  retry_backoff: 1s
+
+http_clients:
+  defaults:
+    timeout: 5s
+    retry:
+      enabled: true
+      attempts: 3
+      backoff: 300ms
+    circuit_breaker:
+      enabled: true
+  endpoints:
+    vendor-api:
+      base_url: "https://vendor.local"
+      headers:
+        Authorization: "Bearer ${VENDOR_API_TOKEN:-}"
+      retry:
+        attempts: 5
+
+feature_flags:
+  ingestion: true
+  device_bridge: true
+  opentelemetry: true
+  pii_redaction: true
+  idempotency: true
+
+profiles:
+  dev:
+    logging.level: debug
+    resilience.retry.max_elapsed_time: 4s
+    observability.tracing.sampler.ratio: 1.0
+  staging:
+    resilience.retry.max_elapsed_time: 6s
+    observability.tracing.sampler.ratio: 0.2
+  prod:
+    resilience.retry.max_elapsed_time: 10s
+    rate_limits.global_rps: 5000
+    observability.tracing.sampler.ratio: 0.1

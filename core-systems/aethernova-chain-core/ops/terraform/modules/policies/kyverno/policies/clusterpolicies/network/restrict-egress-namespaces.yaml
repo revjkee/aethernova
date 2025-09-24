@@ -1,0 +1,52 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-egress-namespaces
+  annotations:
+    policies.kyverno.io/title: Restrict Egress Target Namespaces
+    policies.kyverno.io/category: Network
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: NetworkPolicy
+    policies.kyverno.io/description: >-
+      Enforces that any egress rule in NetworkPolicy which targets Namespaces via
+      namespaceSelector must only select Namespaces explicitly labeled
+      "networking.aethernova.io/egress-allowed=true". This creates an allowlist
+      of egress-eligible Namespaces.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  failurePolicy: Fail
+  rules:
+    - name: require-egress-namespace-allowlist-label
+      match:
+        any:
+          - resources:
+              kinds:
+                - NetworkPolicy
+      preconditions:
+        all:
+          # Применяем правило только если в NetworkPolicy вообще есть egress.
+          - key: "{{ request.object.spec.egress || `[]` }}"
+            operator: AnyNotIn
+            value: [] # egress непустой
+      validate:
+        message: >-
+          Egress to other Namespaces must use a namespaceSelector that includes
+          matchLabels: { networking.aethernova.io/egress-allowed: "true" }.
+        foreach:
+          - list: "request.object.spec.egress[].to[]"
+            preconditions:
+              all:
+                # Проверяем только те подэлементы 'to', где указан namespaceSelector.
+                - key: "{{ element.namespaceSelector }}"
+                  operator: Exists
+            # Шаблон применяется к текущему element (to[*]) — подтверждено в дискуссии/документации Kyverno.
+            # Источники: Kyverno validate.foreach docs / обсуждение о scope element.
+            # Поле namespaceSelector — это LabelSelector; требуем обязательный matchLabels с ключом allow-листа.
+            # Это гарантирует, что egress будет направлен только в неймспейсы, помеченные данным лейблом.
+            # https://kubernetes.io/docs/concepts/services-networking/network-policies/ ;
+            # https://docs.okd.io/latest/rest_api/network_apis/networkpolicy-networking-k8s-io-v1.html
+            pattern:
+              namespaceSelector:
+                matchLabels:
+                  networking.aethernova.io/egress-allowed: "true"

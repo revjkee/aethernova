@@ -1,0 +1,168 @@
+---
+# Molecule prepare: industrial-grade host bootstrap for role `omnimind-core`
+# Target OS families: Debian/Ubuntu, RedHat (RHEL/CentOS/Alma/Rocky)
+# Idempotent, with strict preflight and safe defaults.
+
+- name: Prepare instances for omnimind-core role
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    omnimind_core_user: "omnimind"
+    omnimind_core_group: "omnimind"
+    omnimind_core_install_dir: "/opt/omnimind-core"
+    omnimind_core_data_dir: "/var/lib/omnimind-core"
+    omnimind_core_log_dir: "/var/log/omnimind-core"
+    omnimind_core_cfg_dir: "/etc/omnimind-core"
+    _python_interpreters:
+      - /usr/bin/python3
+      - /usr/local/bin/python3
+      - /usr/bin/python
+      - /usr/local/bin/python
+
+  pre_tasks:
+    - name: "Preflight | Ensure Python is present (raw bootstrap for Debian/Ubuntu)"
+      raw: |
+        set -e
+        if command -v apt-get >/dev/null 2>&1; then
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends python3 python3-apt python3-yaml ca-certificates
+        fi
+      changed_when: false
+      failed_when: false
+
+    - name: "Preflight | Ensure Python is present (raw bootstrap for RHEL-family)"
+      raw: |
+        set -e
+        if command -v dnf >/dev/null 2>&1; then
+          dnf -y install python3 python3-libselinux python3-pyyaml ca-certificates
+        elif command -v yum >/dev/null 2>&1; then
+          yum -y install python3 libselinux-python3 PyYAML ca-certificates
+        fi
+      changed_when: false
+      failed_when: false
+
+    - name: "Preflight | Pick available Python interpreter"
+      raw: "test -x {{ item }} && echo {{ item }} || true"
+      register: _py_candidates
+      with_items: "{{ _python_interpreters }}"
+      changed_when: false
+
+    - name: "Preflight | Set ansible_python_interpreter fact"
+      set_fact:
+        ansible_python_interpreter: "{{ (_py_candidates.results | map(attribute='stdout') | select('match','/.+')) | list | first | default('/usr/bin/python3') }}"
+      when: _py_candidates is defined
+
+    - name: "Facts | Gather"
+      setup:
+
+    - name: "Time | Set timezone to UTC (if timedatectl available)"
+      ansible.builtin.command: timedatectl set-timezone UTC
+      changed_when: false
+      failed_when: false
+
+  tasks:
+    - name: "Packages | Base packages (Debian/Ubuntu)"
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 1800
+        state: present
+        name:
+          - ca-certificates
+          - curl
+          - tar
+          - gnupg
+          - logrotate
+          - systemd
+          - sudo
+          - python3
+          - python3-yaml
+      when: ansible_facts.os_family == "Debian"
+
+    - name: "Packages | Base packages (RedHat family)"
+      ansible.builtin.dnf:
+        state: present
+        name:
+          - ca-certificates
+          - curl
+          - tar
+          - gnupg2
+          - logrotate
+          - systemd
+          - sudo
+          - python3
+          - python3-pyyaml
+          - policycoreutils-python-utils
+      when: ansible_facts.os_family == "RedHat"
+
+    - name: "User | Ensure group exists"
+      ansible.builtin.group:
+        name: "{{ omnimind_core_group }}"
+        system: true
+
+    - name: "User | Ensure user exists"
+      ansible.builtin.user:
+        name: "{{ omnimind_core_user }}"
+        group: "{{ omnimind_core_group }}"
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: "FS | Create application directories"
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ omnimind_core_user }}"
+        group: "{{ omnimind_core_group }}"
+        mode: "{{ item.mode | default('0750') }}"
+      loop:
+        - { path: "{{ omnimind_core_install_dir }}", mode: "0755" }
+        - { path: "{{ omnimind_core_install_dir }}/releases", mode: "0755" }
+        - { path: "{{ omnimind_core_data_dir }}",   mode: "0750" }
+        - { path: "{{ omnimind_core_log_dir }}",    mode: "0750" }
+        - { path: "{{ omnimind_core_cfg_dir }}",    mode: "0750" }
+
+    - name: "Env | Seed minimal service env file for tests"
+      ansible.builtin.copy:
+        dest: "{{ omnimind_core_cfg_dir }}/omnimind-core.env"
+        owner: "{{ omnimind_core_user }}"
+        group: "{{ omnimind_core_group }}"
+        mode: "0640"
+        content: |
+          APP_ENV=testing
+          DB_HOST=127.0.0.1
+          DB_PORT=5432
+          DB_NAME=omnimind
+          DB_USER=omnimind
+          DB_PASS=omnimind
+          REDIS_HOST=127.0.0.1
+          REDIS_PORT=6379
+
+    - name: "Systemd | Detect availability"
+      ansible.builtin.set_fact:
+        omnimind_core_systemd_available: "{{ (ansible_facts.service_mgr | default('')) == 'systemd' }}"
+
+    - name: "Systemd | Daemon reload (if available)"
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: omnimind_core_systemd_available | bool
+      changed_when: false
+
+    - name: "Python | Verify yaml module is importable"
+      ansible.builtin.shell: "{{ ansible_python_interpreter }} -c 'import yaml; print(\"ok\")'"
+      changed_when: false
+
+    - name: "Certificates | Update CA trust (best effort)"
+      ansible.builtin.command: "{{ 'update-ca-certificates' if ansible_facts.os_family == 'Debian' else 'update-ca-trust' }}"
+      changed_when: false
+      failed_when: false
+
+    - name: "Facts | Summary (debug)"
+      ansible.builtin.debug:
+        msg:
+          - "Python: {{ ansible_python_interpreter }}"
+          - "OS: {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }} ({{ ansible_facts.os_family }})"
+          - "Systemd available: {{ omnimind_core_systemd_available }}"
+          - "Prepared dirs: {{ omnimind_core_install_dir }}, {{ omnimind_core_cfg_dir }}, {{ omnimind_core_log_dir }}, {{ omnimind_core_data_dir }}"

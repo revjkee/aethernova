@@ -1,0 +1,949 @@
+"""
+cybersecurity-core GraphQL Schema (v1)
+Industrial-grade SOC domain: Alerts, Incidents, Events, IOCs, EDR/IDS, Assets, Vulns, Cases, Playbooks, RBAC.
+
+Contract-only (SDL). Custom scalars and directives require resolvers in the service layer.
+"""
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+"Opaque global identifier for Relay compatibility."
+interface Node {
+  "Global, stable ID (Relay)."
+  id: ID!
+}
+
+/* =========================
+   Scalars
+   ========================= */
+
+"RFC 3339 / ISO-8601 datetime, UTC recommended."
+scalar DateTime
+
+"Universally Unique Identifier."
+scalar UUID
+
+"Arbitrary JSON object."
+scalar JSONObject
+
+"RFC 3986 URL."
+scalar URL
+
+"Email address (RFC 5321/5322)."
+scalar Email
+
+"IPv4 or IPv6 textual address."
+scalar IPAddress
+
+"IPv4/IPv6 CIDR notation."
+scalar CIDR
+
+"SHA-256 hex digest (lowercase, 64 chars)."
+scalar SHA256
+
+"Base64-encoded binary payload."
+scalar Base64
+
+"Unsigned 64-bit integer."
+scalar UInt64
+
+/* =========================
+   Directives (security & privacy)
+   ========================= */
+
+"""
+RBAC directive. Enforce role-based access on objects/fields.
+Example: field @auth(requires: [ADMIN, RESPONDER])
+"""
+directive @auth(requires: [Role!]!) on OBJECT | FIELD_DEFINITION
+
+"""
+Mark field as sensitive; optionally mask/redact.
+"""
+directive @sensitive(mask: Boolean = true) on FIELD_DEFINITION
+
+"""
+Redact field value at selected trust levels (PII/PHI/SECRET).
+"""
+directive @redact(level: RedactLevel! = PII) on FIELD_DEFINITION
+
+enum RedactLevel {
+  PII
+  PHI
+  SECRET
+}
+
+/* =========================
+   RBAC
+   ========================= */
+
+enum Role {
+  ADMIN
+  ANALYST
+  RESPONDER
+  THREAT_HUNTER
+  AUDITOR
+  READONLY
+  SERVICE
+}
+
+/* =========================
+   Common/Pagination/Tagging
+   ========================= */
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+"Generic tag key/value."
+type Tag {
+  key: String!
+  value: String
+}
+
+input TagInput {
+  key: String!
+  value: String
+}
+
+"Time window."
+input TimeRangeInput {
+  from: DateTime!
+  to: DateTime!
+}
+
+"Generic sort order."
+enum SortOrder {
+  ASC
+  DESC
+}
+
+/* =========================
+   Tenancy & Identity
+   ========================= */
+
+type Tenant implements Node {
+  id: ID!
+  tenantId: UUID!
+  name: String!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type User implements Node {
+  id: ID!
+  userId: UUID!
+  tenantId: UUID!
+  email: Email! @sensitive
+  displayName: String!
+  roles: [Role!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+/* =========================
+   Assets & Inventory
+   ========================= */
+
+enum AssetType {
+  ENDPOINT
+  SERVER
+  CONTAINER
+  MOBILE
+  CLOUD_ACCOUNT
+  K8S_NODE
+  NETWORK_DEVICE
+  APPLICATION
+  DATABASE
+}
+
+enum AssetCriticality {
+  MISSION_CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+type Asset implements Node {
+  id: ID!
+  assetId: UUID!
+  tenantId: UUID!
+  name: String!
+  type: AssetType!
+  hostname: String
+  ipAddresses: [IPAddress!]
+  owner: String
+  criticality: AssetCriticality!
+  tags: [Tag!]
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type AssetConnection {
+  edges: [AssetEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+type AssetEdge {
+  node: Asset!
+  cursor: String!
+}
+
+input AssetWhereInput {
+  ids: [UUID!]
+  types: [AssetType!]
+  criticality: [AssetCriticality!]
+  hostnameContains: String
+  tagKeys: [String!]
+  tagKeyValues: [TagInput!]
+}
+
+input AssetSortInput {
+  field: AssetSortField!
+  order: SortOrder! = DESC
+}
+enum AssetSortField {
+  NAME
+  TYPE
+  CRITICALITY
+  CREATED_AT
+  UPDATED_AT
+}
+
+/* =========================
+   Vulnerabilities
+   ========================= */
+
+enum Severity {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+  INFO
+}
+
+type Vulnerability implements Node {
+  id: ID!
+  vulnId: UUID!
+  tenantId: UUID!
+  cve: String
+  title: String!
+  description: String
+  severity: Severity!
+  cvss: Float
+  publishedAt: DateTime
+  discoveredAt: DateTime
+  affectedAssets(after: String, first: Int = 25): AssetConnection!
+  references: [URL!]
+  tags: [Tag!]
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+/* =========================
+   Threat Intelligence (IOC)
+   ========================= */
+
+enum IndicatorType {
+  DOMAIN
+  URL
+  EMAIL
+  IPV4
+  IPV6
+  CIDR
+  HASH_MD5
+  HASH_SHA1
+  HASH_SHA256
+  FILEPATH
+  YARA
+  RULE_SNORT
+  RULE_SURICATA
+  MIME
+}
+
+enum Confidence {
+  HIGH
+  MEDIUM
+  LOW
+  UNKNOWN
+}
+
+type ThreatIntelIndicator implements Node {
+  id: ID!
+  indicatorId: UUID!
+  tenantId: UUID!
+  type: IndicatorType!
+  value: String! @sensitive
+  description: String
+  confidence: Confidence!
+  firstSeen: DateTime
+  lastSeen: DateTime
+  source: String
+  ttlHours: Int
+  tags: [Tag!]
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+/* =========================
+   Events (EDR/IDS/Net/File/Auth)
+   ========================= */
+
+enum EventType {
+  PROCESS
+  NETWORK
+  FILE
+  AUTH
+  IDS_ALERT
+  EDR_ACTION
+}
+
+interface Event implements Node {
+  id: ID!
+  eventId: UUID!
+  tenantId: UUID!
+  type: EventType!
+  observedAt: DateTime!
+  assetId: UUID
+  severity: Severity
+  raw: JSONObject
+  tags: [Tag!]
+}
+
+type ProcessEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  tenantId: UUID!
+  type: EventType!
+  observedAt: DateTime!
+  assetId: UUID
+  severity: Severity
+  raw: JSONObject
+  tags: [Tag!]
+  pid: UInt64
+  ppid: UInt64
+  user: String
+  commandLine: String @sensitive
+  sha256: SHA256
+  path: String
+}
+
+type NetworkEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  tenantId: UUID!
+  type: EventType!
+  observedAt: DateTime!
+  assetId: UUID
+  severity: Severity
+  raw: JSONObject
+  tags: [Tag!]
+  srcIp: IPAddress
+  srcPort: Int
+  dstIp: IPAddress
+  dstPort: Int
+  protocol: String
+  bytesIn: UInt64
+  bytesOut: UInt64
+}
+
+type FileEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  tenantId: UUID!
+  type: EventType!
+  observedAt: DateTime!
+  assetId: UUID
+  severity: Severity
+  raw: JSONObject
+  tags: [Tag!]
+  action: String
+  path: String
+  sha256: SHA256
+  sizeBytes: UInt64
+}
+
+type AuthEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  tenantId: UUID!
+  type: EventType!
+  observedAt: DateTime!
+  assetId: UUID
+  severity: Severity
+  raw: JSONObject
+  tags: [Tag!]
+  username: String @sensitive
+  success: Boolean
+  sourceIp: IPAddress
+  method: String
+}
+
+type IDSAlertEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  tenantId: UUID!
+  type: EventType!
+  observedAt: DateTime!
+  assetId: UUID
+  severity: Severity
+  raw: JSONObject
+  tags: [Tag!]
+  signatureId: String
+  signature: String
+  category: String
+  priority: Int
+}
+
+enum EDRActionType {
+  QUARANTINE_FILE
+  KILL_PROCESS
+  ISOLATE_HOST
+  RELEASE_ISOLATION
+  DELETE_FILE
+  CUSTOM_SCRIPT
+}
+
+type EDRActionEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  tenantId: UUID!
+  type: EventType!
+  observedAt: DateTime!
+  assetId: UUID
+  severity: Severity
+  raw: JSONObject
+  tags: [Tag!]
+  actionType: EDRActionType!
+  status: String
+  reason: String
+}
+
+union AnyEvent = ProcessEvent | NetworkEvent | FileEvent | AuthEvent | IDSAlertEvent | EDRActionEvent
+
+type EventConnection {
+  edges: [EventEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+type EventEdge {
+  node: AnyEvent!
+  cursor: String!
+}
+
+input EventWhereInput {
+  types: [EventType!]
+  assetIds: [UUID!]
+  severity: [Severity!]
+  timeRange: TimeRangeInput
+  usernameContains: String
+  ip: IPAddress
+  sha256: SHA256
+  tagKeys: [String!]
+  tagKeyValues: [TagInput!]
+}
+
+input EventSortInput {
+  field: EventSortField! = OBSERVED_AT
+  order: SortOrder! = DESC
+}
+enum EventSortField {
+  OBSERVED_AT
+  SEVERITY
+}
+
+/* =========================
+   Alerts & Incidents
+   ========================= */
+
+enum AlertStatus {
+  OPEN
+  ACKNOWLEDGED
+  IN_PROGRESS
+  SUPPRESSED
+  FALSE_POSITIVE
+  RESOLVED
+}
+
+type Alert implements Node {
+  id: ID!
+  alertId: UUID!
+  tenantId: UUID!
+  title: String!
+  description: String
+  severity: Severity!
+  status: AlertStatus!
+  assetId: UUID
+  relatedEventIds: [UUID!]
+  indicatorIds: [UUID!]
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  tags: [Tag!]
+  ownerUserId: UUID
+}
+
+type AlertConnection {
+  edges: [AlertEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+type AlertEdge {
+  node: Alert!
+  cursor: String!
+}
+
+input AlertWhereInput {
+  ids: [UUID!]
+  status: [AlertStatus!]
+  severity: [Severity!]
+  assetIds: [UUID!]
+  indicatorIds: [UUID!]
+  timeRange: TimeRangeInput
+  tagKeys: [String!]
+  ownerUserIds: [UUID!]
+}
+
+input AlertSortInput {
+  field: AlertSortField! = CREATED_AT
+  order: SortOrder! = DESC
+}
+enum AlertSortField {
+  CREATED_AT
+  UPDATED_AT
+  SEVERITY
+  STATUS
+}
+
+enum IncidentSeverity {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum IncidentStatus {
+  NEW
+  TRIAGE
+  CONTAINMENT
+  ERADICATION
+  RECOVERY
+  MONITORING
+  CLOSED
+}
+
+type Comment {
+  authorUserId: UUID!
+  text: String! @sensitive
+  createdAt: DateTime!
+}
+
+type TimelineEntry {
+  at: DateTime!
+  message: String!
+  actorUserId: UUID
+}
+
+type Incident implements Node {
+  id: ID!
+  incidentId: UUID!
+  tenantId: UUID!
+  title: String!
+  summary: String
+  severity: IncidentSeverity!
+  status: IncidentStatus!
+  alertIds: [UUID!]!
+  ownerUserId: UUID
+  responders: [UUID!]!
+  tags: [Tag!]
+  comments: [Comment!]!
+  timeline: [TimelineEntry!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+/* =========================
+   Detection Rules & Playbooks
+   ========================= */
+
+enum RuleLanguage {
+  KQL
+  EQL
+  SQL
+  SIGMA
+  DSL
+}
+
+enum RuleStatus {
+  DRAFT
+  ENABLED
+  DISABLED
+  DEPRECATED
+}
+
+type DetectionRule implements Node {
+  id: ID!
+  ruleId: UUID!
+  tenantId: UUID!
+  name: String!
+  description: String
+  language: RuleLanguage!
+  query: String!
+  status: RuleStatus!
+  severity: Severity!
+  tags: [Tag!]
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+enum PlaybookStatus {
+  DRAFT
+  PUBLISHED
+  DISABLED
+}
+
+type Playbook implements Node {
+  id: ID!
+  playbookId: UUID!
+  tenantId: UUID!
+  name: String!
+  description: String
+  version: String!
+  status: PlaybookStatus!
+  tags: [Tag!]
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+enum RunStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+type PlaybookRun implements Node {
+  id: ID!
+  runId: UUID!
+  playbookId: UUID!
+  tenantId: UUID!
+  status: RunStatus!
+  startedAt: DateTime
+  finishedAt: DateTime
+  logs: [String!]
+}
+
+/* =========================
+   Cases (IR/Compliance)
+   ========================= */
+
+enum CaseStatus {
+  OPEN
+  IN_PROGRESS
+  ON_HOLD
+  CLOSED
+}
+
+type Case implements Node {
+  id: ID!
+  caseId: UUID!
+  tenantId: UUID!
+  title: String!
+  description: String
+  status: CaseStatus!
+  relatedIncidentIds: [UUID!]
+  ownerUserId: UUID
+  tags: [Tag!]
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+/* =========================
+   Audit
+   ========================= */
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  HARD_DELETE
+  ACCESS
+}
+
+type AuditLog implements Node {
+  id: ID!
+  auditId: UUID!
+  tenantId: UUID!
+  actorUserId: UUID
+  action: AuditAction!
+  entityType: String!
+  entityId: UUID
+  at: DateTime!
+  metadata: JSONObject
+}
+
+/* =========================
+   Queries
+   ========================= */
+
+type Query {
+  # Identity/Tenancy
+  me: User! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN, SERVICE])
+  tenant(tenantId: UUID!): Tenant! @auth(requires: [ADMIN, SERVICE])
+
+  # Relay
+  node(id: ID!): Node
+
+  # Assets
+  assets(
+    where: AssetWhereInput
+    after: String
+    first: Int = 50
+    sort: [AssetSortInput!]
+  ): AssetConnection! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  asset(id: UUID!): Asset @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+
+  # Vulnerabilities
+  vulnerability(id: UUID!): Vulnerability @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+
+  # IOCs
+  indicators(
+    types: [IndicatorType!]
+    confidence: [Confidence!]
+    tagKeys: [String!]
+    after: String
+    first: Int = 100
+  ): ThreatIntelIndicatorConnection! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  indicator(id: UUID!): ThreatIntelIndicator @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+
+  # Events
+  events(
+    where: EventWhereInput
+    sort: [EventSortInput!]
+    after: String
+    first: Int = 200
+  ): EventConnection! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  event(id: UUID!): AnyEvent @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+
+  # Alerts
+  alerts(
+    where: AlertWhereInput
+    sort: [AlertSortInput!]
+    after: String
+    first: Int = 100
+  ): AlertConnection! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  alert(id: UUID!): Alert @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+
+  # Incidents
+  incident(id: UUID!): Incident @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  incidents(
+    status: [IncidentStatus!]
+    ownerUserIds: [UUID!]
+    after: String
+    first: Int = 50
+  ): IncidentConnection! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+
+  # Rules
+  detectionRule(id: UUID!): DetectionRule @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  detectionRules(
+    status: [RuleStatus!]
+    language: [RuleLanguage!]
+    after: String
+    first: Int = 100
+  ): DetectionRuleConnection! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+
+  # Playbooks
+  playbook(id: UUID!): Playbook @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  playbooks(
+    status: [PlaybookStatus!]
+    after: String
+    first: Int = 100
+  ): PlaybookConnection! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+
+  # Cases
+  case(id: UUID!): Case @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  cases(
+    status: [CaseStatus!]
+    after: String
+    first: Int = 100
+  ): CaseConnection! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+
+  # Audit
+  auditLogs(
+    actorUserIds: [UUID!]
+    entityType: String
+    timeRange: TimeRangeInput
+    after: String
+    first: Int = 200
+  ): AuditLogConnection! @auth(requires: [AUDITOR, ADMIN])
+}
+
+# Connections for various entities
+type ThreatIntelIndicatorConnection { edges: [ThreatIntelIndicatorEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+type ThreatIntelIndicatorEdge { node: ThreatIntelIndicator!, cursor: String! }
+
+type IncidentConnection { edges: [IncidentEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+type IncidentEdge { node: Incident!, cursor: String! }
+
+type DetectionRuleConnection { edges: [DetectionRuleEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+type DetectionRuleEdge { node: DetectionRule!, cursor: String! }
+
+type PlaybookConnection { edges: [PlaybookEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+type PlaybookEdge { node: Playbook!, cursor: String! }
+
+type CaseConnection { edges: [CaseEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+type CaseEdge { node: Case!, cursor: String! }
+
+type AuditLogConnection { edges: [AuditLogEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+type AuditLogEdge { node: AuditLog!, cursor: String! }
+
+/* =========================
+   Mutations
+   ========================= */
+
+input AlertCreateInput {
+  title: String!
+  description: String
+  severity: Severity!
+  assetId: UUID
+  relatedEventIds: [UUID!]
+  indicatorIds: [UUID!]
+  tags: [TagInput!]
+}
+
+input AlertUpdateStatusInput {
+  alertId: UUID!
+  status: AlertStatus!
+  comment: String
+}
+
+input IncidentCreateInput {
+  title: String!
+  summary: String
+  severity: IncidentSeverity!
+  alertIds: [UUID!]!
+  ownerUserId: UUID
+  tags: [TagInput!]
+}
+
+input IncidentAssignInput {
+  incidentId: UUID!
+  ownerUserId: UUID
+  responders: [UUID!]
+}
+
+input IndicatorCreateInput {
+  type: IndicatorType!
+  value: String!
+  description: String
+  confidence: Confidence! = MEDIUM
+  ttlHours: Int
+  tags: [TagInput!]
+}
+
+input DetectionRuleCreateInput {
+  name: String!
+  description: String
+  language: RuleLanguage!
+  query: String!
+  severity: Severity! = MEDIUM
+  tags: [TagInput!]
+}
+
+input DetectionRuleUpdateStatusInput {
+  ruleId: UUID!
+  status: RuleStatus!
+}
+
+input PlaybookCreateInput {
+  name: String!
+  description: String
+  version: String! = "1.0.0"
+  status: PlaybookStatus! = DRAFT
+  tags: [TagInput!]
+}
+
+input PlaybookRunStartInput {
+  playbookId: UUID!
+  targetIncidentId: UUID
+  targetAlertId: UUID
+  parameters: JSONObject
+}
+
+input CaseCreateInput {
+  title: String!
+  description: String
+  relatedIncidentIds: [UUID!]
+  ownerUserId: UUID
+  tags: [TagInput!]
+}
+
+input CommentAddInput {
+  incidentId: UUID!
+  text: String!
+}
+
+input TagEntityInput {
+  entityType: String!
+  entityId: UUID!
+  tags: [TagInput!]!
+}
+
+input EventsIngestInput {
+  """Raw event batch in NDJSON or vendor JSON format, Base64-encoded; size-limited by service policy."""
+  batch: Base64!
+  """Optional transport metadata (source, collector, parser hints)."""
+  metadata: JSONObject
+}
+
+type Mutation {
+  # Alerts
+  createAlert(input: AlertCreateInput!): Alert! @auth(requires: [RESPONDER, ANALYST, ADMIN])
+  updateAlertStatus(input: AlertUpdateStatusInput!): Alert! @auth(requires: [RESPONDER, ADMIN])
+  acknowledgeAlert(alertId: UUID!): Alert! @auth(requires: [RESPONDER, ANALYST, ADMIN])
+
+  # Incidents
+  createIncident(input: IncidentCreateInput!): Incident! @auth(requires: [RESPONDER, ADMIN])
+  assignIncident(input: IncidentAssignInput!): Incident! @auth(requires: [RESPONDER, ADMIN])
+  addIncidentComment(input: CommentAddInput!): Incident! @auth(requires: [RESPONDER, ANALYST, ADMIN])
+  linkAlertToIncident(incidentId: UUID!, alertId: UUID!): Incident! @auth(requires: [RESPONDER, ADMIN])
+
+  # IOCs
+  addIndicator(input: IndicatorCreateInput!): ThreatIntelIndicator! @auth(requires: [THREAT_HUNTER, RESPONDER, ADMIN])
+
+  # Rules
+  createDetectionRule(input: DetectionRuleCreateInput!): DetectionRule! @auth(requires: [ANALYST, ADMIN])
+  updateDetectionRuleStatus(input: DetectionRuleUpdateStatusInput!): DetectionRule! @auth(requires: [ANALYST, ADMIN])
+
+  # Playbooks
+  createPlaybook(input: PlaybookCreateInput!): Playbook! @auth(requires: [RESPONDER, ADMIN])
+  startPlaybookRun(input: PlaybookRunStartInput!): PlaybookRun! @auth(requires: [RESPONDER, ADMIN])
+  cancelPlaybookRun(runId: UUID!): PlaybookRun! @auth(requires: [RESPONDER, ADMIN])
+
+  # Cases
+  createCase(input: CaseCreateInput!): Case! @auth(requires: [RESPONDER, ANALYST, ADMIN])
+
+  # Events ingest
+  ingestEvents(input: EventsIngestInput!): Boolean! @auth(requires: [SERVICE, ADMIN])
+
+  # Tagging
+  tagEntity(input: TagEntityInput!): Boolean! @auth(requires: [RESPONDER, ANALYST, ADMIN])
+}
+
+/* =========================
+   Subscriptions
+   ========================= */
+
+type Subscription {
+  alertCreated(tenantId: UUID!): Alert! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  incidentUpdated(tenantId: UUID!, incidentId: UUID): Incident! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  eventIngested(tenantId: UUID!, filter: EventWhereInput): AnyEvent! @auth(requires: [READONLY, ANALYST, RESPONDER, ADMIN])
+  playbookRunStatus(tenantId: UUID!, runId: UUID!): PlaybookRun! @auth(requires: [RESPONDER, ADMIN])
+}

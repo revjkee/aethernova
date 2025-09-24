@@ -1,0 +1,224 @@
+# File: veilmind-core/.github/workflows/ci.yaml
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+  # Отдельно повышаем права только в job публикации
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  PYTHONUTF8: "1"
+  FORCE_COLOR: "1"
+  # Порог качества тестов
+  MIN_COVERAGE: "85"
+
+jobs:
+  lint:
+    name: Lint & Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install tools
+        run: |
+          python -m pip install -U pip wheel
+          pip install ruff==0.6.9 black==24.8.0 mypy==1.11.2 types-requests types-PyYAML
+          # Опциональные плагины mypy; игнор ошибки, если их нет в проекте
+          pip install "sqlalchemy[mypy]" pydantic mypy-extensions || true
+
+      - name: Ruff lint
+        run: |
+          ruff version
+          ruff check --output-format=github --exit-non-zero-on-fix .
+      - name: Black check
+        run: |
+          black --version
+          black --check .
+      - name: Mypy
+        run: |
+          mypy --version
+          mypy --config-file mypy.ini veilmind_core tests
+
+  test:
+    name: Tests py${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest ]
+        python: [ "3.10", "3.11", "3.12" ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip wheel
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          # Базовые тест‑зависимости
+          pip install pytest pytest-cov coverage[toml]
+
+      - name: Run tests
+        env:
+          PYTHONHASHSEED: "0"
+        run: |
+          pytest -q --maxfail=1 \
+                 --cov=veilmind_core --cov-report=term-missing:skip-covered --cov-report=xml \
+                 --durations=20
+      - name: Enforce coverage threshold
+        run: |
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          t=ET.parse("coverage.xml").getroot()
+          rate=float(t.get('line-rate', '0'))
+          pct=rate*100
+          req=float("${{ env.MIN_COVERAGE }}")
+          print(f"Coverage: {pct:.2f}% (required {req:.2f}%)")
+          sys.exit(0 if pct+1e-9>=req else 1)
+          PY
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-py${{ matrix.python }}
+          path: |
+            coverage.xml
+            .coverage
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload to Codecov (optional)
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install scanners
+        run: |
+          python -m pip install -U pip
+          pip install bandit safety
+      - name: Bandit SAST
+        run: |
+          bandit -q -r veilmind_core -c pyproject.toml || bandit -q -r veilmind_core
+      - name: Safety DB check
+        run: |
+          if [ -f requirements.txt ]; then
+            safety check -r requirements.txt --full-report || true
+          else
+            echo "requirements.txt not found, skipping Safety"
+          fi
+
+      - name: Trivy FS scan (optional)
+        if: ${{ secrets.TRIVY_GITHUB_TOKEN != '' }}
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          format: table
+          severity: CRITICAL,HIGH
+          github-pat: ${{ secrets.TRIVY_GITHUB_TOKEN }}
+
+  build:
+    name: Build & Validate dist
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ lint, test, security ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Build sdist & wheel
+        run: |
+          python -m pip install -U pip build twine
+          python -m build
+          twine check dist/*
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          retention-days: 14
+
+  publish:
+    name: Publish to TestPyPI/PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ build ]
+    permissions:
+      contents: read
+      id-token: write  # для OIDC‑аутентификации в PyPI
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to TestPyPI (optional)
+        if: ${{ vars.PUBLISH_TO_TESTPYPI == 'true' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+      - name: Publish to PyPI
+        if: ${{ vars.PUBLISH_TO_TESTPYPI != 'true' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

@@ -1,0 +1,156 @@
+version: "3.9"
+
+# ==============================================================================
+# cybersecurity-core / ops/docker / docker-compose.yaml
+# SOC-ядро: OpenSearch + Graylog + MongoDB
+# Требования:
+#   - Docker 24+ и Docker Compose V2+
+#   - Файл .env с секретами/параметрами (см. переменные ниже)
+# Безопасные дефолты: изоляция сетей, cap_drop=ALL, no-new-privileges,
+# рестарт-политики, ulimits, healthchecks, постоянные тома.
+# ==============================================================================
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-sec: &default-security
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: false  # может быть true для некоторых сервисов, но OpenSearch/Graylog пишут на диск
+
+x-common-ulimits: &default-ulimits
+  nofile:
+    soft: 65536
+    hard: 65536
+  memlock:
+    soft: -1
+    hard: -1
+
+networks:
+  secnet:
+    name: cybersecurity-secnet
+    driver: bridge
+  ingress:
+    name: cybersecurity-ingress
+    driver: bridge
+
+volumes:
+  opensearch-data:
+  mongo-data:
+  graylog-data:
+  graylog-journal:
+
+services:
+  opensearch:
+    image: "opensearchproject/opensearch:${OPENSEARCH_TAG:-2.13.0}"
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS:--Xms1g -Xmx1g}"
+      # В проде включите TLS/безопасность; для локальной разработки по умолчанию отключено:
+      - "plugins.security.disabled=${OPENSEARCH_SECURITY_DISABLED:-true}"
+      # Если безопасность включена (false), задайте пароль админа:
+      - "OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-admin}"
+    ulimits: *default-ulimits
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+      # Для TLS положите сертификаты и раскомментируйте ниже:
+      # - ./certs/opensearch/:/usr/share/opensearch/config/certs:ro
+    ports:
+      # Ограничиваем доступ к API OpenSearch только localhost по умолчанию
+      - "127.0.0.1:${OPENSEARCH_HTTP_PORT:-9200}:9200"
+    healthcheck:
+      # Если безопасность включена, добавьте -u admin:${OPENSEARCH_ADMIN_PASSWORD}
+      test: ["CMD-SHELL", "curl -k -s https://localhost:9200 || curl -s http://localhost:9200"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+    labels:
+      com.cybersecurity.role: "search"
+    restart: unless-stopped
+    networks:
+      - secnet
+    logging: *default-logging
+    <<: *default-security
+
+  mongodb:
+    image: "mongo:${MONGO_TAG:-6.0}"
+    container_name: mongodb
+    command:
+      - "--wiredTigerCacheSizeGB"
+      - "${MONGO_CACHE_GB:-1}"
+    environment:
+      - MONGO_INITDB_DATABASE=graylog
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep -q 1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+    labels:
+      com.cybersecurity.role: "metadata"
+    restart: unless-stopped
+    networks:
+      - secnet
+    logging: *default-logging
+    <<: *default-security
+
+  graylog:
+    image: "graylog/graylog:${GRAYLOG_TAG:-6.0}"
+    container_name: graylog
+    depends_on:
+      - mongodb
+      - opensearch
+    environment:
+      # ОБЯЗАТЕЛЬНО: сгенерируйте случайную строку 64+ символа для GRAYLOG_PASSWORD_SECRET
+      - GRAYLOG_PASSWORD_SECRET=${GRAYLOG_PASSWORD_SECRET:?set in .env}
+      # ОБЯЗАТЕЛЬНО: SHA256 от пароля администратора (например, echo -n StrongPass | sha256sum)
+      - GRAYLOG_ROOT_PASSWORD_SHA2=${GRAYLOG_ROOT_PASSWORD_SHA2:?set in .env}
+      # Укажите внешний URI UI Graylog (http/https). Для локали достаточно http://localhost:9000/
+      - GRAYLOG_HTTP_EXTERNAL_URI=${GRAYLOG_HTTP_EXTERNAL_URI:-http://localhost:9000/}
+      # Подключение к MongoDB
+      - GRAYLOG_MONGODB_URI=mongodb://mongodb:27017/graylog
+      # Подключение к OpenSearch
+      - GRAYLOG_ELASTICSEARCH_HOSTS=${GRAYLOG_ELASTICSEARCH_HOSTS:-http://opensearch:9200}
+      # Если в OpenSearch включена безопасность, задайте креды:
+      - GRAYLOG_ELASTICSEARCH_USERNAME=${GRAYLOG_ELASTICSEARCH_USERNAME:-admin}
+      - GRAYLOG_ELASTICSEARCH_PASSWORD=${GRAYLOG_ELASTICSEARCH_PASSWORD:-admin}
+      # Java heap для Graylog
+      - GRAYLOG_SERVER_JAVA_OPTS=${GRAYLOG_JAVA_OPTS:--Xms1g -Xmx1g}
+      # Журнал сообщений (диск) — ускоряет и страхует доставку
+      - GRAYLOG_MESSAGE_JOURNAL_ENABLED=true
+      - GRAYLOG_MESSAGE_JOURNAL_DIR=/usr/share/graylog/data/journal
+      # Включите (true) для приема Syslog на 1514/udp/tcp и GELF на 12201/udp
+      - GRAYLOG_ENABLE_INPUT_SYSLOG=${GRAYLOG_ENABLE_INPUT_SYSLOG:-true}
+      - GRAYLOG_ENABLE_INPUT_GELF=${GRAYLOG_ENABLE_INPUT_GELF:-true}
+    volumes:
+      - graylog-data:/usr/share/graylog/data
+      - graylog-journal:/usr/share/graylog/data/journal
+    ports:
+      # UI Graylog (локально по умолчанию)
+      - "127.0.0.1:${GRAYLOG_HTTP_PORT:-9000}:9000"
+      # Syslog inputs (если включены): udp/tcp
+      - "0.0.0.0:1514:1514/udp"
+      - "0.0.0.0:1514:1514/tcp"
+      # GELF UDP
+      - "0.0.0.0:12201:12201/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/api/system/lbstatus 2>/dev/null | grep -q ALIVE || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+    labels:
+      com.cybersecurity.role: "siem-ui"
+    restart: unless-stopped
+    networks:
+      - secnet
+      - ingress
+    logging: *default-logging
+    <<: *default-security

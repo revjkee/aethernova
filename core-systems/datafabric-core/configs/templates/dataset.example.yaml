@@ -1,0 +1,319 @@
+# DataFabric Core — Dataset Contract Template
+# Назначение: единообразное описание набора данных для продакшн-пайплайнов
+# Переопределяемые значения допускают синтаксис ${ENV_VAR:-default}
+
+apiVersion: datafabric/v1
+kind: Dataset
+metadata:
+  name: example.dataset # уникальное имя в домене
+  title: "Пример набора данных: заказы интернет-магазина"
+  domain: "commerce.orders"
+  description: "Транзакционный слой с заказами, статусами, клиентами и суммами."
+  owners:
+    product:
+      team: "commerce-platform"
+      email: "commerce-platform@example.com"
+    data:
+      team: "data-engineering"
+      email: "data-eng@example.com"
+    security:
+      team: "security-privacy-office"
+      email: "security@example.com"
+  tags:
+    - "pii:medium"
+    - "business-critical"
+    - "gold"
+  confidentiality: "internal" # public|internal|restricted
+  lifecycle: "active"         # draft|active|deprecated|sunset
+  # Версионирование контракта (не путать с версией данных)
+  contractVersion: 1
+
+spec:
+  # Где и в каком формате живут данные
+  storage:
+    format: "delta"   # delta|parquet|iceberg|hudi|csv|jsonl
+    compression: "zstd"
+    location:
+      # Используйте логические алиасы бакетов/префиксов из storage.yaml
+      bucketRef: "curated" # ссылка на логический бакет из конфигурации
+      path: "datasets/commerce/orders"
+      # Альтернативные представления (например, копии/материализации)
+      views:
+        - name: "by_customer"
+          path: "datasets/commerce/orders_by_customer"
+          format: "parquet"
+    catalog:
+      enabled: true
+      provider: "glue"    # glue|hive|unity|none
+      database: "df_curated"
+      table: "orders"
+    versioning:
+      enabled: true
+      # Для object storage форматов — журнал версий или снапшоты
+      retention_versions: 20
+
+  # Партиционирование и кластеризация
+  partitioning:
+    scheme: "time"     # time|id|none
+    time:
+      column: "order_ts"
+      granularity: "day" # hour|day|month
+      hive_style: true
+    clustering:
+      columns: ["customer_id"]
+      buckets: 32
+
+  # Политики жизненного цикла и архивации
+  lifecycle:
+    retention:
+      hot_days: 90
+      warm_days: 365
+      cold_archive_after_days: 730
+      hard_delete_after_days: null   # null = хранить бессрочно
+    vacuum:
+      enabled: true
+      interval_days: 7
+      keep_last_n: 10
+
+  # Источники и lineage
+  lineage:
+    sources:
+      - name: "orders_raw"
+        kind: "stream" # stream|batch|db|file
+        system: "kafka"
+        connectionRef: "kafka:commerce.orders.v1"
+      - name: "customers_dim"
+        kind: "batch"
+        system: "s3"
+        connectionRef: "s3:curated/customers"
+    transformations:
+      - "join orders_raw with customers_dim by customer_id"
+      - "cast monetary fields to decimal(18,2); enforce UTC for timestamps"
+
+  # Схема данных с правилами эволюции
+  schema:
+    evolution:
+      mode: "backward-compatible" # strict|backward-compatible|additive
+      require_migration_review: true
+    primary_key: ["order_id"]
+    unique_keys:
+      - ["order_id"]
+    foreign_keys:
+      - columns: ["customer_id"]
+        ref: "commerce.customers(customer_id)"
+    columns:
+      - name: order_id
+        type: string
+        nullable: false
+        description: "Идентификатор заказа (UUID/v7)"
+        constraints:
+          regex: "^[0-9a-fA-F-]{36}$"
+      - name: customer_id
+        type: string
+        nullable: false
+        description: "Идентификатор клиента"
+      - name: order_ts
+        type: timestamp
+        nullable: false
+        description: "Время создания заказа в UTC"
+        constraints:
+          not_in_future: true
+      - name: currency
+        type: string
+        nullable: false
+        description: "Код валюты ISO 4217"
+        constraints:
+          enum: ["USD","EUR","SEK"]
+      - name: amount_total
+        type: decimal(18,2)
+        nullable: false
+        description: "Сумма заказа"
+        constraints:
+          min: 0
+      - name: status
+        type: string
+        nullable: false
+        description: "Статус заказа"
+        constraints:
+          enum: ["created","paid","shipped","cancelled","refunded"]
+      - name: email
+        type: string
+        nullable: true
+        pii:
+          class: "contact"
+          policyRef: "pii-masking" # ссылается на policies/pii_masking.yaml
+        description: "Email клиента"
+      - name: phone_e164
+        type: string
+        nullable: true
+        pii:
+          class: "contact"
+          policyRef: "pii-masking"
+        description: "Телефон клиента в формате E.164"
+      - name: attributes
+        type: map<string,string>
+        nullable: true
+        description: "Дополнительные атрибуты"
+
+  # Контракт производителя-потребителя
+  contract:
+    producers:
+      - team: "commerce-platform"
+        contact: "commerce-platform@example.com"
+    consumers:
+      - team: "bi-analytics"
+        contact: "bi@example.com"
+        use_cases:
+          - "Построение витрин продаж"
+      - team: "fraud-detection"
+        contact: "fraud@example.com"
+        use_cases:
+          - "Фрод-скоринг на заказах"
+    guarantees:
+      # Гарантии семантики и дедупликации
+      idempotency_key: ["order_id"]
+      duplicate_tolerance_pct: 0.01
+      ordering:
+        by: "order_ts"
+        within_partition: true
+      nullability_policy: "schema-enforced" # reject|null|default
+
+  # Загрузка и инкрементальные правила
+  ingestion:
+    mode: "incremental" # full|incremental|cdc
+    watermark:
+      column: "order_ts"
+      lag_allowance_minutes: 10
+    cdc:
+      enabled: false
+      operation_column: "__op"     # I/U/D
+      ts_column: "__ts"
+    deduplication:
+      keys: ["order_id"]
+      strategy: "latest_by_ts"
+      ts_column: "order_ts"
+    expectations_on_read:
+      on_violation: "quarantine"   # fail|quarantine|log
+      quarantine_path: "datasets/quarantine/commerce/orders"
+
+  # Качество данных и валидаторы
+  quality:
+    # Пороговые SLI/SLO
+    slo:
+      freshness:
+        max_delay_minutes: 30
+      completeness:
+        required_columns_pct: 100
+      accuracy:
+        domain_rules_pass_rate_pct: 99.5
+    # Набор проверок (синтаксис, совместимый с Great Expectations/Folded Rules)
+    checks:
+      - id: "pk_not_null"
+        level: "error"
+        expr: "not_null(order_id)"
+      - id: "amount_non_negative"
+        level: "error"
+        expr: "amount_total >= 0"
+      - id: "currency_in_list"
+        level: "error"
+        expr: "currency in ['USD','EUR','SEK']"
+      - id: "status_enum"
+        level: "error"
+        expr: "status in ['created','paid','shipped','cancelled','refunded']"
+      - id: "email_format"
+        level: "warn"
+        expr: "match_regex(email, '^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$') or is_null(email)"
+    on_failure:
+      action: "block-publish"  # allow|warn|block-publish
+      notify:
+        - "data-eng@example.com"
+        - "commerce-platform@example.com"
+
+  # Безопасность, доступ и PII
+  security:
+    classification: "confidential" # public|internal|confidential|restricted
+    pii:
+      policyRef: "pii-masking"
+      columns:
+        - "email"
+        - "phone_e164"
+    access:
+      model: "rbac"
+      roles:
+        - role: "reader"
+          allow:
+            - "SELECT"
+        - role: "writer"
+          allow:
+            - "INSERT"
+            - "UPDATE"
+        - role: "admin"
+          allow: ["*"]
+      bindings:
+        - role: "reader"
+          subjects:
+            groups:
+              - "bi-analytics"
+        - role: "writer"
+          subjects:
+            groups:
+              - "commerce-platform"
+    row_level_security:
+      enabled: false
+    column_level_masking:
+      enabled: true
+      rules:
+        - column: "email"
+          policy: "mask_email"
+        - column: "phone_e164"
+          policy: "mask_phone"
+
+  # Операционные SLO/SLA и наблюдаемость
+  operations:
+    schedule: "cron(*/5 * * * *)"
+    sla:
+      availability_pct: 99.5
+      freshness_minutes: 30
+    monitoring:
+      metrics:
+        namespace: "df.datasets"
+        labels:
+          dataset: "commerce.orders"
+      alerts:
+        - name: "FreshnessBreach"
+          expr: "dataset_freshness_minutes{dataset='commerce.orders'} > 30"
+          severity: "warning"
+        - name: "QualityFailure"
+          expr: "dataset_quality_failures_total{dataset='commerce.orders'} > 0"
+          severity: "critical"
+    runbook_url: "https://runbooks.example.com/commerce/orders"
+    oncall:
+      rotation: "data-oncall"
+      contact: "oncall@example.com"
+
+  # Экспорт и API
+  exports:
+    - name: "orders_public_api"
+      format: "parquet"
+      path: "datasets/public/commerce/orders"
+      publish_mode: "append" # append|overwrite
+      publish_acl: "internal"
+      schedule: "cron(0 * * * *)"
+
+  # Управление изменениями
+  change_management:
+    review:
+      required: true
+      approvers:
+        - "data-architects@example.com"
+        - "security@example.com"
+    breaking_change_policy: "reject" # allow-with-migration|reject
+    migration_playbook_url: "https://confluence.example.com/data/migrations/orders"
+
+status:
+  # Не редактируется вручную: заполняется пайплайнами
+  created_at: null
+  updated_at: null
+  last_publish_ts: null
+  last_quality_pass_rate_pct: null
+  last_run_id: null

@@ -1,0 +1,327 @@
+# File: veilmind-core/configs/synthetic.yaml
+# Industrial-grade synthetic monitoring configuration
+# Совместим с собственным раннером и легко транслируется в Prometheus Blackbox Exporter.
+# Секреты подтягиваются из env (пример: ${API_TOKEN}, ${BASIC_AUTH}, ${MTLS_CERT_PATH}, ${MTLS_KEY_PATH})
+
+version: "1"
+
+global:
+  project: "veilmind-core"
+  environment: "${ENV:-prod}"
+  owner_team: "veilmind-core"
+  # Тайминги и ретраи по умолчанию
+  defaults:
+    frequency: "30s"           # период запуска одной проверки
+    timeout: "8s"              # общий таймаут проверки
+    jitter: "300ms"            # рандомизация запуска
+    dns_resolver: "1.1.1.1"
+    retries:
+      max_attempts: 2
+      backoff: "250ms"
+      strategy: "exponential"  # fixed|exponential
+    thresholds:
+      # Порог ошибочности за окно (для алертов/выполнения SLO)
+      error_rate:
+        window: "5m"
+        max: 0.01              # 1% ошибок
+      latency_ms:
+        p50: 120
+        p95: 300
+        p99: 1000
+    headers:
+      User-Agent: "VeilmindSynthetic/1.0"
+    labels:
+      service: "veilmind-core"
+      managed_by: "synthetic-runner"
+  # География проб; runner может параллелить по регионам
+  regions:
+    - id: "eu-north-1"
+      name: "Stockholm"
+    - id: "eu-central-1"
+      name: "Frankfurt"
+    - id: "us-east-1"
+      name: "N. Virginia"
+
+alerting:
+  # Метаданные для маршрутизации оповещений
+  severity_map:
+    critical:
+      pager: true
+      ticket: true
+    high:
+      pager: true
+    medium:
+      ticket: true
+    low:
+      ticket: false
+  annotations:
+    runbook_url: "https://runbooks.veilmind.local/synthetic"
+    dashboard_url: "https://grafana.veilmind.local/d/synth/overview"
+  escalation_policy: "primary-oncall"
+
+checks:
+  # --------------------------
+  # 1) HTTP: публичное API
+  # --------------------------
+  - name: "api.health"
+    type: "http"
+    frequency: "15s"
+    regions: ["eu-north-1","eu-central-1","us-east-1"]
+    request:
+      method: "GET"
+      url: "${API_BASE_URL:-https://api.veilmind.example.com}/health"
+      follow_redirects: false
+      timeout: "3s"
+      tls:
+        verify: true
+        min_version: "TLS1.2"
+      expect:
+        status_code: 200
+        body_substring: "ok"
+    thresholds:
+      latency_ms:
+        p95: 200
+        p99: 500
+    labels:
+      component: "api"
+      endpoint: "/health"
+    alerts:
+      severity: "critical"
+      conditions:
+        - type: "unavailable"
+          for: "2m"
+        - type: "latency_p95_exceeds"
+          value_ms: 200
+          for: "10m"
+
+  # Многостадийная проверка логина + защищённый эндпоинт
+  - name: "api.auth_flow"
+    type: "http"
+    frequency: "30s"
+    regions: ["eu-north-1","eu-central-1"]
+    steps:
+      - name: "login"
+        request:
+          method: "POST"
+          url: "${API_BASE_URL:-https://api.veilmind.example.com}/v1/login"
+          timeout: "5s"
+          headers:
+            Content-Type: "application/json"
+          body_json:
+            username: "${SYNTH_USER:-synthetic}"
+            password: "${SYNTH_PASS:-changeme}"
+          expect:
+            status_code: 200
+            jsonpath:
+              - path: "$.token"
+                exists: true
+        capture:
+          # Сохранить токен для следующих шагов
+          token: "$.token"
+      - name: "whoami"
+        request:
+          method: "GET"
+          url: "${API_BASE_URL:-https://api.veilmind.example.com}/v1/whoami"
+          timeout: "5s"
+          headers:
+            Authorization: "Bearer {{ token }}"
+          expect:
+            status_code: 200
+            jsonpath:
+              - path: "$.user"
+                equals: "${SYNTH_USER:-synthetic}"
+    thresholds:
+      latency_ms:
+        p95: 400
+    labels:
+      component: "api"
+      flow: "auth"
+    alerts:
+      severity: "high"
+      conditions:
+        - type: "step_failure"
+          step: "login"
+          for: "2m"
+        - type: "step_failure"
+          step: "whoami"
+          for: "2m"
+        - type: "error_budget_burn"
+          window: "30m"
+          multiple_of_slo: 6
+
+  # Проверка админского UI (TLS + заголовки безопасности)
+  - name: "admin.ui"
+    type: "http"
+    frequency: "1m"
+    regions: ["eu-north-1"]
+    request:
+      method: "GET"
+      url: "${ADMIN_BASE_URL:-https://admin.veilmind.example.com}/"
+      timeout: "6s"
+      tls:
+        verify: true
+      expect:
+        status_code: 200
+        headers_present:
+          - "content-security-policy"
+          - "strict-transport-security"
+          - "x-content-type-options"
+    labels:
+      component: "admin-ui"
+    alerts:
+      severity: "medium"
+      conditions:
+        - type: "header_missing"
+          header: "strict-transport-security"
+          for: "10m"
+
+  # --------------------------
+  # 2) TLS: валидность и сроки
+  # --------------------------
+  - name: "tls.cert_expiry.api"
+    type: "tls_cert"
+    frequency: "6h"
+    regions: ["eu-north-1"]
+    target: "api.veilmind.example.com:443"
+    thresholds:
+      not_after_days_warning: 21
+      not_after_days_critical: 7
+    labels:
+      component: "api"
+    alerts:
+      severity: "medium"
+      conditions:
+        - type: "tls_expiry_lt_days"
+          days: 21
+
+  # --------------------------
+  # 3) TCP доступность инфраструктуры
+  # --------------------------
+  - name: "tcp.postgres"
+    type: "tcp"
+    frequency: "30s"
+    regions: ["eu-north-1"]
+    target: "${PG_HOST:-db.veilmind.internal}:5432"
+    timeout: "2s"
+    labels:
+      component: "postgres"
+    alerts:
+      severity: "high"
+      conditions:
+        - type: "unavailable"
+          for: "2m"
+
+  - name: "tcp.redis"
+    type: "tcp"
+    frequency: "30s"
+    regions: ["eu-north-1"]
+    target: "${REDIS_HOST:-cache.veilmind.internal}:6379"
+    timeout: "2s"
+    labels:
+      component: "redis"
+    alerts:
+      severity: "high"
+      conditions:
+        - type: "unavailable"
+          for: "2m"
+
+  # --------------------------
+  # 4) DNS и ICMP
+  # --------------------------
+  - name: "dns.resolve_api"
+    type: "dns"
+    frequency: "1m"
+    query:
+      name: "api.veilmind.example.com"
+      type: "A"
+      server: "${DNS_SERVER:-8.8.8.8}"
+      timeout: "2s"
+    expect:
+      answers_min: 1
+    labels:
+      component: "dns"
+    alerts:
+      severity: "medium"
+      conditions:
+        - type: "dns_no_answers"
+          for: "5m"
+
+  - name: "icmp.edge"
+    type: "icmp"
+    frequency: "30s"
+    regions: ["eu-north-1","eu-central-1"]
+    target: "${EDGE_LB:-lb.veilmind.example.com}"
+    timeout: "1.5s"
+    thresholds:
+      latency_ms:
+        p95: 120
+        p99: 250
+    labels:
+      component: "edge"
+    alerts:
+      severity: "low"
+      conditions:
+        - type: "latency_p95_exceeds"
+          value_ms: 120
+          for: "15m"
+
+  # --------------------------
+  # 5) МТLS к внутреннему API (опционально)
+  # --------------------------
+  - name: "api.internal.mt l s"
+    type: "http"
+    enabled: ${ENABLE_INTERNAL_MTLS:-false}
+    frequency: "30s"
+    regions: ["eu-central-1"]
+    request:
+      method: "GET"
+      url: "https://internal.veilmind.svc.cluster.local:8443/health"
+      timeout: "4s"
+      tls:
+        verify: true
+        client_cert: "${MTLS_CERT_PATH:-/var/run/synth/certs/client.crt}"
+        client_key:  "${MTLS_KEY_PATH:-/var/run/synth/certs/client.key}"
+        min_version: "TLS1.2"
+      expect:
+        status_code: 200
+        body_substring: "ok"
+    labels:
+      component: "internal-api"
+    alerts:
+      severity: "high"
+      conditions:
+        - type: "unavailable"
+          for: "2m"
+
+export:
+  # Подсказки для экспорта в Prometheus/Blackbox
+  prometheus_blackbox:
+    modules:
+      http_2xx:
+        prober: http
+        timeout: 8s
+        http:
+          preferred_ip_protocol: "ip4"
+          valid_http_versions: ["HTTP/1.1","HTTP/2.0"]
+          fail_if_not_ssl: false
+      tcp_connect:
+        prober: tcp
+        timeout: 3s
+      icmp:
+        prober: icmp
+        timeout: 2s
+      tls_connect:
+        prober: tcp
+        timeout: 5s
+    labels:
+      job: "synthetic"
+    relabeling_hints:
+      # Пример ключевых label’ов, которые стоит сохранять
+      keep: ["check_name","region","component","environment","owner_team"]
+
+audit:
+  # Управление хранением результатов проб раннером
+  retention: "14d"
+  store_body: false
+  store_headers: true
+  pii_redaction: true

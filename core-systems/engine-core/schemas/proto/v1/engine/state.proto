@@ -1,0 +1,431 @@
+// SPDX-License-Identifier: Apache-2.0
+// engine-core/schemas/proto/v1/engine/state.proto
+//
+// Универсальный API и типы для управления состоянием ресурсов (Key-Document Store):
+//  - Модель документа с версионированием (seq/hash/etag) и TTL/retention
+//  - Гарантии чтения: LINEARIZABLE / SEQUENTIAL / BOUNDED_STALE
+//  - Предикаты CAS/IF-MATCH, preconditions по версии/ревизии/лизе
+//  - Разрешение конфликтов: LAST_WRITE_WINS / CRDT_MERGE / REJECT_ON_CONFLICT
+//  - Патчи: RFC6902 (JSON Patch) / RFC7386 (Merge Patch)
+//  - CRDT: LWW-Register, G/PN-Counter, OR-Set (минимальный набор)
+//  - Снапшоты для Event Sourcing + компакция
+//  - Watch/листинг с курсорами и ревизиями
+//
+// Требует: common.proto, error.proto
+
+syntax = "proto3";
+
+package engine.v1.engine;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "engine-core/schemas/proto/v1/common.proto";
+import "engine-core/schemas/proto/v1/error.proto";
+
+option go_package          = "github.com/yourorg/engine-core/gen/proto/engine/v1/engine;enginev1";
+option java_package        = "com.yourorg.engine.v1.engine";
+option java_multiple_files = true;
+option csharp_namespace    = "YourOrg.Engine.V1.Engine";
+option objc_class_prefix   = "ENG";
+option php_namespace       = "YourOrg\\Engine\\V1\\Engine";
+
+// -----------------------------
+// Справочные перечисления
+// -----------------------------
+
+// Гарантии согласованности чтения.
+enum ReadConsistency {
+  READ_CONSISTENCY_UNSPECIFIED = 0;
+  LINEARIZABLE = 1;    // чтение через лидера/кворум, сильная консистентность
+  SEQUENTIAL = 2;      // монотоничное чтение в рамках клиента/сессии
+  BOUNDED_STALE = 3;   // допускается устаревание в пределах staleness_window
+}
+
+// Стратегии разрешения конфликтов при записи.
+enum ConflictResolution {
+  CONFLICT_RESOLUTION_UNSPECIFIED = 0;
+  LAST_WRITE_WINS = 1;   // последний выиграл (по серверным меткам времени/ревизии)
+  CRDT_MERGE = 2;        // прикладной merge CRDT полей
+  REJECT_ON_CONFLICT = 3;// отклонять при расхождении версий
+}
+
+// Поддерживаемые типы патчей.
+enum PatchType {
+  PATCH_TYPE_UNSPECIFIED = 0;
+  JSON_PATCH_RFC6902 = 1;  // список операций op/path/value
+  JSON_MERGE_RFC7386 = 2;  // merge-патч
+}
+
+// Жизненный цикл документа.
+enum LifecycleStatus {
+  LIFECYCLE_STATUS_UNSPECIFIED = 0;
+  ACTIVE = 1;
+  SOFT_DELETED = 2;
+  TOMBSTONE = 3;          // окончательно удален, оставлена «могила» до retention
+}
+
+// Режим наблюдения (Watch).
+enum WatchMode {
+  WATCH_MODE_UNSPECIFIED = 0;
+  CHANGES_ONLY = 1;   // только изменения
+  SNAPSHOT_AND_CHANGES = 2; // первичный снапшот + изменения с ревизии
+}
+
+// -----------------------------
+// Ключ, версия, документ
+// -----------------------------
+
+// Ключ состояния: ссылка на ресурс + пространство имен.
+message StateKey {
+  // Семантический тип ресурса, например "engine.user", "engine.order"
+  string type = 1;
+  // Идентификатор ресурса (UUID/ULID/внешний)
+  engine.v1.common.Id id = 2;
+  // Пространство/неймспейс (опционально для мультиарендности/разделения)
+  string namespace = 3; // напр., tenant/org
+  reserved 4 to 10;
+}
+
+// Версия документа. Используется для CAS/IF-MATCH.
+message Version {
+  uint64 seq = 1;                    // монотонично растущая ревизия
+  bytes hash = 2;                    // контент-хеш (например, sha256)
+  string etag = 3;                   // HTTP-совместимый ETag
+  google.protobuf.Timestamp updated_at = 4;
+  reserved 5 to 10;
+}
+
+// Содержимое/метаданные документа.
+message DocumentState {
+  StateKey key = 1;
+  // Тип контента и полезная нагрузка; сервер не навязывает схему,
+  // но может валидировать согласно schema_id/schema_rev.
+  string content_type = 2;           // "application/json", "application/x-protobuf"
+  bytes data = 3;                    // raw bytes (несжатые); компрессия — на транспортном уровне
+
+  // Технические поля
+  Version version = 4;
+  LifecycleStatus lifecycle = 5;
+  map<string, string> attributes = 6; // до 8KB метаданных
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp expires_at = 8;  // TTL => сервер может удалить по истечении
+  // Контроль целостности полезной нагрузки (дополнительно к version.hash)
+  bytes checksum = 9;                 // например sha256
+  string checksum_alg = 10;           // "sha256", "xxhash64"
+
+  // Привязка к схеме/ревизии (если используется реестр схем)
+  string schema_id = 11;
+  uint32 schema_rev = 12;
+
+  // Происхождение (для lineage)
+  engine.v1.common.ResourceRef source = 13;
+
+  reserved 14 to 20;
+}
+
+// -----------------------------
+// CRDT (минимальный набор)
+// -----------------------------
+
+message LwwRegister {
+  bytes value = 1;
+  google.protobuf.Timestamp timestamp = 2; // серверный ts для сравнения
+}
+
+message GCounter {
+  // Счетчики по репликам; сервер агрегирует сумму.
+  map<string, uint64> replicas = 1;
+}
+
+message PnCounter {
+  map<string, int64> replicas = 1;  // допускает отрицательные дельты
+}
+
+message ORSet {
+  // Элементы представлены парами (id, tag); remove снимает конкретные теги.
+  message Element {
+    bytes value = 1;
+    repeated bytes tags = 2; // уникальные теги вставок
+  }
+  repeated Element elements = 1;
+}
+
+// Объединенная CRDT-полезная нагрузка (при выборе CRDT_MERGE).
+message CrdtPayload {
+  oneof kind {
+    LwwRegister lww = 1;
+    GCounter gcounter = 2;
+    PnCounter pncounter = 3;
+    ORSet orset = 4;
+  }
+  reserved 5 to 10;
+}
+
+// -----------------------------
+// Патчи и предикаты
+// -----------------------------
+
+// Операция JSON Patch (RFC6902).
+message JsonPatchOp {
+  string op = 1;     // add | remove | replace | move | copy | test
+  string path = 2;   // JSON Pointer
+  string from = 3;   // для move/copy
+  google.protobuf.Any value = 4; // значение (add/replace/test)
+}
+
+// Merge Patch (RFC7386): просто заменяемые фрагменты.
+message JsonMergePatch {
+  bytes document = 1; // JSON с фрагментом (raw)
+}
+
+// Предикаты записи (CAS/IF-MATCH).
+message Preconditions {
+  // Все указанные предикаты должны быть истинны.
+  string if_match_etag = 1;
+  uint64 if_seq_at_least = 2;
+  bytes if_hash_equals = 3;
+  // Требование активной лизы (если используется распределенная блокировка).
+  string require_lease_id = 4;
+  reserved 5 to 10;
+}
+
+// -----------------------------
+// Запросы/ответы
+// -----------------------------
+
+message GetStateRequest {
+  StateKey key = 1;
+  ReadConsistency consistency = 2;
+  // Для BOUNDED_STALE сервер может отдавать реплику не старше окна.
+  google.protobuf.Duration staleness_window = 3;
+  // Проекция (опционально): путь JSON Pointer для частичного чтения body.
+  repeated string projection_paths = 4;
+}
+
+message GetStateResponse {
+  DocumentState doc = 1;
+}
+
+message PutStateRequest {
+  DocumentState doc = 1;                 // ключ, content_type, data, schema*, attrs
+  Preconditions preconditions = 2;       // CAS/IF-MATCH
+  ConflictResolution conflict_resolution = 3;
+  // TTL/retention: если expires_at пуст, TTL берется из default политики сервера
+  google.protobuf.Duration ttl = 4;
+  // CRDT-путь: если заполнен, сервер выполнит merge по CRDT (doc.data интерпретируется согласно CrdtPayload)
+  CrdtPayload crdt = 5;
+  // Идемпотентность: ключ запроса (хранится ограниченное время)
+  string idempotency_key = 6;
+}
+
+message PutStateResponse {
+  DocumentState doc = 1;                 // итоговая версия после применения
+}
+
+message PatchStateRequest {
+  StateKey key = 1;
+  PatchType type = 2;
+  repeated JsonPatchOp json_patch = 3;   // при JSON_PATCH_RFC6902
+  JsonMergePatch merge_patch = 4;        // при JSON_MERGE_RFC7386
+  Preconditions preconditions = 5;
+  ConflictResolution conflict_resolution = 6;
+  string idempotency_key = 7;
+}
+
+message PatchStateResponse {
+  DocumentState doc = 1;
+}
+
+message DeleteStateRequest {
+  StateKey key = 1;
+  // SOFT_DELETED по умолчанию; для tombstone=true — немедленная «могила» до retention.
+  bool tombstone = 2;
+  Preconditions preconditions = 3;
+}
+
+message DeleteStateResponse {
+  DocumentState doc = 1; // финальный статус (SOFT_DELETED/TOMBSTONE)
+}
+
+// Листинг с курсором.
+message ListStateRequest {
+  // Фильтры
+  string type = 1;                         // resource type
+  string namespace = 2;
+  LifecycleStatus lifecycle = 3;           // фильтр по статусу
+  // Пагинация
+  string cursor = 4;                       // opaque
+  uint32 page_size = 5;                    // 1..1000
+  // Сортировка
+  string order_by = 6;                     // "version.seq", "created_at"
+  engine.v1.common.SortDirection direction = 7;
+  // Префиксный поиск по id/атрибутам может быть реализован сервером (best-effort)
+  map<string, string> attr_equals = 8;
+}
+
+message ListStateResponse {
+  repeated DocumentState docs = 1;
+  string next_cursor = 2;
+}
+
+// Лизы/блокировки для эксклюзивных операций.
+message Lease {
+  string lease_id = 1;
+  StateKey key = 2;
+  google.protobuf.Timestamp acquired_at = 3;
+  google.protobuf.Duration ttl = 4;
+  reserved 5 to 10;
+}
+
+message AcquireLeaseRequest {
+  StateKey key = 1;
+  google.protobuf.Duration ttl = 2;           // 5..600s
+  // Опционально: CAS по текущей версии перед выдачей лизы
+  Preconditions preconditions = 3;
+}
+
+message AcquireLeaseResponse {
+  Lease lease = 1;
+}
+
+message RenewLeaseRequest {
+  string lease_id = 1;
+  google.protobuf.Duration ttl = 2;
+}
+
+message RenewLeaseResponse {
+  Lease lease = 1;
+}
+
+message ReleaseLeaseRequest {
+  string lease_id = 1;
+}
+
+message ReleaseLeaseResponse {}
+
+// Watch изменений.
+message WatchRequest {
+  // Фильтрация ключей: namespace/type, либо конкретный ключ
+  string namespace = 1;
+  string type = 2;
+  StateKey key = 3;
+  // Начальная ревизия (seq); 0 => от текущей
+  uint64 from_seq = 4;
+  WatchMode mode = 5;
+}
+
+message ChangeEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    UPSERT = 1;
+    DELETE = 2;
+    TOMBSTONE = 3;
+  }
+  Kind kind = 1;
+  DocumentState doc = 2;
+  // Причина/ошибка (например, конфликт слияния) — опционально
+  engine.v1.error.Error error = 3;
+}
+
+message WatchResponse {
+  // При SNAPSHOT_AND_CHANGES сервер сначала отдаёт снимок (zero or more),
+  // затем — поток изменений.
+  oneof kind {
+    DocumentState snapshot = 1;
+    ChangeEvent change = 2;
+    Heartbeat heartbeat = 3;
+  }
+}
+
+message Heartbeat {
+  uint64 current_seq = 1;
+  google.protobuf.Timestamp now = 2;
+}
+
+// Снапшоты для event-sourcing и компакции.
+message Snapshot {
+  StateKey key = 1;
+  DocumentState doc = 2;                // материализованное состояние
+  uint64 from_event_seq = 3;            // от какой ревизии построен
+  uint64 to_event_seq = 4;              // по какую ревизию включительно
+  google.protobuf.Timestamp created_at = 5;
+  reserved 6 to 10;
+}
+
+message CreateSnapshotRequest {
+  StateKey key = 1;
+  Preconditions preconditions = 2;      // опционально: зафиксировать версию
+}
+
+message CreateSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message GetSnapshotRequest {
+  StateKey key = 1;
+}
+
+message GetSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+// -----------------------------
+// Сервис
+// -----------------------------
+
+service StateService {
+  rpc GetState(GetStateRequest) returns (GetStateResponse);
+  rpc PutState(PutStateRequest) returns (PutStateResponse);
+  rpc PatchState(PatchStateRequest) returns (PatchStateResponse);
+  rpc DeleteState(DeleteStateRequest) returns (DeleteStateResponse);
+
+  rpc ListState(ListStateRequest) returns (ListStateResponse);
+
+  rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
+
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+}
+
+// -----------------------------
+// Контракты/инварианты (для реализации)
+// -----------------------------
+//
+// 1) Версионирование:
+//    - version.seq монотонично растет при каждом успешном изменении (Put/Patch/Delete).
+//    - version.hash и etag отражают bytes(data) + content_type + ключевые метаданные.
+//    - Клиент для CAS использует Preconditions: if_match_etag / if_seq_at_least / if_hash_equals.
+//
+// 2) Конфликты:
+//    - REJECT_ON_CONFLICT => сервер возвращает error.CONFLICT с текущей версией в details.
+//    - LAST_WRITE_WINS => сервер сравнивает server-side updated_at/seq и применяет последнее изменение.
+//    - CRDT_MERGE => если заполнен Put.crdt, выполняется merge по указанному типу.
+//
+// 3) Патчи:
+//    - JSON_PATCH_RFC6902: операции применяются к JSON-документу (content_type=application/json).
+//    - JSON_MERGE_RFC7386: сервер выполняет merge согласно RFC 7386.
+//    - При несоответствии content_type сервер возвращает INVALID_ARGUMENT.
+//
+// 4) TTL/retention:
+//    - Если expires_at в будущем — документ должен быть удален сервером не раньше этого времени.
+//    - TOMBSTONE хранится до периода ретенции (политика сервера) для предотвращения «воскрешения».
+//
+// 5) ReadConsistency:
+//    - LINEARIZABLE читает через лидера/кворум; SEQUENTIAL обеспечивает монотонию для клиента;
+//      BOUNDED_STALE допускает устаревание не старше staleness_window.
+//
+// 6) Watch:
+//    - При разрыве клиента рекомендуется возобновлять с последней полученной seq.
+//    - Heartbeat отправляется периодически для поддержания соединения.
+//
+// 7) Идемпотентность:
+//    - idempotency_key стабилизирует ответ Put/Patch в пределах retention ключей (напр., 24 часа).
+//
+// 8) Совместимость:
+//    - Поля помеченные reserved не переиспользовать.
+//    - Клиент обязан игнорировать незнакомые поля и варианты oneof.

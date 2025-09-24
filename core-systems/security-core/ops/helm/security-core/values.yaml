@@ -1,0 +1,309 @@
+# =============================================================================
+# Aethernova / core-systems/security-core
+# Helm values — промышленный профиль безопасности (Zero-Trust baseline)
+# Путь: core-systems/security-core/ops/helm/security-core/values.yaml
+# =============================================================================
+
+global:
+  namespace: "security-core"
+  imagePullSecrets: []        # например: ["regcred"]
+  priorityClassName: "system-cluster-critical"
+
+  # Единые метки/аннотации для всех объектов чарта
+  labels:
+    app.kubernetes.io/part-of: security-core
+    security.aethernova.io/profile: baseline
+  annotations: {}
+
+  # Общие пресеты ресурсов
+  resourcesPreset: "medium"
+  resourcesPresets:
+    tiny:
+      requests: { cpu: "25m",  memory: "32Mi" }
+      limits:   { cpu: "100m", memory: "128Mi" }
+    small:
+      requests: { cpu: "50m",  memory: "64Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }
+    medium:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits:   { cpu: "400m", memory: "512Mi" }
+    large:
+      requests: { cpu: "200m", memory: "256Mi" }
+      limits:   { cpu: "1",    memory: "1Gi" }
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  # Безопасные дефолтные контексты
+  podSecurityContext:
+    fsGroup: 65532
+    runAsUser: 65532
+    runAsGroup: 65532
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContextDefault:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+
+# Профиль кластера и совместимость
+profile:
+  level: "restricted"     # baseline | restricted
+  provider: "auto"        # auto | eks | gke | aks | k3s | kind | onprem
+  cni: "auto"             # auto | calico | cilium | antrea | weave
+
+# Сервис‑аккаунт и RBAC
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+  # Доп. роли/биндинги для модулей (если требуются)
+  extraClusterRoles: []
+  extraClusterRoleBindings: []
+
+# -----------------------------------------------------------------------------
+# Сетевые политики (NetworkPolicy)
+# -----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  policyMode: "enforce"   # enforce | audit (если CNI поддерживает)
+  defaultDeny: true
+
+  # Разрешение только DNS‑egress из namespace к CoreDNS (TCP/UDP 53)
+  allowDnsEgress:
+    enabled: true
+    namespace: "kube-system"
+    podLabelsAnyOf:
+      - k8s-app: "kube-dns"
+      - k8s-app: "coredns"
+    ports:
+      - protocol: UDP
+        port: 53
+      - protocol: TCP
+        port: 53
+
+  # Дополнительные egress‑правила (минимум по умолчанию)
+  additionalEgress: []
+  # Пример:
+  # - name: allow-egress-https
+  #   toCIDRs: ["0.0.0.0/0"]
+  #   ports:
+  #     - protocol: TCP
+  #       port: 443
+
+  # Дополнительные ingress‑правила
+  additionalIngress: []
+  # Пример:
+  # - name: allow-ingress-from-ingress-nginx
+  #   fromNamespaces: ["ingress-nginx"]
+  #   fromPodSelector:
+  #     matchLabels:
+  #       app.kubernetes.io/name: ingress-nginx
+  #   ports:
+  #     - protocol: TCP
+  #       port: 8080
+
+  excludePodsByLabels: {}
+  # Пример: {"security.aethernova.io/np-exempt": "true"}
+
+# -----------------------------------------------------------------------------
+# Pod Security Standards (замена PSP) — установка namespace‑меток и/или политик
+# -----------------------------------------------------------------------------
+podSecurity:
+  addNamespaceLabels: true
+  enforce: true
+  labels:
+    pod-security.kubernetes.io/enforce: "restricted"
+    pod-security.kubernetes.io/enforce-version: "latest"
+    pod-security.kubernetes.io/audit: "restricted"
+    pod-security.kubernetes.io/warn: "restricted"
+
+# -----------------------------------------------------------------------------
+# Kyverno — admission политики (рекомендуется по умолчанию)
+# -----------------------------------------------------------------------------
+kyverno:
+  enabled: true
+  namespace: "kyverno"
+  helmReleaseName: "kyverno"
+  replicaCount: 2
+  resourcesPreset: "small"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  # Политики безопасности (включаемые правила)
+  policies:
+    disallowPrivileged:              { enabled: true }
+    disallowHostPID:                 { enabled: true }
+    disallowHostIPC:                 { enabled: true }
+    disallowHostNetwork:             { enabled: true }
+    disallowHostPath:                { enabled: true }
+    disallowUnsafeSysctls:           { enabled: true }
+    restrictHostPorts:               { enabled: true, allowed: [] }
+    restrictVolumeTypes:             { enabled: true, denyTypes: ["hostPath","nfs","cifs","glusterfs"] }
+    blockPrivilegeEscalation:        { enabled: true }
+    dropAllCapabilities:             { enabled: true, allowList: ["NET_BIND_SERVICE"] }
+    requireRunAsNonRoot:             { enabled: true }
+    requireReadOnlyRootFilesystem:   { enabled: true }
+    requireSeccomp:                  { enabled: true, defaultProfile: "RuntimeDefault" }
+    requireAppArmor:                 { enabled: true, defaultProfile: "runtime/default" }
+    requireProbes:                   { enabled: true }   # liveness/readiness/startup
+    disallowLatestTag:               { enabled: true }
+    limitImageRegistries:
+      enabled: false
+      allowList: ["registry.k8s.io", "ghcr.io", "gcr.io"]
+    verifyImages:
+      enabled: false
+      # Настроить ключи/attestors при включении
+      attestors: []
+      # Пример:
+      # - name: cosign-key
+      #   keyRef:
+      #     kind: Secret
+      #     name: cosign-pubkey
+      #     namespace: security-core
+
+# -----------------------------------------------------------------------------
+# Gatekeeper (OPA) — альтернативный движок политик (выключен по умолчанию)
+# -----------------------------------------------------------------------------
+gatekeeper:
+  enabled: false
+  namespace: "gatekeeper-system"
+  constraints: []
+  # Пример:
+  # - kind: K8sPSPPrivilegedContainer
+  #   parameters: {}
+
+# -----------------------------------------------------------------------------
+# Runtime Threat Detection — Falco (eBPF)
+# -----------------------------------------------------------------------------
+falco:
+  enabled: true
+  namespace: "falco"
+  driver:
+    kind: "ebpf"    # ebpf | modern_ebpf | kernel_module
+  rules:
+    base: "stable"  # stable | latest
+    custom: []      # список ConfigMap с кастомными правилами
+  outputs:
+    stdout: true
+    webhook:
+      enabled: false
+      url: ""
+      headers: {}
+    loki:
+      enabled: false
+      url: ""
+      labels: {}
+  resourcesPreset: "small"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# -----------------------------------------------------------------------------
+# Vulnerability & Config scan — Trivy
+# -----------------------------------------------------------------------------
+trivy:
+  enabled: true
+  namespace: "trivy-system"
+  mode: "daemonset"      # daemonset | cronjob
+  schedule: "0 */6 * * *"   # если mode=cronjob
+  severity: "CRITICAL,HIGH"
+  ignoreUnfixed: true
+  securityChecks: "vuln,secret,config"
+  resourcesPreset: "small"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# -----------------------------------------------------------------------------
+# CIS Benchmark — kube-bench
+# -----------------------------------------------------------------------------
+kubeBench:
+  enabled: true
+  namespace: "kube-bench"
+  schedule: "0 2 * * *"
+  benchmark: "cis-1.8"
+  resourcesPreset: "tiny"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# -----------------------------------------------------------------------------
+# Kubernetes API Audit (требует контроль над апи-сервером; выключено по умолчанию)
+# -----------------------------------------------------------------------------
+audit:
+  enabled: false
+  policyConfigMap:
+    create: true
+    name: "security-core-audit-policy"
+    data: |
+      apiVersion: audit.k8s.io/v1
+      kind: Policy
+      rules:
+        - level: Metadata
+  shipping:
+    fluentBit:
+      enabled: false
+      outputs: []
+      # Пример:
+      # - type: loki
+      #   url: http://loki.loki:3100
+      #   labels: { job: "k8s-audit" }
+
+# -----------------------------------------------------------------------------
+# Управление секретами (опционально: External Secrets)
+# -----------------------------------------------------------------------------
+externalSecrets:
+  enabled: false
+  namespace: "security-core"
+  secretStoreRef:
+    kind: ""
+    name: ""
+
+# -----------------------------------------------------------------------------
+# Политика образов/реестры
+# -----------------------------------------------------------------------------
+images:
+  pullPolicy: "IfNotPresent"
+
+  # Рекомендовано закреплять digest (sha256). Значения ниже — плейсхолдеры.
+  kyverno: "ghcr.io/kyverno/kyverno:latest"
+  falco: "falco/falco:latest"
+  trivy: "aquasec/trivy:latest"
+  kubeBench: "aquasec/kube-bench:latest"
+  busybox: "busybox:1.36.1"
+
+# -----------------------------------------------------------------------------
+# Телеметрия/алерты (опционально)
+# -----------------------------------------------------------------------------
+alerts:
+  enabled: false
+  routes: []
+  # Пример:
+  # - name: falco-critical
+  #   match:
+  #     severity: "critical"
+  #   webhook: "https://hooks.example"
+
+telemetry:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# Тесты политики (smoke)
+# -----------------------------------------------------------------------------
+tests:
+  enabled: true
+  networkPolicy:
+    connectivityProbe:
+      enabled: true
+      allowDnsResolution: true
+  kyverno:
+    dryRun: true

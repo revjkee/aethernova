@@ -1,0 +1,166 @@
+# =============================================================================
+# Aethernova / security-core
+# File: core-systems/security-core/configs/policies/mfa.yaml
+# Purpose: Промышленная MFA-политика (RBAC + входные точки)
+# Requires: Kyverno >= 1.9 (foreach), установленный в кластере
+# =============================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mfa-allowed-groups
+  namespace: security-core
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/part-of: security-core
+    security.aethernova.io/profile: prod
+data:
+  # ключ = имя группы в IdP (OIDC/SAML/LDAP), значение "true" означает,
+  # что для этой группы в IdP принудительно включена MFA (правило на стороне IdP).
+  # Примеры (замените на свои):
+  "company:k8s:admins:mfa": "true"
+  "company:k8s:devops:mfa": "true"
+  "company:k8s:readers:mfa": "true"
+
+---
+# -----------------------------------------------------------------------------
+# Kyverno ClusterPolicy: RBAC только для MFA-групп. Запрещает:
+# - любые биндинги на kind: User (индивидуальные учётки),
+# - биндинги на kind: Group, если группа НЕ в белом списке mfa-allowed-groups,
+# - биндинги на kind: ServiceAccount — опционально блокируются (оставим allow).
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: rbac-mfa-enforce
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/part-of: security-core
+    security.aethernova.io/rule: rbac-mfa
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: deny-non-mfa-rbac
+      match:
+        any:
+          - resources:
+              kinds:
+                - RoleBinding
+                - ClusterRoleBinding
+      context:
+        - name: mfaGroups
+          configMap:
+            name: mfa-allowed-groups
+            namespace: security-core
+      # Для каждого субъекта биндинга валидируем требования.
+      foreach:
+        - list: "request.object.subjects"
+          deny:
+            conditions:
+              any:
+                # 1) Полный запрет kind: User — только группы с MFA!
+                - key: "{{ element.kind }}"
+                  operator: Equals
+                  value: "User"
+
+                # 2) kind: Group — имя группы должно быть в mfa-allowed-groups (value == 'true')
+                - key: "{{ element.kind == 'Group' && (mfaGroups.data[element.name] || '') != 'true' }}"
+                  operator: Equals
+                  value: true
+
+                # 3) (Опционально) запрет биндингов на ServiceAccount:
+                #   раскомментируйте, если хотите запретить прямые SA в RBAC
+                # - key: "{{ element.kind }}"
+                #   operator: Equals
+                #   value: "ServiceAccount"
+
+---
+# -----------------------------------------------------------------------------
+# Kyverno ClusterPolicy: Входные точки должны декларировать внешнюю OIDC+MFA
+# Требует:
+# - метку security.aethernova.io/mfa=required
+# - для Ingress (nginx): обязательные аннотации auth-url / auth-signin
+# - для Gateway API HTTPRoute: аннотацию об обязательной аутентификации
+# Примечание: сама MFA реализуется вне кластера (IdP / oauth2-proxy / envoy extAuthz).
+# Политика гарантирует наличие декларативных требований в ingress/route.
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ingress-mfa-required
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/part-of: security-core
+    security.aethernova.io/rule: ingress-mfa
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-mfa-label-and-auth-annotations
+      match:
+        any:
+          - resources:
+              kinds:
+                - Ingress
+                - gateway.networking.k8s.io/v1/HTTPRoute
+      validate:
+        message: "Входная точка должна требовать внешнюю OIDC‑аутентификацию с MFA."
+        anyPattern:
+          # Вариант A: Ingress (IngressClass nginx / подобные)
+          - (kind): "Ingress"
+            metadata:
+              labels:
+                security.aethernova.io/mfa: "required"
+            metadata:
+              annotations:
+                # Типовые для nginx‑ingress при использовании oauth2‑proxy / внешней аутентификации
+                nginx.ingress.kubernetes.io/auth-url: "?*"
+                nginx.ingress.kubernetes.io/auth-signin: "?*"
+                # Рекомендуется прокидывать заголовок, указывающий на MFA (реализуется внешним прокси)
+                # Аннотация ниже фиксирует договорённость на уровне декларации
+                security.aethernova.io/authn: "oidc"
+          # Вариант B: Gateway API HTTPRoute — проверяем ключевую метку и декларацию
+          - (kind): "HTTPRoute"
+            metadata:
+              labels:
+                security.aethernova.io/mfa: "required"
+            metadata:
+              annotations:
+                security.aethernova.io/authn: "oidc"
+                # Для провайдер‑специфичных имплементаций можно потребовать дополнительные аннотации
+                # например: gateway.envoyproxy.io/ext-authz: "enabled"
+
+---
+# -----------------------------------------------------------------------------
+# (Опционально) Kyverno ClusterPolicy: запрет привилегированных групп
+# Например, прямые биндинги на system:masters или kubernetes-admin.
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: rbac-forbid-privileged-groups
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/part-of: security-core
+    security.aethernova.io/rule: rbac-no-priv-groups
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: forbid-system-masters
+      match:
+        any:
+          - resources:
+              kinds:
+                - RoleBinding
+                - ClusterRoleBinding
+      foreach:
+        - list: "request.object.subjects"
+          deny:
+            conditions:
+              any:
+                - key: "{{ element.kind == 'Group' && (element.name == 'system:masters' || element.name == 'kubernetes-admin') }}"
+                  operator: Equals
+                  value: true

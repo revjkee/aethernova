@@ -1,0 +1,428 @@
+apiVersion: "aethernova.io/authz/v1"
+kind: AuthorizationPolicy
+metadata:
+  name: security-core
+  version: "1.0.0"
+  description: "Zero-Trust политика авторизации для сервиса security-core (RBAC+ABAC)."
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/part-of: core-systems
+    security.aethernova/hardening: "true"
+
+spec:
+  evaluation:
+    algorithm: deny-overrides          # Любой deny останавливает и отклоняет запрос
+    ruleOrder: explicit-first-match    # Правила обрабатываются по порядку; при равенстве — deny
+    defaultDecision: deny
+    contextRequired: true              # Запрос без контекста (claims, mTLS, headers) — deny
+
+  # Источники атрибутов: JWT/OIDC, mTLS, заголовки, внешние аттестаторы
+  attributeSources:
+    jwt:
+      required: true
+      issuers:
+        - "https://auth.aethernova/idp"
+      audiences:
+        - "security-core"
+      clockSkew: "60s"
+      claimMapping:
+        subject: "sub"
+        roles: "roles"                     # массив строк
+        tenant: "tenant_id"                # строка
+        scope: "scp"                       # массив/строка
+        authMethods: "amr"                 # методы аутентификации (mfa, hwk, pwd и т.п.)
+        assuranceLevel: "acr"              # уровень (например, urn:...:phishing-resistant)
+        device:
+          compliant: "device.compliant"    # bool
+          managed:   "device.managed"      # bool
+          secureBoot:"device.secure_boot"  # bool
+        risk:
+          score: "risk.score"              # 0..100
+          level: "risk.level"              # low/medium/high
+    mtls:
+      requiredForServices: true
+      sanSelectors:
+        spiffeID: "URI"
+        dnsName:  "DNS"
+      allowedSPIFFEPrefixes:
+        - "spiffe://aethernova/internal/"
+    request:
+      headers:
+        clientIP: "x-forwarded-for"
+        traceID: "x-trace-id"
+      context:
+        geoCountry: "ctx.geo.country"
+        timeOfDay:  "ctx.time.tod"
+        dayOfWeek:  "ctx.time.dow"
+        k8sNamespace: "ctx.k8s.ns"
+    externals:
+      riskProvider:
+        enabled: true
+        minFreshness: "30s"                # кэш аттестации риска
+
+  # Классификация данных и чувствительность операций
+  dataClassification:
+    levels: ["public", "internal", "confidential", "restricted"]
+    defaultLevel: "internal"
+    resourceMap:
+      "/v1/healthz": "public"
+      "/v1/metrics": "internal"
+      "/v1/keys/**": "restricted"
+      "/v1/policy/**": "restricted"
+      "/v1/events/**": "confidential"
+
+  # Универсальная модель ресурсов/действий
+  resources:
+    - id: "health"
+      match:
+        methods: ["GET"]
+        paths: ["/v1/healthz"]
+    - id: "metrics"
+      match:
+        methods: ["GET"]
+        paths: ["/v1/metrics"]
+    - id: "keys"
+      match:
+        methods: ["GET","POST","PUT","DELETE"]
+        paths: ["/v1/keys/*", "/v1/keys/**"]
+      actions:
+        - "keys:read"
+        - "keys:create"
+        - "keys:update"
+        - "keys:delete"
+        - "keys:rotate"
+        - "crypto:sign"
+        - "crypto:decrypt"
+    - id: "policy"
+      match:
+        methods: ["GET","POST","PUT","DELETE"]
+        paths: ["/v1/policy/*", "/v1/policy/**"]
+      actions:
+        - "policy:read"
+        - "policy:update"
+        - "policy:publish"
+    - id: "events"
+      match:
+        methods: ["GET","POST"]
+        paths: ["/v1/events/*", "/v1/events/**"]
+      actions:
+        - "events:ingest"
+        - "events:read"
+
+  # Роли (RBAC) — абстракция над наборами действий
+  roles:
+    - name: "owner"
+      description: "Полный доступ с SoD-исключениями и обязательным step-up."
+      grants: ["*"]
+    - name: "admin"
+      grants:
+        - "policy:*"
+        - "keys:read"
+        - "keys:create"
+        - "keys:update"
+        - "keys:rotate"
+        - "events:read"
+    - name: "custodian"
+      description: "Операции с ключами без управления политиками."
+      grants:
+        - "keys:read"
+        - "keys:create"
+        - "keys:update"
+        - "keys:rotate"
+        - "crypto:*"
+    - name: "analyst"
+      grants:
+        - "events:read"
+        - "metrics:read"
+    - name: "service"
+      description: "S2S‑роль для внутренних сервисов."
+      grants:
+        - "events:ingest"
+        - "keys:read"
+        - "crypto:sign"
+
+  # Привязки ролей (RBAC) + атрибутные условия (ABAC)
+  bindings:
+    # Люди
+    - subjects:
+        users:
+          - matchClaim:
+              claim: "roles"
+              anyOf: ["owner"]
+      assignRoles: ["owner"]
+    - subjects:
+        users:
+          - matchClaim:
+              claim: "roles"
+              anyOf: ["admin"]
+      assignRoles: ["admin"]
+    - subjects:
+        users:
+          - matchClaim:
+              claim: "roles"
+              anyOf: ["custodian"]
+      assignRoles: ["custodian"]
+    - subjects:
+        users:
+          - matchClaim:
+              claim: "roles"
+              anyOf: ["analyst"]
+      assignRoles: ["analyst"]
+
+    # Сервисы (S2S) — через mTLS SPIFFE и namespace
+    - subjects:
+        services:
+          - spiffePrefix: "spiffe://aethernova/internal/security-core/"
+            k8sNamespace: "security-core"
+      assignRoles: ["service"]
+
+  # Ограничения разделения обязанностей (SoD) — роли, которые нельзя совмещать
+  separationOfDuties:
+    forbiddenRolePairs:
+      - ["owner", "analyst"]
+      - ["admin", "custodian"]
+
+  # Условия/обязанности (обязательные действия контроля) для step-up, контекстных ограничений и маскировки
+  obligations:
+    stepUpMFA:
+      id: "mfa_required"
+      requireAMRAnyOf: ["mfa", "hwk"]      # аппаратный ключ/МФА
+      requireACRAnyOf:
+        - "urn:ietf:params:acr:phishing-resistant"
+      sessionMaxAge: "30m"
+    redactFields:
+      id: "pii_redact"
+      fields:
+        - "$.data.ssn"
+        - "$.data.email"
+    justInTimeApproval:
+      id: "jit_approval"
+      approversRole: "owner"
+      ttl: "15m"
+
+  # Правила доступа (порядок важен). Алгоритм deny-overrides.
+  rules:
+    # 1) Техническое здоровье/метрики
+    - id: allow-health
+      description: "Здоровье сервиса."
+      effect: allow
+      resources: ["health"]
+      subjects:
+        any: true
+      conditions:
+        classificationAtMost: "public"
+
+    - id: allow-metrics-analyst
+      effect: allow
+      resources: ["metrics"]
+      actions: ["metrics:read"]
+      subjects:
+        rolesAnyOf: ["analyst","admin","owner"]
+      conditions:
+        classificationAtMost: "internal"
+        time:
+          allow:
+            - "Mon-Fri 07:00-21:00 Europe/Stockholm"
+
+    # 2) S2S ingestion
+    - id: allow-events-s2s
+      effect: allow
+      resources: ["events"]
+      actions: ["events:ingest"]
+      subjects:
+        rolesAnyOf: ["service"]
+      conditions:
+        mtlsRequired: true
+        tenantBinding:
+          fromClaim: "tenant_id"
+          resourceScopeParam: "tenant"
+        network:
+          cidrAllow:
+            - "10.0.0.0/8"
+            - "172.16.0.0/12"
+
+    # 3) Управление ключами: требует step-up MFA и устройство в соответствии с политикой
+    - id: allow-key-management
+      effect: allow
+      resources: ["keys"]
+      actions: ["keys:create","keys:update","keys:rotate","keys:read","crypto:*"]
+      subjects:
+        rolesAnyOf: ["custodian","admin","owner"]
+      conditions:
+        device:
+          compliant: true
+          managed: true
+          secureBoot: true
+        stepUp:
+          obligationRef: "mfa_required"
+        risk:
+          maxScore: 60
+          disallowLevels: ["high"]
+        geo:
+          allowCountries: ["SE","FI","NO","DK","DE"]
+        time:
+          allow:
+            - "Mon-Fri 08:00-20:00 Europe/Stockholm"
+
+    # 4) Управление политиками: только admin/owner с JIT‑одобрением
+    - id: allow-policy-admin
+      effect: allow
+      resources: ["policy"]
+      actions: ["policy:read","policy:update","policy:publish"]
+      subjects:
+        rolesAnyOf: ["admin","owner"]
+      conditions:
+        stepUp:
+          obligationRef: "mfa_required"
+        jit:
+          obligationRef: "jit_approval"
+        risk:
+          maxScore: 40
+
+    # 5) Чтение событий аналитиками
+    - id: allow-events-read-analyst
+      effect: allow
+      resources: ["events"]
+      actions: ["events:read"]
+      subjects:
+        rolesAnyOf: ["analyst","admin","owner"]
+      conditions:
+        classificationAtMost: "confidential"
+        obligations:
+          - "pii_redact"
+
+    # 6) Явные запреты
+    - id: deny-noncompliant-device
+      effect: deny
+      resources: ["keys","policy","events","metrics"]
+      subjects:
+        any: true
+      conditions:
+        device:
+          compliant: false
+
+    - id: deny-cross-tenant
+      effect: deny
+      resources: ["*"]
+      subjects:
+        any: true
+      conditions:
+        tenantIsolation: true   # если tenant из claims не совпадает с tenant ресурса
+
+  # Квоты и лимиты на субъекта/роль/ресурс
+  rateLimits:
+    enabled: true
+    windows:
+      - name: burst
+        duration: "1m"
+        limits:
+          byRole:
+            analyst: 300
+            service: 1200
+            admin: 600
+            owner: 600
+      - name: sustained
+        duration: "1h"
+        limits:
+          byRole:
+            analyst: 5000
+            service: 50000
+            admin: 8000
+            owner: 8000
+
+  quotas:
+    enabled: true
+    perSubjectDaily:
+      eventsIngest:
+        match:
+          resources: ["events"]
+          actions: ["events:ingest"]
+        limit: 250000
+
+  # Исключения (таймбоксированные), автоматически истекают и требуют step‑up
+  exceptions:
+    requireStepUp: true
+    items: []
+    # пример:
+    # - id: "exp-2025-08-20-hotfix"
+    #   subject: "user:123e4567"
+    #   rolesGrant: ["admin"]
+    #   scope:
+    #     resources: ["policy"]
+    #     actions: ["policy:update"]
+    #   expiresAt: "2025-08-20T21:00:00+02:00"
+
+  # Аудит и журналирование
+  audit:
+    level: "decision"               # none | minimal | decision | verbose
+    sinks:
+      - type: "otlp"
+        endpoint: "otel-collector.observability:4317"
+        timeout: "2s"
+      - type: "file"
+        path: "/var/log/security-core/authz.log"
+        rotation:
+          maxSizeMB: 50
+          maxBackups: 10
+          maxAgeDays: 14
+    redact:
+      fields:
+        - "$.request.headers.authorization"
+        - "$.request.body.password"
+        - "$.response.body.secrets"
+    siemTags:
+      product: "security-core"
+      component: "authz"
+      schema: "aethernova.authz.v1"
+
+  # Привязка к внешним системам секретов/ключей
+  integrations:
+    vault:
+      transitPath: "transit/"
+      kvPaths:
+        - "secret/security-core/"
+    opa:
+      enabled: false
+      endpoint: ""
+
+  # Переопределения по окружениям
+  environmentOverrides:
+    dev:
+      evaluation:
+        defaultDecision: deny
+      rateLimits:
+        windows:
+          - name: burst
+            duration: "1m"
+            limits:
+              byRole:
+                service: 3000
+      rules:
+        - patch:
+            id: allow-metrics-analyst
+            conditions:
+              time:
+                allow:
+                  - "Mon-Sun 00:00-23:59 Europe/Stockholm"
+    prod:
+      evaluation:
+        algorithm: deny-overrides
+      obligations:
+        stepUpMFA:
+          sessionMaxAge: "15m"
+      rateLimits:
+        windows:
+          - name: burst
+            duration: "1m"
+            limits:
+              byRole:
+                service: 900
+      audit:
+        level: "verbose"
+
+  # Инварианты политики — валидируются в загрузчике
+  invariants:
+    requireDefaultDeny: true
+    forbidWildcardOwnerInProd: true
+    checkSoDConflicts: true
+    validateIssuers: true

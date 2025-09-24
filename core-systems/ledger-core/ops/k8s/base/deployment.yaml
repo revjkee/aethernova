@@ -1,0 +1,230 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-core
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: ledger
+    app.kubernetes.io/version: "v0.0.0"              # переопределяется оверлеем
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # Связываем выпущенный образ/коммит для трассировки провенанса
+    org.opencontainers.image.source: "https://github.com/ORG/REPO"
+    org.opencontainers.image.revision: "sha-0000000" # переопределяется CI
+spec:
+  replicas: 2                                         # базово — 2; оверлеи могут масштабировать
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-core
+        app.kubernetes.io/instance: ledger-core
+        app.kubernetes.io/component: api
+      annotations:
+        # Запрет на автоматические перезапуски от сторонних операторов, если нужно: "false"/"true"
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+        # Обновляется CI для инвалидации кэша и разрешения rollout
+        checksum/config: "00000000000000000000000000000000"
+        checksum/secret: "00000000000000000000000000000000"
+    spec:
+      serviceAccountName: ledger-core
+      # Узлы и анти-аффинити для высокой доступности
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ledger-core
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ledger-core
+      tolerations: []   # заполняется в оверлеях при необходимости
+      enableServiceLinks: false
+      # Безопасный рантайм по умолчанию
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets: []  # при необходимости добавить секреты реестра
+      initContainers:
+        - name: wait-db-and-migrate
+          image: ghcr.io/org/repo/ledger-core:stable
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              echo "Waiting for DB..."
+              # Ожидание доступности Postgres через psql, или простая проверка TCP
+              timeout 60 sh -c 'until nc -z ${LEDGER_DB_HOST:-postgres} ${LEDGER_DB_PORT:-5432}; do sleep 2; done'
+              echo "Running migrations..."
+              ledger-core migrate up --dsn "$LEDGER_DB_DSN"
+          env:
+            - name: LEDGER_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-core-secrets
+                  key: db_dsn
+            - name: LEDGER_DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: ledger-core-config
+                  key: db_host
+            - name: LEDGER_DB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: ledger-core-config
+                  key: db_port
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: [ "ALL" ]
+      containers:
+        - name: api
+          image: ghcr.io/org/repo/ledger-core:stable   # заменяется CI на конкретный digest
+          imagePullPolicy: IfNotPresent
+          args:
+            - serve
+            - "--http-bind=0.0.0.0:8080"
+            - "--grpc-bind=0.0.0.0:9090"
+            - "--log-format=json"
+            - "--log-level=info"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 9090
+            - name: metrics
+              containerPort: 9091
+          env:
+            - name: LEDGER_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-core-secrets
+                  key: db_dsn
+            - name: LEDGER_ENABLE_HASH_CHAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: ledger-core-config
+                  key: enable_hash_chain
+            - name: LEDGER_MAX_BATCH
+              valueFrom:
+                configMapKeyRef:
+                  name: ledger-core-config
+                  key: max_batch
+            - name: LEDGER_DECIMAL_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: ledger-core-config
+                  key: decimal_mode
+            - name: LEDGER_API_HTTP_ADDR
+              value: "0.0.0.0:8080"
+            - name: LEDGER_API_GRPC_ADDR
+              value: "0.0.0.0:9090"
+            # Downward API: трассировка и диагностика
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+            - name: POD_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+          envFrom:
+            - configMapRef:
+                name: ledger-core-config-optional
+                optional: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: tls
+              mountPath: /app/tls
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /v1/health?ready=1
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /v1/health?live=1
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /v1/health?startup=1
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12   # до 60с на холодный старт
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: [ "ALL" ]
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      # Эфемерные и проецируемые тома
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: config
+          projected:
+            sources:
+              - configMap:
+                  name: ledger-core-config
+        - name: tls
+          projected:
+            sources:
+              - secret:
+                  name: ledger-core-tls
+                  optional: true

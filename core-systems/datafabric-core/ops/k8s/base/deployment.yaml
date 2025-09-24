@@ -1,0 +1,193 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datafabric-core
+  labels:
+    app.kubernetes.io/name: datafabric-core
+    app.kubernetes.io/instance: datafabric-core
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: datafabric
+    app.kubernetes.io/version: "PLACEHOLDER_TAG"      # выставляется оверлеем
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  replicas: 2                                          # базовое HA; масштабируется оверлеями
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: datafabric-core
+      app.kubernetes.io/instance: datafabric-core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: datafabric-core
+        app.kubernetes.io/instance: datafabric-core
+        app.kubernetes.io/component: engine
+      annotations:
+        # Пример: аннотация для Prometheus. В оверлеях можно заменить на ServiceMonitor.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+        # Обновление конфигов без рестартов через checksum (kustomize configmapgenerator добавит хэш в имя)
+        # kubectl.kubernetes.io/default-container: datafabric-core
+    spec:
+      serviceAccountName: datafabric-core
+      automountServiceAccountToken: false
+      priorityClassName: ""                             # задайте в прод-оверлее при необходимости
+      dnsPolicy: ClusterFirst
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: datafabric-core
+              app.kubernetes.io/instance: datafabric-core
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: datafabric-core
+                    app.kubernetes.io/instance: datafabric-core
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: datafabric-core
+          image: "PLACEHOLDER_REGISTRY/datafabric-core:PLACEHOLDER_TAG"
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "engine.cli.main"]
+          args:
+            - "run"
+            - "--grace"
+            - "5.0"
+            # дополнительные аргументы подставляйте в оверлеях
+          env:
+            # Базовые переменные. Добавьте/переопределите в оверлеях через envFrom.
+            - name: ENGINE_LOG_LEVEL
+              value: "INFO"
+            - name: ENGINE_LOG_FORMAT
+              value: "json"
+            - name: ENGINE_PROFILE_DIR
+              value: "/var/lib/datafabric/profiles"
+            - name: CACHE_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: datafabric-secrets
+                  key: CACHE_REDIS_URL
+                  optional: true
+            - name: DF_SQL_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: datafabric-config
+                  key: DF_SQL_ENDPOINT
+                  optional: true
+            - name: DF_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datafabric-secrets
+                  key: DF_AUTH_TOKEN
+                  optional: true
+            - name: LEDGER_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: datafabric-config
+                  key: LEDGER_ENDPOINT
+                  optional: true
+            - name: LEDGER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: datafabric-secrets
+                  key: LEDGER_API_KEY
+                  optional: true
+          envFrom:
+            - configMapRef:
+                name: datafabric-config
+                optional: true
+            - secretRef:
+                name: datafabric-secrets
+                optional: true
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 3
+            timeoutSeconds: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "echo 'shutting down'; sleep 5"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: runtime
+              mountPath: /var/lib/datafabric
+            - name: config
+              mountPath: /etc/datafabric
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: "256Mi"
+        - name: runtime
+          emptyDir: {}
+        - name: config
+          projected:
+            sources:
+              - configMap:
+                  name: datafabric-config
+                  optional: true
+              - secret:
+                  name: datafabric-secrets
+                  optional: true
+      imagePullSecrets:
+        - name: regcred            # задайте в оверлеях или удалите, если не нужен

@@ -1,0 +1,340 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ledger-core-prometheus-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/part-of: ledger-core
+    role: alert-rules
+spec:
+  groups:
+
+  # =========================================================
+  # 1) Service SLO & Availability (API / Worker)
+  # =========================================================
+  - name: ledger-core.service.slo
+    interval: 30s
+    rules:
+      # API: высокий уровень 5xx (OpenTelemetry/Prometheus http_server requests)
+      - alert: LedgerApiHighErrorRate5xx
+        expr: |
+          (
+            sum by (namespace) (
+              rate(http_server_requests_seconds_count{namespace="ledger-core", app=~"ledger-core", component="api", outcome="error"}[5m])
+            )
+            /
+            sum by (namespace) (
+              rate(http_server_requests_seconds_count{namespace="ledger-core", app=~"ledger-core", component="api"}[5m])
+            )
+          ) > 0.02
+        for: 10m
+        labels:
+          severity: page
+          team: ledger
+          service: api
+        annotations:
+          summary: "API повышенная доля 5xx > 2% за 10m"
+          description: "Доля ошибок (5xx/исключения) устойчиво выше 2% за последние 10 минут."
+          runbook_url: "https://runbooks.internal/ledger-core/api-high-5xx"
+
+      # API: p95 latency выше SLO (используем histogram от OTel: http.server.duration)
+      - alert: LedgerApiHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(http_server_duration_seconds_bucket{namespace="ledger-core", app=~"ledger-core", component="api"}[5m])
+            )
+          ) > 0.300
+        for: 15m
+        labels:
+          severity: ticket
+          team: ledger
+          service: api
+        annotations:
+          summary: "API p95 латентность > 300ms (15m)"
+          description: "p95 http request latency превышает 300ms в течение 15 минут."
+          runbook_url: "https://runbooks.internal/ledger-core/api-latency"
+
+      # Worker: рост ошибок задач
+      - alert: LedgerWorkerHighErrorRate
+        expr: |
+          (
+            sum by (namespace) (rate(ledger_jobs_processed_total{namespace="ledger-core", app=~"ledger-core", component="worker", result="error"}[5m]))
+            /
+            clamp_min(sum by (namespace) (rate(ledger_jobs_processed_total{namespace="ledger-core", app=~"ledger-core", component="worker"}[5m])), 1)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: page
+          team: ledger
+          service: worker
+        annotations:
+          summary: "Worker error rate > 5% (10m)"
+          description: "Доля неуспешных задач у worker превышает 5% устойчиво 10 минут."
+          runbook_url: "https://runbooks.internal/ledger-core/worker-errors"
+
+      # Error budget burn (multiwindow, multi‑burn) для API:
+      # Быстрое сгорание бюджета по ошибкам (например, целевой успешности 99.9%)
+      - alert: LedgerApiFastErrorBudgetBurn
+        expr: |
+          # 1h окно
+          (
+            1 - (
+              sum(rate(http_server_requests_seconds_count{namespace="ledger-core", app=~"ledger-core", component="api", outcome!="error"}[1h]))
+              /
+              sum(rate(http_server_requests_seconds_count{namespace="ledger-core", app=~"ledger-core", component="api"}[1h]))
+            )
+          ) > (1 - 0.999) * 14
+          and
+          # 5m окно
+          (
+            1 - (
+              sum(rate(http_server_requests_seconds_count{namespace="ledger-core", app=~"ledger-core", component="api", outcome!="error"}[5m]))
+              /
+              sum(rate(http_server_requests_seconds_count{namespace="ledger-core", app=~"ledger-core", component="api"}[5m]))
+            )
+          ) > (1 - 0.999) * 14
+        for: 5m
+        labels:
+          severity: page
+          team: ledger
+          slo: availability
+        annotations:
+          summary: "API быстрый burn error-budget (99.9%)"
+          description: "Скорость сгорания EБ превышает 14× нормы одновременно на 5m и 1h окнах."
+          runbook_url: "https://runbooks.internal/ledger-core/api-slo-burn"
+
+      # DeadMansSwitch — для проверки цепочки оповещений
+      - alert: LedgerDeadMansSwitch
+        expr: vector(1)
+        labels:
+          severity: none
+          team: sre
+        annotations:
+          summary: "Dead Man's Switch"
+          description: "Всегда срабатывает; используется для валидации алерт‑канала."
+
+  # =========================================================
+  # 2) Dependencies: PostgreSQL / Redis
+  # =========================================================
+  - name: ledger-core.dependencies
+    interval: 30s
+    rules:
+      # Postgres недоступен
+      - alert: LedgerPostgresDown
+        expr: min_over_time(pg_up{namespace="ledger-core"}[2m]) == 0
+        for: 2m
+        labels:
+          severity: page
+          team: db
+        annotations:
+          summary: "PostgreSQL недоступен"
+          description: "Экспортер сообщает pg_up=0 в течение 2 минут (namespace=ledger-core)."
+          runbook_url: "https://runbooks.internal/ledger-core/pg-down"
+
+      # Медленные запросы: рост времени выполнения (pg_stat_statements, если включено)
+      - alert: LedgerPostgresHighQueryTime
+        expr: |
+          rate(pg_stat_statements_total_time_seconds_total{namespace="ledger-core"}[5m])
+          /
+          clamp_min(rate(pg_stat_statements_calls_total{namespace="ledger-core"}[5m]), 1)
+          > 0.200
+        for: 15m
+        labels:
+          severity: ticket
+          team: db
+        annotations:
+          summary: "PostgreSQL среднее время запроса > 200ms (15m)"
+          description: "Среднее per‑call время по pg_stat_statements превышает 200ms за 15 минут."
+          runbook_url: "https://runbooks.internal/ledger-core/pg-slow-queries"
+
+      # Сатурация подключений
+      - alert: LedgerPostgresConnectionsSaturation
+        expr: |
+          (sum(pg_stat_activity_count{namespace="ledger-core"}) by (namespace))
+          /
+          clamp_min(sum(pg_settings_max_connections{namespace="ledger-core"}) by (namespace), 1)
+          > 0.85
+        for: 10m
+        labels:
+          severity: ticket
+          team: db
+        annotations:
+          summary: "PostgreSQL подключений > 85% лимита"
+          description: "Число активных подключений превышает 85% max_connections."
+          runbook_url: "https://runbooks.internal/ledger-core/pg-connections"
+
+      # Дисковое пространство БД (через kubelet_volume_stats или node_filesystem)
+      - alert: LedgerPostgresLowDiskSpace
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint=~"/var/lib/postgresql.*",fstype!~"tmpfs|overlay"} 
+           / node_filesystem_size_bytes{mountpoint=~"/var/lib/postgresql.*",fstype!~"tmpfs|overlay"}) < 0.10
+        for: 10m
+        labels:
+          severity: page
+          team: db
+        annotations:
+          summary: "PostgreSQL мало места на диске (<10%)"
+          description: "Свободного места на файловой системе под данными PostgreSQL осталось <10%."
+          runbook_url: "https://runbooks.internal/ledger-core/pg-disk-space"
+
+      # Redis недоступен
+      - alert: LedgerRedisDown
+        expr: min_over_time(redis_up{namespace="ledger-core"}[2m]) == 0
+        for: 2m
+        labels:
+          severity: page
+          team: cache
+        annotations:
+          summary: "Redis недоступен"
+          description: "Экспортер сообщает redis_up=0 в течение 2 минут."
+          runbook_url: "https://runbooks.internal/ledger-core/redis-down"
+
+      # Redis память > 90%
+      - alert: LedgerRedisHighMemoryUsage
+        expr: |
+          (redis_memory_used_bytes{namespace="ledger-core"}
+           / clamp_min(redis_memory_max_bytes{namespace="ledger-core"}, 1))
+          > 0.90
+        for: 10m
+        labels:
+          severity: ticket
+          team: cache
+        annotations:
+          summary: "Redis потребляет >90% памяти"
+          description: "Использование памяти Redis превышает 90% от maxmemory."
+          runbook_url: "https://runbooks.internal/ledger-core/redis-memory"
+
+      # Очереди (пример: длина очереди задач, если метрика предоставляется)
+      - alert: LedgerQueueBacklog
+        expr: |
+          max(ledger_queue_depth{namespace="ledger-core"}) by (queue) > 1000
+        for: 15m
+        labels:
+          severity: ticket
+          team: ledger
+        annotations:
+          summary: "Рост бэколога очереди > 1000 сообщений"
+          description: "Глубина очереди превышает 1000 в течение 15 минут."
+          runbook_url: "https://runbooks.internal/ledger-core/queue-backlog"
+
+  # =========================================================
+  # 3) Kubernetes Workload Health (pods/resources)
+  # =========================================================
+  - name: ledger-core.k8s.workload
+    interval: 30s
+    rules:
+      # Pod рестарты
+      - alert: LedgerPodsFrequentRestarts
+        expr: |
+          increase(kube_pod_container_status_restarts_total{namespace="ledger-core"}[15m]) > 3
+        for: 0m
+        labels:
+          severity: ticket
+          team: sre
+        annotations:
+          summary: "Частые рестарты контейнеров (>3 за 15m)"
+          description: "Зафиксировано более 3 рестартов контейнеров за 15 минут."
+          runbook_url: "https://runbooks.internal/ledger-core/pod-restarts"
+
+      # OOMKill
+      - alert: LedgerContainerOOMKilled
+        expr: |
+          increase(kube_pod_container_status_last_terminated_reason{namespace="ledger-core", reason="OOMKilled"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: page
+          team: sre
+        annotations:
+          summary: "Контейнер завершен по OOMKill"
+          description: "Контейнер(ы) были убиты OOM за последние 10 минут."
+          runbook_url: "https://runbooks.internal/ledger-core/oomkill"
+
+      # CPU saturation (requests aware)
+      - alert: LedgerContainerHighCPU
+        expr: |
+          sum by (pod) (
+            rate(container_cpu_usage_seconds_total{namespace="ledger-core", image!=""}[5m])
+          )
+          /
+          clamp_min(
+            sum by (pod) (kube_pod_container_resource_requests{namespace="ledger-core", resource="cpu"}),
+            0.1
+          ) > 0.9
+        for: 15m
+        labels:
+          severity: ticket
+          team: sre
+        annotations:
+          summary: "Высокая загрузка CPU > 90% от requests (15m)"
+          description: "Средняя загрузка CPU контейнеров выше 90% от запрошенного ресурса."
+          runbook_url: "https://runbooks.internal/ledger-core/high-cpu"
+
+      # Memory saturation (requests aware)
+      - alert: LedgerContainerHighMemory
+        expr: |
+          sum by (pod) (
+            container_memory_working_set_bytes{namespace="ledger-core", image!=""}
+          )
+          /
+          clamp_min(
+            sum by (pod) (kube_pod_container_resource_requests{namespace="ledger-core", resource="memory"}),
+            104857600
+          ) > 0.9
+        for: 15m
+        labels:
+          severity: ticket
+          team: sre
+        annotations:
+          summary: "Высокое использование памяти > 90% от requests (15m)"
+          description: "Рабочий набор памяти превышает 90% от запрошенного объема."
+          runbook_url: "https://runbooks.internal/ledger-core/high-memory"
+
+      # Эвикции
+      - alert: LedgerPodEvicted
+        expr: |
+          increase(kube_pod_evict_events_total{namespace="ledger-core"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: ticket
+          team: sre
+        annotations:
+          summary: "Эвикция подов"
+          description: "Зафиксирована эвикция подов за последние 10 минут."
+          runbook_url: "https://runbooks.internal/ledger-core/eviction"
+
+  # =========================================================
+  # 4) Platform / Infra (TLS, Node FS)
+  # =========================================================
+  - name: ledger-core.platform
+    interval: 1m
+    rules:
+      # TLS Certificate expiry (если экспонируется blackbox_exporter'ом)
+      - alert: LedgerExternalCertExpiringSoon
+        expr: |
+          probe_ssl_earliest_cert_expiry{job="blackbox", target=~".*ledger.*"} - time() < 86400 * 14
+        for: 5m
+        labels:
+          severity: ticket
+          team: platform
+        annotations:
+          summary: "Сертификат истекает < 14 дней"
+          description: "Срок действия внешнего TLS сертификата подходит к концу менее чем через 14 дней."
+          runbook_url: "https://runbooks.internal/ledger-core/cert-renewal"
+
+      # Узлы: мало места на корневом FS
+      - alert: KubernetesNodeLowDiskSpace
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay", mountpoint="/"}
+           / node_filesystem_size_bytes{fstype!~"tmpfs|overlay", mountpoint="/"}
+          ) < 0.10
+        for: 30m
+        labels:
+          severity: ticket
+          team: platform
+        annotations:
+          summary: "На ноде осталось <10% диска (/)"
+          description: "Свободное место на системном разделе ноды менее 10% в течение 30 минут."
+          runbook_url: "https://runbooks.internal/platform/node-disk"

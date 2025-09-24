@@ -1,0 +1,464 @@
+# path: policy-core/configs/security.yaml
+apiVersion: policy.core.aethernova/v1
+kind: SecurityPolicyBundle
+meta:
+  name: policy-core-security
+  version: 1.0.0
+  revision: "2025.08.28"
+  environment: "${APP_ENV:-dev}"         # dev|staging|prod
+  owner: "platform-security-core"
+  contacts:
+    - "secops@aethernova.local"
+  docs:
+    - "docs://aethernova/policy/overview"
+  generated_at: "2025-08-28T08:00:00Z"
+  checksum_sha256: "RECOMPLETE_ME_ON_CHANGE"
+  signatures: []                          # опциональные отсоединённые подписи
+
+# ==================== ШАБЛОНЫ (ANCHORS) ====================
+templates:
+
+  rbac: &rbac
+    model: "RBAC+ABAC"
+    roles:
+      - id: owner
+        perms: [policy.admin, policy.write, policy.read, audit.read, secrets.manage]
+      - id: admin
+        perms: [policy.write, policy.read, audit.read]
+      - id: editor
+        perms: [policy.write, policy.read]
+      - id: reader
+        perms: [policy.read]
+      - id: bot
+        perms: [policy.read]
+    attributes:
+      # Примеры атрибутов для ABAC
+      - key: tenant
+        type: string
+      - key: data_class
+        type: enum
+        values: [public, internal, confidential, secret]
+
+  crypto: &crypto
+    tls:
+      min_version: "1.3"
+      ciphersuites:
+        - "TLS_AES_256_GCM_SHA384"
+        - "TLS_CHACHA20_POLY1305_SHA256"
+        - "TLS_AES_128_GCM_SHA256"
+      require_pfs: true
+      client_auth: "optional"     # optional|require (prod => require для приватных зон)
+      stapling_ocsp: true
+      hsts:
+        enabled: true
+        max_age: 31536000
+        include_subdomains: true
+        preload: false
+    jwt:
+      accepted_algs: ["RS256", "ES256", "EdDSA"]
+      issuer: "${OIDC_ISSUER:-}"
+      audience: ["policy-core", "aethernova"]
+      jwks_uri: "${OIDC_JWKS_URI:-}"
+      access_ttl: "15m"
+      refresh_ttl: "7d"
+      clock_skew: "30s"
+      require_iat: true
+      require_exp: true
+      require_aud: true
+      deny_none_alg: true
+    keys:
+      provider: "blackvault"      # blackvault|aws-kms|gcp-kms|file
+      rotation:
+        enabled: true
+        interval: "90d"
+        overlap_window: "14d"
+      kdf:
+        algorithm: "scrypt"
+        params: { n: 16384, r: 8, p: 1 }
+      hashing:
+        algorithm: "argon2id"
+        params: { memory_kib: 65536, iterations: 3, parallelism: 2 }
+
+  cors: &cors
+    enabled: true
+    allow_credentials: false
+    allowed_origins:
+      - "https://*.aethernova.local"
+    allowed_methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+    allowed_headers: ["Authorization","Content-Type","X-Request-Id"]
+    exposed_headers: ["X-Request-Id"]
+    max_age: 600
+
+  csrf: &csrf
+    enabled: true
+    same_site: "Lax"          # Strict|Lax|None
+    header_name: "X-CSRF-Token"
+    cookie_name: "__Host-csrf"
+    token_ttl: "30m"
+
+  headers: &headers
+    content_security_policy:
+      mode: "enforce"         # enforce|report-only
+      policy: >
+        default-src 'none';
+        frame-ancestors 'none';
+        base-uri 'self';
+        script-src 'self';
+        style-src 'self';
+        img-src 'self' data:;
+        font-src 'self';
+        connect-src 'self' https:;
+        object-src 'none';
+        frame-src 'none';
+        worker-src 'self';
+        upgrade-insecure-requests;
+    referrer_policy: "no-referrer"
+    x_content_type_options: "nosniff"
+    x_frame_options: "DENY"
+    permissions_policy: "geolocation=(), microphone=(), camera=()"
+
+  ratelimit: &ratelimit
+    strategy: "token-bucket"
+    limits:
+      # ключи: per_ip / per_token / per_route
+      per_ip:
+        capacity: 300
+        refill_per_sec: 3
+        burst: 60
+      per_token:
+        capacity: 600
+        refill_per_sec: 6
+        burst: 120
+      per_route:
+        "/api/v1/auth/*": { capacity: 60, refill_per_sec: 1, burst: 10 }
+        "/api/v1/admin/*": { capacity: 120, refill_per_sec: 2, burst: 20 }
+    banlist_ttl: "15m"
+    shadow_mode: false
+
+  ip_filters: &ip_filters
+    default_action: "allow"
+    allow_cidrs: []
+    deny_cidrs:
+      - "0.0.0.0/8"      # зарезервированные, пример
+      - "127.0.0.0/8"
+      - "::1/128"
+    protected_routes:
+      - path: "/metrics"
+        action: "allow"
+        allow_cidrs: ["10.0.0.0/8","192.168.0.0/16","fd00::/8"]
+      - path: "/admin/*"
+        action: "deny_unless"
+        allow_cidrs: ["10.0.0.0/8","fd00::/8"]
+
+  body_limits: &body_limits
+    max_bytes: "1Mi"
+    max_multipart_bytes: "10Mi"
+    allowed_mime:
+      - "application/json"
+      - "application/x-yaml"
+      - "multipart/form-data"
+
+  upload_security: &upload_security
+    antivirus:
+      enabled: true
+      engine: "clamav"
+      max_scan_bytes: "50Mi"
+      timeout: "10s"
+      treat_errors_as_block: true
+    media_sniffing:
+      enabled: true
+      enforce_declared_mime: true
+
+  validation: &validation
+    schema_enforce: true
+    reject_unknown_fields: true
+    numeric_bounds_check: true
+    string_length_check: true
+
+  secrets: &secrets
+    provider: "blackvault"
+    mount_prefix: "kv/policy-core"
+    cache_ttl: "60s"
+    require_encryption_in_transit: true
+
+  audit: &audit
+    enabled: true
+    sinks:
+      - type: "otel"
+        endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}"
+      - type: "file"
+        path: "/var/log/policy-core/audit.jsonl"
+    redact_fields:
+      - "password"
+      - "secret"
+      - "token"
+      - "authorization"
+      - "set-cookie"
+      - "*.ssn"
+      - "*.card"
+    pii_detection:
+      enabled: true
+      mode: "redact"     # redact|hash|drop
+    retention:
+      days: 90
+    sampling:
+      rate: 1.0          # 1.0 = 100%
+
+  anomaly: &anomaly
+    enabled: true
+    detectors:
+      - id: "suspicious-auth"
+        kind: "rate-with-geo"
+        window: "10m"
+        threshold: 20
+        action: "flag"
+      - id: "payload-spike"
+        kind: "size-zscore"
+        window: "5m"
+        z: 4.0
+        action: "throttle"
+    responses:
+      flag: { notify: ["secops"], ratelimit_multiplier: 0.5 }
+      throttle: { temporary_limit_seconds: 600 }
+
+  data_classes: &data_classes
+    default: "internal"
+    classes:
+      public:
+        encrypt_at_rest: false
+        encrypt_in_transit: true
+        retention_days: 365
+      internal:
+        encrypt_at_rest: true
+        encrypt_in_transit: true
+        retention_days: 365
+      confidential:
+        encrypt_at_rest: true
+        encrypt_in_transit: true
+        retention_days: 730
+        access_roles: ["owner","admin"]
+      secret:
+        encrypt_at_rest: true
+        encrypt_in_transit: true
+        retention_days: 3650
+        access_roles: ["owner"]
+    mapping:
+      # пример сопоставления схем данных
+      "user.email": confidential
+      "user.password_hash": secret
+      "token.refresh": secret
+      "telemetry.event": internal
+
+  dependency_policy: &dependency_policy
+    require_sbom: true
+    allowed_licenses:
+      - "Apache-2.0"
+      - "MIT"
+      - "BSD-3-Clause"
+    deny_licenses:
+      - "GPL-3.0-only"
+    vuln_threshold:
+      max_severity: "high"     # none|low|medium|high|critical
+      block_on_critical: true
+
+  incident: &incident
+    playbooks:
+      - id: "auth-breach"
+        severity: "high"
+        steps:
+          - "rotate-keys"
+          - "revoke-refresh-tokens"
+          - "enable-strict-ratelimits"
+          - "raise-pagerduty"
+      - id: "data-leak"
+        severity: "critical"
+        steps:
+          - "freeze-exports"
+          - "isolate-namespaces"
+          - "notify-dpo"
+          - "forensic-snapshot"
+    notify:
+      channels: ["pagerduty","slack:#sec-alarms","email:secops@aethernova.local"]
+
+# ==================== ГЛОБАЛЬНЫ ПОЛИТИКИ ====================
+policies:
+  rbac: *rbac
+  crypto: *crypto
+  cors: *cors
+  csrf: *csrf
+  headers: *headers
+  ratelimit: *ratelimit
+  ip_filters: *ip_filters
+  body_limits: *body_limits
+  upload_security: *upload_security
+  validation: *validation
+  secrets: *secrets
+  audit: *audit
+  anomaly: *anomaly
+  data_classes: *data_classes
+  dependency_policy: *dependency_policy
+  incident_response: *incident
+
+# ==================== ТОКЕНЫ / АУТЕНТИФИКАЦИЯ ====================
+auth:
+  primary: "jwt"               # jwt|mtls|api-key
+  methods:
+    jwt:
+      enabled: true
+      <<: *crypto
+      required_scopes:
+        - "policy.read"
+      role_claim: "role"
+      scope_claim: "scope"
+    mtls:
+      enabled: false
+      client_ca_ref: "${MTLS_CLIENT_CA_REF:-}"
+      pin_spki_sha256: []      # список пинов, если используется
+    api_key:
+      enabled: true
+      header: "X-API-Key"
+      prefix: ""
+      hashing: "sha256"
+      scopes:
+        - "policy.read"
+
+# ==================== ПРОФИЛИ ОКРУЖЕНИЙ ====================
+environments:
+  dev:
+    headers:
+      content_security_policy:
+        mode: "report-only"
+    cors:
+      allowed_origins:
+        - "http://localhost:*"
+        - "http://127.0.0.1:*"
+    ratelimit:
+      shadow_mode: true
+    crypto:
+      tls:
+        client_auth: "optional"
+    audit:
+      sampling:
+        rate: 1.0
+
+  staging:
+    headers:
+      content_security_policy:
+        mode: "enforce"
+    cors:
+      allowed_origins:
+        - "https://staging.aethernova.local"
+    crypto:
+      tls:
+        client_auth: "optional"
+    ratelimit:
+      shadow_mode: false
+
+  prod:
+    headers:
+      content_security_policy:
+        mode: "enforce"
+    cors:
+      allowed_origins:
+        - "https://*.aethernova.com"
+    crypto:
+      tls:
+        client_auth: "require"
+    ratelimit:
+      shadow_mode: false
+    audit:
+      retention:
+        days: 365
+
+# ==================== ПРАВИЛА ДЛЯ РОУТОВ ====================
+routes:
+  - path: "/api/v1/public/*"
+    auth_required: false
+    ratelimit_profile: "per_ip"
+    data_class: "public"
+    cors_override:
+      allowed_origins: ["*"]
+      allow_credentials: false
+
+  - path: "/api/v1/auth/*"
+    auth_required: true
+    required_scopes: ["auth.basic"]
+    ratelimit_override:
+      capacity: 60
+      refill_per_sec: 1
+      burst: 10
+    body_limits_override:
+      max_bytes: "256Ki"
+    data_class: "confidential"
+
+  - path: "/api/v1/admin/*"
+    auth_required: true
+    required_roles: ["owner","admin"]
+    required_scopes: ["policy.admin"]
+    ip_filter:
+      action: "deny_unless"
+      allow_cidrs: ["10.0.0.0/8","fd00::/8"]
+    data_class: "secret"
+
+  - path: "/metrics"
+    auth_required: false
+    ip_filter:
+      action: "allow"
+      allow_cidrs: ["10.0.0.0/8","192.168.0.0/16","fd00::/8"]
+    headers_override:
+      x_frame_options: "DENY"
+
+  - path: "/healthz"
+    auth_required: false
+    ratelimit_profile: "per_ip"
+    data_class: "public"
+
+# ==================== ПАРОЛИ / УЧЁТНЫЕ ЗАПИСИ (если применимо) ====================
+account_policy:
+  password:
+    enabled: true
+    min_length: 12
+    require_sets:
+      upper: 1
+      lower: 1
+      digit: 1
+      special: 1
+    reuse_history: 5
+    max_age_days: 365
+    lockout:
+      attempts: 10
+      window: "10m"
+      cooldown: "15m"
+  mfa:
+    enabled: true
+    methods: ["totp","webauthn"]
+    require_for_roles: ["owner","admin"]
+
+# ==================== ЖУРНАЛЫ / ОБСЕРВАБИЛИТИ ====================
+observability:
+  logging:
+    level: "${LOG_LEVEL:-info}"
+    json: true
+    request_id_header: "X-Request-Id"
+  tracing:
+    sampler: "parentbased_always_on"
+    otlp_endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}"
+  metrics:
+    include_default: true
+    path: "/metrics"
+    labels:
+      service: "policy-core"
+
+# ==================== ЦЕПОЧКА ПОСТАВОК / РЕЛИЗЫ ====================
+supply_chain:
+  sbom:
+    format: "cyclonedx-json"
+    required_on_build: true
+  signatures:
+    container:
+      required: true
+      provider: "cosign"
+      key_ref: "${COSIGN_KEY_REF:-}"
+  updates:
+    require_rfc_approval: true
+    require_code_reviewers: 2

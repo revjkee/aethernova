@@ -1,0 +1,216 @@
+# veilmind-core/configs/templates/redaction_rules.example.yaml
+apiVersion: veilmind.io/v1
+kind: RedactionRules
+metadata:
+  name: redaction-rules-example
+  owner: security@veilmind.example
+  description: "Единые правила редактирования для logs/traces/metrics/storage"
+spec:
+  version: 1
+  precedence: ordered            # 'ordered' == first-match-wins
+
+  defaults:
+    strategy: mask_all           # fallback-стратегия, если правило не указано
+    maxAttrLength: 256           # макс. длина значения атрибута после редактирования
+    maxAttrs: 64                 # макс. число атрибутов на запись
+    dropBinary: true             # бинарные значения дропать
+    dropIfValueBytesGtKB: 64     # слишком большие значения усекать/дропать
+    redactTag: SENSITIVE         # тег классификации по умолчанию
+    maskChar: "*"                # символ маски
+
+  # Ключи, которые ВСЕГДА редактируются (идут в самом начале пайплайна)
+  denylistKeys:
+    - password
+    - passwd
+    - secret
+    - token
+    - access_token
+    - refresh_token
+    - id_token
+    - authorization
+    - api_key
+    - apikey
+    - cookie
+    - set-cookie
+    - private_key
+    - client_secret
+    - db_password
+    - jwt
+    - otp
+
+  # Ключи, которые можно оставлять (последнее правило-allow)
+  allowlistKeys:
+    - trace_id
+    - span_id
+    - service.name
+    - deployment.environment
+    - otel.*
+    - x-request-id
+    - status_code
+
+  # Стандартные паттерны PII/секретов
+  patterns:
+    EMAIL:        { regex: '(?i)\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b', flags: ['IGNORECASE'] }
+    JWT:          { regex: '\\beyJ[a-zA-Z0-9_\\-]+\\.[a-zA-Z0-9_\\-]+\\.[a-zA-Z0-9_\\-]+\\b' }
+    BEARER:       { regex: '(?i)bearer\\s+[A-Za-z0-9._\\-]+' }
+    CARD_PAN:     { regex: '\\b[0-9]{13,19}\\b' }
+    IBAN:         { regex: '\\b[A-Z]{2}[0-9]{2}[A-Z0-9]{1,30}\\b' }
+    PHONE:        { regex: '(?i)\\+?[0-9][0-9\\-\\s()]{7,}' }
+    SECRET_ASSIGN:{ regex: '(?i)\\b(pwd|pass(word)?|secret|token|key)\\b\\s*[:=]\\s*\\S+' }
+
+  # Стратегии редактирования (якоря для переиспользования)
+  strategies:
+    mask_all: &mask_all         { type: mask, char: "*", keepLeft: 0, keepRight: 0 }
+    partial2: &partial2         { type: mask, char: "*", keepLeft: 2, keepRight: 2 }
+    partial4: &partial4         { type: mask, char: "*", keepLeft: 4, keepRight: 4 }
+    email_mask: &email_mask     { type: emailMask, keepLocal: 1, keepDomain: 0 }
+    hash_sha256: &hash_sha256   { type: hash, algo: sha256, saltRef: "secrets://k8s/ns/veilmind/secret/redact-salt" }
+    tokenize_fpe: &tokenize_fpe { type: tokenize, providerRef: "tokenizer://vault/fpe", radix: 10, preserveFormat: true }
+    truncate128: &truncate128   { type: truncate, maxLen: 128, suffix: "...(truncated)" }
+    drop: &drop                 { type: drop }
+    allow: &allow               { type: allow }
+
+  # Контекстно-зависимые лимиты и политики
+  contexts:
+    logs:
+      limits: { maxAttrs: 64, maxAttrLen: 256, maxEvents: 100 }
+      headers:
+        allow: [ traceparent, tracestate, baggage, x-request-id ]
+        drop:  [ authorization, cookie, set-cookie ]
+    traces:
+      limits: { maxAttrs: 64, maxAttrLen: 256, maxLinks: 32, maxEvents: 64 }
+      headers:
+        allow: [ traceparent, tracestate, baggage, x-request-id ]
+    metrics:
+      limits: { maxLabels: 20, maxLabelLen: 64, maxSeriesLen: 128 }
+      series:
+        dropNameRegex: '.*_bucket$'        # снижение кардинальности гистограмм
+    storage:
+      limits: { maxAttrs: 128, maxAttrLen: 512 }
+
+  # УПОРЯДОЧЕННЫЕ ПРАВИЛА — первое совпадение применяется
+  rules:
+    # 1) Жесткая зачистка по ключам denylist
+    - id: redact-denylist-keys
+      priority: 10
+      when: [ logs, traces, metrics, storage ]
+      match: { keyRegex: '(?i)(password|passwd|secret|token|api[_-]?key|authorization|cookie|set-cookie|private[_-]?key|client[_-]?secret|db[_-]?password|jwt|otp)' }
+      action: { strategy: *mask_all, tag: RESTRICTED }
+
+    # 2) Секреты в строках значений (Bearer/JWT/assignment)
+    - id: redact-bearer
+      priority: 20
+      when: [ logs, traces ]
+      match: { valueRegex: '(?i)bearer\\s+[A-Za-z0-9._\\-]+' }
+      action: { strategy: *mask_all, tag: RESTRICTED }
+
+    - id: redact-jwt
+      priority: 21
+      when: [ logs, traces ]
+      match: { type: JWT }
+      action: { strategy: *mask_all, tag: RESTRICTED }
+
+    - id: redact-secret-assignment
+      priority: 22
+      when: [ logs, traces ]
+      match: { type: SECRET_ASSIGN }
+      action: { strategy: *mask_all, tag: RESTRICTED }
+
+    # 3) Платежные/PII
+    - id: tokenize-card-pan
+      priority: 30
+      when: [ logs, traces, storage ]
+      match: { type: CARD_PAN }
+      action: { strategy: *tokenize_fpe, tag: RESTRICTED }
+
+    - id: mask-email
+      priority: 40
+      when: [ logs, traces, storage ]
+      match: { type: EMAIL }
+      action: { strategy: *email_mask, tag: SENSITIVE }
+
+    - id: mask-phone
+      priority: 41
+      when: [ logs, traces, storage ]
+      match: { type: PHONE }
+      action: { strategy: *partial2, tag: SENSITIVE }
+
+    # 4) Идентификаторы — хэшируем
+    - id: hash-ids
+      priority: 50
+      when: [ logs, traces, storage ]
+      match: { keyRegex: '(?i)^(user_)?id$' }
+      action: { strategy: *hash_sha256, tag: SENSITIVE }
+
+    # 5) Управление объемом
+    - id: truncate-long-values
+      priority: 80
+      when: [ logs, traces, storage ]
+      match: { valueBytesGtKB: 16 }
+      action: { strategy: *truncate128 }
+
+    - id: drop-binary-blobs
+      priority: 85
+      when: [ logs, traces, storage ]
+      match: { isBinary: true }
+      action: { strategy: *drop }
+
+    - id: logs-truncate-high-cardinality
+      priority: 90
+      when: [ logs, metrics ]
+      match: { keyRegex: '(?i)^(stack|trace|debug_dump|query_params|sql|args)$' }
+      action: { strategy: *truncate128 }
+
+    # 6) Явный allow для безопасных тех. атрибутов (самый конец)
+    - id: allow-otel-safe-ids
+      priority: 1000
+      when: [ logs, traces, metrics ]
+      match: { keyRegex: '^(trace_id|span_id|status_code|service\\.name|deployment\\.environment|otel\\.)$' }
+      action: { strategy: *allow }
+
+  # Профили сред
+  profiles:
+    dev:
+      overrides:
+        defaults: { maxAttrLength: 512 }
+        contexts:
+          logs: { limits: { maxAttrs: 128 } }
+    staging:
+      overrides:
+        defaults: { maxAttrLength: 256 }
+    prod:
+      overrides:
+        defaults: { maxAttrLength: 256 }
+        contexts:
+          logs: { limits: { maxAttrs: 64 } }
+
+  # Самопроверка и гварды
+  validation:
+    denyInvalidRegex: true
+    maxRules: 300
+    required:
+      - defaults.strategy
+      - strategies
+      - patterns
+      - rules
+
+  # Тест-векторы для CI (быстрая проверка корректности)
+  tests:
+    - id: jwt_redaction
+      input:
+        logs:
+          message: "Authorization: Bearer abc.def.ghi"
+      expectRegex:
+        logs.message: "\\[REDACTED\\]"
+    - id: email_masking
+      input:
+        traces:
+          attributes: { "user.email": "user@example.org" }
+      expectRegex:
+        traces.attributes.user.email: "u.*@example\\.org"
+    - id: pan_tokenization
+      input:
+        logs:
+          card: "4111111111111111"
+      expectNotRegex:
+        logs.card: "4111111111111111"   # оригинал не должен присутствовать

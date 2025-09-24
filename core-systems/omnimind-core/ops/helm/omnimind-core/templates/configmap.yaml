@@ -1,0 +1,222 @@
+# omnimind-core/ops/helm/templates/configmap.yaml
+{{- /*
+  Helpers: имя, метки, аннотации, безопасные required, checksum.
+  Оставлены здесь, чтобы файл был самодостаточным (без _helpers.tpl).
+*/ -}}
+{{- define "omnimind.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "omnimind.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := include "omnimind.name" . -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "omnimind.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" -}}
+{{- end -}}
+
+{{- define "omnimind.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "omnimind.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "omnimind.labels" -}}
+helm.sh/chart: {{ include "omnimind.chart" . }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: omnimind
+{{ include "omnimind.selectorLabels" . }}
+{{- with .Values.global.extraLabels }}
+{{ toYaml . | nindent 0 }}
+{{- end }}
+{{- end -}}
+
+{{- define "omnimind.annotations" -}}
+{{- with .Values.global.extraAnnotations }}
+{{ toYaml . | nindent 0 }}
+{{- end }}
+{{- end -}}
+
+{{- /* Строгая проверка: в production требуем некоторые поля */ -}}
+{{- define "omnimind.required" -}}
+{{- $prod := eq (default "development" .Values.global.env) "production" -}}
+{{- if $prod -}}
+{{- /* Список обязательных ключей для prod */ -}}
+{{- required "global.env must be set" .Values.global.env -}}
+{{- required "app.server.port must be set" .Values.app.server.port -}}
+{{- required "database.url must be set" .Values.database.url -}}
+{{- required "security.jwt.publicKeyPath must be set" .Values.security.jwt.publicKeyPath -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* checksum от ключевых секций для обновления Pod при изменениях */ -}}
+{{- define "omnimind.configChecksum" -}}
+{{- $d := dict
+  "app"      (default dict .Values.app)
+  "logging"  (default dict .Values.logging)
+  "telemetry"(default dict .Values.telemetry)
+  "security" (default dict .Values.security)
+  "llm"      (default dict .Values.llm)
+  "storage"  (default dict .Values.storage)
+  "workers"  (default dict .Values.workers)
+  "extra"    (default dict .Values.extraConfig)
+-}}
+{{- toYaml $d | sha256sum -}}
+{{- end -}}
+
+---
+{{- /* Выполняем строгую проверку (no-op в dev/stage) */ -}}
+{{ include "omnimind.required" . }}
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "omnimind.fullname" . }}-config
+  labels:
+    {{- include "omnimind.labels" . | nindent 4 }}
+  annotations:
+    checksum/config: {{ include "omnimind.configChecksum" . | quote }}
+    {{- include "omnimind.annotations" . | nindent 4 }}
+data:
+  # Основной конфиг приложения (рендер через tpl позволяет использовать Go-шаблоны в values)
+  app.yaml: |
+    {{- $app := default dict .Values.app -}}
+    {{- $rendered := tpl (toYaml $app) $ | fromYaml -}}
+    {{- toYaml $rendered | nindent 4 }}
+
+  # Логирование: формат/уровни/сэмплинг/пути
+  logging.yaml: |
+    {{- $log := dict | merge (dict) (default dict .Values.logging) -}}
+    level: {{ default "INFO" $log.level }}
+    format: {{ default "json" $log.format }}
+    accessLog: {{ default true $log.accessLog }}
+    sampling:
+      rate: {{ default 1.0 $log.sampling.rate }}
+    sinks:
+      - type: {{ default "stdout" (get $log "sink" | default "stdout") }}
+        path: {{ default "" $log.path | quote }}
+    fields:
+      service: {{ include "omnimind.fullname" . }}
+      instance: {{ .Release.Name }}
+
+  # Телеметрия/трейсинг/метрики
+  telemetry.yaml: |
+    {{- $t := dict | merge (dict) (default dict .Values.telemetry) -}}
+    enabled: {{ default false $t.enabled }}
+    prometheus:
+      enabled: {{ default true (get $t "prometheus.enabled") }}
+      endpoint: {{ default "/metrics" (get $t "prometheus.endpoint") }}
+    otel:
+      exporter: {{ default "otlp" (get $t "otel.exporter") }}
+      endpoint: {{ default "http://otel-collector:4317" (get $t "otel.endpoint") }}
+      sampler: {{ default "parentbased_traceidratio" (get $t "otel.sampler") }}
+      samplerArg: {{ default 0.1 (get $t "otel.samplerArg") }}
+
+  # Безопасность/JWT/политики/лимиты
+  security.yaml: |
+    {{- $s := dict | merge (dict) (default dict .Values.security) -}}
+    cors:
+      allowOrigins: {{ toYaml (default (list "https://localhost") (get $s "cors.allowOrigins")) | nindent 6 }}
+      allowHeaders: {{ toYaml (default (list "Authorization" "Content-Type" "X-Request-Id") (get $s "cors.allowHeaders")) | nindent 6 }}
+      allowMethods: {{ toYaml (default (list "GET" "POST" "PUT" "DELETE" "OPTIONS") (get $s "cors.allowMethods")) | nindent 6 }}
+      allowCredentials: {{ default false (get $s "cors.allowCredentials") }}
+    jwt:
+      issuer: {{ default "omnimind" (get $s "jwt.issuer") }}
+      audience: {{ default "omnimind-clients" (get $s "jwt.audience") }}
+      alg: {{ default "RS256" (get $s "jwt.alg") }}
+      accessTtlMin: {{ default 30 (get $s "jwt.accessTtlMin") }}
+      refreshTtlHr: {{ default 720 (get $s "jwt.refreshTtlHr") }}
+      publicKeyPath: {{ default "/run/secrets/jwt/public.pem" (get $s "jwt.publicKeyPath") }}
+      privateKeyPath: {{ default "/run/secrets/jwt/private.pem" (get $s "jwt.privateKeyPath") }}
+    rateLimit:
+      enabled: {{ default true (get $s "rateLimit.enabled") }}
+      default: {{ default "100r/m" (get $s "rateLimit.default") | quote }}
+      burst: {{ default 50 (get $s "rateLimit.burst") }}
+
+  # Поставщики LLM/embeddings/векторные БД
+  llm.yaml: |
+    {{- $l := dict | merge (dict) (default dict .Values.llm) -}}
+    provider: {{ default "local" (get $l "provider") }}
+    model: {{ default "llama-3-8b-instruct" (get $l "model") }}
+    temperature: {{ default 0.2 (get $l "temperature") }}
+    maxTokens: {{ default 2048 (get $l "maxTokens") }}
+    timeoutSec: {{ default 60 (get $l "timeoutSec") }}
+    sse: {{ default true (get $l "sse") }}
+    embeddings:
+      provider: {{ default "openai" (get $l "embeddings.provider") }}
+      model: {{ default "text-embedding-3-small" (get $l "embeddings.model") }}
+    vectorStore:
+      provider: {{ default "pgvector" (get $l "vectorStore.provider") }}
+      pgvector:
+        schema: {{ default "public" (get $l "vectorStore.pgvector.schema") }}
+        table: {{ default "embeddings" (get $l "vectorStore.pgvector.table") }}
+      qdrant:
+        url: {{ default "http://qdrant:6333" (get $l "vectorStore.qdrant.url") | quote }}
+        apiKey: {{ default "" (get $l "vectorStore.qdrant.apiKey") | quote }}
+
+  # Хранилища/БД/кеши/объектное хранилище
+  storage.yaml: |
+    {{- $st := dict | merge (dict) (default dict .Values.storage) -}}
+    database:
+      url: {{ default "postgresql+asyncpg://omni_user:CHANGE_ME@postgres:5432/omnimind" (get $st "database.url") | quote }}
+      pool:
+        min: {{ default 5 (get $st "database.pool.min") }}
+        max: {{ default 30 (get $st "database.pool.max") }}
+        statementTimeoutMs: {{ default 15000 (get $st "database.statementTimeoutMs") }}
+    redis:
+      url: {{ default "redis://redis:6379/0" (get $st "redis.url") | quote }}
+      tls: {{ default false (get $st "redis.tls") }}
+    s3:
+      enabled: {{ default true (get $st "s3.enabled") }}
+      endpoint: {{ default "http://minio:9000" (get $st "s3.endpoint") | quote }}
+      region: {{ default "us-east-1" (get $st "s3.region") | quote }}
+      bucket: {{ default "omnimind-data" (get $st "s3.bucket") | quote }}
+      forcePathStyle: {{ default true (get $st "s3.forcePathStyle") }}
+
+  # Воркеры/очереди/планировщик
+  workers.yaml: |
+    {{- $w := dict | merge (dict) (default dict .Values.workers) -}}
+    tasks:
+      enabled: {{ default true (get $w "tasks.enabled") }}
+      backend: {{ default "celery" (get $w "tasks.backend") }}
+      brokerUrl: {{ default "redis://redis:6379/1" (get $w "tasks.brokerUrl") | quote }}
+      resultBackend: {{ default "redis://redis:6379/2" (get $w "tasks.resultBackend") | quote }}
+      concurrency: {{ default 4 (get $w "tasks.concurrency") }}
+      prefetchMult: {{ default 4 (get $w "tasks.prefetchMult") }}
+      softTimeLimitSec: {{ default 60 (get $w "tasks.softTimeLimitSec") }}
+      hardTimeLimitSec: {{ default 90 (get $w "tasks.hardTimeLimitSec") }}
+
+  # ENV-файл для совместимости (опционально). Содержимое рендерится как шаблон.
+  app.env: |
+    {{- if .Values.env }}
+    {{- tpl .Values.env $ | nindent 4 }}
+    {{- else }}
+    APP_NAME=omnimind-core
+    APP_ENV={{ default "development" .Values.global.env }}
+    TZ={{ default "Europe/Stockholm" .Values.global.tz }}
+    {{- end }}
+
+  # Произвольные дополнительные YAML-фрагменты (рендерятся через tpl)
+  {{- if .Values.extraConfig }}
+  extra.yaml: |
+    {{- tpl (toYaml .Values.extraConfig) $ | nindent 4 }}
+  {{- end }}
+
+  # Фич-флаги (удобно переключать поведение без релиза)
+  features.yaml: |
+    {{- $f := default dict .Values.features -}}
+    chat: {{ default true (get $f "chat") }}
+    tools: {{ default true (get $f "tools") }}
+    functionCalls: {{ default true (get $f "functionCalls") }}
+    vision: {{ default false (get $f "vision") }}
+    speech: {{ default false (get $f "speech") }}
+    agenticWorkflows: {{ default true (get $f "agenticWorkflows") }}
+    auditLogs: {{ default true (get $f "auditLogs") }}

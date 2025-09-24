@@ -1,0 +1,352 @@
+# DataFabric Core — Feature Flags & Progressive Delivery
+# Схема рассчитана на загрузку в сервис (envFrom) и верификацию в CI.
+schema:
+  version: 1
+  format: "aethernova.features/1.0"
+  owner: "platform-team"
+  updated_at: "2025-08-14"
+  # Жёсткие ключи, чтобы избегать «дрейфа» схемы
+  enums:
+    environments: ["dev", "staging", "prod"]
+    types: ["bool", "int", "float", "string", "json"]
+    strategies: ["fixed", "percent", "cohort", "schedule", "expression"]
+    backpressure: ["reject_new", "drop_oldest", "block"]
+    rate_policy: ["token_bucket", "leaky_bucket"]
+  evaluation:
+    order: ["constraints", "dependencies", "schedule", "strategy", "guardrails"]
+    default_env: "prod"
+
+meta:
+  service: "datafabric-core"
+  tags: ["data-fabric", "ingest", "orchestration", "observability"]
+  audit:
+    enabled: true
+    sink: "stdout" # или "otlp"/"s3"
+  metrics:
+    provider: "otel"
+    attributes:
+      service.name: "datafabric-core"
+      service.namespace: "datafabric"
+
+# Сегменты пользователей/нагрузки (используются в rules.*.match)
+segments:
+  # Пример сегмента — трафик из EU, api‑ключи партнёра X, или доля по хешу
+  eu_clients:
+    match:
+      any:
+        - attr.region: "EU"
+        - attr.country in ["SE","DE","NL","PL","LT","LV","EE","FI"]
+  partner_x:
+    match:
+      all:
+        - attr.partner_id: "partner-x"
+        - attr.plan in ["pro","enterprise"]
+  hash20:
+    rollout:
+      by: "hash(user.id)"
+      modulus: 100
+      threshold: 20    # 20%
+
+# Глобальные ограничения (guardrails) — отменяют раскатку при нарушении SLO.
+guardrails:
+  # Имена метрик и пороги согласуйте с реальными экспортером/алертами
+  slo_p95_latency_ms:
+    metric: "http_server_duration_ms{route='/ingest'}"
+    window: "5m"
+    threshold: 200
+    comparator: "<="
+  error_rate:
+    metric: "http_server_error_ratio{route='/ingest'}"
+    window: "5m"
+    threshold: 0.01
+    comparator: "<="
+
+# Политики по умолчанию для окружений
+policies:
+  dev:
+    defaults:
+      enabled: true
+      guardrails_enforced: false
+    sampling:
+      traces_ratio: 0.2
+  staging:
+    defaults:
+      enabled: true
+      guardrails_enforced: true
+    sampling:
+      traces_ratio: 0.1
+  prod:
+    defaults:
+      enabled: true
+      guardrails_enforced: true
+    sampling:
+      traces_ratio: 0.05
+
+# ---- ОПИСАНИЕ ФЛАГОВ ----
+features:
+
+  # 1) Дедупликация событий
+  - key: "ingest.dedup"
+    type: "bool"
+    owner: "ingest-team"
+    description: "Дедупликация входящих событий по ключам id/ts/source."
+    dependencies: []
+    constraints:
+      # Жёстные лимиты на объёмы буфера
+      max_buffer_bytes: 10485760
+    rules:
+      dev:
+        strategy: "fixed"
+        value: true
+      staging:
+        strategy: "percent"
+        value: true
+        percent: 50
+        segment: "hash20"
+      prod:
+        strategy: "percent"
+        value: true
+        percent: 10
+        cohort_key: "account.id"
+        guardrails:
+          enforce: ["slo_p95_latency_ms", "error_rate"]
+    rollout_plan:
+      - step: { percent: 10, hold: "30m" }
+      - step: { percent: 25, hold: "1h" }
+      - step: { percent: 50, hold: "2h" }
+      - step: { percent: 100, hold: "4h" }
+    kill_switch:
+      envs: ["staging","prod"]
+      ticket_required: true
+
+  # 2) Валидация схемы полезной нагрузки
+  - key: "ingest.schema_validation"
+    type: "bool"
+    owner: "schemas-team"
+    description: "Валидация payload по JSON‑схемам/Avro перед обработкой."
+    dependencies: []
+    rules:
+      dev:     { strategy: "fixed", value: true }
+      staging: { strategy: "fixed", value: true }
+      prod:
+        strategy: "expression"
+        value_if: "attr.source in ['app','sdk','etl']"
+        else: false
+
+  # 3) Обогащение события (enrichment)
+  - key: "ingest.enrichment"
+    type: "bool"
+    owner: "ingest-team"
+    description: "Обогащение события (geo/ip/device), может быть затратным."
+    dependencies:
+      - "ingest.schema_validation"
+    rules:
+      dev:     { strategy: "fixed", value: true }
+      staging:
+        strategy: "percent"
+        value: true
+        percent: 25
+      prod:
+        strategy: "cohort"
+        value: true
+        cohorts:
+          - name: "eu_clients"
+            segment: "eu_clients"
+          - name: "partner_x"
+            segment: "partner_x"
+        default: false
+    budget:
+      max_cpu_millis_per_event: 1.5
+      max_wall_ms_per_event: 5
+
+  # 4) Ограничение скорости приёма
+  - key: "ingest.rate_limiter"
+    type: "json"
+    owner: "platform-team"
+    description: "Политики rate‑limit (token_bucket/leaky_bucket) для Ingest."
+    dependencies: []
+    rules:
+      dev:
+        strategy: "fixed"
+        value:
+          policy: "token_bucket"
+          capacity: 2000
+          refill_per_sec: 2000
+      staging:
+        strategy: "fixed"
+        value:
+          policy: "token_bucket"
+          capacity: 10000
+          refill_per_sec: 10000
+      prod:
+        strategy: "fixed"
+        value:
+          policy: "leaky_bucket"
+          drain_per_sec: 20000
+          burst_allowance: 5000
+    guardrails:
+      enforce: ["error_rate"]
+
+  # 5) Backpressure
+  - key: "pipeline.backpressure_mode"
+    type: "string"
+    owner: "platform-team"
+    description: "Политика обратного давления: reject_new|drop_oldest|block."
+    constraints:
+      allowed: ["reject_new","drop_oldest","block"]
+    rules:
+      dev:     { strategy: "fixed", value: "reject_new" }
+      staging: { strategy: "fixed", value: "drop_oldest" }
+      prod:    { strategy: "fixed", value: "block" }
+
+  # 6) Circuit Breaker на внешние таргеты
+  - key: "egress.circuit_breaker"
+    type: "json"
+    owner: "platform-team"
+    description: "Размыкание при превышении ошибок/latency на egress."
+    rules:
+      dev:
+        strategy: "fixed"
+        value: { error_ratio: 0.5, p95_ms: 500, cool_down: "60s" }
+      staging:
+        strategy: "fixed"
+        value: { error_ratio: 0.2, p95_ms: 300, cool_down: "120s" }
+      prod:
+        strategy: "fixed"
+        value: { error_ratio: 0.05, p95_ms: 200, cool_down: "300s" }
+    kill_switch:
+      envs: ["prod"]
+      ticket_required: true
+
+  # 7) Трассировка/семплинг (OTEL)
+  - key: "observability.tracing"
+    type: "json"
+    owner: "platform-team"
+    description: "Управление трассировкой: sampler/type/ratio/links."
+    rules:
+      dev:
+        strategy: "fixed"
+        value: { sampler: "parentbased_traceidratio", ratio: 0.2 }
+      staging:
+        strategy: "fixed"
+        value: { sampler: "parentbased_traceidratio", ratio: 0.1 }
+      prod:
+        strategy: "fixed"
+        value: { sampler: "parentbased_traceidratio", ratio: 0.05 }
+
+  # 8) Темные чтения (dark‑reads) для смены хранилища
+  - key: "storage.dark_reads"
+    type: "bool"
+    owner: "storage-team"
+    description: "Параллельное чтение из нового хранилища без влияния на ответ."
+    rules:
+      dev:     { strategy: "fixed", value: true }
+      staging: { strategy: "percent", value: true, percent: 10 }
+      prod:    { strategy: "percent", value: true, percent: 1 }
+    dependencies: []
+    guardrails:
+      enforce: ["slo_p95_latency_ms"]
+
+  # 9) WAL/идемпотентность на записи
+  - key: "storage.wal_idempotency"
+    type: "bool"
+    owner: "storage-team"
+    description: "Запись через WAL с идемпотентными ключами."
+    dependencies:
+      - "ingest.dedup"
+    rules:
+      dev:     { strategy: "fixed", value: true }
+      staging: { strategy: "fixed", value: true }
+      prod:
+        strategy: "schedule"
+        value: true
+        schedule:
+          window:
+            start: "22:00"
+            end: "06:00"
+            tz: "UTC"
+
+  # 10) Анти‑инъекционный фильтр
+  - key: "ingest.sanitizer"
+    type: "json"
+    owner: "security"
+    description: "Фильтрация запрещённых подстрок/байтов, нормализация строк."
+    rules:
+      dev:
+        strategy: "fixed"
+        value:
+          forbidden: ["<script>", "</script>", "<?php", "--", "/*", "*/", "${jndi:ldap://"]
+          trim_bytes: 8192
+      staging:
+        strategy: "fixed"
+        value: { forbidden: ["<script>", "</script>", "--"], trim_bytes: 8192 }
+      prod:
+        strategy: "fixed"
+        value: { forbidden: ["<script>", "</script>"], trim_bytes: 8192 }
+
+  # 11) Эксперимент A/B на батчировании egress
+  - key: "egress.batch_experiment"
+    type: "json"
+    owner: "research"
+    description: "A/B‑тест: размер батча/таймаут и влияние на SLO."
+    experiment:
+      variations:
+        A: { batch_size: 100, flush_ms: 25 }
+        B: { batch_size: 250, flush_ms: 50 }
+      split:
+        staging: { A: 50, B: 50 }
+        prod:    { A: 90, B: 10 }
+      metrics:
+        primary: "egress_batch_throughput"
+        secondary: ["egress_error_ratio", "egress_p95_ms"]
+    rules:
+      dev:     { strategy: "fixed", value: "A" }
+      staging: { strategy: "fixed", value: "A" }
+      prod:    { strategy: "percent", value: "B", percent: 10 }
+
+  # 12) Инварианты детерминизма (включает e2e‑replay проверки)
+  - key: "qa.replay_determinism_checks"
+    type: "bool"
+    owner: "quality"
+    description: "В рантайме периодически прогоняет контрольные входы и сверяет хэши."
+    rules:
+      dev:     { strategy: "fixed", value: true }
+      staging: { strategy: "fixed", value: true }
+      prod:    { strategy: "fixed", value: false }
+
+# ---- ВАЛИДАЦИЯ ДЛЯ CI ----
+validation:
+  required_keys:
+    - "ingest.dedup"
+    - "ingest.schema_validation"
+    - "pipeline.backpressure_mode"
+    - "ingest.rate_limiter"
+  constraints:
+    - key: "pipeline.backpressure_mode"
+      allowed: ["reject_new","drop_oldest","block"]
+    - key: "ingest.rate_limiter"
+      shape:
+        required: ["policy"]
+        one_of:
+          - when: { policy: "token_bucket" }
+            require: ["capacity","refill_per_sec"]
+          - when: { policy: "leaky_bucket" }
+            require: ["drain_per_sec"]
+  dependencies:
+    - key: "ingest.enrichment"
+      requires: ["ingest.schema_validation"]
+    - key: "storage.wal_idempotency"
+      requires: ["ingest.dedup"]
+  guardrails:
+    enforce_in_envs: ["staging","prod"]
+    must_define: ["slo_p95_latency_ms","error_rate"]
+
+# ---- ПРИМЕНЕНИЕ В РАНТАЙМЕ (подсказки приложению) ----
+runtime:
+  evaluation:
+    attributes: ["user.id","account.id","attr.region","attr.partner_id","attr.plan","attr.source"]
+    hash_salt_env: "FEATURE_HASH_SALT"   # секрет в окружении
+  overrides_env:
+    # Позволяет точечно принудительно включать флаги через ENV (для аварийных обходов)
+    enabled: "FEATURE_OVERRIDE_ENABLE"   # CSV: key1,key2
+    disabled: "FEATURE_OVERRIDE_DISABLE" # CSV: key3,key4

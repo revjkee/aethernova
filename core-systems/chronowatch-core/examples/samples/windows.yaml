@@ -1,0 +1,346 @@
+# chronowatch-core/examples/samples/windows.yaml
+apiVersion: chronowatch.aethernova.io/v1
+kind: ChronoWatchConfig
+schema_version: "1.2"
+
+metadata:
+  id: "chronowatch-win64-sample"
+  description: "Industrial Windows config with RBAC, telemetry, and drift policy"
+  owner: "platform-ops-core"
+  environment: "dev"
+  created_at: "2025-08-29"
+  platform:
+    os: "windows"
+    os_min_version: "10.0.17763"
+    arch: "x86_64"
+
+runtime:
+  service:
+    install_mode: "service"
+    service_name: "ChronoWatchAgent"
+    run_as: "LocalService"
+    restart_policy: "on-failure"
+    restart_backoff_seconds: 10
+    restart_max_retries: 5
+  filesystem:
+    base_dir: 'C:\ProgramData\ChronoWatch'
+    data_dir: 'C:\ProgramData\ChronoWatch\data'
+    log_dir:  'C:\ProgramData\ChronoWatch\logs'
+    tmp_dir:  'C:\ProgramData\ChronoWatch\tmp'
+  process:
+    nice: "normal"
+    cpu_quota_percent: 50
+    memory_limit_mb: 256
+
+security:
+  require_signed_binaries: true
+  config_integrity:
+    enabled: true
+    method: "x509"
+    cert_store: "LocalMachine\\Root"
+    allowed_thumbprints:
+      - "${CHRONO_CERT_THUMBPRINT}"
+  secrets:
+    strategy: "env"
+    mappings:
+      OTLP_AUTH_TOKEN: "${OTLP_AUTH_TOKEN}"
+      WEBHOOK_TOKEN: "${WEBHOOK_TOKEN}"
+  sandbox:
+    lockdown_syscalls: false
+    restrict_shell_exec: true
+  rbac:
+    roles:
+      - name: "time-admins"
+        allow:
+          - "action.resync"
+          - "action.reconfigure_w32time"
+          - "policy.override"
+      - name: "time-observers"
+        allow:
+          - "read.telemetry"
+          - "read.state"
+    bindings:
+      - subject: "BUILTIN\\Administrators"
+        role: "time-admins"
+      - subject: "BUILTIN\\Users"
+        role: "time-observers"
+
+telemetry: &telemetry_base
+  logging:
+    level: "info"
+    json: true
+    file:
+      path: 'C:\ProgramData\ChronoWatch\logs\agent.log'
+      max_size_mb: 100
+      max_backups: 10
+      max_age_days: 14
+    windows_eventlog:
+      enabled: true
+      channel: "Application"
+      source: "ChronoWatch"
+  metrics:
+    exporters:
+      otlp:
+        enabled: true
+        protocol: "grpc"
+        endpoint: "${OTLP_ENDPOINT:-http://localhost:4317}"
+        headers:
+          authorization: "Bearer ${OTLP_AUTH_TOKEN}"
+        timeout_ms: 5000
+        retry:
+          enabled: true
+          initial_interval_ms: 500
+          max_interval_ms: 10000
+          max_elapsed_ms: 60000
+  traces:
+    enabled: true
+    sampler: "parentbased_traceidratio"
+    sampler_arg: 0.1
+    exporters:
+      otlp:
+        protocol: "grpc"
+        endpoint: "${OTLP_TRACES_ENDPOINT:-http://localhost:4317}"
+
+health:
+  liveness:
+    interval_ms: 5000
+    failure_threshold: 3
+  readiness:
+    interval_ms: 3000
+    failure_threshold: 3
+  self_diagnostics:
+    check_clock_monotonic: true
+    check_filesystem_perms: true
+    check_eventlog_registration: true
+
+time_policy: &time_policy_base
+  measurement_interval_ms: 2000
+  smoothing:
+    method: "ema"
+    alpha: 0.3
+    window: 10
+  tolerances:
+    drift_warning_ms: 5
+    drift_critical_ms: 25
+    jitter_warning_ms: 3
+    jitter_critical_ms: 10
+    max_frequency_adjust_ppm: 500
+  monotonic_guard:
+    enabled: true
+    abort_on_backward_jump_ms: 1
+  virtualization_awareness:
+    enabled: true
+    hypervisors: ["Hyper-V", "VMware", "KVM"]
+  maintenance_windows:
+    timezone: "${LOCAL_TZ:-Europe/Stockholm}"
+    windows:
+      - name: "nightly"
+        cron: "0 0 2 * * *"
+        duration_minutes: 30
+
+time_sources:
+  primary:
+    type: "w32time"
+    mode: "manual"
+    # Note: NTS is not configured here; Windows Time Service uses NTP/NT5DS.
+    peers:
+      - host: "time.windows.com"
+        special_poll_interval_sec: 1024
+        min_poll_exp: 6
+        max_poll_exp: 10
+        require_signature: false
+      - host: "time.google.com"
+        special_poll_interval_sec: 1024
+        min_poll_exp: 6
+        max_poll_exp: 10
+        require_signature: false
+      - host: "pool.ntp.org"
+        special_poll_interval_sec: 1024
+        min_poll_exp: 6
+        max_poll_exp: 10
+        require_signature: false
+    fallback:
+      use_domain_nt5ds_if_joined: true
+      max_failover_chain: 2
+    apply_strategy:
+      apply_on_start: true
+      verify_after_apply_sec: 5
+  secondary:
+    type: "manual_ntp_probe"
+    hosts:
+      - "time.facebook.com"
+      - "time.cloudflare.com"
+    probe_timeout_ms: 800
+    parallelism: 2
+    quorum: 1
+
+detections:
+  rules:
+    - id: "drift-warning"
+      expr: "abs(drift_ms) >= tolerances.drift_warning_ms && abs(drift_ms) < tolerances.drift_critical_ms"
+      severity: "warning"
+      debounce_ms: 5000
+    - id: "drift-critical"
+      expr: "abs(drift_ms) >= tolerances.drift_critical_ms"
+      severity: "critical"
+      debounce_ms: 2000
+    - id: "jitter-warning"
+      expr: "jitter_ms >= tolerances.jitter_warning_ms && jitter_ms < tolerances.jitter_critical_ms"
+      severity: "warning"
+      debounce_ms: 5000
+    - id: "jitter-critical"
+      expr: "jitter_ms >= tolerances.jitter_critical_ms"
+      severity: "critical"
+      debounce_ms: 2000
+    - id: "backward-jump"
+      expr: "backward_jump_ms > 0"
+      severity: "critical"
+      debounce_ms: 0
+
+actions:
+  inhibitors:
+    respect_maintenance_windows: true
+    max_actions_per_minute: 5
+  on_warning:
+    - type: "notify"
+      channels:
+        - kind: "eventlog"
+        - kind: "webhook"
+          url: "${WEBHOOK_URL:-https://example.org/chronowatch/webhook}"
+          headers:
+            Authorization: "Bearer ${WEBHOOK_TOKEN}"
+          timeout_ms: 3000
+    - type: "resync_soft"
+      w32time:
+        command: "w32tm /resync"
+        timeout_ms: 5000
+        retry: 1
+  on_critical:
+    - type: "resync_hard"
+      w32time:
+        command: "w32tm /config /update && w32tm /resync /force"
+        timeout_ms: 8000
+        retry: 2
+    - type: "reconfigure_w32time"
+      manualpeerlist: "time.windows.com time.google.com pool.ntp.org"
+      flags: "0x8"
+      update_command: "w32tm /config /manualpeerlist:\"${manualpeerlist}\" /syncfromflags:manual /update"
+      post_verify_sec: 5
+    - type: "exec"
+      command: "powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\\ProgramData\\ChronoWatch\\scripts\\post_critical.ps1'"
+      timeout_ms: 15000
+    - type: "notify"
+      channels:
+        - kind: "eventlog"
+        - kind: "webhook"
+          url: "${WEBHOOK_URL:-https://example.org/chronowatch/webhook}"
+          headers:
+            Authorization: "Bearer ${WEBHOOK_TOKEN}"
+          timeout_ms: 3000
+
+observability:
+  exporters: *telemetry_base
+  metrics_labels:
+    service: "chronowatch"
+    platform: "windows"
+    env: "${ENVIRONMENT:-dev}"
+
+incident_policy:
+  open_condition: "any_critical or 3_warnings_in_10m"
+  auto_close_after_minutes: 15
+  deduplication_key: "rule_id+hostname"
+
+update:
+  strategy: "pinned"
+  pinned_version: "${CHRONOWATCH_VERSION:-1.4.0}"
+  allow_downgrade: false
+  verify_signature: true
+
+profiles:
+  dev:
+    <<: *telemetry_base
+    overrides:
+      telemetry:
+        logging:
+          level: "debug"
+        metrics:
+          exporters:
+            otlp:
+              endpoint: "${OTLP_ENDPOINT:-http://localhost:4317}"
+      time_policy:
+        <<: *time_policy_base
+        tolerances:
+          drift_warning_ms: 10
+          drift_critical_ms: 50
+      metadata:
+        environment: "dev"
+
+  stage:
+    <<: *telemetry_base
+    overrides:
+      telemetry:
+        logging:
+          level: "info"
+        metrics:
+          exporters:
+            otlp:
+              endpoint: "${OTLP_ENDPOINT:-http://otel-stage:4317}"
+      time_sources:
+        primary:
+          peers:
+            - host: "time.google.com"
+              special_poll_interval_sec: 512
+              min_poll_exp: 6
+              max_poll_exp: 10
+              require_signature: false
+            - host: "time.cloudflare.com"
+              special_poll_interval_sec: 512
+              min_poll_exp: 6
+              max_poll_exp: 10
+              require_signature: false
+      time_policy:
+        <<: *time_policy_base
+        tolerances:
+          drift_warning_ms: 5
+          drift_critical_ms: 25
+      metadata:
+        environment: "stage"
+
+  prod:
+    <<: *telemetry_base
+    overrides:
+      telemetry:
+        logging:
+          level: "warn"
+        metrics:
+          exporters:
+            otlp:
+              endpoint: "${OTLP_ENDPOINT:-http://otel-prod:4317}"
+              headers:
+                authorization: "Bearer ${OTLP_AUTH_TOKEN}"
+      security:
+        require_signed_binaries: true
+        config_integrity:
+          enabled: true
+      time_sources:
+        primary:
+          peers:
+            - host: "time.cloudflare.com"
+              special_poll_interval_sec: 256
+              min_poll_exp: 6
+              max_poll_exp: 9
+              require_signature: false
+            - host: "time.google.com"
+              special_poll_interval_sec: 256
+              min_poll_exp: 6
+              max_poll_exp: 9
+              require_signature: false
+      time_policy:
+        <<: *time_policy_base
+        tolerances:
+          drift_warning_ms: 2
+          drift_critical_ms: 10
+          jitter_warning_ms: 2
+          jitter_critical_ms: 5
+      metadata:
+        environment: "prod"

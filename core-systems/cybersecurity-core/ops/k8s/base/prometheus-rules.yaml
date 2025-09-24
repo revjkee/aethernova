@@ -1,0 +1,362 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cybersecurity-core-prometheus-rules
+  labels:
+    app.kubernetes.io/name: cybersecurity-core
+    app.kubernetes.io/component: observability
+    role: alert-rules
+spec:
+  groups:
+
+    # -------------------- Availability / Core Hygiene --------------------
+    - name: availability.core
+      rules:
+        - alert: ExporterDown
+          expr: sum by (job) (up == 0) > 0
+          for: 5m
+          labels:
+            severity: critical
+            domain: platform
+          annotations:
+            summary: "Экспортер недоступен (job={{ $labels.job }})"
+            description: "Один или более таргетов для job={{ $labels.job }} недоступны >5m."
+            runbook: "ops/runbooks/exporter_down.md"
+
+        - alert: KubeStateMetricsDown
+          expr: up{job=~"kube-state-metrics"} == 0
+          for: 10m
+          labels:
+            severity: critical
+            domain: platform
+          annotations:
+            summary: "kube-state-metrics недоступен"
+            description: "Без kube-state-metrics не работают многие правила и дашборды >10m."
+            runbook: "ops/runbooks/ksm_down.md"
+
+        - alert: NodeExporterDown
+          expr: up{job=~"node-exporter"} == 0
+          for: 10m
+          labels:
+            severity: critical
+            domain: platform
+          annotations:
+            summary: "node-exporter недоступен (instance={{ $labels.instance }})"
+            description: "Метрики узла недоступны >10m. Проверьте DaemonSet и сети."
+            runbook: "ops/runbooks/node_exporter_down.md"
+
+        - alert: PrometheusRuleEvaluationErrors
+          expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+          for: 15m
+          labels:
+            severity: high
+            domain: observability
+          annotations:
+            summary: "Ошибки оценки правил Prometheus"
+            description: "Обнаружены провалы в оценке правил за 10m. Проверьте синтаксис/зависимости."
+            runbook: "ops/runbooks/rule_eval_failures.md"
+
+        - alert: AlertmanagerDown
+          expr: up{job=~"alertmanager"} == 0
+          for: 10m
+          labels:
+            severity: high
+            domain: observability
+          annotations:
+            summary: "Alertmanager недоступен"
+            description: "Уведомления не будут доставляться."
+            runbook: "ops/runbooks/alertmanager_down.md"
+
+    # -------------------- Kubernetes Control Plane --------------------
+    - name: k8s.control-plane
+      rules:
+        - alert: APIServerDown
+          expr: up{job=~"kube-apiserver"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            domain: control-plane
+          annotations:
+            summary: "kube-apiserver недоступен"
+            description: "API Kubernetes недоступно >5m."
+            runbook: "ops/runbooks/apiserver_down.md"
+
+        - alert: APIServerHighErrorRate
+          expr: |
+            (
+              sum(rate(apiserver_request_total{code=~"5.."}[5m]))
+              /
+              sum(rate(apiserver_request_total[5m]))
+            ) > 0.05
+          for: 10m
+          labels:
+            severity: high
+            domain: control-plane
+          annotations:
+            summary: "Высокая доля 5xx у kube-apiserver"
+            description: "Доля 5xx запросов к kube-apiserver >5% за 10m."
+            runbook: "ops/runbooks/apiserver_5xx.md"
+
+        - alert: APIServerLatencyP99High
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum(rate(apiserver_request_duration_seconds_bucket[5m])) by (le, verb)
+            ) > 1
+          for: 10m
+          labels:
+            severity: medium
+            domain: control-plane
+          annotations:
+            summary: "Высокая p99 латентность kube-apiserver"
+            description: "p99 > 1s за 10m. Возможны проблемы с etcd/нагрузкой."
+            runbook: "ops/runbooks/apiserver_latency.md"
+
+        - alert: SchedulerDown
+          expr: up{job=~"kube-scheduler"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            domain: control-plane
+          annotations:
+            summary: "kube-scheduler недоступен"
+            description: "Планирование подов остановлено."
+            runbook: "ops/runbooks/scheduler_down.md"
+
+        - alert: ControllerManagerDown
+          expr: up{job=~"kube-controller-manager"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            domain: control-plane
+          annotations:
+            summary: "kube-controller-manager недоступен"
+            description: "Контроллеры не работают (реплики/эндпойнты и т.д.)."
+            runbook: "ops/runbooks/kcm_down.md"
+
+    # -------------------- Nodes & Filesystems --------------------
+    - name: k8s.nodes
+      rules:
+        - alert: NodeNotReady
+          expr: |
+            kube_node_status_condition{condition="Ready",status="true"} == 0
+          for: 10m
+          labels:
+            severity: critical
+            domain: node
+          annotations:
+            summary: "Узел не в состоянии Ready (node={{ $labels.node }})"
+            description: "Узел не готов >10m. Проверьте kubelet/сеть/ресурсы."
+            runbook: "ops/runbooks/node_not_ready.md"
+
+        - alert: NodeMemoryPressure
+          expr: kube_node_status_condition{condition="MemoryPressure",status="true"} == 1
+          for: 10m
+          labels:
+            severity: high
+            domain: node
+          annotations:
+            summary: "MemoryPressure на узле"
+            description: "Kubelet сообщает о давлении памяти >10m."
+            runbook: "ops/runbooks/node_memory_pressure.md"
+
+        - alert: FilesystemSpaceLow
+          expr: |
+            (node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|aufs",mountpoint!~"/run.*|/var/lib/kubelet/pods/.+"}
+              / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs|overlay|aufs",mountpoint!~"/run.*|/var/lib/kubelet/pods/.+"}) < 0.10
+          for: 15m
+          labels:
+            severity: high
+            domain: node
+          annotations:
+            summary: "Мало места на ФС ({{ $labels.instance }} {{ $labels.mountpoint }})"
+            description: "Свободно <10% >15m. Рассмотрите очистку/расширение."
+            runbook: "ops/runbooks/fs_space_low.md"
+
+        - alert: FilesystemInodesLow
+          expr: |
+            (node_filesystem_files_free{fstype!~"tmpfs|ramfs|overlay|aufs"} 
+              / node_filesystem_files{fstype!~"tmpfs|ramfs|overlay|aufs"}) < 0.10
+          for: 15m
+          labels:
+            severity: medium
+            domain: node
+          annotations:
+            summary: "Мало inodes ({{ $labels.instance }} {{ $labels.mountpoint }})"
+            description: "Свободно <10% inodes >15m."
+            runbook: "ops/runbooks/fs_inodes_low.md"
+
+    # -------------------- Workloads --------------------
+    - name: k8s.workloads
+      rules:
+        - alert: PodCrashLooping
+          expr: |
+            max_over_time(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}[5m]) > 0
+          for: 10m
+          labels:
+            severity: high
+            domain: workload
+          annotations:
+            summary: "CrashLoopBackOff в поде ({{ $labels.namespace }}/{{ $labels.pod }})"
+            description: "Контейнер(ы) в CrashLoop >10m."
+            runbook: "ops/runbooks/pod_crashloop.md"
+
+        - alert: ContainerOOMKilled
+          expr: increase(kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}[15m]) > 0
+          for: 1m
+          labels:
+            severity: medium
+            domain: workload
+          annotations:
+            summary: "Контейнер завершен по OOMKilled ({{ $labels.namespace }}/{{ $labels.pod }})"
+            description: "Зафиксирован OOMKilled за последние 15 минут."
+            runbook: "ops/runbooks/oomkilled.md"
+
+        - alert: HighContainerCPUThrottling
+          expr: |
+            rate(container_cpu_cfs_throttled_seconds_total{container!=""}[5m])
+            /
+            rate(container_cpu_cfs_periods_total{container!=""}[5m]) > 0.25
+          for: 10m
+          labels:
+            severity: medium
+            domain: workload
+          annotations:
+            summary: "Высокий CPU throttling ({{ $labels.namespace }}/{{ $labels.pod }})"
+            description: "Доля throttling >25% за 10m. Проверьте лимиты/ресурсы."
+            runbook: "ops/runbooks/cpu_throttling.md"
+
+        - alert: PodPendingTooLong
+          expr: sum by (namespace,pod) (kube_pod_status_phase{phase="Pending"}) > 0
+          for: 30m
+          labels:
+            severity: low
+            domain: workload
+          annotations:
+            summary: "Под долго в Pending ({{ $labels.namespace }}/{{ $labels.pod }})"
+            description: "Поды остаются Pending >30m. Возможно, нет ресурсов или проблемный узел."
+            runbook: "ops/runbooks/pod_pending.md"
+
+    # -------------------- Security & Anomalies --------------------
+    - name: security.anomalies
+      rules:
+        - alert: APIAuth401403Spike
+          expr: |
+            (
+              sum(rate(apiserver_request_total{code=~"401|403"}[5m]))
+              /
+              sum(rate(apiserver_request_total[5m]))
+            ) > 0.05
+          for: 10m
+          labels:
+            severity: high
+            domain: security
+          annotations:
+            summary: "Рост 401/403 на kube-apiserver"
+            description: "Доля 401/403 >5% за 10m. Возможны неуспешные аутентификации/политики."
+            runbook: "ops/runbooks/api_auth_spike.md"
+
+        - alert: Ingress4xxRateHigh
+          expr: |
+            (
+              sum(rate(nginx_ingress_controller_requests{status=~"4.."}[5m]))
+              /
+              sum(rate(nginx_ingress_controller_requests[5m]))
+            ) > 0.1
+          for: 10m
+          labels:
+            severity: medium
+            domain: security
+          annotations:
+            summary: "Высокая доля 4xx на Ingress"
+            description: "Доля 4xx >10% за 10m. Проверьте аутентификацию/ACL/приложение."
+            runbook: "ops/runbooks/ingress_4xx.md"
+
+        - alert: Ingress5xxRateHigh
+          expr: |
+            (
+              sum(rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))
+              /
+              sum(rate(nginx_ingress_controller_requests[5m]))
+            ) > 0.05
+          for: 10m
+          labels:
+            severity: high
+            domain: security
+          annotations:
+            summary: "Высокая доля 5xx на Ingress"
+            description: "Доля 5xx >5% за 10m. Возможны ошибки приложений/бэкендов."
+            runbook: "ops/runbooks/ingress_5xx.md"
+
+        - alert: FalcoExporterAbsent
+          expr: absent(falco_events_total)
+          for: 30m
+          labels:
+            severity: low
+            domain: security
+          annotations:
+            summary: "Отсутствуют метрики Falco"
+            description: "falco_events_total не виден >30m. Если Falco должен быть, проверьте DaemonSet/ServiceMonitor."
+            runbook: "ops/runbooks/falco_absent.md"
+
+        - alert: FalcoHighPriorityAlerts
+          expr: increase(falco_events_total{priority=~"critical|emergency"}[10m]) > 0
+          for: 1m
+          labels:
+            severity: critical
+            domain: security
+          annotations:
+            summary: "Falco: критические события"
+            description: "Обнаружены события Falco с высоким приоритетом за 10m."
+            runbook: "ops/runbooks/falco_critical.md"
+
+        - alert: ExcessivePodEgressTraffic
+          expr: |
+            sum by (namespace, pod) (rate(container_network_transmit_bytes_total{pod!=""}[5m])) > 10485760
+          for: 10m
+          labels:
+            severity: medium
+            domain: security
+          annotations:
+            summary: "Аномально высокий egress трафик ({{ $labels.namespace }}/{{ $labels.pod }})"
+            description: "Передача >10 MiB/s в течение 10m. Проверьте возможную утечку данных."
+            runbook: "ops/runbooks/egress_spike.md"
+
+    # -------------------- Storage / PV --------------------
+    - name: k8s.storage
+      rules:
+        - alert: PersistentVolumeFailed
+          expr: kube_persistentvolume_status_phase{phase="Failed"} == 1
+          for: 5m
+          labels:
+            severity: high
+            domain: storage
+          annotations:
+            summary: "PV в состоянии Failed (pv={{ $labels.persistentvolume }})"
+            description: "Том не доступен. Проверьте CSI/сторедж."
+            runbook: "ops/runbooks/pv_failed.md"
+
+        - alert: PersistentVolumeClaimPending
+          expr: kube_persistentvolumeclaim_status_phase{phase="Pending"} == 1
+          for: 15m
+          labels:
+            severity: medium
+            domain: storage
+          annotations:
+            summary: "PVC не биндуется ({{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }})"
+            description: "PVC в Pending >15m. Проверьте StorageClass/квоты."
+            runbook: "ops/runbooks/pvc_pending.md"
+
+    # -------------------- Meta / Coverage --------------------
+    - name: coverage.meta
+      rules:
+        - alert: NginxIngressMetricsAbsent
+          expr: absent(nginx_ingress_controller_requests)
+          for: 30m
+          labels:
+            severity: low
+            domain: observability
+          annotations:
+            summary: "Отсутствуют метрики NGINX Ingress"
+            description: "nginx_ingress_controller_requests не виден >30m. Если Ingress-NGINX используется, настройте ServiceMonitor."
+            runbook: "ops/runbooks/ingress_metrics_absent.md"

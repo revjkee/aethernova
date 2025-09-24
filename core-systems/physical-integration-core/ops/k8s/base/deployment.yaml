@@ -1,0 +1,176 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: physical-integration-core
+  namespace: physical-integration
+  labels:
+    app.kubernetes.io/name: physical-integration-core
+    app.kubernetes.io/instance: physical-integration-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: physical-integration
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: physical-integration-core
+      app.kubernetes.io/instance: physical-integration-core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: physical-integration-core
+        app.kubernetes.io/instance: physical-integration-core
+        app.kubernetes.io/component: api
+      annotations:
+        # Prometheus scraping (если /metrics включён в сервисе)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        # Хеш конфигурации для детерминированного rollout (подставляется шаблонизатором/скриптом)
+        checksum/config: "{{CONFIG_CHECKSUM}}"
+    spec:
+      # Минимизация привилегий и побочных эффектов
+      serviceAccountName: physical-integration-core
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # Ограничение уровня безопасности pod-а
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: 2000
+      terminationGracePeriodSeconds: 30
+      # Размещение и устойчивость
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 70
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: physical-integration-core
+                topologyKey: kubernetes.io/hostname
+            - weight: 30
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: physical-integration-core
+                topologyKey: topology.kubernetes.io/zone
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: physical-integration-core
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: physical-integration-core
+      # Ноды/толерации — при необходимости раскомментируйте
+      # nodeSelector: {}
+      # tolerations: []
+      volumes:
+        - name: config
+          configMap:
+            name: physical-integration-config
+            optional: true
+        - name: secrets
+          secret:
+            secretName: physical-integration-secrets
+            optional: true
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi
+        - name: cache
+          emptyDir:
+            sizeLimit: 512Mi
+      containers:
+        - name: app
+          image: ghcr.io/your-org/physical-integration-core:1.0.0
+          imagePullPolicy: IfNotPresent
+          args:
+            # Пример: если используется встроенный HTTP‑сервер/CLI
+            - "server"
+            - "--host=0.0.0.0"
+            - "--port=8080"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PIC_LOG_LEVEL
+              value: "info"
+            - name: PIC_BIND_ADDR
+              value: "0.0.0.0:8080"
+            # Явные дефолты; секреты/конфиги подтягиваются через envFrom ниже
+          envFrom:
+            - configMapRef:
+                name: physical-integration-config
+                optional: true
+            - secretRef:
+                name: physical-integration-secrets
+                optional: true
+          # Readiness проверяет готовность бизнес‑логики
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            timeoutSeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          # Liveness — устойчивость процесса
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            timeoutSeconds: 2
+            periodSeconds: 10
+            failureThreshold: 3
+          # Startup — для холодного старта/миграций
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"] # дать балансировщику отсоединить трафик
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: secrets
+              mountPath: /app/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/app

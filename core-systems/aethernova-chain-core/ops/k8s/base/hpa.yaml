@@ -1,0 +1,149 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chain-core-api
+  namespace: default
+  labels:
+    app.kubernetes.io/name: chain-core-api
+    app.kubernetes.io/part-of: aethernova-chain-core
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: chain-core-api
+  minReplicas: 2
+  maxReplicas: 50
+
+  behavior:
+    # Стабилизация и политики масштабирования
+    scaleUp:
+      stabilizationWindowSeconds: 0          # немедленный апскейл (допускается autoscaling/v2)
+      policies:
+        - type: Percent
+          value: 100                         # не более 100% от текущих реплик за один шаг
+          periodSeconds: 60
+        - type: Pods
+          value: 10                          # и не более 10 подов за 60 секунд
+          periodSeconds: 60
+      selectPolicy: Max                      # применять наиболее агрессивную политику из списка
+    scaleDown:
+      stabilizationWindowSeconds: 300        # дефолт для даунскейла — ~5 минут
+      policies:
+        - type: Percent
+          value: 50                          # не более -50% за шаг (мягкий даунскейл)
+          periodSeconds: 60
+        - type: Pods
+          value: 5
+          periodSeconds: 60
+      selectPolicy: Min                      # наименее агрессивная политика при уменьшении
+
+  metrics:
+    # 1) Классический resource CPU target (средняя утилизация по подам)
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70             # примерная целевая утилизация CPU ~70%
+
+    # 2) Классический resource Memory target (средняя утилизация памяти по подам)
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+    # 3) ContainerResource — таргет по конкретному контейнеру в поде (например "app")
+    - type: ContainerResource
+      containerResource:
+        name: cpu
+        container: app
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+    # 4) Pods metric (Custom Metrics API): среднее значение метрики на под, например RPS
+    # Требуется установленный metrics-adapter (например, Prometheus Adapter) и экспонирование метрики.
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second      # имя метрики в Custom Metrics API
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: chain-core-api
+        target:
+          type: AverageValue
+          averageValue: "20"                 # целевой RPS на под (пример)
+
+    # 5) External metric (External Metrics API): например задержка очереди или лаг Kafka
+    # Также предоставляется адаптером (Prometheus Adapter) как external.*
+    - type: External
+      external:
+        metric:
+          name: external_slo_latency_p95_ms
+          selector:
+            matchLabels:
+              service: chain-core-api
+        target:
+          type: AverageValue
+          averageValue: "250"                # целевой p95 (мс) — пример
+
+---
+# Пример HPA для фонового воркера с очередью (другая рабочая нагрузка)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chain-core-worker
+  namespace: default
+  labels:
+    app.kubernetes.io/name: chain-core-worker
+    app.kubernetes.io/part-of: aethernova-chain-core
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: chain-core-worker
+  minReplicas: 1
+  maxReplicas: 100
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 200
+          periodSeconds: 60
+        - type: Pods
+          value: 20
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 10
+          periodSeconds: 60
+      selectPolicy: Min
+  metrics:
+    # Скейлимся по длине очереди (external/custom metric), нормированной на число подов
+    - type: External
+      external:
+        metric:
+          name: queue_messages_ready
+          selector:
+            matchLabels:
+              queue: chain-tasks
+        target:
+          type: AverageValue
+          averageValue: "100"               # целевое количество сообщений на под
+
+    # Резервный сигнал — CPU
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

@@ -1,0 +1,283 @@
+{
+  "schema": {
+    "version": 1,
+    "format": "aethernova.policies/1.0",
+    "owner": "platform-team",
+    "updated_at": "2025-08-14"
+  },
+  "meta": {
+    "service": "datafabric-core",
+    "description": "Seed-политики доступа, квоты, экспорт и криптопрофили для datafabric-core",
+    "links": {
+      "features": "configs/features.yaml",
+      "retention": "configs/policies/retention.yaml",
+      "lineage_policy": "configs/policies/rego/lineage_guard.rego"
+    }
+  },
+  "defaults": {
+    "environment": "prod",
+    "region": "eu-north-1",
+    "audit": {
+      "enabled": true,
+      "sink": "otlp",
+      "redact_fields": ["token", "secret", "subject_id", "key_material"]
+    },
+    "crypto": {
+      "encryption_at_rest": "AES256",
+      "kms_keys": {
+        "s3": "arn:aws:kms:eu-north-1:000000000000:key/REPLACE_ME",
+        "rds": "arn:aws:kms:eu-north-1:000000000000:key/REPLACE_ME",
+        "msk": "arn:aws:kms:eu-north-1:000000000000:key/REPLACE_ME",
+        "logs": "arn:aws:kms:eu-north-1:000000000000:key/REPLACE_ME"
+      }
+    },
+    "rate_limits": {
+      "default_qps": 100,
+      "burst": 200,
+      "window_sec": 1,
+      "egress_qps": 1000
+    },
+    "quotas": {
+      "storage_bytes": 53687091200,
+      "daily_events": 10000000,
+      "topics": 10
+    },
+    "exports": {
+      "dlp_required_for_public": true,
+      "public_approvals": ["DPO", "Security"],
+      "forbid_pii_to_public": true
+    }
+  },
+  "data_classification": {
+    "levels": [
+      {"name": "public", "rank": 0, "description": "Публичные данные"},
+      {"name": "internal", "rank": 1, "description": "Внутренние данные"},
+      {"name": "confidential", "rank": 2, "description": "Конфиденциальные данные"},
+      {"name": "restricted", "rank": 3, "description": "Строго ограниченные данные"}
+    ],
+    "min_retention_by_class": {
+      "public": "P7D",
+      "internal": "P30D",
+      "confidential": "P180D",
+      "restricted": "P365D"
+    }
+  },
+  "tenants": [
+    {
+      "id": "tenant-alpha",
+      "name": "Alpha Ltd",
+      "tier": "pro",
+      "active": true,
+      "region": "eu-north-1",
+      "quotas": { "storage_bytes": 171798691840, "daily_events": 50000000, "topics": 25 },
+      "rate_limits": { "default_qps": 500, "burst": 1000, "window_sec": 1 },
+      "export_policy": { "allow_public": false, "allow_partner": true },
+      "labels": { "vertical": "ecommerce" }
+    },
+    {
+      "id": "tenant-beta",
+      "name": "Beta AB",
+      "tier": "enterprise",
+      "active": true,
+      "region": "eu-north-1",
+      "quotas": { "storage_bytes": 343597383680, "daily_events": 120000000, "topics": 50 },
+      "rate_limits": { "default_qps": 2000, "burst": 4000, "window_sec": 1 },
+      "export_policy": { "allow_public": false, "allow_partner": true },
+      "labels": { "vertical": "fintech" }
+    }
+  ],
+  "rbac": {
+    "roles": [
+      {
+        "name": "platform.admin",
+        "description": "Полные права над системными объектами и политиками",
+        "permissions": ["*"]
+      },
+      {
+        "name": "tenant.admin",
+        "description": "Администрирование в рамках арендатора",
+        "permissions": [
+          "ingest:write", "ingest:read",
+          "datasets:read", "datasets:write",
+          "exports:request", "keys:manage",
+          "quotas:read", "metrics:read"
+        ]
+      },
+      {
+        "name": "tenant.reader",
+        "description": "Чтение метаданных и метрик",
+        "permissions": ["datasets:read", "metrics:read", "audit:read"]
+      },
+      {
+        "name": "security.officer",
+        "description": "Согласование экспортов и управление legal hold",
+        "permissions": ["exports:approve", "legal_hold:manage", "audit:read"]
+      },
+      {
+        "name": "dpo",
+        "description": "DPO: согласование публичных экспортов и GDPR‑удалений",
+        "permissions": ["exports:approve", "gdpr:erasure:approve", "audit:read"]
+      }
+    ],
+    "bindings": [
+      { "subject": "user:alice@example.com", "roles": ["platform.admin"] },
+      { "subject": "group:beta-admins", "roles": ["tenant.admin"], "tenant": "tenant-beta" },
+      { "subject": "group:alpha-readers", "roles": ["tenant.reader"], "tenant": "tenant-alpha" },
+      { "subject": "group:sec", "roles": ["security.officer"] },
+      { "subject": "group:dpo", "roles": ["dpo"] }
+    ]
+  },
+  "abac": {
+    "attributes": ["tenant", "region", "data_class", "pii", "subject_id"],
+    "rules": [
+      {
+        "name": "deny.cross_tenant",
+        "effect": "deny",
+        "when": "request.tenant != resource.tenant"
+      },
+      {
+        "name": "deny_restricted_to_non_sec",
+        "effect": "deny",
+        "when": "resource.data_class == 'restricted' && !( 'security.officer' in request.roles || 'platform.admin' in request.roles )"
+      },
+      {
+        "name": "allow_internal_read_same_region",
+        "effect": "allow",
+        "when": "action == 'datasets:read' && resource.data_class in ['public','internal'] && request.region == resource.region"
+      }
+    ]
+  },
+  "access": {
+    "ip_allowlists": {
+      "prod": ["10.0.0.0/8", "192.168.0.0/16"],
+      "staging": ["0.0.0.0/0"],
+      "dev": ["0.0.0.0/0"]
+    },
+    "api_keys": [
+      {
+        "id": "key_alpha_ingest",
+        "tenant": "tenant-alpha",
+        "scopes": ["ingest:write"],
+        "created_at": "2025-08-01T00:00:00Z",
+        "masked_key": "dfc_live_********************ALPHA",
+        "status": "active"
+      },
+      {
+        "id": "key_beta_exports",
+        "tenant": "tenant-beta",
+        "scopes": ["exports:request", "datasets:read"],
+        "created_at": "2025-08-01T00:00:00Z",
+        "masked_key": "dfc_live_********************BETA",
+        "status": "active"
+      }
+    ]
+  },
+  "exports": {
+    "destinations": [
+      { "name": "public_s3", "type": "s3", "public": true, "bucket": "REPLACE_ME-public", "dlp": "required" },
+      { "name": "partner_x", "type": "s3", "public": false, "bucket": "REPLACE_ME-partner-x", "contract_required": true }
+    ],
+    "rules": [
+      {
+        "name": "forbid_pii_public",
+        "effect": "deny",
+        "when": "destination.public == true && dataset.pii == true"
+      },
+      {
+        "name": "require_dlp_for_public",
+        "effect": "require",
+        "actions": ["dlp.scan", "seek.approvals:DPO,Security"],
+        "when": "destination.public == true"
+      },
+      {
+        "name": "partner_contract_required",
+        "effect": "require",
+        "actions": ["contract.verify"],
+        "when": "destination.name == 'partner_x'"
+      }
+    ]
+  },
+  "datasets": {
+    "catalog": [
+      {
+        "id": "raw_events",
+        "tenant": "*",
+        "classification": "internal",
+        "pii": true,
+        "pii_level": "strong",
+        "retention_ref": "configs/policies/retention.yaml#rules.prod.classes.raw_events"
+      },
+      {
+        "id": "enriched_events",
+        "tenant": "*",
+        "classification": "internal",
+        "pii": true,
+        "pii_level": "weak",
+        "retention_ref": "configs/policies/retention.yaml#rules.prod.classes.enriched_events"
+      },
+      {
+        "id": "analytics_parquet",
+        "tenant": "*",
+        "classification": "confidential",
+        "pii": false,
+        "pii_level": "none",
+        "retention_ref": "configs/policies/retention.yaml#rules.prod.classes.analytics"
+      }
+    ]
+  },
+  "opa": {
+    "bundles": [
+      {
+        "name": "lineage_guard",
+        "source": "configs/policies/rego/lineage_guard.rego",
+        "entrypoint": "data.datafabric.lineage.guard.decision",
+        "enforce_in": ["staging", "prod"]
+      }
+    ]
+  },
+  "slo_guardrails": {
+    "enabled": true,
+    "metrics": {
+      "ingest_p95_ms": { "metric": "http_server_duration_ms{route='/ingest'}", "threshold": 200, "window": "5m", "comparator": "<=" },
+      "error_rate": { "metric": "http_server_error_ratio{route='/ingest'}", "threshold": 0.01, "window": "5m", "comparator": "<=" }
+    },
+    "on_breach": ["scale.up.hint", "flag.rollout.pause", "exports.pause_public"]
+  },
+  "environments": {
+    "dev": {
+      "ip_allowlists": ["0.0.0.0/0"],
+      "rate_limits": { "default_qps": 200, "burst": 400, "window_sec": 1 },
+      "quotas": { "storage_bytes": 26843545600, "daily_events": 2000000 },
+      "audit": { "enabled": true, "sink": "stdout" }
+    },
+    "staging": {
+      "ip_allowlists": ["0.0.0.0/0"],
+      "rate_limits": { "default_qps": 500, "burst": 1000, "window_sec": 1 },
+      "quotas": { "storage_bytes": 107374182400, "daily_events": 10000000 },
+      "audit": { "enabled": true, "sink": "otlp" }
+    },
+    "prod": {
+      "ip_allowlists": ["10.0.0.0/8", "192.168.0.0/16"],
+      "rate_limits": { "default_qps": 1000, "burst": 2000, "window_sec": 1 },
+      "quotas": { "storage_bytes": 343597383680, "daily_events": 100000000 },
+      "audit": { "enabled": true, "sink": "otlp" }
+    }
+  },
+  "validation": {
+    "require": [
+      "rbac.roles.*.permissions",
+      "rbac.bindings.*.roles",
+      "datasets.catalog.*.retention_ref",
+      "opa.bundles.*.source"
+    ],
+    "constraints": [
+      { "key": "data_classification.levels.*.rank", "min": 0, "max": 3 },
+      { "key": "rate_limits.default_qps", "min": 10 },
+      { "key": "quotas.storage_bytes", "min": 104857600 }
+    ],
+    "cross_refs": [
+      { "ensure": "datasets.catalog.*.classification", "in_set": ["public", "internal", "confidential", "restricted"] }
+    ]
+  },
+  "notes": "Значения ARN/KMS/бакетов/доменов подставляются через CI при сидировании. Конкретные инфраструктурные идентификаторы не подтверждены: I cannot verify this."
+}

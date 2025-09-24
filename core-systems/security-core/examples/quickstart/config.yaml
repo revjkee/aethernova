@@ -1,0 +1,378 @@
+# =============================================================================
+# security-core :: Quickstart Production-Grade Configuration
+# Все значения можно переопределять переменными окружения вида ${NAME:default}
+# Версия схемы
+# =============================================================================
+apiVersion: security-core/v1
+kind: SecurityCoreConfig
+
+meta:
+  service_name: ${SERVICE_NAME:security-core}
+  service_env: ${SERVICE_ENV:prod}          # prod|stage|dev
+  region: ${SERVICE_REGION:eu-north-1}
+  zone: ${SERVICE_ZONE:eu-north-1a}
+  instance_id: ${HOSTNAME:localhost}
+  version: ${SERVICE_VERSION:1.0.0}
+
+# =============================================================================
+# HTTP/ASGI сервер и безопасные заголовки
+# =============================================================================
+http:
+  host: ${HTTP_HOST:0.0.0.0}
+  port: ${HTTP_PORT:8443}
+  workers: ${HTTP_WORKERS:4}                # uvicorn/gunicorn
+  request_timeout_sec: ${HTTP_TIMEOUT:30}
+  keepalive_sec: ${HTTP_KEEPALIVE:75}
+  proxy:
+    trust_x_forwarded: ${HTTP_TRUST_XFF:true}
+    hops: ${HTTP_XFF_HOPS:1}
+  cors:
+    enabled: ${HTTP_CORS_ENABLED:true}
+    allow_origins: ${HTTP_CORS_ORIGINS:https://app.example.com}
+    allow_methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    allow_headers: ["authorization","content-type","x-request-id","x-correlation-id","x-tenant-id"]
+    allow_credentials: ${HTTP_CORS_CREDENTIALS:false}
+    max_age_sec: 600
+  csrf:
+    enabled: ${HTTP_CSRF_ENABLED:true}
+    cookie_name: ${CSRF_COOKIE_NAME:sc_csrf}
+    header_name: ${CSRF_HEADER_NAME:x-csrf-token}
+    secret: ${CSRF_SECRET:CHANGE_ME_LONG_RANDOM}
+  security_headers:
+    hsts: "max-age=63072000; includeSubDomains; preload"
+    frame_options: "DENY"
+    x_content_type_options: "nosniff"
+    referrer_policy: "no-referrer"
+    permissions_policy: "geolocation=(), microphone=()"
+    csp: "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+
+tls:
+  enabled: ${TLS_ENABLED:true}
+  certificate_file: ${TLS_CERT_FILE:/etc/tls/tls.crt}
+  private_key_file: ${TLS_KEY_FILE:/etc/tls/tls.key}
+  client_auth: ${TLS_CLIENT_AUTH:none}     # none|optional|required (mTLS)
+  client_ca_file: ${TLS_CLIENT_CA_FILE:}
+  minimum_version: ${TLS_MIN_VERSION:TLSv1_2}
+  ciphers: ${TLS_CIPHERS:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256}
+
+# =============================================================================
+# Логирование и наблюдаемость
+# =============================================================================
+logging:
+  level: ${LOG_LEVEL:INFO}                 # DEBUG|INFO|WARN|ERROR
+  json: ${LOG_JSON:true}
+  destination: ${LOG_DESTINATION:stdout}   # stdout|stderr|file
+  file_path: ${LOG_FILE_PATH:/var/log/security-core/app.log}
+  rotation:
+    enabled: ${LOG_ROTATE:true}
+    max_size_mb: ${LOG_ROTATE_SIZE_MB:200}
+    max_backups: ${LOG_ROTATE_BACKUPS:7}
+    max_age_days: ${LOG_ROTATE_AGE_DAYS:7}
+  pii_redaction:
+    enabled: true
+    keys: ["password","authorization","token","secret","set-cookie","otp","email","phone"]
+  include_fields:
+    trace: true
+    tenant: true
+    user: true
+    risk: true
+
+telemetry:
+  opentelemetry:
+    enabled: ${OTEL_ENABLED:true}
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://otel-collector:4318}
+    protocol: ${OTEL_PROTOCOL:http/protobuf}
+    headers: ${OTEL_HEADERS:}
+    sampling_ratio: ${OTEL_SAMPLING:0.1}
+    service_name: ${SERVICE_NAME:security-core}
+  prometheus:
+    enabled: ${PROM_ENABLED:true}
+    path: ${PROM_PATH:/metrics}
+
+# =============================================================================
+# Аутентификация и контекст безопасности
+# =============================================================================
+security:
+  context:
+    service: ${SERVICE_NAME:security-core}
+    version: ${SERVICE_VERSION:1.0.0}
+    # Отражать корреляционные заголовки в ответе
+    echo_headers: true
+
+authn:
+  # ---------------------------- JWT/JOSE ----------------------------
+  jwt:
+    # Несколько доверенных эмитентов (OIDC/IdP). Первый — по умолчанию.
+    issuers:
+      - name: primary
+        iss: ${JWT_ISS:https://id.example.com}
+        aud: ${JWT_AUD:security-core}
+        jwks_url: ${JWT_JWKS_URL:https://id.example.com/.well-known/jwks.json}
+        allowed_algs: ["RS256","PS256","ES256","EdDSA"]
+        expected_typ: "JWT"
+        leeway_seconds: 60
+        jwks_cache_ttl_sec: 300
+        max_age_seconds: 86400
+      - name: partner
+        iss: ${PARTNER_ISS:https://partner-idp.example.com}
+        aud: ${PARTNER_AUD:security-core}
+        jwks_url: ${PARTNER_JWKS_URL:https://partner-idp.example.com/jwks}
+        allowed_algs: ["RS256","PS256"]
+        expected_typ: "JWT"
+        leeway_seconds: 60
+        jwks_cache_ttl_sec: 300
+        max_age_seconds: 43200
+
+    # Запрет симметричных HS* по умолчанию
+    allow_symmetric: false
+
+  # ---------------------------- Сессии ------------------------------
+  sessions:
+    store: ${SESS_STORE:redis}             # redis|memory
+    redis:
+      dsn: ${REDIS_DSN:redis://redis:6379/0}
+      keyspace: ${REDIS_KEYSPACE:sc:sess:}
+      # Для атомарного rotate refresh используйте Lua-скрипты (см. реализацию стора)
+    policy:
+      access_ttl: ${SESS_ACCESS_TTL:15m}           # скользящее окно
+      refresh_ttl: ${SESS_REFRESH_TTL:30d}         # абсолютный срок refresh
+      absolute_ttl: ${SESS_ABSOLUTE_TTL:7d}
+      pre_session_ttl: ${SESS_PRE_TTL:5m}
+      pin_ip: ${SESS_PIN_IP:true}
+      pin_ua: ${SESS_PIN_UA:true}
+      max_user_sessions: ${SESS_MAX_PER_USER:10}
+      on_limit: ${SESS_ON_LIMIT:evict_oldest}      # evict_oldest|reject_new
+      device_required_for_admin: ${SESS_DEVICE_REQUIRED_FOR_ADMIN:false}
+    keyring:
+      active_kid: ${SESS_ACTIVE_KID:v1}
+      keys:
+        - kid: v1
+          secret_b64: ${SESS_K_V1_B64:BASE64_32B_SECRET}   # os.urandom(32) в Base64
+        # - kid: v2
+        #   secret_b64: ${SESS_K_V2_B64:}
+    cookie:
+      name: ${SESS_COOKIE_NAME:sc_sid}
+      domain: ${SESS_COOKIE_DOMAIN:.example.com}
+      path: "/"
+      secure: true
+      http_only: true
+      same_site: Lax
+
+  # ---------------------------- MFA/Step-up -------------------------
+  mfa:
+    default_aal: AAL1
+    enforce:
+      # Требования AAL по ролям/действиям
+      roles:
+        admin: AAL2
+        finance: AAL2
+      actions:
+        "pii.read": AAL2
+        "secrets.rotate": AAL3
+
+# =============================================================================
+# Криптография и PKI
+# =============================================================================
+crypto:
+  verifier_profiles:
+    default:
+      allowed_algs: ["RS256","PS256","ES256","EdDSA"]
+      allow_symmetric: false
+      expected_typ: "JWT"
+      leeway_seconds: 60
+      jwks_cache_ttl: 300
+      max_age_seconds: 86400
+    strict_ed25519:
+      allowed_algs: ["EdDSA"]
+      expected_typ: "JWT"
+      leeway_seconds: 30
+
+pki:
+  csr_policy:
+    allow_algs: ["RSA","EC","Ed25519"]
+    min_rsa_bits: 2048
+    allowed_ec_curves: ["P-256","P-384","P-521"]
+    forbid_ca: true
+    require_san: true
+    required_ekus: ["serverAuth"]
+    allowed_ekus: ["serverAuth","clientAuth","OCSPSigning"]
+    allowed_ku_true: ["digital_signature","key_encipherment"]
+    san_dns_allow_patterns: ["*.example.com","api.example.com"]
+    san_ip_allow_subnets: ["10.0.0.0/8","192.168.0.0/16","fd00::/8"]
+    max_san_total: 100
+    allow_must_staple: false
+  defaults:
+    key:
+      kind: ${CSR_KEY_KIND:EC}      # RSA|EC|Ed25519
+      rsa_bits: ${CSR_RSA_BITS:2048}
+      ec_curve: ${CSR_EC_CURVE:P-256}
+    signing_hash: ${CSR_HASH:SHA256}
+
+# =============================================================================
+# Соответствие требованиям (GDPR) и аудит
+# =============================================================================
+compliance:
+  gdpr:
+    dpo_contact: ${GDPR_DPO:dpo@example.com}
+    data_retention_days:
+      audit_events: ${GDPR_RET_AUDIT_DAYS:365}
+      sessions: ${GDPR_RET_SESS_DAYS:30}
+      forensics_archives: ${GDPR_RET_IR_DAYS:3650}
+    breach_notify_hours: ${GDPR_NOTIFY_HOURS:72}
+    lawful_basis: ${GDPR_LAWFUL_BASIS:legitimate_interests}
+    data_subject_requests:
+      email: ${GDPR_DSR_EMAIL:privacy@example.com}
+      export_format: ["json","csv"]
+    logging_minimization: true
+    pii_redaction_patterns:
+      - "(?i)authorization:\\s*bearer\\s+[A-Za-z0-9\\-_.]{10,}"
+      - "(?i)password\\s*=\\s*[^,\\s]{3,}"
+      - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
+
+audit:
+  sinks:
+    # Любой из адаптеров можно включить/отключить
+    splunk:
+      enabled: ${SINK_SPLUNK:false}
+      url: ${SPLUNK_HEC_URL:https://splunk.example.com:8088/services/collector}
+      token: ${SPLUNK_HEC_TOKEN:}
+      sourcetype: "security-core:event"
+      index: ${SPLUNK_INDEX:security}
+    elastic:
+      enabled: ${SINK_ELASTIC:false}
+      url: ${ELASTIC_BULK_URL:https://es.example.com:9200/_bulk}
+      index: ${ELASTIC_INDEX:security-core-events}
+      api_key: ${ELASTIC_API_KEY:}
+    azure:
+      enabled: ${SINK_AZURE:false}
+      workspace_id: ${AZURE_WS_ID:}
+      shared_key_b64: ${AZURE_SHARED_KEY_B64:}
+      log_type: ${AZURE_LOG_TYPE:SecurityCoreEvents}
+    syslog:
+      enabled: ${SINK_SYSLOG:false}
+      host: ${SYSLOG_HOST:syslog.example.com}
+      port: ${SYSLOG_PORT:6514}
+      protocol: ${SYSLOG_PROTO:tls}       # udp|tcp|tls
+      facility: ${SYSLOG_FACILITY:1}
+      app_name: ${SYSLOG_APP_NAME:security-core}
+    webhook:
+      enabled: ${SINK_WEBHOOK:false}
+      url: ${WEBHOOK_URL:https://siem-ingest.example.com/hook}
+      headers:
+        Content-Type: application/json
+  batching:
+    batch_max: ${SINK_BATCH_MAX:500}
+    batch_max_bytes: ${SINK_BATCH_BYTES:2097152}
+    flush_interval_sec: ${SINK_FLUSH_SEC:2}
+    retries: ${SINK_RETRIES:5}
+    backoff_base: ${SINK_BACKOFF_BASE:0.3}
+    backoff_factor: ${SINK_BACKOFF_FACTOR:2.0}
+    backoff_jitter: ${SINK_BACKOFF_JITTER:0.2}
+    backoff_cap: ${SINK_BACKOFF_CAP:10.0}
+  hmac:
+    enable: ${SINK_HMAC_ENABLE:false}
+    secret_b64: ${SINK_HMAC_SECRET_B64:}
+    header: ${SINK_HMAC_HEADER:x-siem-signature}
+  tls:
+    verify: ${SINK_TLS_VERIFY:true}
+    client_cert: ${SINK_TLS_CLIENT_CERT:}
+    client_key: ${SINK_TLS_CLIENT_KEY:}
+
+# =============================================================================
+# Криминалистика (forensics) — лимиты и маски
+# =============================================================================
+forensics:
+  redact_patterns:
+    - "(?i)api[_-]?key\\s*[:=]\\s*[A-Za-z0-9\\-_]{8,}"
+    - "(?i)secret\\s*=\\s*[^,\\s]{3,}"
+    - "(?i)authorization:\\s*bearer\\s+[A-Za-z0-9\\-_.]{10,}"
+    - "(?i)email\\s*[:=]\\s*[^,\\s]+@[^,\\s]+"
+  collect_limits:
+    max_bytes_per_file: ${IR_MAX_BYTES_FILE:52428800}
+  exclude_globs: ["**/*.gz","**/*.zip","**/*.xz","**/*.zst","**/*.7z"]
+
+# =============================================================================
+# Ограничения и кэширование
+# =============================================================================
+rate_limit:
+  global:
+    enabled: ${RL_ENABLED:true}
+    window_sec: ${RL_WINDOW:60}
+    max_requests: ${RL_MAX:600}
+  per_ip:
+    enabled: ${RL_IP_ENABLED:true}
+    window_sec: ${RL_IP_WINDOW:60}
+    max_requests: ${RL_IP_MAX:120}
+
+cache:
+  backend: ${CACHE_BACKEND:memory}        # memory|redis
+  redis_dsn: ${CACHE_REDIS_DSN:redis://redis:6379/1}
+  default_ttl_sec: ${CACHE_TTL:300}
+
+# =============================================================================
+# Политики доступа (RBAC/ABAC)
+# =============================================================================
+policy:
+  rbac:
+    roles:
+      admin:
+        permissions: ["users.read","users.write","secrets.rotate","pii.read"]
+      analyst:
+        permissions: ["audit.read","pii.read"]
+      user:
+        permissions: ["self.read","self.update"]
+  abac:
+    rules:
+      - id: "owner_read"
+        resource: "profile"
+        action: "read"
+        when: "${ctx.auth.user_id == resource.owner_id}"
+      - id: "tenant_isolation"
+        resource: "*"
+        action: "*"
+        when: "${ctx.auth.tenant_id == resource.tenant_id}"
+
+# =============================================================================
+# Оценка риска
+# =============================================================================
+risk_engine:
+  thresholds:
+    low: 0
+    medium: 40
+    high: 70
+    critical: 90
+  signals:
+    ip_velocity: ${RISK_IP_VELOCITY:true}
+    impossible_travel: ${RISK_IMP_TRAVEL:true}
+    new_device: ${RISK_NEW_DEVICE:true}
+
+# =============================================================================
+# Управление секретами и ротацией
+# =============================================================================
+kms:
+  provider: ${KMS_PROVIDER:none}          # none|aws-kms|gcp-kms|hashicorp-vault
+  rotation_days: ${KMS_ROTATION_DAYS:90}
+  keys:
+    session_mac:
+      kid: ${SESS_ACTIVE_KID:v1}
+      source: env
+      env_name: SESS_K_V1_B64
+    jwt_jwks_cache_key:
+      kid: jwks
+      source: memory
+
+# =============================================================================
+# Исходящие вызовы (propagation SecurityContext)
+# =============================================================================
+outbound:
+  default_timeout_sec: ${HTTP_OUT_TIMEOUT:5}
+  propagate_headers:
+    - x-correlation-id
+    - x-request-id
+    - x-tenant-id
+    - x-user-id
+  retry:
+    retries: 3
+    backoff_base: 0.2
+    backoff_factor: 2.0
+    backoff_cap: 5.0

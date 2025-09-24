@@ -1,0 +1,317 @@
+schemaVersion: "1.0"
+kind: Schedules
+metadata:
+  owner: platform-ops
+  product: chronowatch-core
+  generatedAt: "2025-08-28T00:00:00Z"
+
+defaults: &defaults
+  enabled: true
+  timezone: "Europe/Stockholm"
+  startAfter: "2025-01-01T00:00:00Z"       # глобальная нижняя граница
+  endBefore: null                          # можно задать дату стопа
+  concurrency:
+    policy: Forbid                         # Forbid | Replace | Allow
+    maxRunning: 1
+    queue: "default-fifo"
+  retry:
+    attempts: 5
+    backoff: exponential                   # fixed | exponential
+    minDelay: "5s"
+    maxDelay: "5m"
+    jitter: true
+  timeout: "30m"
+  sla:
+    soft: "5m"                             # целевое время завершения
+    hard: "10m"                            # предел, после которого инцидент
+  catchup:
+    enabled: true                          # выполнять пропущенные фреймы
+    maxFrames: 24                          # ограничение на хвост
+  backfill:
+    enabled: true
+    window: "30d"                          # максимум глубина бэкфилла
+  rollout:
+    strategy: canary                       # none | canary
+    canary:
+      shards: 1                            # 1 под или 1% шардов
+      bakeTime: "10m"
+  notifications: &notify_defaults
+    onStart: []
+    onSuccess: []
+    onRetry:
+      - channel: slack
+        target: "#chronowatch-jobs"
+    onSlaMiss:
+      - channel: pagerduty
+        target: "chronowatch-api"
+    onFailure:
+      - channel: pagerduty
+        target: "chronowatch-critical"
+      - channel: slack
+        target: "#alerts"
+  secretsRefs:
+    # ссылки, которые могут использоваться в параметрах задач
+    k8s:
+      namespace: "chronowatch"
+      items:
+        - name: "chronowatch-api-secrets"
+          keys: ["DB_URL", "KAFKA_PASSWORD", "API_TOKEN"]
+  rateLimits:
+    globalQps: 50
+    perJobQps: 10
+  observability:
+    metricsTags:
+      service: chronowatch-core
+    healthcheck:
+      endpoint: "/health"
+      timeout: "5s"
+  calendars:
+    business-hours:
+      timezone: "Europe/Stockholm"
+      rules:
+        - weekdays: [1,2,3,4,5]            # 1=Mon..7=Sun
+          from: "08:00"
+          to: "20:00"
+    maintenance-window:
+      timezone: "Europe/Stockholm"
+      rules:
+        - cron: "0 2 * * Sun"              # каждое воскресенье 02:00-04:00
+          duration: "2h"
+  blackouts:
+    - name: year-end-freeze
+      from: "2025-12-24T00:00:00+01:00"
+      to:   "2026-01-02T23:59:59+01:00"
+      reason: "Release freeze"
+
+profiles:
+  dev:
+    <<: *defaults
+    rateLimits:
+      globalQps: 10
+      perJobQps: 5
+    notifications:
+      <<: *notify_defaults
+      onFailure:
+        - channel: slack
+          target: "#chronowatch-dev"
+  staging:
+    <<: *defaults
+    rateLimits:
+      globalQps: 25
+      perJobQps: 8
+  prod:
+    <<: *defaults
+
+tasks:
+  # ────────────────────────────────────────────────────────────────────────────
+  # 1) Ежечасная агрегация API метрик
+  # ────────────────────────────────────────────────────────────────────────────
+  - id: api-metrics-hourly
+    name: "API hourly aggregation"
+    owners: ["team-observability"]
+    description: "Свод метрик API по часам с выгрузкой в DWH"
+    labels: {component: api, tier: batch}
+    schedule:
+      type: cron
+      expr: "5 * * * *"                    # в 05 минут каждого часа
+      calendar: business-hours
+      misfirePolicy: Catchup               # FireAndProceed | DoNothing | Catchup
+    params:
+      window: "1h"
+      sourceTable: "metrics.api_raw"
+      destTable: "metrics.api_hourly"
+    concurrency:
+      policy: Forbid
+      maxRunning: 1
+    retry:
+      attempts: 4
+      minDelay: "10s"
+      maxDelay: "2m"
+      backoff: exponential
+      jitter: true
+    timeout: "20m"
+    sla: {soft: "4m", hard: "8m"}
+    notifications:
+      onSuccess:
+        - channel: metrics
+          target: "sla-recorder"
+      onFailure:
+        - channel: pagerduty
+          target: "chronowatch-batch"
+    dependencies: []                       # корневая джоба
+    resources:
+      class: "batch-small"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 2) Ночной биллинг с переносом при блэкауте и DAG подзадач
+  # ────────────────────────────────────────────────────────────────────────────
+  - id: billing-close
+    name: "Daily billing close"
+    owners: ["team-billing"]
+    description: "Закрытие дня биллинга и публикация отчета"
+    labels: {component: billing, tier: batch}
+    schedule:
+      type: cron
+      expr: "55 23 * * *"                  # 23:55 ежедневно
+      misfirePolicy: Catchup
+      skipInBlackouts: true
+    params:
+      period: "P1D"
+    timeout: "45m"
+    sla: {soft: "15m", hard: "30m"}
+    concurrency:
+      policy: Replace                       # при новом слоте заменить текущий
+      maxRunning: 1
+    notifications:
+      onStart:
+        - channel: slack
+          target: "#billing"
+    dependencies:
+      - id: billing-close:extract
+      - id: billing-close:reconcile
+      - id: billing-close:publish
+    dag:
+      nodes:
+        - id: billing-close:extract
+          run:
+            image: "registry/chronowatch/billing:{{ .ReleaseVersion }}"
+            cmd: ["billing", "extract", "--date", "{{ .FrameStartISO }}"]
+          retry: {attempts: 5, minDelay: "15s", maxDelay: "3m", backoff: exponential, jitter: true}
+        - id: billing-close:reconcile
+          needs: ["billing-close:extract"]
+          run:
+            image: "registry/chronowatch/billing:{{ .ReleaseVersion }}"
+            cmd: ["billing", "reconcile", "--date", "{{ .FrameStartISO }}"]
+        - id: billing-close:publish
+          needs: ["billing-close:reconcile"]
+          run:
+            image: "registry/chronowatch/billing:{{ .ReleaseVersion }}"
+            cmd: ["billing", "publish", "--date", "{{ .FrameStartISO }}"]
+      rollout:
+        strategy: canary
+        canary: {shards: 1, bakeTime: "15m"}
+    resources:
+      class: "batch-medium"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 3) Ивент-триггерная задача от Kafka с защитой по лагу
+  # ────────────────────────────────────────────────────────────────────────────
+  - id: reindex-from-kafka
+    name: "Search reindex from Kafka"
+    owners: ["team-search"]
+    description: "Стриминговый реиндекс документов из топика событий"
+    labels: {component: search, tier: streaming}
+    schedule:
+      type: event
+      source: kafka
+      topic: "chronowatch.events.documents"
+      group: "reindexer"
+      minBatch: 100                         # минимальный размер пакета
+      maxBatch: 5000
+      maxLag:  "2m"                         # срабатывание при лаге > 2 минут
+      idleTimeout: "30s"                    # флаш если событий нет
+    concurrency:
+      policy: Allow
+      maxRunning: 5
+      queue: "stream-high"
+    retry:
+      attempts: 10
+      minDelay: "1s"
+      maxDelay: "30s"
+      backoff: exponential
+      jitter: true
+    timeout: "5m"
+    sla: {soft: "1m", hard: "2m"}
+    rateLimitOverride: {qps: 200}
+    secretsRefs:
+      k8s:
+        namespace: "chronowatch"
+        items:
+          - name: "chronowatch-search-secrets"
+            keys: ["SEARCH_API_TOKEN", "KAFKA_PASSWORD"]
+    resources:
+      class: "stream-cpu"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 4) Ежедневные бэкапы с окном бизнес-часов и пропуском в блэкаут
+  # ────────────────────────────────────────────────────────────────────────────
+  - id: backups-daily
+    name: "Daily backups"
+    owners: ["team-sre"]
+    description: "Снимок БД и хранилища с проверкой восстановления"
+    labels: {component: ops, tier: ops}
+    schedule:
+      type: cron
+      expr: "0 3 * * *"                     # 03:00 ежедневно
+      calendar: business-hours
+      misfirePolicy: FireAndProceed
+      skipInBlackouts: true
+    params:
+      snapshotRetention: "30d"
+      verifyRestore: true
+    timeout: "2h"
+    sla: {soft: "20m", hard: "40m"}
+    notifications:
+      onSuccess:
+        - channel: slack
+          target: "#sre"
+      onFailure:
+        - channel: pagerduty
+          target: "chronowatch-backups"
+    resources:
+      class: "ops-io"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # 5) Пример часовой инкрементальной ETL с кэчапом и бэкфиллом
+  # ────────────────────────────────────────────────────────────────────────────
+  - id: etl-incremental-hourly
+    name: "ETL incremental hourly"
+    owners: ["team-data"]
+    description: "Инкрементальная загрузка событий в DWH"
+    labels: {component: data, tier: etl}
+    schedule:
+      type: cron
+      expr: "0 * * * *"
+      misfirePolicy: Catchup
+    params:
+      slice: "hour"
+      watermarkField: "event_time"
+    catchup:
+      enabled: true
+      maxFrames: 48
+    backfill:
+      enabled: true
+      window: "14d"
+    timeout: "25m"
+    sla: {soft: "6m", hard: "12m"}
+    dependencies:
+      - id: api-metrics-hourly
+    resources:
+      class: "batch-small"
+
+overrides:
+  # Пер-окруженческие переопределения по задачам
+  dev:
+    tasks:
+      - match: {id: "reindex-from-kafka"}
+        apply:
+          concurrency: {maxRunning: 1}
+          rateLimitOverride: {qps: 20}
+      - match: {id: "backups-daily"}
+        apply:
+          enabled: false
+  staging:
+    tasks:
+      - match: {id: "billing-close"}
+        apply:
+          schedule:
+            expr: "55 23 * * Mon-Fri"      # только будни на стейджинге
+  prod:
+    tasks:
+      - match: {id: "api-metrics-hourly"}
+        apply:
+          sla: {soft: "3m", hard: "6m"}
+      - match: {id: "reindex-from-kafka"}
+        apply:
+          concurrency: {maxRunning: 8}
+          rateLimitOverride: {qps: 400}

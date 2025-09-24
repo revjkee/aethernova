@@ -1,0 +1,435 @@
+# path: veilmind-core/configs/detectors.yaml
+version: "1.0.0"
+schema: "veilmind.detectors/1.0"
+
+metadata:
+  owner: secops
+  app: veilmind-core
+  updated_at: "2025-08-21"
+  description: >
+    Конфигурация промышленного конвейера детектирования для veilmind-core.
+    Включает нормализацию, обогащение, правила, корреляцию и маршрутизацию.
+
+globals:
+  timezone: "UTC"
+  default_window_s: 900        # окно агрегирования по умолчанию
+  max_event_delay_s: 120       # допустимая задержка поступления событий
+  min_severity_to_alert: "medium"
+  risk_scoring:
+    base_weights:              # базовые веса факторов риска
+      auth_failed: 0.4
+      geo_mismatch: 0.6
+      ip_reputation_bad: 0.8
+      mfa_bypass: 0.9
+      privilege_change: 0.9
+      api_rate_spike: 0.5
+      device_non_compliant: 0.6
+      policy_tamper: 1.0
+    score_to_severity:         # пороги преобразования риск-скоринга в уровень
+      low:     0.0
+      medium:  0.5
+      high:    0.75
+      critical: 0.9
+
+normalizers:
+  - name: http_access
+    if_stream: http_access_log
+    mapping:
+      ts: "@timestamp"
+      user: "auth.user"
+      ip: "client.ip"
+      method: "http.method"
+      path: "url.path"
+      status: "http.status_code"
+      ua: "user_agent.original"
+      tenant: "tenant.id"
+  - name: auth_events
+    if_stream: authn
+    mapping:
+      ts: "@timestamp"
+      user: "user.id"
+      ip: "source.ip"
+      mfa: "auth.mfa"
+      result: "auth.result"    # success|failure
+      provider: "auth.provider"
+      tenant: "tenant.id"
+      reason: "auth.reason"
+  - name: policy_core
+    if_stream: policy_core
+    mapping:
+      ts: "@timestamp"
+      correlation_id: "event.correlation_id"
+      decision: "policy.effect" # Permit|Deny|Indeterminate
+      reason: "policy.reason"
+      resource_type: "resource.type"
+      action: "action.name"
+      subject: "subject.id"
+      ip: "environment.ip"
+      tenant: "tenant.id"
+
+enrichers:
+  - name: ip_reputation
+    provider: builtin.reputation
+    inputs: [ip]
+    outputs: [rep.score, rep.tags]  # score 0..100, tags: [bot, tor, cloud, …]
+    cache_ttl_s: 3600
+  - name: geoip
+    provider: builtin.geoip
+    inputs: [ip]
+    outputs: [geo.iso_code, geo.city, geo.asn]
+    cache_ttl_s: 86400
+  - name: user_directory
+    provider: adapter.userdb
+    inputs: [user, tenant]
+    outputs: [user.role, user.department, user.owner_email, user.risk_baseline]
+    cache_ttl_s: 300
+  - name: device_posture
+    provider: adapter.device
+    inputs: [user, ip]
+    outputs: [device.attested, device.os, device.os_up_to_date, device.jailbroken]
+    cache_ttl_s: 300
+
+dictionaries:
+  trusted_cidrs:
+    - "10.0.0.0/8"
+    - "192.168.0.0/16"
+    - "172.16.0.0/12"
+  corporate_asn: [ "AS64500" ]
+  ok_geo_countries: [ "SE", "FI", "NO", "DE", "NL" ]
+  service_accounts: [ "svc-ci", "svc-backup", "svc-metrics" ]
+  high_value_resources:
+    - type: "document"
+      id_prefix: "sec-"
+    - type: "token"
+      id_prefix: "root-"
+  api_sensitive_paths:
+    - "/api/v1/admin"
+    - "/api/v1/policies"
+    - "/api/v1/tokens"
+  suppression_windows:
+    noisy_ips: 600   # подавление повторных алертов для «шумных» IP
+
+suppressions:
+  - name: lab_network
+    if_any:
+      - ip in_cidr trusted_cidrs
+      - geo.asn in corporate_asn
+    effect: "drop"          # drop|mute
+    reason: "trusted network"
+  - name: healthcheck_paths
+    if_all:
+      - path starts_with "/health"
+      - method in ["GET"]
+    effect: "mute"
+    reason: "health check"
+    ttl_s: 3600
+
+detectors:
+
+  # 1) Подозрительные неуспехи входа
+  - id: AUTH_FAIL_BRUTEFORCE
+    name: "Множественные неуспешные входы с одного IP"
+    stream: authn
+    window_s: 600
+    where:
+      - result == "failure"
+      - not (user in service_accounts)
+    group_by: [ip, tenant]
+    threshold:
+      count_ge: 10
+    risk:
+      factors:
+        - key: auth_failed
+          weight: 0.4
+        - key: ip_reputation_bad
+          weight: 0.6
+          if: rep.score >= 70
+        - key: geo_mismatch
+          weight: 0.4
+          if: not (geo.iso_code in ok_geo_countries)
+    output:
+      title: "Bruteforce по аутентификации"
+      severity_from_risk: true
+      tags: [auth, brute, account]
+      artifacts:
+        ip: "{{ip}}"
+        user_candidates: "{{distinct(user,5)}}"
+        rep_tags: "{{rep.tags}}"
+
+  # 2) Geo‑velocity
+  - id: GEO_VELOCITY
+    name: "Невозможная гео‑скорость входа"
+    stream: authn
+    window_s: 3600
+    where:
+      - result == "success"
+      - not (user in service_accounts)
+    correlation:
+      type: sequence
+      by: [user, tenant]
+      steps:
+        - within_s: 3600
+          eval: >
+            geovelocity_kmh(prev.geo, geo) > 900
+    risk:
+      factors:
+        - key: geo_mismatch
+          weight: 0.7
+    output:
+      title: "Impossible travel"
+      severity: "high"
+      tags: [auth, geo]
+      artifacts:
+        prev_ip: "{{prev.ip}}"
+        curr_ip: "{{ip}}"
+        prev_geo: "{{prev.geo.iso_code}}"
+        curr_geo: "{{geo.iso_code}}"
+
+  # 3) MFA обход/отсутствие при чувствительных операциях
+  - id: MFA_REQUIRED_BUT_MISSING
+    name: "Чувствительная операция без MFA"
+    stream: policy_core
+    window_s: 60
+    where:
+      - decision == "Permit"
+      - action in ["update","delete","write"]
+      - resource_type in ["document","token","queue"]
+      - not mfa
+    enrich:
+      - device_posture
+    risk:
+      factors:
+        - key: mfa_bypass
+          weight: 0.9
+        - key: device_non_compliant
+          weight: 0.4
+          if: device.os_up_to_date == false or device.jailbroken == true
+    output:
+      title: "MFA отсутствует на чувствительной операции"
+      severity_from_risk: true
+      tags: [mfa, policy, zero-trust]
+      artifacts:
+        user: "{{subject}}"
+        action: "{{action}}"
+        resource_type: "{{resource_type}}"
+
+  # 4) Эскалация привилегий
+  - id: PRIVILEGE_ESCALATION
+    name: "Изменение роли пользователя до привилегированной"
+    stream: http_access_log
+    window_s: 300
+    where:
+      - path in api_sensitive_paths
+      - method in ["POST","PUT","PATCH"]
+      - status in [200,201,204]
+    correlation:
+      type: join
+      join_on: [user, tenant]
+      with_stream: user_directory_change
+      within_s: 300
+      predicate: |
+        event.change == "role_update" and
+        (event.new_role in ["admin","security_engineer"])
+    risk:
+      factors:
+        - key: privilege_change
+          weight: 0.9
+    output:
+      title: "Privilege escalation"
+      severity: "critical"
+      tags: [iam, privilege, api]
+      artifacts:
+        user: "{{user}}"
+        new_role: "{{event.new_role}}"
+
+  # 5) Аномалия частоты API
+  - id: API_RATE_SPIKE
+    name: "Резкий всплеск запросов API c одного субъекта"
+    stream: http_access_log
+    window_s: 120
+    where:
+      - status not_in [429, 499, 500, 502, 503, 504]
+    group_by: [user, tenant]
+    baseline:
+      method: ewma
+      alpha: 0.2
+      min_samples: 50
+    threshold:
+      when: rate_per_minute > 3.0 * baseline.rate_per_minute
+    risk:
+      factors:
+        - key: api_rate_spike
+          weight: 0.5
+    output:
+      title: "API rate spike"
+      severity: "medium"
+      tags: [api, anomaly]
+      artifacts:
+        rpm: "{{rate_per_minute}}"
+        rpm_baseline: "{{baseline.rate_per_minute}}"
+
+  # 6) Тамперинг политик
+  - id: POLICY_TAMPER
+    name: "Попытка изменения/подмены политик"
+    stream: policy_core
+    window_s: 60
+    where:
+      - decision in ["Deny","Indeterminate"]
+      - reason in ["opa-invalid-response","opa-http-error","zero-trust-default-deny"]
+    threshold:
+      count_ge: 5
+    risk:
+      factors:
+        - key: policy_tamper
+          weight: 1.0
+    output:
+      title: "Policy tamper suspected"
+      severity: "high"
+      tags: [policy, integrity]
+      artifacts:
+        correlation_id: "{{correlation_id}}"
+
+  # 7) Несоответствие постуры устройства
+  - id: DEVICE_NON_COMPLIANT
+    name: "Несоответствие постуры устройства требованиям"
+    stream: authn
+    window_s: 300
+    where:
+      - result == "success"
+    enrich:
+      - device_posture
+    threshold:
+      when: device.attested == false or device.os_up_to_date == false or device.jailbroken == true
+    risk:
+      factors:
+        - key: device_non_compliant
+          weight: 0.6
+    output:
+      title: "Device posture non-compliant"
+      severity: "medium"
+      tags: [device, posture]
+      artifacts:
+        device_os: "{{device.os}}"
+        compliant: "{{device.attested and device.os_up_to_date and (not device.jailbroken)}}"
+
+  # 8) Доступ к высокоценным ресурсам вне часов
+  - id: AFTER_HOURS_SENSITIVE_ACCESS
+    name: "Доступ к HV ресурсам вне рабочих часов"
+    stream: policy_core
+    window_s: 60
+    where:
+      - decision == "Permit"
+      - resource_type in [r.type for r in high_value_resources]
+    threshold:
+      when: local_hour(ts, "Europe/Stockholm") not_in  [8..19]
+    risk:
+      factors:
+        - key: privilege_change
+          weight: 0.4
+        - key: geo_mismatch
+          weight: 0.3
+          if: not (geo.iso_code in ok_geo_countries)
+    output:
+      title: "After-hours HV access"
+      severity_from_risk: true
+      tags: [behavior, hv]
+      artifacts:
+        hour: "{{local_hour(ts,'Europe/Stockholm')}}"
+
+correlation_rules:
+  - id: MULTI_VECTOR_ACCOUNT_TAKEOVER
+    name: "Мультивекторный ATO (brute + impossible travel + mfa missing)"
+    window_s: 3600
+    by: [user, tenant]
+    sequence:
+      - AUTH_FAIL_BRUTEFORCE
+      - GEO_VELOCITY
+      - MFA_REQUIRED_BUT_MISSING
+    output:
+      title: "Account Takeover suspected"
+      severity: "critical"
+      tags: [ato, killchain]
+      escalate: true
+
+routing:
+  default_channel: "secops.p3"
+  channels:
+    - id: secops.p2
+      type: pagerduty
+      severity_min: "high"
+      dedup_keys: ["id","user","ip"]
+    - id: secops.p3
+      type: slack
+      webhook_ref: "slack://secops-core"
+      severity_min: "medium"
+    - id: siem
+      type: syslog
+      endpoint: "udp://siem.internal:514"
+      format: cef
+  routes:
+    - match:
+        any_of_ids: ["PRIVILEGE_ESCALATION","MULTI_VECTOR_ACCOUNT_TAKEOVER","POLICY_TAMPER"]
+      to: ["secops.p2","siem"]
+    - match:
+        severity: ["medium","high","critical"]
+      to: ["secops.p3","siem"]
+
+case_management:
+  provider: "builtin"
+  auto_create_case_for_severity: ["high","critical"]
+  auto_assign:
+    by_tag:
+      iam: "team-iam"
+      policy: "team-platform"
+      device: "team-endpoint"
+  sla_minutes:
+    high: 60
+    critical: 15
+  statuses: ["new","triage","contain","eradicate","recover","monitor","closed"]
+  transitions:
+    - from: "new"
+      to: "triage"
+      allowed_roles: ["secops","ir_lead"]
+    - from: "triage"
+      to: "contain"
+      allowed_roles: ["secops","ir_lead"]
+    - from: "contain"
+      to: "eradicate"
+      allowed_roles: ["secops","ir_lead"]
+    - from: "eradicate"
+      to: "recover"
+      allowed_roles: ["secops","ir_lead"]
+    - from: "recover"
+      to: "monitor"
+      allowed_roles: ["secops","ir_lead"]
+    - from: "monitor"
+      to: "closed"
+      allowed_roles: ["secops","ir_lead"]
+
+telemetry:
+  metrics:
+    enabled: true
+    export: otlp
+    histogram_buckets_s: [0.1,0.2,0.5,1,2,5,10]
+  logs:
+    redaction_keys: ["password","secret","token","authorization","api_key"]
+  tracing:
+    enabled: true
+    sample_ratio: 0.05
+
+tests:  # встроенные self-check сценарии конфигурации
+  - name: should_detect_bruteforce
+    feed:
+      stream: authn
+      template: {result: "failure", ip: "203.0.113.10", user: "alice", tenant: "t1"}
+      repeat: 10
+      within_s: 60
+    expect:
+      detector_id: AUTH_FAIL_BRUTEFORCE
+      min_severity: "medium"
+  - name: should_route_critical_to_p2
+    feed:
+      detector_id: MULTI_VECTOR_ACCOUNT_TAKEOVER
+      synthesized: true
+    expect:
+      routes_include: ["secops.p2"]

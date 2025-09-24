@@ -1,0 +1,136 @@
+# physical-integration-core/ops/k8s/base/ingress.yaml
+# Главный публичный Ingress (API)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pic-api
+  namespace: physical-integration-core
+  labels:
+    app.kubernetes.io/name: physical-integration-core
+    app.kubernetes.io/part-of: physical-integration-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/instance: prod
+  annotations:
+    # TLS/HTTPS и автоматическая выдача сертификата (cert-manager)
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
+    # Принудительный HTTPS
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # Таймауты и размеры
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+
+    # CORS (укажите точные origin'ы вашего фронтенда)
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.com, https://admin.example.com"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, PUT, POST, PATCH, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization,Content-Type,Accept,Origin,User-Agent,Cache-Control,Pragma"
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+    nginx.ingress.kubernetes.io/cors-expose-headers: "X-Request-Id"
+
+    # Rate limiting (per client)
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+
+    # Безопасные заголовки (всегда)
+    nginx.ingress.kubernetes.io/server-snippet: |
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+      add_header X-XSS-Protection "1; mode=block" always;
+      add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+      add_header Content-Security-Policy "default-src 'none'; connect-src 'self' https://api.example.com; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'" always;
+      add_header X-Request-Id $req_id always;
+
+    # (необязательно) Перенаправления www/non-www
+    # nginx.ingress.kubernetes.io/from-to-www-redirect: "true"
+
+    # (необязательно) OWASP CRS / ModSecurity — включайте только если сборка контроллера поддерживает модуль
+    # nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    # nginx.ingress.kubernetes.io/enable-owasp-core-rules: "true"
+    # nginx.ingress.kubernetes.io/modsecurity-snippet: |
+    #   SecRuleEngine On
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [ "api.example.com" ]          # ЗАМЕНИТЕ на ваш домен
+      secretName: pic-tls                   # ЗАМЕНИТЕ на ваш секрет с сертификатом
+  rules:
+    - host: api.example.com                 # ЗАМЕНИТЕ на ваш домен
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: physical-integration-core   # ЗАМЕНИТЕ при необходимости
+                port:
+                  number: 8080                    # или name: http, если порт сервиса именован
+
+---
+# Отдельный Ingress для административной зоны /admin с IP-списком и Basic Auth
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pic-admin
+  namespace: physical-integration-core
+  labels:
+    app.kubernetes.io/name: physical-integration-core
+    app.kubernetes.io/component: admin
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Ограничение по источникам (ЗАМЕНИТЕ подсети на свои)
+    nginx.ingress.kubernetes.io/whitelist-source-range: "203.0.113.0/24, 10.0.0.0/8, 192.168.0.0/16"
+    # Basic Auth: создайте secret с htpasswd (kubectl create secret generic pic-admin-basic-auth --from-file=auth)
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: pic-admin-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "Authentication Required"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [ "api.example.com" ]
+      secretName: pic-tls
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /admin
+            pathType: Prefix
+            backend:
+              service:
+                name: physical-integration-core
+                port:
+                  number: 8080
+
+---
+# Пример canary-Ingress (10% трафика) — применяйте при наличии canary-сервиса/версии
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pic-api-canary
+  namespace: physical-integration-core
+  labels:
+    app.kubernetes.io/name: physical-integration-core
+    app.kubernetes.io/component: api
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"   # 10% трафика
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: physical-integration-core-canary   # укажите имя canary-сервиса
+                port:
+                  number: 8080

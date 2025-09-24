@@ -1,0 +1,405 @@
+---
+# roles/chronowatch-core/tasks/main.yml
+# Максимально идемпотентная установка/обновление ChronoWatch Core
+# Поддерживает два режима запуска:
+#   - container: systemd + (podman|docker) с pull образа
+#   - binary: systemd + локальный бинарь из артефакта
+#
+# Важные переменные (пример overrides в inventory/group_vars/chronowatch.yml):
+#   chrono_user: "chronowatch"
+#   chrono_group: "chronowatch"
+#   chrono_home: "/opt/chronowatch"
+#   chrono_mode: "container"        # container|binary
+#   chrono_container_runtime: "podman"  # podman|docker
+#   chrono_container_image: "registry.example.com/chronowatch/core:1.0.0"
+#   chrono_container_pull: true
+#   chrono_listen_port: 8080
+#   chrono_config: {}               # dict -> application.yaml
+#   chrono_env: {}                  # dict -> /etc/chronowatch/chronowatch.env
+#   chrono_artifact_url: ""         # для binary: URL tar.gz/zip
+#   chrono_artifact_checksum: ""    # sha256:xxxx
+#   chrono_binary_path: "/opt/chronowatch/bin/chronowatch-core"
+#   chrono_exec_args: []            # доп. аргументы запуска
+#   chrono_log_dir: "/var/log/chronowatch"
+#   chrono_data_dir: "/var/lib/chronowatch"
+#   chrono_config_dir: "/etc/chronowatch"
+#   chrono_service_name: "chronowatch-core"
+#   chrono_selinux: true
+#   chrono_firewalld_manage: true
+#   chrono_logrotate_manage: true
+#   chrono_sysctl_manage: true
+#   chrono_open_files_limit: 65535
+#   chrono_restart_on_change: true
+
+- name: "Preflight | Assert minimal requirements"
+  ansible.builtin.assert:
+    that:
+      - ansible_version.full is version('2.12', '>=')
+      - ansible_facts.os_family in ['RedHat', 'Debian']
+      - chrono_mode in ['container', 'binary']
+    fail_msg: "Unsupported Ansible version/OS family or chrono_mode. Check variables."
+  tags: [preflight]
+
+- name: "Preflight | Set sane defaults (if undefined)"
+  ansible.builtin.set_fact:
+    chrono_user: "{{ chrono_user | default('chronowatch') }}"
+    chrono_group: "{{ chrono_group | default('chronowatch') }}"
+    chrono_home: "{{ chrono_home | default('/opt/chronowatch') }}"
+    chrono_container_runtime: "{{ chrono_container_runtime | default('podman') }}"
+    chrono_listen_port: "{{ chrono_listen_port | default(8080) }}"
+    chrono_log_dir: "{{ chrono_log_dir | default('/var/log/chronowatch') }}"
+    chrono_data_dir: "{{ chrono_data_dir | default('/var/lib/chronowatch') }}"
+    chrono_config_dir: "{{ chrono_config_dir | default('/etc/chronowatch') }}"
+    chrono_service_name: "{{ chrono_service_name | default('chronowatch-core') }}"
+    chrono_open_files_limit: "{{ chrono_open_files_limit | default(65535) }}"
+  tags: [preflight]
+
+- name: "OS | Ensure packages present (base)"
+  ansible.builtin.package:
+    name: >-
+      {{ (ansible_facts.os_family == 'Debian') |
+          ternary(['ca-certificates','tar','gzip'], ['ca-certificates','tar']) }}
+    state: present
+  tags: [packages]
+
+- name: "OS | Container runtime packages (if container mode)"
+  ansible.builtin.package:
+    name: "{{ 'podman' if chrono_container_runtime == 'podman' else 'docker' }}"
+    state: present
+  when: chrono_mode == 'container'
+  tags: [packages]
+
+- name: "OS | Ensure docker service (if docker runtime)"
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+  when:
+    - chrono_mode == 'container'
+    - chrono_container_runtime == 'docker'
+  tags: [packages]
+
+- name: "Users | Ensure group exists"
+  ansible.builtin.group:
+    name: "{{ chrono_group }}"
+    system: true
+  tags: [users]
+
+- name: "Users | Ensure user exists"
+  ansible.builtin.user:
+    name: "{{ chrono_user }}"
+    group: "{{ chrono_group }}"
+    home: "{{ chrono_home }}"
+    shell: /sbin/nologin
+    system: true
+    create_home: false
+  tags: [users]
+
+- name: "FS | Create directories"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ chrono_user }}"
+    group: "{{ chrono_group }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop:
+    - { path: "{{ chrono_home }}" }
+    - { path: "{{ chrono_home }}/bin" }
+    - { path: "{{ chrono_config_dir }}", mode: "0755" }
+    - { path: "{{ chrono_log_dir }}", mode: "0755" }
+    - { path: "{{ chrono_data_dir }}", mode: "0750" }
+  tags: [filesystem]
+
+- name: "Config | Render application.yaml from dict"
+  vars:
+    _config_yaml: "{{ chrono_config | default({}) | to_nice_yaml(indent=2) }}"
+  ansible.builtin.copy:
+    dest: "{{ chrono_config_dir }}/application.yaml"
+    owner: "{{ chrono_user }}"
+    group: "{{ chrono_group }}"
+    mode: "0640"
+    content: "{{ _config_yaml }}"
+  register: chrono_cfg_file
+  tags: [config]
+
+- name: "Config | Validate application.yaml (pyyaml)"
+  ansible.builtin.shell: |
+    python3 - << 'PY'
+    import yaml,sys
+    p="{{ path }}"
+    with open(p,'r',encoding='utf-8') as f:
+        yaml.safe_load(f)
+    print("OK")
+    PY
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: result.rc != 0
+  vars:
+    path: "{{ chrono_config_dir }}/application.yaml"
+  register: result
+  tags: [config,validate]
+
+- name: "Config | Render environment file from dict"
+  vars:
+    _env_lines: >-
+      {{
+        (chrono_env | default({}))
+        | dict2items
+        | map('combine', {'line': (item.key ~ '=' ~ (item.value | string))})
+        | map(attribute='line')
+        | list
+      }}
+  ansible.builtin.copy:
+    dest: "/etc/chronowatch/{{ chrono_service_name }}.env"
+    owner: "{{ chrono_user }}"
+    group: "{{ chrono_group }}"
+    mode: "0640"
+    content: |-
+      {% for line in _env_lines %}{{ line }}
+      {% endfor %}
+  register: chrono_env_file
+  tags: [config]
+
+- name: "Binary | Download and install artifact (if binary mode)"
+  when:
+    - chrono_mode == 'binary'
+    - chrono_artifact_url | default('') | length > 0
+  block:
+    - name: "Binary | Download artifact"
+      ansible.builtin.get_url:
+        url: "{{ chrono_artifact_url }}"
+        dest: "{{ chrono_home }}/artifact.tar.gz"
+        mode: "0644"
+        checksum: "{{ chrono_artifact_checksum | default(omit) }}"
+      register: dl
+    - name: "Binary | Extract artifact"
+      ansible.builtin.unarchive:
+        src: "{{ chrono_home }}/artifact.tar.gz"
+        dest: "{{ chrono_home }}/bin"
+        remote_src: true
+        extra_opts: [ "--no-same-owner" ]
+      register: extracted
+    - name: "Binary | Ensure binary permissions"
+      ansible.builtin.file:
+        path: "{{ chrono_binary_path }}"
+        state: file
+        owner: "{{ chrono_user }}"
+        group: "{{ chrono_group }}"
+        mode: "0755"
+  tags: [binary]
+
+- name: "Container | Pull image (if container mode)"
+  when:
+    - chrono_mode == 'container'
+    - chrono_container_pull | default(true)
+  block:
+    - name: "Container | Pull via podman"
+      ansible.builtin.command: "podman pull {{ chrono_container_image }}"
+      changed_when: "'Downloaded newer image' in podman_pull.stdout or 'Storing signatures' in podman_pull.stdout"
+      register: podman_pull
+      when: chrono_container_runtime == 'podman'
+    - name: "Container | Pull via docker"
+      ansible.builtin.docker_image:
+        name: "{{ chrono_container_image }}"
+        source: pull
+      when: chrono_container_runtime == 'docker'
+  tags: [container]
+
+- name: "Systemd | Unit file (container mode)"
+  when: chrono_mode == 'container'
+  ansible.builtin.blockinfile:
+    path: "/etc/systemd/system/{{ chrono_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+    create: true
+    block: |-
+      [Unit]
+      Description=ChronoWatch Core (container)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      EnvironmentFile=/etc/chronowatch/{{ chrono_service_name }}.env
+      User={{ chrono_user }}
+      Group={{ chrono_group }}
+      Restart=always
+      RestartSec=5s
+      LimitNOFILE={{ chrono_open_files_limit }}
+      ExecStartPre=/bin/sh -c '{{ chrono_container_runtime }} rm -f {{ chrono_service_name }} || true'
+      ExecStart={{ chrono_container_runtime }} run --rm --name {{ chrono_service_name }} \
+        --env-file /etc/chronowatch/{{ chrono_service_name }}.env \
+        -p {{ chrono_listen_port }}:{{ chrono_listen_port }} \
+        -v {{ chrono_config_dir }}:/config:ro \
+        -v {{ chrono_log_dir }}:/var/log/chronowatch \
+        -v {{ chrono_data_dir }}:/var/lib/chronowatch \
+        {{ chrono_container_image }} \
+        --config /config/application.yaml \
+        --port {{ chrono_listen_port }} {% for a in (chrono_exec_args|default([])) %} {{ a }} {% endfor %}
+      ExecStop={{ chrono_container_runtime }} stop {{ chrono_service_name }}
+      ExecStopPost={{ chrono_container_runtime }} rm -f {{ chrono_service_name }}
+
+      [Install]
+      WantedBy=multi-user.target
+  register: unit_container
+  tags: [systemd]
+
+- name: "Systemd | Unit file (binary mode)"
+  when: chrono_mode == 'binary'
+  ansible.builtin.blockinfile:
+    path: "/etc/systemd/system/{{ chrono_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+    create: true
+    block: |-
+      [Unit]
+      Description=ChronoWatch Core (binary)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User={{ chrono_user }}
+      Group={{ chrono_group }}
+      EnvironmentFile=/etc/chronowatch/{{ chrono_service_name }}.env
+      WorkingDirectory={{ chrono_home }}
+      ExecStart={{ chrono_binary_path }} --config {{ chrono_config_dir }}/application.yaml --port {{ chrono_listen_port }} {% for a in (chrono_exec_args|default([])) %} {{ a }} {% endfor %}
+      Restart=always
+      RestartSec=5s
+      LimitNOFILE={{ chrono_open_files_limit }}
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+  register: unit_binary
+  tags: [systemd]
+
+- name: "Systemd | daemon-reload (if unit changed)"
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: (unit_container is defined and unit_container.changed) or (unit_binary is defined and unit_binary.changed)
+  tags: [systemd]
+
+- name: "SELinux | fcontext and restorecon (optional)"
+  when:
+    - chrono_selinux | default(true)
+    - ansible_facts.selinux.status is defined
+    - ansible_facts.selinux.status == 'enabled'
+  block:
+    - name: "SELinux | set fcontext"
+      community.general.sefcontext:
+        target: "{{ item.path }}(/.*)?"
+        setype: "{{ item.type }}"
+        state: present
+      loop:
+        - { path: "{{ chrono_log_dir }}",  type: "var_log_t" }
+        - { path: "{{ chrono_data_dir }}", type: "var_lib_t" }
+        - { path: "{{ chrono_config_dir }}", type: "etc_t" }
+    - name: "SELinux | restorecon"
+      ansible.builtin.command: "restorecon -Rv {{ item }}"
+      loop:
+        - "{{ chrono_log_dir }}"
+        - "{{ chrono_data_dir }}"
+        - "{{ chrono_config_dir }}"
+      changed_when: false
+  tags: [selinux]
+
+- name: "FirewallD | open service port (optional)"
+  when:
+    - chrono_firewalld_manage | default(true)
+    - ansible_facts.services is not defined or ('firewalld.service' in ansible_facts.services)
+  block:
+    - name: "FirewallD | ensure started"
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+    - name: "FirewallD | add port permanent"
+      ansible.posix.firewalld:
+        port: "{{ chrono_listen_port }}/tcp"
+        permanent: true
+        state: enabled
+        immediate: true
+  tags: [firewall]
+
+- name: "Logrotate | configure (optional)"
+  when: chrono_logrotate_manage | default(true)
+  ansible.builtin.copy:
+    dest: "/etc/logrotate.d/{{ chrono_service_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |-
+      {{ chrono_log_dir }}/*.log {
+        daily
+        rotate 14
+        compress
+        delaycompress
+        missingok
+        notifempty
+        copytruncate
+        create 0640 {{ chrono_user }} {{ chrono_group }}
+      }
+  tags: [logrotate]
+
+- name: "Sysctl | tune (optional)"
+  when: chrono_sysctl_manage | default(true)
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_file: /etc/sysctl.d/99-chronowatch.conf
+  loop:
+    - { name: "net.core.somaxconn", value: "1024" }
+    - { name: "fs.file-max", value: "{{ chrono_open_files_limit | int * 4 }}" }
+  tags: [sysctl]
+
+- name: "Service | enable"
+  ansible.builtin.service:
+    name: "{{ chrono_service_name }}"
+    enabled: true
+  tags: [service]
+
+- name: "Service | restart on change (config/env/unit/runtime)"
+  when: chrono_restart_on_change | default(true)
+  ansible.builtin.service:
+    name: "{{ chrono_service_name }}"
+    state: restarted
+  when: >
+    (chrono_cfg_file is defined and chrono_cfg_file.changed) or
+    (chrono_env_file is defined and chrono_env_file.changed) or
+    (unit_container is defined and unit_container.changed) or
+    (unit_binary is defined and unit_binary.changed) or
+    (podman_pull is defined and podman_pull.changed) or
+    (dl is defined and dl.changed) or
+    (extracted is defined and extracted.changed)
+  tags: [service]
+
+- name: "Service | ensure running"
+  ansible.builtin.service:
+    name: "{{ chrono_service_name }}"
+    state: started
+  tags: [service]
+
+- name: "Health | Wait for TCP port"
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: "{{ chrono_listen_port }}"
+    delay: 1
+    timeout: 60
+    state: started
+  tags: [health]
+
+- name: "Health | HTTP readiness probe (best-effort)"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ chrono_listen_port }}/health/ready"
+    status_code: 200
+    return_content: false
+  register: readiness
+  failed_when: false
+  changed_when: false
+  tags: [health]

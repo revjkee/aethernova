@@ -1,0 +1,289 @@
+# omnimind-core/ops/ansible/inventory/group_vars/all.yml
+# Профиль: продакшн-безопасность, мульти-дистрибутив (Debian/Ubuntu/RHEL/Alma)
+
+################################################################################
+# Базовые параметры Ansible
+################################################################################
+ansible_connection: ssh
+ansible_user: deploy
+ansible_become: true
+ansible_become_method: sudo
+ansible_ssh_common_args: "-o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6"
+ansible_python_interpreter: /usr/bin/python3
+
+# Автоопределение менеджера пакетов (можно жёстко задать: apt|dnf|yum|zypper)
+pkg_mgr_map:
+  Debian: apt
+  Ubuntu: apt
+  AlmaLinux: dnf
+  Rocky: dnf
+  RedHat: dnf
+  CentOS: dnf
+pkg_mgr: "{{ pkg_mgr_map.get(ansible_facts.distribution, 'apt') }}"
+
+################################################################################
+# Глобальные метки окружения
+################################################################################
+env_name: "staging"             # override в group_vars/staging/ или prod/
+org_name: "omnimind"
+project_name: "omnimind-core"
+region: "eu-central-1"
+timezone: "UTC"
+
+################################################################################
+# Сетевая политика и базовые порты приложения
+################################################################################
+app_bind_host: "0.0.0.0"
+app_port_http: 8080
+app_port_metrics: 8080         # если /metrics на том же порту
+app_health_live_path: "/healthz/live"
+app_health_ready_path: "/healthz/ready"
+allow_ingress_cidrs:
+  - "10.0.0.0/8"
+  - "172.16.0.0/12"
+  - "192.168.0.0/16"
+  # public ingress добавлять явно через группы/хосты
+
+################################################################################
+# Пользователи и SSH
+################################################################################
+users_manage_enabled: true
+users_managed:
+  - name: "deploy"
+    uid: 1001
+    groups: ["sudo","docker"]
+    shell: "/bin/bash"
+    ssh_authorized_keys: "{{ lookup('file', 'ops/ansible/keys/deploy.pub') | default('', true) }}"
+    sudo_nopasswd: true
+  - name: "ops"
+    uid: 1002
+    groups: ["sudo"]
+    shell: "/bin/bash"
+    ssh_authorized_keys: "{{ lookup('file', 'ops/ansible/keys/ops.pub') | default('', true) }}"
+    sudo_nopasswd: false
+
+ssh_hardening_enabled: true
+ssh_hardening_config:
+  Port: 22
+  Protocol: 2
+  PermitRootLogin: "no"
+  PasswordAuthentication: "no"
+  PubkeyAuthentication: "yes"
+  KbdInteractiveAuthentication: "no"
+  ChallengeResponseAuthentication: "no"
+  X11Forwarding: "no"
+  AllowTcpForwarding: "no"
+  AllowAgentForwarding: "no"
+  ClientAliveInterval: 300
+  ClientAliveCountMax: 2
+  LoginGraceTime: 20
+  MaxAuthTries: 3
+  MaxSessions: 5
+  UsePAM: "yes"
+  Ciphers:
+    - chacha20-poly1305@openssh.com
+    - aes256-gcm@openssh.com
+    - aes128-gcm@openssh.com
+  MACs:
+    - hmac-sha2-512-etm@openssh.com
+    - hmac-sha2-256-etm@openssh.com
+  KexAlgorithms:
+    - curve25519-sha256
+    - curve25519-sha256@libssh.org
+
+################################################################################
+# Системный харднинг
+################################################################################
+system_hardening_enabled: true
+firewall_enabled: true
+firewall_open_ports:
+  - { port: "{{ app_port_http }}", proto: "tcp" }
+  - { port: 22, proto: "tcp" }
+  # metrics ingress в приватной сети
+  - { port: "{{ app_port_metrics }}", proto: "tcp", src: "10.0.0.0/8" }
+
+sysctl_hardening_enabled: true
+sysctl_params:
+  net.ipv4.ip_forward: 0
+  net.ipv4.conf.all.rp_filter: 1
+  net.ipv4.tcp_syncookies: 1
+  net.ipv4.conf.all.accept_redirects: 0
+  net.ipv4.conf.all.send_redirects: 0
+  net.ipv4.conf.all.accept_source_route: 0
+  net.ipv4.conf.all.log_martians: 1
+  net.ipv6.conf.all.disable_ipv6: 1
+  kernel.randomize_va_space: 2
+  fs.protected_hardlinks: 1
+  fs.protected_symlinks: 1
+  fs.protected_fifos: 2
+  fs.protected_regular: 2
+  kernel.kptr_restrict: 2
+  kernel.dmesg_restrict: 1
+  vm.swappiness: 10
+
+auditd_enabled: true
+auditd_rules_profile: "cis_minimal"
+
+ntp_enabled: true
+ntp_servers:
+  - "time.cloudflare.com"
+  - "time.google.com"
+chrony_enabled: true
+
+################################################################################
+# Логи, ротация и мониторинг
+################################################################################
+logging_enabled: true
+logrotate_rules:
+  - path: "/var/log/omnimind/*.log"
+    rotate: 14
+    size: "50M"
+    compress: true
+    missingok: true
+    copytruncate: true
+journald_persistent: true
+
+monitoring_enabled: true
+node_exporter_enabled: true
+process_exporter_enabled: false
+prometheus_scrape_labels:
+  job: "omnimind-core"
+  env: "{{ env_name }}"
+  region: "{{ region }}"
+
+alert_thresholds:
+  cpu_high_pct: 85
+  mem_high_pct: 85
+  fs_usage_pct: 80
+  app_http_5xx_rate: 1.0       # % от общего RPS
+  app_latency_p95_ms: 300
+
+################################################################################
+# Контейнерный рантайм
+################################################################################
+container_runtime: "docker"     # docker|containerd
+docker_channel: "stable"
+docker_daemon_config:
+  log-driver: "json-file"
+  log-opts:
+    max-size: "50m"
+    max-file: "5"
+  storage-driver: "overlay2"
+  live-restore: true
+  userns-remap: "default"
+
+################################################################################
+# Приложение: сервис, конфиг и окружение
+################################################################################
+app_unit_name: "omnimind-core"
+app_run_user: "omnimind"
+app_run_group: "omnimind"
+app_home: "/opt/omnimind/omnimind-core"
+app_data_dir: "/var/lib/omnimind"
+app_log_dir: "/var/log/omnimind"
+app_tmp_dir: "/var/tmp/omnimind"
+
+app_env:
+  APP_NAME: "omnimind-core"
+  APP_ENV: "{{ env_name }}"
+  LOG_LEVEL: "INFO"
+  BIND_HOST: "{{ app_bind_host }}"
+  BIND_PORT: "{{ app_port_http }}"
+  METRICS_PORT: "{{ app_port_metrics }}"
+  HEALTH_LIVE_PATH: "{{ app_health_live_path }}"
+  HEALTH_READY_PATH: "{{ app_health_ready_path }}"
+  # База/брокер задаются в группах/хостах:
+  DB_HOST: "{{ db_host | default('') }}"
+  DB_PORT: "{{ db_port | default('5432') }}"
+  DB_NAME: "{{ db_name | default('omnimind') }}"
+  DB_SSLMODE: "require"
+  CACHE_URL: "{{ cache_url | default('') }}"
+  BROKER_URL: "{{ broker_url | default('') }}"
+
+# Секреты из Ansible Vault (не хранить открытым текстом)
+secrets:
+  db_user: "{{ vault_db_user }}"
+  db_password: "{{ vault_db_password }}"
+  jwt_secret: "{{ vault_jwt_secret }}"
+  oauth_client_id: "{{ vault_oauth_client_id | default('') }}"
+  oauth_client_secret: "{{ vault_oauth_client_secret | default('') }}"
+
+# Пример включения файлов сертификатов через Vault или files/
+tls_enabled: true
+tls_cert_path: "/etc/omnimind/tls/tls.crt"
+tls_key_path:  "/etc/omnimind/tls/tls.key"
+tls_bundle_path: "/etc/omnimind/tls/ca.crt"
+
+################################################################################
+# Обновления и безопасность пакетов
+################################################################################
+auto_updates_enabled: false      # включать в dev/staging
+reboot_if_needed: false
+unattended_upgrades_blacklist: []
+
+vuln_scan_enabled: true          # роль для trivy/grype в CI или по cron
+trivy_severity: "CRITICAL,HIGH"
+
+################################################################################
+# Папки и права
+################################################################################
+paths_ensure:
+  - { path: "{{ app_home }}", owner: "{{ app_run_user }}", group: "{{ app_run_group }}", mode: "0750" }
+  - { path: "{{ app_data_dir }}", owner: "{{ app_run_user }}", group: "{{ app_run_group }}", mode: "0750" }
+  - { path: "{{ app_log_dir }}",  owner: "{{ app_run_user }}", group: "{{ app_run_group }}", mode: "0755" }
+  - { path: "{{ app_tmp_dir }}",  owner: "{{ app_run_user }}", group: "{{ app_run_group }}", mode: "0770" }
+  - { path: "/etc/omnimind/tls",  owner: "root",              group: "root",              mode: "0750" }
+
+file_limits_enabled: true
+limits_conf:
+  - domain: "{{ app_run_user }}"
+    type: "soft"
+    item: "nofile"
+    value: 65535
+  - domain: "{{ app_run_user }}"
+    type: "hard"
+    item: "nofile"
+    value: 65535
+
+################################################################################
+# Хуки и теги Ansible
+################################################################################
+pre_tasks_enabled: true
+post_tasks_enabled: true
+
+tags_default_run:
+  - "baseline"
+  - "security"
+  - "runtime"
+  - "app"
+
+################################################################################
+# Переменные Vault (пример: зашифровать ansible-vault и положить в group_vars/all/vault.yml)
+################################################################################
+# Эти переменные ДОЛЖНЫ определяться в зашифрованном файле:
+# vault_db_user: !vault |
+#   $ANSIBLE_VAULT;1.1;AES256...
+# vault_db_password: !vault |
+#   $ANSIBLE_VAULT;1.1;AES256...
+# vault_jwt_secret: !vault |
+#   $ANSIBLE_VAULT;1.1;AES256...
+# vault_oauth_client_id: !vault |
+#   $ANSIBLE_VAULT;1.1;AES256...
+# vault_oauth_client_secret: !vault |
+#   $ANSIBLE_VAULT;1.1;AES256...
+
+################################################################################
+# Переключатели ролей (enable/disable)
+################################################################################
+roles_flags:
+  role_users: "{{ users_manage_enabled }}"
+  role_ssh_hardening: "{{ ssh_hardening_enabled }}"
+  role_firewall: "{{ firewall_enabled }}"
+  role_sysctl: "{{ sysctl_hardening_enabled }}"
+  role_auditd: "{{ auditd_enabled }}"
+  role_ntp: "{{ ntp_enabled or chrony_enabled }}"
+  role_logging: "{{ logging_enabled }}"
+  role_monitoring: "{{ monitoring_enabled }}"
+  role_docker: "{{ container_runtime == 'docker' }}"
+  role_containerd: "{{ container_runtime == 'containerd' }}"
+  role_app: true

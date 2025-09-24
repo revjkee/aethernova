@@ -1,0 +1,89 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chronowatch-api-hpa
+  labels:
+    app.kubernetes.io/name: chronowatch-api
+    app.kubernetes.io/part-of: chronowatch-core
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: chronowatch-api   # при необходимости синхронизируйте с именем вашего Deployment
+  minReplicas: 3
+  maxReplicas: 30
+
+  # Поведение автоскейлера: агрессивный scale-up, консервативный scale-down
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        # Не более +100% за минуту
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        # И не более +4 пода за минуту
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+    scaleDown:
+      # Защита от флаппинга: держим окно 5 минут
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        # Не более -50% за минуту
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        # И не более -4 пода за минуту
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+
+  # Многомерное масштабирование: ресурсы + прикладные метрики
+  metrics:
+    # 1) CPU по Utilization (процент от requests)
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60  # целевая загрузка CPU
+
+    # 2) Память по Utilization (процент от requests)
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70  # целевая загрузка RAM
+
+    # 3) Внутрикластерный прикладной метрик "requests_per_second" (среднее на под)
+    # Требуется metrics-server + адаптер для custom.metrics (например, kube-state-metrics + Prometheus Adapter)
+    - type: Pods
+      pods:
+        metric:
+          name: requests_per_second
+          # опционально можно ограничить выборку по labelSelector
+          # selector:
+          #   matchLabels:
+          #     app.kubernetes.io/name: chronowatch-api
+        target:
+          type: AverageValue
+          averageValue: "50"   # целевых 50 rps на под (единицы — зависят от адаптера)
+
+    # 4) Внешний метрик, например, задержка потребителя Kafka (consumer lag)
+    # Требуется external.metrics адаптер (Prometheus Adapter / Stackdriver / и т.п.)
+    - type: External
+      external:
+        metric:
+          name: kafka_consumer_lag
+          selector:
+            matchLabels:
+              topic: chronowatch-events
+              group: chronowatch-api
+        target:
+          type: AverageValue
+          averageValue: "100"  # целевой порог по lag (соответствует единицам адаптера)

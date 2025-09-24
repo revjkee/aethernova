@@ -1,0 +1,459 @@
+---
+# Industrial-grade Ansible tasks for oblivionvault-core
+# Idempotent, OS-aware (Debian/Ubuntu, RHEL/Rocky, SUSE), hardened.
+
+- name: "Preflight | Verify minimal Ansible version"
+  ansible.builtin.assert:
+    that:
+      - (ansible_version.full is version('2.12', '>='))  # Adjust if needed
+    fail_msg: "Ansible >= 2.12 is required."
+
+- name: "Preflight | Verify supported OS family"
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family in ['Debian', 'RedHat', 'Suse']
+    fail_msg: "Unsupported OS family {{ ansible_os_family }}."
+
+- name: "Preflight | Compute sane defaults"
+  ansible.builtin.set_fact:
+    ov_service_name: "{{ ov_service_name | default('oblivionvault') }}"
+    ov_user:         "{{ ov_user         | default('oblivionvault') }}"
+    ov_group:        "{{ ov_group        | default('oblivionvault') }}"
+    ov_base_dir:     "{{ ov_base_dir     | default('/var/lib/oblivionvault') }}"
+    ov_data_dir:     "{{ ov_data_dir     | default(ov_base_dir + '/data') }}"
+    ov_log_dir:      "{{ ov_log_dir      | default('/var/log/oblivionvault') }}"
+    ov_conf_dir:     "{{ ov_conf_dir     | default('/etc/oblivionvault') }}"
+    ov_bin_path:     "{{ ov_bin_path     | default('/usr/local/bin/oblivionvault') }}"
+    ov_bind_addr:    "{{ ov_bind_addr    | default('127.0.0.1') }}"
+    ov_port:         "{{ ov_port         | default(9443) | int }}"
+    ov_tls_mode:     "{{ ov_tls_mode     | default('selfsigned') }}"   # selfsigned|none
+    ov_tls_dir:      "{{ ov_tls_dir      | default(ov_conf_dir + '/tls') }}"
+    ov_env_file:     "{{ ov_env_file     | default(ov_conf_dir + '/ov.env') }}"
+    ov_log_level:    "{{ ov_log_level    | default('info') }}"
+    ov_health_url:   "{{ ov_health_url   | default('') }}"
+    ov_sysctl_hardening: "{{ ov_sysctl_hardening | default(true) }}"
+    ov_limits_nofile: "{{ ov_limits_nofile | default(1048576) }}"
+    ov_download_timeout: "{{ ov_download_timeout | default(300) }}"
+    ov_binary_mode:  "{{ ov_binary_mode | default('0755') }}"
+
+- name: "Preflight | Validate critical variables if binary download is requested"
+  ansible.builtin.assert:
+    that:
+      - (ov_binary_url is defined and ov_binary_url | length > 0) implies (ov_binary_sha256 is defined and ov_binary_sha256 | length > 0)
+    fail_msg: "ov_binary_url requires ov_binary_sha256 for supply-chain integrity."
+  when: ov_binary_url is defined and (ov_binary_url | length > 0)
+
+- name: "Packages | Define package lists per OS family"
+  ansible.builtin.set_fact:
+    _pkgs_common:
+      - ca-certificates
+      - curl
+      - coreutils
+      - tar
+      - gzip
+      - jq
+      - openssl
+      - rsync
+      - logrotate
+    _pkgs_debian_extra:
+      - ufw
+      - apparmor-utils
+    _pkgs_redhat_extra:
+      - firewalld
+      - policycoreutils-python-utils
+    _pkgs_suse_extra:
+      - firewalld
+      - apparmor-utils
+
+- name: "Packages | Install required packages"
+  ansible.builtin.package:
+    name: >-
+      {{
+        _pkgs_common
+        + (ansible_os_family == 'Debian')|ternary(_pkgs_debian_extra, [])
+        + (ansible_os_family == 'RedHat')|ternary(_pkgs_redhat_extra, [])
+        + (ansible_os_family == 'Suse')|ternary(_pkgs_suse_extra, [])
+      }}
+    state: present
+  become: true
+
+- name: "System | Ensure group exists"
+  ansible.builtin.group:
+    name: "{{ ov_group }}"
+    system: true
+  become: true
+
+- name: "System | Ensure user exists"
+  ansible.builtin.user:
+    name: "{{ ov_user }}"
+    group: "{{ ov_group }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+  become: true
+
+- name: "FS | Create directories"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ ov_user }}"
+    group: "{{ ov_group }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop:
+    - { path: "{{ ov_base_dir }}", mode: "0750" }
+    - { path: "{{ ov_data_dir }}", mode: "0750" }
+    - { path: "{{ ov_log_dir }}",  mode: "0750" }
+    - { path: "{{ ov_conf_dir }}", mode: "0750" }
+    - { path: "{{ ov_tls_dir }}",  mode: "0700" }
+  become: true
+
+- name: "FS | Tighten ACLs (if setfacl available)"
+  ansible.posix.acl:
+    path: "{{ item }}"
+    etype: user
+    entity: "{{ ov_user }}"
+    permissions: rwx
+    state: present
+  loop:
+    - "{{ ov_base_dir }}"
+    - "{{ ov_data_dir }}"
+    - "{{ ov_log_dir }}"
+    - "{{ ov_conf_dir }}"
+  become: true
+  when: ansible_facts.packages is not defined or ('acl' in ansible_facts.packages or True)  # best-effort
+
+- name: "Binary | Download signed release (optional)"
+  ansible.builtin.get_url:
+    url: "{{ ov_binary_url }}"
+    dest: "{{ ov_bin_path }}"
+    mode: "{{ ov_binary_mode }}"
+    owner: root
+    group: root
+    checksum: "sha256:{{ ov_binary_sha256 }}"
+    timeout: "{{ ov_download_timeout }}"
+  become: true
+  when: ov_binary_url is defined and (ov_binary_url | length > 0)
+  register: _downloaded_binary
+
+- name: "Binary | Ensure binary exists if not downloading (external provisioning)"
+  ansible.builtin.stat:
+    path: "{{ ov_bin_path }}"
+  register: _bin_stat
+
+- name: "Binary | Fail if binary missing"
+  ansible.builtin.assert:
+    that:
+      - _bin_stat.stat.exists
+      - _bin_stat.stat.mode is defined
+    fail_msg: "Binary {{ ov_bin_path }} is not present and ov_binary_url was not provided."
+
+- name: "TLS | Generate self-signed certificate (optional)"
+  block:
+    - name: "TLS | Private key"
+      community.crypto.openssl_privatekey:
+        path: "{{ ov_tls_dir }}/server.key"
+        owner: "{{ ov_user }}"
+        group: "{{ ov_group }}"
+        mode: "0600"
+      become: true
+
+    - name: "TLS | CSR"
+      community.crypto.openssl_csr:
+        path: "{{ ov_tls_dir }}/server.csr"
+        privatekey_path: "{{ ov_tls_dir }}/server.key"
+        common_name: "{{ ov_bind_addr }}"
+        owner: "{{ ov_user }}"
+        group: "{{ ov_group }}"
+        mode: "0600"
+        subject_alt_name:
+          - "IP:{{ ov_bind_addr }}"
+          - "DNS:localhost"
+      become: true
+
+    - name: "TLS | Self-signed certificate"
+      community.crypto.openssl_certificate:
+        path: "{{ ov_tls_dir }}/server.crt"
+        privatekey_path: "{{ ov_tls_dir }}/server.key"
+        csr_path: "{{ ov_tls_dir }}/server.csr"
+        provider: selfsigned
+        owner: "{{ ov_user }}"
+        group: "{{ ov_group }}"
+        mode: "0640"
+        valid_days: 825
+      become: true
+  when: ov_tls_mode == 'selfsigned'
+
+- name: "TLS | Set TLS paths (even if mode is 'none')"
+  ansible.builtin.set_fact:
+    _ov_tls_cert: "{{ (ov_tls_mode == 'selfsigned') | ternary(ov_tls_dir + '/server.crt', (ov_tls_cert | default(''))) }}"
+    _ov_tls_key:  "{{ (ov_tls_mode == 'selfsigned') | ternary(ov_tls_dir + '/server.key', (ov_tls_key  | default(''))) }}"
+
+- name: "Config | Render environment file from ov_env dict (optional)"
+  ansible.builtin.copy:
+    dest: "{{ ov_env_file }}"
+    owner: "{{ ov_user }}"
+    group: "{{ ov_group }}"
+    mode: "0640"
+    content: |-
+      {% for k, v in (ov_env | default({})).items() -%}
+      {{ k }}="{{ v }}"
+      {% endfor -%}
+  become: true
+  when: ov_env is defined
+
+- name: "Config | Write main configuration"
+  ansible.builtin.copy:
+    dest: "{{ ov_conf_dir }}/config.yml"
+    owner: "{{ ov_user }}"
+    group: "{{ ov_group }}"
+    mode: "0640"
+    content: |-
+      server:
+        bind_addr: "{{ ov_bind_addr }}"
+        port: {{ ov_port }}
+        tls:
+          enabled: {{ (ov_tls_mode != 'none') | ternary('true','false') }}
+          cert_file: "{{ _ov_tls_cert | default('') }}"
+          key_file:  "{{ _ov_tls_key  | default('') }}"
+      storage:
+        engine: "file"
+        path: "{{ ov_data_dir }}"
+        encryption_key: "{{ ov_encryption_key | default('') }}"
+      logging:
+        level: "{{ ov_log_level }}"
+        file: "{{ ov_log_dir }}/oblivionvault.log"
+        json: true
+      security:
+        disable_http: true
+        allowlist: {{ ov_allowlist | default([]) | to_nice_yaml(indent=10) | trim }}
+      telemetry:
+        prometheus:
+          enabled: {{ ov_prometheus_enabled | default(true) | ternary('true','false') }}
+          bind_addr: "127.0.0.1"
+          port: {{ ov_prometheus_port | default(9464) | int }}
+  become: true
+  register: _config_written
+
+- name: "Systemd | Install hardened unit"
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ ov_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |-
+      [Unit]
+      Description=OblivionVault Core
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      EnvironmentFile=-{{ ov_env_file }}
+      User={{ ov_user }}
+      Group={{ ov_group }}
+      ExecStart={{ ov_bin_path }} --config {{ ov_conf_dir }}/config.yml
+      WorkingDirectory={{ ov_base_dir }}
+      Restart=on-failure
+      RestartSec=3s
+      TimeoutStartSec=60
+      LimitNOFILE={{ ov_limits_nofile }}
+      NoNewPrivileges=yes
+      PrivateTmp=yes
+      ProtectSystem=strict
+      ProtectHome=true
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      LockPersonality=yes
+      MemoryDenyWriteExecute=yes
+      RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+      RestrictNamespaces=yes
+      RestrictRealtime=yes
+      SystemCallArchitectures=native
+      ReadWritePaths={{ ov_data_dir }} {{ ov_log_dir }} {{ ov_conf_dir }}
+      CapabilityBoundingSet=
+      AmbientCapabilities=
+      # Sandboxing extras (kernel allowing):
+      UMask=007
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+  register: _unit_written
+
+- name: "Systemd | Reload daemon if unit changed"
+  ansible.builtin.systemd:
+    daemon_reload: true
+  become: true
+  when: _unit_written is changed
+
+- name: "Hardening | Sysctl (optional)"
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_set: true
+    reload: true
+  loop:
+    - { name: 'fs.file-max',        value: '1000000' }
+    - { name: 'net.core.somaxconn', value: '1024' }
+    - { name: 'vm.swappiness',      value: '10' }
+  become: true
+  when: ov_sysctl_hardening | bool
+
+- name: "Hardening | PAM limits"
+  ansible.builtin.copy:
+    dest: "/etc/security/limits.d/{{ ov_service_name }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |-
+      {{ ov_user }} soft nofile {{ ov_limits_nofile }}
+      {{ ov_user }} hard nofile {{ ov_limits_nofile }}
+  become: true
+
+- name: "Firewall | Open service port (UFW)"
+  community.general.ufw:
+    rule: allow
+    port: "{{ ov_port }}"
+    proto: tcp
+  become: true
+  when:
+    - ansible_os_family == 'Debian'
+    - "'ufw' in ansible_facts.packages or True"  # best-effort
+
+- name: "Firewall | Ensure firewalld running (RHEL/SUSE)"
+  ansible.builtin.service:
+    name: firewalld
+    state: started
+    enabled: true
+  become: true
+  when:
+    - ansible_os_family in ['RedHat', 'Suse']
+
+- name: "Firewall | Open service port (firewalld)"
+  ansible.posix.firewalld:
+    port: "{{ ov_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  become: true
+  when:
+    - ansible_os_family in ['RedHat', 'Suse']
+
+- name: "SELinux | Allow service dirs (if enforcing)"
+  block:
+    - name: "SELinux | Label data dir"
+      community.general.sefcontext:
+        target: "{{ ov_data_dir }}(/.*)?"
+        setype: var_lib_t
+        state: present
+      become: true
+
+    - name: "SELinux | Label log dir"
+      community.general.sefcontext:
+        target: "{{ ov_log_dir }}(/.*)?"
+        setype: var_log_t
+        state: present
+      become: true
+
+    - name: "SELinux | Apply contexts"
+      ansible.builtin.command: "restorecon -Rv {{ ov_data_dir }} {{ ov_log_dir }}"
+      become: true
+      changed_when: false
+  when:
+    - ansible_os_family in ['RedHat']
+    - ansible_selinux is defined
+    - ansible_selinux.status == "enabled"
+
+- name: "AppArmor | Ensure complain mode not restricting (best-effort)"
+  ansible.builtin.command: "aa-complain {{ ov_bin_path }}"
+  become: true
+  changed_when: false
+  failed_when: false
+  when:
+    - ansible_os_family in ['Debian', 'Suse']
+
+- name: "Logging | logrotate policy"
+  ansible.builtin.copy:
+    dest: "/etc/logrotate.d/{{ ov_service_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |-
+      {{ ov_log_dir }}/oblivionvault.log {
+          weekly
+          rotate 8
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0640 {{ ov_user }} {{ ov_group }}
+          postrotate
+              /bin/systemctl kill -s SIGUSR1 {{ ov_service_name }}.service >/dev/null 2>&1 || true
+          endscript
+      }
+  become: true
+
+- name: "Audit | Monitor binary and config with auditd (best-effort)"
+  ansible.builtin.copy:
+    dest: "/etc/audit/rules.d/{{ ov_service_name }}.rules"
+    owner: root
+    group: root
+    mode: "0640"
+    content: |-
+      -w {{ ov_bin_path }} -p x -k ov-bin
+      -w {{ ov_conf_dir }}/config.yml -p wa -k ov-config
+  become: true
+  when: "'auditd' in ansible_facts.packages or True"  # best-effort
+
+- name: "Service | Ensure directories ownership"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: "{{ ov_user }}"
+    group: "{{ ov_group }}"
+    recurse: true
+  loop:
+    - "{{ ov_data_dir }}"
+    - "{{ ov_log_dir }}"
+    - "{{ ov_conf_dir }}"
+  become: true
+
+- name: "Service | Start and enable"
+  ansible.builtin.service:
+    name: "{{ ov_service_name }}"
+    state: started
+    enabled: true
+  become: true
+
+- name: "Healthcheck | Wait for TCP port"
+  ansible.builtin.wait_for:
+    host: "{{ ov_bind_addr }}"
+    port: "{{ ov_port }}"
+    delay: 1
+    timeout: 30
+    state: started
+  when: ov_health_url | length == 0
+
+- name: "Healthcheck | HTTP(S) endpoint (optional)"
+  ansible.builtin.uri:
+    url: "{{ ov_health_url }}"
+    method: GET
+    return_content: false
+    status_code: [200,204,401,403]
+    validate_certs: false
+    timeout: 15
+  register: _health_http
+  failed_when: _health_http.status not in [200,204,401,403]
+  when: ov_health_url | length > 0
+
+- name: "Summary | Output key parameters"
+  ansible.builtin.debug:
+    msg:
+      service: "{{ ov_service_name }}"
+      bind: "{{ ov_bind_addr }}:{{ ov_port }}"
+      conf: "{{ ov_conf_dir }}/config.yml"
+      tls: "{{ (ov_tls_mode != 'none') | ternary(_ov_tls_cert ~ '|' ~ _ov_tls_key, 'disabled') }}"
+      data_dir: "{{ ov_data_dir }}"
+      log_dir: "{{ ov_log_dir }}"
+      binary: "{{ ov_bin_path }}"

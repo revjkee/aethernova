@@ -1,0 +1,379 @@
+# physical-integration-core/configs/features.yaml
+# Промышленный конфиг фич‑флагов для управления возможностями physical‑integration‑core.
+# Порядок приоритета: defaults < environments.<env> < overrides (таргетинг).
+# Все новые фичи должны стартовать в режиме disabled + shadow + жесткие лимиты.
+
+apiVersion: aetherv1
+kind: FeatureFlags
+metadata:
+  app: physical-integration-core
+  schema: 1.2.0
+  owner: platform-ops@aethernova
+  updatedAt: "2025-08-22T08:00:00Z"
+  changeId: "ffc-2025-08-22-001"
+  # Управление совместимостью: минимальная версия сервиса, где допустима эта конфигурация
+  serviceCompatibility:
+    minAppVersion: "1.0.0"
+    maxAppVersion: "2.x"
+  rolloutPolicy:
+    defaultStrategy: "progressive"
+    guardrails:
+      minCanaryDuration: "30m"
+      minObserveAfterEnable: "10m"
+      abortOnErrorRate: ">=0.5%"         # мгновенный стоп при росте ошибок
+      abortOnSLOBreachedMinutes: 5
+    autoRollback:
+      enabled: true
+      evaluateEvery: "1m"
+      conditions:
+        - metric: "pipeline_error_rate"
+          op: ">="
+          threshold: 0.5
+          window: "5m"
+        - metric: "device_disconnect_rate"
+          op: ">="
+          threshold: 1.0
+          window: "5m"
+
+defaults: &defaults
+  global:
+    killSwitch: false            # Мгновенная блокировка всего модуля (требует ручного подтверждения в CI)
+    safeMode:
+      enabled: true              # При авариях — деградация до буферизации + локальный кэш
+      bufferMaxMB: 512
+      dropNonCriticalTelemetry: true
+    backpressure:
+      enabled: true
+      queue:
+        maxDepthMB: 1024
+        highWatermarkPct: 80
+        drainRateMsgsPerSec: 500
+      shed:
+        nonEssentialPipelines: true
+    rateLimits:
+      defaultRpsPerNode: 200
+      burstPerNode: 400
+      perTenant:
+        defaultRps: 100
+      perDevice:
+        defaultRps: 10
+    circuitBreaker:
+      enabled: true
+      failureRateThresholdPct: 25
+      slowCallDurationMs: 800
+      slowCallRateThresholdPct: 30
+      slidingWindow:
+        size: 50
+        type: "COUNT"
+      openStateDuration: "60s"
+      halfOpenMaxCalls: 10
+    observability:
+      traces: { enabled: true, sampleRate: 0.05 }
+      metrics: { enabled: true, level: "detailed" }
+      logs:
+        level: "INFO"
+        redact:
+          pii: true
+          secrets: true
+    security:
+      mTLS:
+        required: true
+        minTlsVersion: "1.2"
+        clientAuth: "require"
+        rotateCertsDays: 30
+      keyManagement:
+        rotationDays: 45
+        allowLegacyKeys: false
+      attestation:
+        enabled: true
+        requireTPM: false
+        requireSecureBoot: true
+    firmwareOTA:
+      enabled: false
+      shadow: true
+      maxParallelPerTenant: 2
+      rollbackOnFail: true
+      verifySignature: true
+
+  connectors:
+    opcua:
+      enabled: false
+      shadow: true
+      compatibility:
+        minSdk: "1.0.0"
+      session:
+        maxSessionsPerNode: 50
+        readBatch: 200
+        writeBatch: 100
+        samplingIntervalMs: 500
+      security:
+        mode: "SignAndEncrypt"
+        messageSecurity: "Basic256Sha256"
+        allowAnonymous: false
+    modbus:
+      enabled: false
+      shadow: true
+      tcp:
+        enabled: true
+        timeoutMs: 1500
+        retries: 2
+      rtu:
+        enabled: false
+      coalesceReads: true
+      maxConcurrentMastersPerNode: 50
+    mqtt:
+      enabled: true
+      shadow: false
+      qos: 1
+      sessionExpirySec: 3600
+      retainPolicy: "no-retain"
+      maxSubscriptionsPerTenant: 2000
+      security:
+        allowWildcards: false
+        requireClientCert: true
+    bacnet:
+      enabled: false
+      shadow: true
+      ipv6: false
+      discovery:
+        enabled: true
+        maxDevices: 500
+        timeoutSec: 30
+    profinet:
+      enabled: false
+      shadow: true
+
+  pipelines:
+    ingest:
+      enabled: true
+      batch:
+        size: 1000
+        lingerMs: 50
+      compression: "lz4"
+    normalize:
+      enabled: true
+      schemaRegistry:
+        required: true
+        compatMode: "BACKWARD"
+    enrich:
+      enabled: false
+      shadow: true
+      sources:
+        - "static-tags"
+        - "geo-ip"
+    egress:
+      enabled: true
+      retry:
+        maxAttempts: 5
+        backoff:
+          type: "exponential"
+          baseMs: 200
+          maxMs: 5000
+      destinations:
+        primary:
+          type: "kafka"
+          acks: "all"
+          maxInFlight: 5
+        secondary:
+          type: "object-store"
+          enabled: true
+          writeConsistency: "quorum"
+
+  governance:
+    allowTenants: ["*"]          # по умолчанию все разрешены
+    denyTenants: []
+    allowClusters: ["*"]
+    denyClusters: []
+    deviceTargeting:
+      allowTags: ["*"]
+      denyTags: ["compromised", "unsupported"]
+
+  rollout:
+    strategy: "progressive"
+    stages:
+      - name: "shadow-verify"
+        enableShadowOnly: true
+        minDuration: "30m"
+      - name: "canary-10"
+        trafficPercent: 10
+        minDuration: "60m"
+      - name: "canary-50"
+        trafficPercent: 50
+        minDuration: "2h"
+      - name: "full"
+        trafficPercent: 100
+        minDuration: "0m"
+
+environments:
+  prod:
+    <<: *defaults
+    global:
+      observability:
+        traces: { enabled: true, sampleRate: 0.02 }
+        logs: { level: "INFO" }
+      rateLimits:
+        defaultRpsPerNode: 150
+        burstPerNode: 300
+    connectors:
+      mqtt:
+        enabled: true
+        qos: 1
+        security:
+          allowWildcards: false
+          requireClientCert: true
+      opcua:
+        enabled: false
+        shadow: true
+    pipelines:
+      ingest:
+        batch:
+          size: 1500
+          lingerMs: 40
+  staging:
+    <<: *defaults
+    global:
+      observability:
+        traces: { enabled: true, sampleRate: 0.1 }
+        logs: { level: "DEBUG" }
+    connectors:
+      opcua:
+        enabled: true
+        shadow: false
+      modbus:
+        enabled: true
+        shadow: false
+    governance:
+      denyTenants: ["load-test-*"]   # исключаем синтетические тенанты
+
+  dev:
+    <<: *defaults
+    global:
+      observability:
+        traces: { enabled: true, sampleRate: 0.2 }
+        logs: { level: "DEBUG" }
+      security:
+        mTLS:
+          requireTPM: false
+    connectors:
+      mqtt:
+        enabled: true
+        shadow: false
+      opcua:
+        enabled: true
+        shadow: false
+      modbus:
+        enabled: true
+        shadow: false
+      bacnet:
+        enabled: true
+        shadow: false
+
+overrides:
+  # Таргетинг по кластерам
+  clusters:
+    "eu-prod-k8s-1":
+      connectors:
+        opcua:
+          enabled: true
+          shadow: false
+      rollout:
+        stages:
+          - name: "canary-10"
+            trafficPercent: 10
+            minDuration: "90m"
+          - name: "canary-50"
+            trafficPercent: 50
+            minDuration: "3h"
+          - name: "full"
+            trafficPercent: 100
+            minDuration: "0m"
+
+    "us-prod-k8s-2":
+      global:
+        rateLimits:
+          defaultRpsPerNode: 180
+          burstPerNode: 360
+      connectors:
+        mqtt:
+          qos: 2
+
+  # Таргетинг по тенантам
+  tenants:
+    "tenant-a":
+      pipelines:
+        enrich:
+          enabled: true
+          shadow: false
+      connectors:
+        modbus:
+          tcp:
+            timeoutMs: 1200
+            retries: 3
+    "tenant-b":
+      global:
+        rateLimits:
+          perTenant:
+            defaultRps: 150
+
+  # Таргетинг по тегам устройств (пример: промышленные линии L2)
+  deviceTags:
+    "line-l2":
+      connectors:
+        opcua:
+          session:
+            samplingIntervalMs: 250
+            readBatch: 400
+
+dependencies:
+  # Фича/модуль -> список обязательных зависимостей
+  - feature: "pipelines.normalize"
+    requires:
+      - "pipelines.ingest"
+      - "global.security.mTLS"
+  - feature: "pipelines.enrich"
+    requires:
+      - "pipelines.normalize"
+  - feature: "connectors.opcua"
+    requires:
+      - "global.security.attestation"
+      - "global.circuitBreaker"
+
+sloGuards:
+  # SLO‑ограничители для автопрекращения канареек/включений
+  - name: "ingest-errors"
+    metric: "pipeline_error_rate"
+    op: "<"
+    threshold: 0.3
+    window: "10m"
+    onViolation:
+      action: "rollback"
+      target: "lastStable"
+  - name: "opcua-session-fail"
+    metric: "opcua_session_failure_pct"
+    op: "<"
+    threshold: 2.0
+    window: "15m"
+    onViolation:
+      action: "disable"
+      target: "connectors.opcua"
+
+audit:
+  requireSignedChanges: true
+  signer: "config-ci@aethernova"
+  lastSignature:
+    alg: "ed25519"
+    # Бинарная подпись должна храниться отдельно (секрет/репозиторий артефактов).
+    ref: "sig://features.yaml/ffc-2025-08-22-001"
+
+validation:
+  # Подсказки валидатору в CI (jsonschema/OPA/консистентность зависимостей)
+  schemaRef: "schemas/featureflags-1.2.0.json"
+  rules:
+    - type: "dependency-closure"
+      level: "error"
+    - type: "no-wildcard-in-prod-deny"
+      level: "warn"
+    - type: "percent-sum-check"
+      level: "error"
+
+# Конец файла

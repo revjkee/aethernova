@@ -1,0 +1,358 @@
+# Adversary Emulation Profile — Linux Server (SAFE SIMULATION)
+# Schema is designed for internal attack_simulator engine
+# All potentially destructive actions are gated and defaulted to simulate-only
+
+schema_version: "1.2"
+profile:
+  id: "ae-linux-baseline-001"
+  name: "Linux Server — Baseline Adversary Emulation (Safe Mode)"
+  version: "2025.09.05"
+  description: >
+    Профиль эмуляции противника для Linux-серверов в безопасном режиме.
+    Тактики и техники согласованы с MITRE ATT&CK; вредоносные операции заменены на безопасные симуляции (маркер-файлы, syslog logger).
+    Подходит для лабораторий и non-prod сред. Все «боевые» команды помечены gated: true и заблокированы по умолчанию.
+  references:
+    mitre_attack:
+      - id: "T1059"
+        url: "https://attack.mitre.org/techniques/T1059/"
+        note: "Command and Scripting Interpreter"
+      - id: "T1078"
+        url: "https://attack.mitre.org/techniques/T1078/"
+        note: "Valid Accounts"
+      - id: "T1021.004"
+        url: "https://attack.mitre.org/techniques/T1021/004/"
+        note: "Remote Services: SSH"
+      - id: "T1046"
+        url: "https://attack.mitre.org/techniques/T1046/"
+        note: "Network Service Discovery"
+      - id: "T1053"
+        url: "https://attack.mitre.org/techniques/T1053/"
+        note: "Scheduled Task/Job (cron/systemd timers)"
+      - id: "T1562"
+        url: "https://attack.mitre.org/techniques/T1562/"
+        note: "Impair Defenses"
+      - id: "T1005"
+        url: "https://attack.mitre.org/techniques/T1005/"
+        note: "Data from Local System"
+      - id: "T1041"
+        url: "https://attack.mitre.org/techniques/T1041/"
+        note: "Exfiltration Over C2 Channel"
+
+target:
+  platform: "linux"
+  os_families: ["debian", "ubuntu", "rhel", "centos", "rocky", "sles", "alpine"]
+  architecture: ["x86_64", "arm64"]
+  min_required_privilege: "user"
+  labels_required: ["nonprod", "lab"]
+  network:
+    require_restricted_egress: true
+    allowed_egress_cidrs: ["127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16"]  # adjust per lab
+
+safety:
+  simulation_mode: true               # hard default: no destructive actions
+  approval_required: true
+  env_requirements:
+    must_set:
+      - "ATTACK_SIM_OK=true"
+  blocklist_command_patterns:
+    - "rm -rf /"
+    - "mkfs*"
+    - "dd if=/dev/zero of=/dev/sd*"
+    - "shutdown*"
+    - "systemctl stop *audit*"
+  opsec:
+    cleanup_on_exit: true
+    throttle_seconds: 1
+    randomize_artifacts: true
+    redact_host_identifiers: true
+
+telemetry:
+  required:
+    - "syslog"        # /var/log/syslog | /var/log/messages
+    - "auditd"        # Linux Audit Framework
+    - "osquery"       # optional
+    - "edr"           # vendor-agnostic
+  data_tags:
+    - "process_creation"
+    - "network_connections"
+    - "file_modification"
+    - "auth_events"
+  correlation_hints:
+    - "Link logger 'attack-sim' tags with auditd execve and netflow events"
+
+variables:
+  WORKDIR: "/tmp/attack-sim"
+  TAG: "ATTACK-SIM"
+  MARKER: "SIMULATED"
+  SSH_TEST_HOST: "127.0.0.1"
+  SSH_TEST_PORT: 22
+
+prerequisites:
+  ensure_tools_present:
+    - name: "bash"
+      check: "command -v bash >/dev/null 2>&1"
+    - name: "logger"
+      check: "command -v logger >/dev/null 2>&1"
+    - name: "ss"
+      check: "command -v ss >/dev/null 2>&1"
+    - name: "crontab"
+      check: "command -v crontab >/dev/null 2>&1 || true"
+    - name: "systemctl"
+      check: "command -v systemctl >/dev/null 2>&1 || true"
+
+lifecycle:
+  setup:
+    - id: "setup_workdir"
+      run: "mkdir -p ${WORKDIR} && chmod 700 ${WORKDIR}"
+    - id: "setup_banner"
+      run: "echo '${MARKER} | Profile ${profile.id} started at $(date -Is)' | logger -t ${TAG}"
+
+  teardown:
+    - id: "teardown_cleanup"
+      run: "rm -rf ${WORKDIR}/* 2>/dev/null || true"
+    - id: "teardown_banner"
+      run: "echo '${MARKER} | Profile ${profile.id} finished at $(date -Is)' | logger -t ${TAG}"
+
+phases:
+  - name: "Initial Access (Valid Accounts)"
+    tactic: "initial-access"
+    steps:
+      - id: "ia_valid_accounts_sim"
+        technique: "T1078"
+        name: "Valid Accounts — simulated SSH login event"
+        simulate:
+          run: >
+            echo '[${MARKER}] would attempt SSH login to ${SSH_TEST_HOST}:${SSH_TEST_PORT} using valid creds' |
+            logger -t ${TAG} &&
+            echo "ssh-login-simulated $(date -Is)" > ${WORKDIR}/ssh_login_sim.txt
+        execute:
+          gated: true
+          run: "true"   # no real login in safe mode
+        detect:
+          data_sources: ["DS0028 Logon Session", "DS0009 Process"]
+          hints:
+            - "Correlate auth.log/secure with process_creation for ssh"
+        verify:
+          run: "test -f ${WORKDIR}/ssh_login_sim.txt"
+
+  - name: "Execution"
+    tactic: "execution"
+    steps:
+      - id: "exec_cmd_interpreter_sim"
+        technique: "T1059"
+        name: "Command & Scripting Interpreter — benign command"
+        simulate:
+          run: >
+            echo '[${MARKER}] /bin/bash -c \"id && uname -a\"' | logger -t ${TAG} &&
+            { id; uname -a; } > ${WORKDIR}/exec_info.txt 2>&1
+        execute:
+          gated: true
+          run: "/bin/bash -c 'true'"
+        detect:
+          data_sources: ["DS0009 Process"]
+          hints:
+            - "auditd execve for /bin/bash, /usr/bin/id, /usr/bin/uname"
+        verify:
+          run: "grep -q 'uid=' ${WORKDIR}/exec_info.txt"
+
+  - name: "Discovery"
+    tactic: "discovery"
+    steps:
+      - id: "disc_network_service_sim"
+        technique: "T1046"
+        name: "Network Service Discovery — simulated"
+        simulate:
+          run: >
+            echo '[${MARKER}] would run: ss -tuln && (optional) nmap in lab only' | logger -t ${TAG} &&
+            ss -tuln > ${WORKDIR}/ss.txt 2>/dev/null || true &&
+            echo 'open-ports: 22,80 (simulated)' > ${WORKDIR}/net_scan.txt
+        execute:
+          gated: true
+          run: "true"
+        detect:
+          data_sources: ["DS0029 Network Traffic", "DS0009 Process"]
+          hints:
+            - "Look for short-lived invocations of 'ss' by unusual parent"
+        verify:
+          run: "test -s ${WORKDIR}/ss.txt && test -s ${WORKDIR}/net_scan.txt"
+
+      - id: "disc_host_enum_sim"
+        technique: "T1082"
+        name: "System Information Discovery — benign"
+        simulate:
+          run: >
+            { hostnamectl status 2>/dev/null || uname -a; } > ${WORKDIR}/host_info.txt &&
+            echo '[${MARKER}] system info enumerated' | logger -t ${TAG}
+        execute:
+          gated: true
+          run: "true"
+        detect:
+          data_sources: ["DS0009 Process", "DS0019 Host Status"]
+        verify:
+          run: "test -s ${WORKDIR}/host_info.txt"
+
+  - name: "Persistence"
+    tactic: "persistence"
+    steps:
+      - id: "persist_scheduled_job_sim"
+        technique: "T1053"
+        name: "Scheduled Task/Job — cron/systemd (simulation only)"
+        simulate:
+          run: >
+            echo '# ${MARKER} pseudo-cron entry (not installed)' > ${WORKDIR}/cron_sim.txt &&
+            echo '[${MARKER}] would create cron/systemd timer in lab' | logger -t ${TAG}
+        execute:
+          gated: true
+          run: "true"
+        detect:
+          data_sources: ["DS0003 Scheduled Job", "DS0009 Process"]
+          hints:
+            - "Look for edits to /var/spool/cron or systemd timers (test env only)"
+        verify:
+          run: "test -s ${WORKDIR}/cron_sim.txt"
+
+  - name: "Privilege Escalation (benign check)"
+    tactic: "privilege-escalation"
+    steps:
+      - id: "pe_env_probe_sim"
+        technique: "T1068"
+        name: "Exploit for Privilege Escalation — simulation banner only"
+        simulate:
+          run: >
+            echo '[${MARKER}] privilege escalation attempt (simulated — no exploit)' | logger -t ${TAG} &&
+            echo 'no-op' > ${WORKDIR}/pe_sim.txt
+        execute:
+          gated: true
+          run: "false"
+        detect:
+          data_sources: ["DS0009 Process"]
+
+  - name: "Defense Evasion"
+    tactic: "defense-evasion"
+    steps:
+      - id: "de_evasion_sim"
+        technique: "T1562"
+        name: "Impair Defenses — simulation banner only"
+        simulate:
+          run: >
+            echo '[${MARKER}] would attempt to alter logging (blocked by policy)' | logger -t ${TAG} &&
+            echo 'blocked-by-policy' > ${WORKDIR}/defense_evasion.txt
+        execute:
+          gated: true
+          run: "false"
+        detect:
+          data_sources: ["DS0029 Network Traffic", "DS0009 Process"]
+
+  - name: "Credential Access (benign)"
+    tactic: "credential-access"
+    steps:
+      - id: "ca_local_files_sim"
+        technique: "T1003"
+        name: "OS Credential Access — simulation marker only"
+        simulate:
+          run: >
+            echo '[${MARKER}] credential access simulation (no access to secrets)' | logger -t ${TAG} &&
+            echo 'no-secrets-touched' > ${WORKDIR}/cred_sim.txt
+        execute:
+          gated: true
+          run: "false"
+        detect:
+          data_sources: ["DS0011 File"]
+
+  - name: "Lateral Movement"
+    tactic: "lateral-movement"
+    steps:
+      - id: "lm_ssh_service_probe_sim"
+        technique: "T1021.004"
+        name: "Remote Services: SSH — simulation"
+        simulate:
+          run: >
+            echo '[${MARKER}] would probe SSH at ${SSH_TEST_HOST}:${SSH_TEST_PORT}' | logger -t ${TAG} &&
+            echo 'ssh-probe-simulated' > ${WORKDIR}/ssh_probe.txt
+        execute:
+          gated: true
+          run: "true"
+        detect:
+          data_sources: ["DS0028 Logon Session", "DS0029 Network Traffic"]
+        verify:
+          run: "test -s ${WORKDIR}/ssh_probe.txt"
+
+  - name: "Collection"
+    tactic: "collection"
+    steps:
+      - id: "col_local_data_sim"
+        technique: "T1005"
+        name: "Data from Local System — benign files"
+        simulate:
+          run: >
+            { cat /etc/issue 2>/dev/null || echo 'no-issue'; } > ${WORKDIR}/collect_issue.txt &&
+            echo '[${MARKER}] collected benign local data' | logger -t ${TAG}
+        execute:
+          gated: true
+          run: "true"
+        detect:
+          data_sources: ["DS0011 File", "DS0009 Process"]
+        verify:
+          run: "test -s ${WORKDIR}/collect_issue.txt"
+
+  - name: "Exfiltration"
+    tactic: "exfiltration"
+    steps:
+      - id: "exfil_over_c2_sim"
+        technique: "T1041"
+        name: "Exfiltration Over C2 Channel — simulation to blackhole"
+        simulate:
+          run: >
+            sha256sum ${WORKDIR}/collect_issue.txt 2>/dev/null | awk '{print $1}' > ${WORKDIR}/hash.txt &&
+            echo '[${MARKER}] would exfiltrate hash (not content), but blocked' | logger -t ${TAG}
+        execute:
+          gated: true
+          run: "true"
+        detect:
+          data_sources: ["DS0029 Network Traffic", "DS0012 Network Content"]
+        verify:
+          run: "test -s ${WORKDIR}/hash.txt"
+
+  - name: "Impact (no-op)"
+    tactic: "impact"
+    steps:
+      - id: "impact_placeholder_sim"
+        technique: "T1490"
+        name: "Inhibit System Recovery — simulation marker only"
+        simulate:
+          run: >
+            echo '[${MARKER}] impact step is disabled by policy' | logger -t ${TAG} &&
+            echo 'impact-disabled' > ${WORKDIR}/impact.txt
+        execute:
+          gated: true
+          run: "false"
+        detect:
+          data_sources: ["DS0009 Process"]
+
+controls:
+  gates:
+    - type: "label_required"
+      key: "nonprod"
+      description: "Запрещено на продакшене"
+    - type: "env_required"
+      key: "ATTACK_SIM_OK"
+      value: "true"
+  approvals:
+    required_roles: ["BlueTeamLead", "CISO"]
+  rollback:
+    steps:
+      - "rm -rf ${WORKDIR}/* 2>/dev/null || true"
+
+reporting:
+  artifacts:
+    - path: "${WORKDIR}/**/*"
+      retain_days: 7
+  fields:
+    - "step_id"
+    - "technique"
+    - "simulate_run_status"
+    - "verify_status"
+    - "timestamps"
+  scoring:
+    detection_weight: 0.7
+    prevention_weight: 0.3

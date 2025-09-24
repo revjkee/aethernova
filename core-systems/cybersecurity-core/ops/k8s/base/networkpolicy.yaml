@@ -1,0 +1,213 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  labels:
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/component: network-security
+    policy-tier: baseline
+spec:
+  # Применяется ко всем pod'ам в текущем namespace
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Пустые списки = deny-all
+  ingress: []
+  egress: []
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  labels:
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/component: network-security
+    policy-tier: core-services
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    # Разрешаем DNS к CoreDNS/kube-dns (TCP/UDP 53) в kube-system
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: coredns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-from-ingress-controller
+  labels:
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/component: network-security
+    policy-tier: edge
+spec:
+  # Только поды, которые мы явно хотим сделать доступными снаружи
+  podSelector:
+    matchLabels:
+      security.aethernova.io/public: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # NGINX Ingress Controller (ingress-nginx)
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+        # Istio ingress-gateway (если используется)
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              app: istio-ingressgateway
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  labels:
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/component: observability
+    policy-tier: observability
+spec:
+  # Разрешаем scrape метрик только у подов, где это явно включено
+  podSelector:
+    matchLabels:
+      security.aethernova.io/metrics: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Prometheus в namespace "monitoring"
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+        # Либо Prometheus в namespace "observability"
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      # Часто используемые metrics-порты; при необходимости скорректируйте
+      ports:
+        - protocol: TCP
+          port: 8080   # http /metrics
+        - protocol: TCP
+          port: 9100   # node_exporter/sidecar exporters
+        - protocol: TCP
+          port: 9113   # blackbox/mtail/etc. (пример)
+        - protocol: TCP
+          port: 9121   # redis_exporter
+        - protocol: TCP
+          port: 9153   # coredns metrics
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-internal-datastores
+  labels:
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/component: data-access
+    policy-tier: application
+spec:
+  # Только поды, которым явно разрешён доступ к БД
+  podSelector:
+    matchLabels:
+      security.aethernova.io/allow-db-egress: "true"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: databases
+          podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - postgresql
+                  - redis
+                  - mongodb
+                  - rabbitmq
+                  - elasticsearch
+      ports:
+        - protocol: TCP
+          port: 5432   # PostgreSQL
+        - protocol: TCP
+          port: 6379   # Redis
+        - protocol: TCP
+          port: 27017  # MongoDB
+        - protocol: TCP
+          port: 5672   # RabbitMQ (AMQP)
+        - protocol: TCP
+          port: 9200   # Elasticsearch HTTP
+        - protocol: TCP
+          port: 9300   # Elasticsearch transport
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-via-egress-gateway
+  labels:
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/component: egress
+    policy-tier: edge
+spec:
+  # Web-выход наружу допускается только через egress-шлюз и только для помеченных pod'ов
+  podSelector:
+    matchLabels:
+      security.aethernova.io/allow-web-egress: "true"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: egress
+          podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - egress-gateway
+                  - envoy-egress
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80

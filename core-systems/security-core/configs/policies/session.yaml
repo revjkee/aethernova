@@ -1,0 +1,309 @@
+apiVersion: security.aethernova.io/v1
+kind: SessionPolicy
+metadata:
+  name: security-core-session-policy
+  owners:
+    - platform-security
+    - infra-ops
+  description: >
+    Политика управления сессиями для компонентов security-core: безопасная
+    аутентификация, ротация и аудит. Совместима с OIDC/OAuth 2.1.
+  environmentTiers: [dev, staging, prod]
+  compliance:
+    - owasp-asvs-2.6.1
+    - cis-kubernetes
+    - iso-27001-a.9
+    - soc2-security
+
+spec:
+  token:
+    format: jwt
+    issuer: "${SESSION_ISSUER:https://auth.internal}"
+    audiences: ["security-core-api"]
+    clockSkew: 30s
+    signing:
+      # Подпись через KMS (см. configs/kms.yaml -> signing-master)
+      kidStrategy: rolling
+      jwkPublish:
+        endpoint: "/.well-known/jwks.json"
+        cacheTtl: 10m
+      kms:
+        keyAlias: "security-core/signing"
+        requireHsm: true
+        algorithms: ["RS256", "ES256"]
+        rotation:
+          enabled: true
+          schedule: "0 4 * * SUN"
+          overlap: 7d
+    claims:
+      required:
+        - sub
+        - iat
+        - exp
+        - iss
+        - aud
+        - auth.level
+      mappings:
+        sub: user.id
+        email: user.email_hash
+        roles: user.roles
+        amr: auth.methods
+        acr: auth.level
+        org: org.id
+      privacy:
+        # Исключаем PII из токенов; email передаем в захэшированном виде
+        hashFields: [user.email]
+        dropFields: [user.phone, user.name]
+    replayProtection:
+      jti: required
+      storeWindow: 15m
+
+  session:
+    idleTimeout: 20m
+    absoluteLifetime: 12h
+    renewal:
+      sliding: true
+      minRenewInterval: 5m
+      rotateSessionIdOnRenew: true
+    concurrency:
+      perUser: 5
+      perDevice: 2
+    fixationProtection: rotateOnLogin
+    binding:
+      device:
+        required: true
+        method: "hash(userAgent + clientHints + hw.salt)"
+        saltEnv: "${DEVICE_FINGERPRINT_SALT}"
+      clientIp:
+        mode: soft # soft: допускает смену в пределах ASN/подсети; strict для prod в overrides
+        cidrLeeway: "24"
+      geo:
+        enforceImpossibleTravel: true
+        velocityKmPerH: 800
+
+  refresh:
+    enabled: true
+    ttl: 15d
+    grace: 2m
+    rotation:
+      rotateOnUse: true
+      invalidatePrevious: true
+      reuseDetection: lockAccountOnReuse
+      reuseLockDuration: 30m
+    binding:
+      requireSameDevice: true
+      requireSameUserAgent: true
+
+  cookies:
+    access:
+      name: "sc_at"
+      path: "/"
+      domain: "${COOKIE_DOMAIN:.internal}"
+      secure: true
+      httpOnly: true
+      sameSite: "Strict"
+      partitioned: true
+    refresh:
+      name: "sc_rt"
+      path: "/"
+      domain: "${COOKIE_DOMAIN:.internal}"
+      secure: true
+      httpOnly: true
+      sameSite: "Strict"
+      partitioned: true
+      rotationHintHeader: "X-Token-Renewed"
+    csrf:
+      enabled: true
+      mode: double-submit
+      headerName: "X-CSRF-Token"
+      cookieName: "sc_csrf"
+      sameSite: "Strict"
+
+  storage:
+    backend: redisCluster
+    keyPrefix: "sc:sess:"
+    redisCluster:
+      addresses:
+        - "${REDIS_ADDR_1:redis-0.redis.svc.cluster.local:6379}"
+        - "${REDIS_ADDR_2:redis-1.redis.svc.cluster.local:6379}"
+        - "${REDIS_ADDR_3:redis-2.redis.svc.cluster.local:6379}"
+      db: 0
+      tls:
+        enabled: true
+        caFile: "${REDIS_TLS_CA:/var/run/secrets/redis/ca.pem}"
+        certFile: "${REDIS_TLS_CERT:/var/run/secrets/redis/tls.crt}"
+        keyFile: "${REDIS_TLS_KEY:/var/run/secrets/redis/tls.key}"
+        serverName: "${REDIS_TLS_SNI:redis.internal}"
+      timeouts:
+        connect: 1s
+        read: 50ms
+        write: 50ms
+      pool:
+        size: 80
+        maxConnAge: 30m
+        minIdleConns: 10
+      failover:
+        maxRetries: 5
+        backoff: { min: 50ms, max: 2s }
+    persistence:
+      # Защищенная эвакуация активных сессий при обновлениях
+      snapshot:
+        enabled: true
+        interval: 5m
+
+  limits:
+    rate:
+      signInPerIpPerMin: 60
+      signInPerUserPerMin: 20
+      refreshPerUserPerMin: 30
+      mfaVerifyPerUserPerMin: 30
+    lockout:
+      failedSignInWindow: 15m
+      failedSignInThreshold: 10
+      lockDuration: 30m
+
+  riskEngine:
+    enabled: true
+    signals:
+      - ip_reputation
+      - geo_velocity
+      - device_change
+      - tor_exit
+      - asn_change
+      - time_anomaly
+    thresholds:
+      medium: 50
+      high: 80
+    actions:
+      onMedium: [step_up_mfa, shorten_ttl]
+      onHigh: [deny, revoke_all_user_sessions]
+
+  mfa:
+    requiredFor:
+      riskLevels: [high]
+      paths:
+        - "/admin/**"
+        - "/settings/security/**"
+        - "/v1/kms/**"
+        - "/v1/keys/**"
+    methods: [totp, webauthn, passkey, push]
+    stepUp:
+      ttlAfterStepUp: 2h
+      rememberDevice:
+        enabled: true
+        ttl: 14d
+        cookieName: "sc_mfa_trust"
+        sameSite: "Strict"
+        secure: true
+        httpOnly: false
+
+  revocation:
+    onPasswordChange: all_user_sessions
+    onMfaDisable: all_devices
+    onRiskHigh: current_and_related
+    globalKillSwitch:
+      enabled: true
+      keyEnv: "${SESSIONS_KILL_SWITCH_KEY}"
+
+  oidc:
+    enabled: true
+    discovery:
+      path: "/.well-known/openid-configuration"
+      cacheTtl: 10m
+    scopes:
+      default: ["openid", "profile", "email", "roles", "offline_access"]
+    consent:
+      required: false
+
+  headers:
+    set:
+      - { name: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" }
+      - { name: "Content-Security-Policy", value: "default-src 'none'; frame-ancestors 'none'; base-uri 'none'" }
+      - { name: "X-Frame-Options", value: "DENY" }
+      - { name: "X-Content-Type-Options", value: "nosniff" }
+      - { name: "Referrer-Policy", value: "no-referrer" }
+
+  audit:
+    enabled: true
+    redact:
+      fields: ["user.email", "device.fingerprint", "ip"]
+    sinks:
+      - type: otlp
+        endpoint: "${OTLP_EXPORTER_ENDPOINT}"
+        insecure: false
+      - type: file
+        path: "/var/log/security-core/session-audit.log"
+    emitEvents:
+      - sign_in
+      - sign_out
+      - refresh
+      - revoke
+      - lock
+      - unlock
+      - mfa_enroll
+      - mfa_verify
+      - csrf_violation
+      - anomaly_detected
+
+  integrity:
+    # Подпись server-side session state, если используется доп. state в cookies
+    hmac:
+      alg: "HS512"
+      keyEnv: "${SESSION_HMAC_KEY}"
+      rotateEvery: "30d"
+      overlap: "7d"
+
+  environments:
+    dev:
+      overrides:
+        session:
+          idleTimeout: 60m
+          absoluteLifetime: 24h
+          binding:
+            clientIp:
+              mode: soft
+              cidrLeeway: "20"
+        refresh:
+          ttl: 30d
+        cookies:
+          access: { sameSite: "Lax" }
+          refresh: { sameSite: "Lax" }
+        riskEngine:
+          thresholds: { medium: 70, high: 90 }
+        storage:
+          pool: { size: 30 }
+        token:
+          signing:
+            kms:
+              requireHsm: false
+    staging:
+      overrides:
+        session:
+          idleTimeout: 30m
+          absoluteLifetime: 12h
+        refresh:
+          ttl: 21d
+        riskEngine:
+          thresholds: { medium: 60, high: 85 }
+    prod:
+      overrides:
+        session:
+          idleTimeout: 15m
+          absoluteLifetime: 8h
+          binding:
+            clientIp:
+              mode: strict
+              cidrLeeway: "28"
+        refresh:
+          ttl: 14d
+        limits:
+          rate:
+            signInPerIpPerMin: 30
+            signInPerUserPerMin: 15
+            refreshPerUserPerMin: 20
+        riskEngine:
+          thresholds: { medium: 50, high: 80 }
+        token:
+          signing:
+            kms:
+              requireHsm: true

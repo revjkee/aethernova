@@ -1,0 +1,236 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "security-core.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "security-core.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: core-systems
+    app.kubernetes.io/component: security-core
+    app.kubernetes.io/tier: backend
+  annotations:
+    # Перекатываем Pod при изменении конфигов/секретов
+    checksum/config: {{ toYaml .Values.config | sha256sum }}
+    checksum/secrets: {{ toYaml .Values.secrets | sha256sum }}
+    # Пользовательские аннотации подов (передаем из values)
+    {{- if .Values.podAnnotations }}
+    {{- toYaml .Values.podAnnotations | nindent 4 }}
+    {{- end }}
+spec:
+  replicas: {{ .Values.replicaCount | default 2 }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit | default 10 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.updateStrategy.maxUnavailable | default 0 }}
+      maxSurge: {{ .Values.updateStrategy.maxSurge | default "25%" }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "security-core.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "security-core.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/part-of: core-systems
+        app.kubernetes.io/component: security-core
+        {{- if .Values.podLabels }}
+        {{- toYaml .Values.podLabels | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Пример: scrape метрик Prometheus (если включено)
+        {{- if .Values.metrics.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.metrics.port }}"
+        prometheus.io/path: "{{ .Values.metrics.path }}"
+        {{- end }}
+        {{- if .Values.extraPodAnnotations }}
+        {{- toYaml .Values.extraPodAnnotations | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range .Values.imagePullSecrets }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      serviceAccountName: {{ include "security-core.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.podSecurity.automountSAToken | default false }}
+      priorityClassName: {{ .Values.priorityClassName | default "" | quote }}
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+      dnsPolicy: ClusterFirst
+      {{- if .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml .Values.hostAliases | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: {{ .Values.podSecurity.fsGroup | default 10001 }}
+        fsGroupChangePolicy: OnRootMismatch
+        runAsUser: {{ .Values.podSecurity.runAsUser | default 10001 }}
+        runAsGroup: {{ .Values.podSecurity.runAsGroup | default 10001 }}
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ .Values.topologySpread.topologyKey | default "topology.kubernetes.io/zone" }}
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "security-core.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- if .Values.affinity }}
+      affinity: {{- toYaml .Values.affinity | nindent 8 }}
+      {{- end }}
+      {{- if .Values.nodeSelector }}
+      nodeSelector: {{- toYaml .Values.nodeSelector | nindent 8 }}
+      {{- end }}
+      {{- if .Values.tolerations }}
+      tolerations: {{- toYaml .Values.tolerations | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.initContainers }}
+      initContainers:
+        {{- toYaml .Values.initContainers | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: {{ include "security-core.name" . }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          {{- if .Values.command }}
+          command: {{- toYaml .Values.command | nindent 12 }}
+          {{- end }}
+          {{- if .Values.args }}
+          args: {{- toYaml .Values.args | nindent 12 }}
+          {{- end }}
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port | default 8443 }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port | default 9090 }}
+              protocol: TCP
+            {{- end }}
+
+          env:
+            - name: TZ
+              value: {{ .Values.timezone | default "UTC" | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logging.level | default "info" | quote }}
+            {{- if .Values.extraEnv }}
+            {{- toYaml .Values.extraEnv | nindent 12 }}
+            {{- end }}
+          {{- if or .Values.configMap.enabled .Values.secretRefs.enabled .Values.envFrom }}
+          envFrom:
+            {{- if .Values.configMap.enabled }}
+            - configMapRef:
+                name: {{ include "security-core.fullname" . }}-config
+            {{- end }}
+            {{- if .Values.secretRefs.enabled }}
+            - secretRef:
+                name: {{ include "security-core.fullname" . }}-secrets
+            {{- end }}
+            {{- if .Values.envFrom }}
+            {{- toYaml .Values.envFrom | nindent 12 }}
+            {{- end }}
+          {{- end }}
+
+          volumeMounts:
+            # readOnlyRootFilesystem требует отдельные точки монтирования для записи
+            - name: tmp
+              mountPath: /tmp
+            - name: work
+              mountPath: /var/run/security-core
+            {{- if and .Values.tls.enabled .Values.tls.mount }}
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath | default "/etc/tls" }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.extraVolumeMounts }}
+            {{- toYaml .Values.extraVolumeMounts | nindent 12 }}
+            {{- end }}
+
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path | default "/health/ready" }}
+              port: {{ .Values.probes.port | default "http" }}
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 5 }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
+
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path | default "/health/live" }}
+              port: {{ .Values.probes.port | default "http" }}
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 10 }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
+
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path | default "/health/startup" }}
+              port: {{ .Values.probes.port | default "http" }}
+              scheme: {{ if .Values.tls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds | default 5 }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold | default 30 }}
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh","-c","sleep {{ .Values.lifecycle.preStopSleepSeconds | default 5 }}"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          resources:
+            {{- if .Values.resources }}
+            {{- toYaml .Values.resources | nindent 12 }}
+            {{- else }}
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+              ephemeral-storage: "512Mi"
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+              ephemeral-storage: "128Mi"
+            {{- end }}
+
+        {{- if .Values.sidecars }}
+        {{- toYaml .Values.sidecars | nindent 8 }}
+        {{- end }}
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.volumes.tmp.sizeLimit | default "256Mi" }}
+        - name: work
+          emptyDir: {}
+        {{- if and .Values.tls.enabled .Values.tls.mount }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName | default (printf "%s-tls" (include "security-core.fullname" .)) }}
+            optional: false
+        {{- end }}
+        {{- if .Values.extraVolumes }}
+        {{- toYaml .Values.extraVolumes | nindent 8 }}
+        {{- end }}

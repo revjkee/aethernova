@@ -1,0 +1,178 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aethernova-chain-core.fullname" . }}-node
+  labels:
+    {{- include "aethernova-chain-core.labels" . | nindent 4 }}
+  {{- with .Values.deployment.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.replicaCount | default 3 }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit | default 10 }}
+  {{- if .Values.strategy }}
+  strategy: {{- toYaml .Values.strategy | nindent 4 }}
+  {{- else }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 25%
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "aethernova-chain-core.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        {{- include "aethernova-chain-core.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: node
+      annotations:
+        # Триггерим перекатку при изменении конфигов/секретов
+        checksum/config: {{ include (print .Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.secretsEnabled }}
+        checksum/secret: {{ include (print .Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "aethernova-chain-core.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 6 }}
+      {{- end }}
+      priorityClassName: {{ .Values.priorityClassName | default "medium-priority" }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- if .Values.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.topologySpreadConstraints.maxSkew | default 1 }}
+          topologyKey: {{ .Values.topologySpreadConstraints.topologyKey | default "topology.kubernetes.io/zone" }}
+          whenUnsatisfiable: {{ .Values.topologySpreadConstraints.whenUnsatisfiable | default "ScheduleAnyway" }}
+          labelSelector:
+            matchLabels:
+              {{- include "aethernova-chain-core.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: node
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 6 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "aethernova-chain-core.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: node
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: chain-node
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          args:
+            - "--network={{ required \"Values.network is required\" .Values.network }}"
+            - "--data-dir=/data"
+            - "--config=/config/config.toml"
+            - "--rpc-port={{ .Values.ports.rpc }}"
+            {{- range $arg := .Values.extraArgs }}
+            - "{{ $arg }}"
+            {{- end }}
+          ports:
+            - name: rpc
+              containerPort: {{ .Values.ports.rpc | default 30333 }}
+              protocol: TCP
+            - name: p2p
+              containerPort: {{ .Values.ports.p2p | default 30334 }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.env.RUST_LOG | default "info" | quote }}
+            {{- range $k, $v := .Values.env.extra }}
+            - name: {{ $k }}
+              value: {{ tpl ($v | toString) $ | quote }}
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "aethernova-chain-core.fullname" . }}-cfg
+              {{- if .Values.secretsEnabled }}
+            - secretRef:
+                name: {{ include "aethernova-chain-core.fullname" . }}-secret
+              {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /config
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Probes: startup → readiness → liveness
+          # Best practices: использовать startupProbe для "прогрева" и защиты от ранних рестартов
+          # refs: k8s docs on probes
+          startupProbe:
+            httpGet:
+              path: /healthz/startup
+              port: rpc
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: rpc
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: rpc
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop: ["ALL"]
+        {{- with .Values.sidecars }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (include "aethernova-chain-core.fullname" . | printf "%s-pvc") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "aethernova-chain-core.fullname" . }}-cfg
+            {{- if .Values.configMap.immutable }}
+            immutable: true
+            {{- end }}
+      {{- with .Values.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}

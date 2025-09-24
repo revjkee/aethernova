@@ -1,0 +1,389 @@
+# mythos-core/configs/quests.yaml
+# Промышленная конфигурация квестов Mythos Core.
+# Правила:
+# - Все идентификаторы неизменяемы (stable ID). Правим поведение — повышаем revision.
+# - Любые изменения экономики/условий сопровождаем bump'ом revision и changelog.
+# - В значениях времени используем UTC (RFC3339/ISO8601).
+# - Секреты/ключи сюда не попадают.
+
+apiVersion: mythos-core/v1
+kind: QuestConfig
+metadata:
+  schemaVersion: 1
+  generatedAt: "2025-08-27T00:00:00Z"
+  owner: "mythos-core-team"
+  environment: "prod"  # prod|staging|dev — может переопределяться переменной окружения при деплое
+  changelog: |
+    v1: initial public schema with i18n/ab/segmentation/telemetry/anti-cheat.
+
+# -----------------------------
+# Глобальные дефолты и анкоры
+# -----------------------------
+defaults:
+  # Дефолтные окна и лимиты выполнения
+  availability: &default_availability
+    startsAt: "2025-01-01T00:00:00Z"
+    endsAt: null                 # null = бессрочно
+    timezone: "UTC"
+    cooldown: "0s"              # ISO8601 duration допускается, но для простоты используем сек/м/ч/д
+    maxCompletions:
+      perUser: 1                # 1 — одноразовый квест; 0 — бесконечный; число >1 — ограниченный
+      perUserPerDay: 0          # 0 — без дневного лимита
+  # Дефолтные античит-ограничения
+  antiCheat: &default_anticheat
+    minSessionSeconds: 30
+    requireServerEvents: true         # прогресс считается только по серверным событиям
+    maxProgressPerMinute: 100
+    blockVPN: false
+  # Дефолтная телеметрия (префиксы событий)
+  telemetry: &default_telemetry
+    events:
+      started: "quest_started"
+      progressed: "quest_progressed"
+      completed: "quest_completed"
+      failed: "quest_failed"
+    attributes:
+      app: "mythos-core"
+      schema: 1
+  # Дефолтные награды
+  rewards: &default_rewards
+    constraints:
+      totalValueCap: 1000           # верхняя граница «ценности» наград (для экономического баланса)
+      uniquePerLifetime: false
+    grant:
+      currency:
+        gold: 0
+        gems: 0
+      xp: 0
+      items: []
+  # Дефолтная сегментация (всем пользователям)
+  segmentation: &default_segmentation
+    rolloutPercent: 100        # 0..100
+    regions: []                # [] = нет фильтра
+    platforms: []              # [] = нет фильтра
+    minAppVersion: null
+    attributes: {}             # произвольные кей-вэлю фильтры (AND), значения — строки/числа/булевы/списки
+  # Дефолтные флаги
+  flags: &default_flags
+    enabled: true
+    mutuallyExclusiveGroups: []  # список групп взаимного исключения (например: ["daily-featured"])
+    autoClaimOnComplete: true    # награды выдаются автоматически
+
+# Анкоры для повторно используемых наборов наград
+rewardPresets:
+  smallDaily: &reward_small_daily
+    <<: *default_rewards
+    grant:
+      currency:
+        gold: 100
+        gems: 0
+      xp: 25
+      items: []
+  mediumCombat: &reward_medium_combat
+    <<: *default_rewards
+    grant:
+      currency:
+        gold: 350
+        gems: 5
+      xp: 100
+      items: [{ id: "potion_minor_heal", qty: 2 }]
+  firstTimeBonus: &reward_first_time
+    <<: *default_rewards
+    constraints:
+      totalValueCap: 2000
+      uniquePerLifetime: true
+    grant:
+      currency:
+        gold: 500
+        gems: 20
+      xp: 250
+      items: [{ id: "banner_unique_01", qty: 1 }]
+
+# --------------------------------------
+# Каталог квестов (каждый — неизменяемый ID + revision)
+# --------------------------------------
+quests:
+  # 1) Ежедневный вход
+  - id: "daily_login_streak"
+    revision: 3
+    flags: *default_flags
+    category: "daily"
+    difficulty: "easy"      # easy|normal|hard|legendary
+    tags: ["engagement", "retention", "login"]
+    i18n:
+      name:
+        en: "Daily Login"
+        ru: "Ежедневный вход"
+      description:
+        en: "Log in once today."
+        ru: "Войдите в игру сегодня один раз."
+    ui:
+      icon: "icons/daily_login.png"
+      color: "#2E86DE"
+      priority: 90
+    availability:
+      <<: *default_availability
+      cooldown: "24h"
+      maxCompletions:
+        perUser: 0             # бесконечно, но 1 раз в сутки благодаря cooldown
+        perUserPerDay: 1
+      schedule:
+        cron: "0 0 * * *"      # опционально: открывать ровно в полночь UTC
+    segmentation: *default_segmentation
+    abTest:
+      bucket: "daily_login_copy"
+      variants:
+        - key: "A"
+          traffic: 50
+          i18n:
+            description:
+              en: "Log in today to claim a small bonus."
+              ru: "Войдите сегодня, чтобы получить небольшой бонус."
+        - key: "B"
+          traffic: 50
+          i18n:
+            description:
+              en: "Come back today and pick up your reward."
+              ru: "Зайдите сегодня и заберите награду."
+    prerequisites:
+      questsCompleted: []       # нет зависимостей
+      level:
+        min: 1
+      itemsOwned: []
+    steps:
+      - id: "login_once"
+        kind: "event"           # event|counter|collect|visit|custom
+        event:
+          name: "user_login"    # серверное событие
+          conditions: {}        # доп. фильтры по атрибутам события
+        objectives:
+          # одна цель — одно срабатывание события
+          - id: "login"
+            type: "counter"     # counter — увеличивает прогресс на 1
+            target: 1
+            track: "server"     # server|client (server предпочтительно)
+    completion:
+      policy: "all_steps"       # all_steps|any_step
+      timeout: null
+    rewards:
+      base: *reward_small_daily
+      firstTime: *reward_first_time
+      repeats:
+        daily:
+          # Повторные награды могут быть урезаны, чтобы избежать инфляции
+          currency:
+            gold: 50
+            gems: 0
+          xp: 10
+          items: []
+      caps:
+        perDay:
+          currency:
+            gold: 500
+            gems: 5
+          xp: 1000
+    telemetry: *default_telemetry
+    antiCheat:
+      <<: *default_anticheat
+      minSessionSeconds: 10
+    locks:
+      exclusiveWith: []         # список других quest.id, которые нельзя активировать одновременно
+    rollout:
+      # безопасная поэтапная раскатка
+      stages:
+        - percent: 10
+          since: "2025-01-01T00:00:00Z"
+        - percent: 50
+          since: "2025-01-03T00:00:00Z"
+        - percent: 100
+          since: "2025-01-05T00:00:00Z"
+
+  # 2) Охота на гоблинов — цепочка с несколькими целями
+  - id: "hunt_goblins"
+    revision: 7
+    flags:
+      <<: *default_flags
+      mutuallyExclusiveGroups: ["weekly-featured"]
+    category: "combat"
+    difficulty: "normal"
+    tags: ["combat", "kill", "weekly"]
+    i18n:
+      name:
+        en: "Goblin Hunt"
+        ru: "Охота на гоблинов"
+      description:
+        en: "Defeat goblins in the Forest region. Bigger rewards for elites."
+        ru: "Побеждайте гоблинов в регионе Лес. Больше наград за элитных врагов."
+    ui:
+      icon: "icons/goblin.png"
+      color: "#27AE60"
+      priority: 70
+    availability:
+      <<: *default_availability
+      cooldown: "7d"
+      maxCompletions:
+        perUser: 1              # раз в неделю
+        perUserPerDay: 0
+      schedule:
+        window:
+          # Доступно с понедельника 00:00 UTC по воскресенье 23:59 UTC
+          weekly: ["mon", "sun"]
+    segmentation:
+      <<: *default_segmentation
+      regions: ["EU", "US"]
+      platforms: ["pc", "console"]
+    prerequisites:
+      questsCompleted: []
+      level: { min: 5 }
+      itemsOwned: []
+    steps:
+      - id: "kill_basic"
+        kind: "event"
+        event:
+          name: "enemy_killed"
+          conditions:
+            species: "goblin"
+            region: "forest"
+            tier: ["normal", "elite"]
+        objectives:
+          - id: "kill_20"
+            type: "counter"
+            target: 20
+            weight: 1
+          - id: "kill_elite"
+            type: "counter"
+            target: 3
+            weight: 3
+        failureConditions:
+          # опционально: запрещает засчитывать прогресс за аномально быстрые киллы
+          maxRatePerMinute: 60
+      - id: "loot_ear"
+        kind: "collect"
+        objectives:
+          - id: "collect_goblin_ear"
+            type: "item"
+            itemId: "goblin_ear"
+            target: 5
+            track: "server"
+    completion:
+      policy: "all_steps"
+      timeout: "72h"
+    rewards:
+      base: *reward_medium_combat
+      dynamic:
+        # Пример динамической надбавки за элитных врагов
+        formula: "base + min(eliteKills * 25, 250)"  # интерпретация на сервере
+        caps:
+          totalBonus: 250
+      repeats: {}
+      caps:
+        perWeek:
+          currency:
+            gold: 2000
+            gems: 20
+          xp: 5000
+    telemetry:
+      <<: *default_telemetry
+      events:
+        started: "q_goblins_started"
+        progressed: "q_goblins_progressed"
+        completed: "q_goblins_completed"
+        failed: "q_goblins_failed"
+    antiCheat:
+      <<: *default_anticheat
+      minSessionSeconds: 60
+      maxProgressPerMinute: 120
+    locks:
+      exclusiveWith: ["raid_elder_trolls"]
+    rollout:
+      stages:
+        - percent: 5
+          since: "2025-01-02T00:00:00Z"
+        - percent: 100
+          since: "2025-01-09T00:00:00Z"
+
+  # 3) Демонстрация сегментации и A/B без экономики (мета-квест)
+  - id: "tutorial_finish"
+    revision: 2
+    flags: *default_flags
+    category: "onboarding"
+    difficulty: "easy"
+    tags: ["tutorial", "new-user"]
+    i18n:
+      name: { en: "Finish Tutorial", ru: "Завершите обучение" }
+      description:
+        en: "Complete the tutorial to unlock starter rewards."
+        ru: "Завершите обучение, чтобы получить стартовые награды."
+    ui: { icon: "icons/tutorial.png", color: "#8E44AD", priority: 95 }
+    availability: *default_availability
+    segmentation:
+      <<: *default_segmentation
+      attributes:
+        # пример фильтра: показывать только новым пользователям без гильдии
+        has_guild: false
+        account_age_days_lte: 7
+    prerequisites:
+      level: { min: 1, max: 20 }
+      questsCompleted: []
+      itemsOwned: []
+    steps:
+      - id: "finish_tutorial"
+        kind: "custom"
+        event:
+          name: "tutorial_completed"
+          conditions: {}
+        objectives:
+          - id: "complete"
+            type: "flag"
+            target: 1
+    completion: { policy: "all_steps", timeout: null }
+    rewards:
+      base:
+        <<: *default_rewards
+        grant:
+          currency: { gold: 200, gems: 10 }
+          xp: 150
+          items: [{ id: "starter_pack", qty: 1 }]
+    telemetry: *default_telemetry
+    antiCheat: *default_anticheat
+    abTest:
+      bucket: "tut_reward_size"
+      variants:
+        - key: "control"
+          traffic: 70
+        - key: "bigger"
+          traffic: 30
+          rewardsOverride:
+            base:
+              grant:
+                currency: { gold: 300, gems: 15 }
+                xp: 200
+
+# -----------------------------
+# Оверрайды по окружениям
+# -----------------------------
+environments:
+  dev:
+    flags:
+      enableAllQuests: true
+    overrides:
+      quests:
+        - id: "daily_login_streak"
+          availability:
+            startsAt: "2025-01-01T00:00:00Z"
+            cooldown: "60s"
+            maxCompletions: { perUserPerDay: 100 }
+        - id: "hunt_goblins"
+          segmentation:
+            regions: []      # доступно всем
+  staging:
+    overrides:
+      quests:
+        - id: "hunt_goblins"
+          rollout:
+            stages:
+              - percent: 100
+                since: "2025-01-01T00:00:00Z"
+  prod:
+    overrides:
+      quests: []

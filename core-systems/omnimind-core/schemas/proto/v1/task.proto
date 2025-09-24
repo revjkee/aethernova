@@ -1,0 +1,345 @@
+syntax = "proto3";
+
+package omnimind.core.v1;
+
+option go_package             = "github.com/omnimind/omnimind-core/gen/go/omnimind/core/v1;corev1";
+option java_multiple_files    = true;
+option java_package           = "com.omnimind.core.v1";
+option csharp_namespace       = "OmniMind.Core.V1";
+option objc_class_prefix      = "OMC";
+option php_namespace          = "OmniMind\\Core\\V1";
+option cc_enable_arenas       = true;
+
+// Well-known types
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/rpc/status.proto";
+
+// -----------------------------------------------------------------------------
+// Ресурсная модель
+// Имена ресурсов соответствуют шаблону:
+//   projects/{project}/locations/{location}/queues/{queue}/tasks/{task}
+// Поле parent в запросах — до уровня queue.
+// -----------------------------------------------------------------------------
+
+// Статус задачи в жизненном цикле.
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_SCHEDULED   = 1;  // запланирована к постановке (future ETA)
+  TASK_STATUS_QUEUED      = 2;  // стоит в очереди
+  TASK_STATUS_LEASED      = 3;  // выдана воркеру по лизу (ожидается ack/nack)
+  TASK_STATUS_RUNNING     = 4;  // выполняется (внутри воркера)
+  TASK_STATUS_SUCCEEDED   = 5;  // выполнена успешно
+  TASK_STATUS_FAILED      = 6;  // исчерпаны ретраи или фатальная ошибка
+  TASK_STATUS_CANCELED    = 7;  // отменена пользователем/политикой
+  TASK_STATUS_TIMED_OUT   = 8;  // превысила дедлайн выполнения
+}
+
+// Приоритет диспетчеризации.
+enum TaskPriority {
+  TASK_PRIORITY_UNSPECIFIED = 0;
+  TASK_PRIORITY_VERY_LOW    = 1;
+  TASK_PRIORITY_LOW         = 2;
+  TASK_PRIORITY_NORMAL      = 3;
+  TASK_PRIORITY_HIGH        = 4;
+  TASK_PRIORITY_URGENT      = 5;
+}
+
+// Тип задачи (для телеметрии/маршрутизации).
+enum TaskType {
+  TASK_TYPE_UNSPECIFIED = 0;
+  TASK_TYPE_GENERIC     = 1;
+  TASK_TYPE_HTTP        = 2;
+  TASK_TYPE_PUBSUB      = 3;
+}
+
+// Политика ретраев.
+message RetryPolicy {
+  // Максимум попыток, включая первую (>=1).
+  int32 max_attempts = 1;
+
+  // Минимальный/максимальный бэкофф между попытками.
+  google.protobuf.Duration min_backoff = 2;  // напр. 1s
+  google.protobuf.Duration max_backoff = 3;  // напр. 5m
+
+  // Множитель экспоненциального бэкоффа (>=1.0).
+  double backoff_multiplier = 4;
+
+  // Джиттер 0..1 для рандомизации (напр. 0.2 = ±20%).
+  double jitter = 5;
+}
+
+// Метаинформация о создании/происхождении задачи.
+message TaskMetadata {
+  string created_by        = 1;  // сервис/пользователь
+  string created_via       = 2;  // api|sdk|ui|import
+  string request_id        = 3;  // идемпотентность CreateTask
+  string tenant_id         = 4;  // многотенантность
+  string trace_id          = 5;  // трассировка (W3C TraceContext)
+  string parent_span_id    = 6;
+  map<string, string> labels = 7; // дополнительные метки
+}
+
+// Универсальная полезная нагрузка.
+message GenericPayload {
+  string content_type = 1;  // напр. application/json
+  bytes  data         = 2;  // произвольный бинарный контент
+  // Альтернативно — произвольная JSON-структура:
+  google.protobuf.Struct json = 3;
+}
+
+// HTTP задача.
+message HttpRequest {
+  string method = 1; // GET/POST/PUT/DELETE/...
+  string url    = 2; // абсолютный URL
+  map<string, string> headers = 3;
+  bytes body = 4; // тело запроса
+
+  // Максимальный runtime на стороне обработчика (воркера/прокси), иначе timeout.
+  google.protobuf.Duration dispatch_deadline = 5;
+}
+
+// Pub/Sub задача.
+message PubSubMessage {
+  string topic = 1; // имя/ARN/полный путь к топику
+  map<string, string> attributes = 2;
+  bytes data = 3;
+  string ordering_key = 4;
+}
+
+// Итог выполнения задачи.
+message TaskResult {
+  // Успешный результат (необязательно).
+  google.protobuf.Any output = 1;
+
+  // Последняя ошибка в случае неуспеха (google.rpc.Status).
+  google.rpc.Status last_error = 2;
+
+  // Произвольные метаданные выполнения (например, измеренные метрики).
+  map<string, string> execution_metadata = 3;
+}
+
+// Описание задачи.
+message Task {
+  // Полное имя ресурса:
+  // projects/{project}/locations/{location}/queues/{queue}/tasks/{task}
+  string name = 1;
+
+  // Короткий идентификатор (последний сегмент name).
+  string uid = 2;
+
+  // Имя очереди (parent): projects/{project}/locations/{location}/queues/{queue}
+  string queue = 3;
+
+  TaskType     type        = 4;
+  TaskPriority priority    = 5;
+  TaskStatus   status      = 6;
+
+  // Счетчик попыток (начинается с 1 для первой попытки).
+  int32 attempt = 7;
+
+  RetryPolicy retry = 8;
+
+  // Временные метки жизненного цикла.
+  google.protobuf.Timestamp create_time       = 9;
+  google.protobuf.Timestamp schedule_time     = 10; // ETA для постановки в очередь
+  google.protobuf.Timestamp lease_expire_time = 11; // когда истекает текущий лиз
+  google.protobuf.Timestamp start_time        = 12; // фактический старт исполнения
+  google.protobuf.Timestamp end_time          = 13; // завершение (success/fail/cancel/timeout)
+
+  // Дедлайн выполнения (wall time), по истечении — timeout.
+  google.protobuf.Duration execution_deadline = 14;
+
+  // Дедупликационный ключ (идемпотентность на уровне очереди/тенанта).
+  string deduplication_key = 15;
+
+  // Метаданные происхождения/трассировки/тенанта.
+  TaskMetadata metadata = 16;
+
+  // Пользовательские метки (для фильтрации/таргетинга).
+  map<string, string> labels = 17;
+
+  // Полезная нагрузка (одна из).
+  oneof payload {
+    GenericPayload generic   = 20;
+    HttpRequest    http      = 21;
+    PubSubMessage  pubsub    = 22;
+  }
+
+  // Результат выполнения.
+  TaskResult result = 23;
+
+  // Зарезервировано для будущей эволюции (сохраните номера).
+  reserved 24, 25, 26;
+  reserved "old_field_1", "old_field_2";
+}
+
+// -----------------------------------------------------------------------------
+// Запросы/ответы сервиса TaskService
+// -----------------------------------------------------------------------------
+
+message CreateTaskRequest {
+  // Родительская очередь: projects/{project}/locations/{location}/queues/{queue}
+  string parent = 1;
+
+  // Создаваемая задача. Поля name/uid игнорируются при создании.
+  Task task = 2;
+
+  // request_id обеспечивает идемпотентность (72 часа).
+  string request_id = 3;
+}
+
+message GetTaskRequest {
+  string name = 1; // полное имя Task
+}
+
+message UpdateTaskRequest {
+  Task task = 1;
+  google.protobuf.FieldMask update_mask = 2; // поля, допустимые к обновлению
+}
+
+message DeleteTaskRequest {
+  string name = 1;
+  // Если true — мягкое удаление, иначе твердое.
+  bool soft = 2;
+}
+
+message ListTasksRequest {
+  string parent = 1;  // очередь
+  int32 page_size = 2; // 0=дефолт, макс ограничен сервером
+  string page_token = 3;
+
+  // Простой фильтр (сервер-определенный синтаксис), например:
+  // 'status=QUEUED AND priority>=HIGH AND labels.env:"prod"'
+  string filter = 4;
+
+  // Сортировка, напр.: "priority desc, schedule_time asc"
+  string order_by = 5;
+
+  // Включать ли завершенные/удаленные в выдачу.
+  bool show_finished = 6;
+}
+
+message ListTasksResponse {
+  repeated Task tasks = 1;
+  string next_page_token = 2;
+}
+
+// Лизинг задач для обработки воркером.
+message LeaseTasksRequest {
+  string parent = 1;  // очередь
+  int32  max_tasks = 2; // сколько задач выдать
+  google.protobuf.Duration lease_duration = 3; // длительность лиза (TTL)
+
+  // Ограничение выборки: по приоритету/меткам/тенанту и т.д.
+  string filter = 4;
+
+  // Идентификатор воркера/пула (для телеметрии/продления лиза).
+  string worker_id = 5;
+}
+
+// Выданная по лизу задача с токеном подтверждения.
+message LeasedTask {
+  Task task = 1;
+
+  // Эфемерный токен для подтверждения ack/nack/renew.
+  string ack_token = 2;
+
+  google.protobuf.Timestamp lease_expire_time = 3;
+}
+
+message LeaseTasksResponse {
+  repeated LeasedTask tasks = 1;
+}
+
+// Подтверждение успешной обработки.
+message AcknowledgeTaskRequest {
+  string name = 1;
+  string ack_token = 2;
+
+  // Опциональный результат на ack (переносится в Task.result).
+  TaskResult result = 3;
+}
+
+// Отказ от задачи (вернуть в очередь).
+message RejectTaskRequest {
+  string name = 1;
+  string ack_token = 2;
+
+  // Причина отказа/ошибка последней попытки.
+  google.rpc.Status error = 3;
+
+  // Если задано — переотложить задачу через delay (иначе сервер решит по RetryPolicy).
+  google.protobuf.Duration retry_delay = 4;
+
+  // Если true — без ожидания бэкоффа (оверрайд политики).
+  bool retry_immediately = 5;
+}
+
+// Продление текущего лиза.
+message RenewLeaseRequest {
+  string name = 1;
+  string ack_token = 2;
+  google.protobuf.Duration lease_duration = 3;
+}
+
+message RenewLeaseResponse {
+  google.protobuf.Timestamp lease_expire_time = 1;
+}
+
+// Синхронный запуск задачи по имени (не меняет очередь, полезно для дебага/cron).
+message RunTaskRequest {
+  string name = 1;
+  // Если true — сервер дождется завершения и вернет Task с обновленным result/status.
+  bool synchronous = 2;
+  google.protobuf.Duration timeout = 3; // ограничение ожидания для synchronous
+}
+
+// Пустой ответ.
+message Empty {}
+
+// Пиковый просмотр без лизинга (для UI/отладки).
+message PeekTaskRequest {
+  string parent = 1;
+  int32 max_tasks = 2;
+}
+
+message PeekTaskResponse {
+  repeated Task tasks = 1;
+}
+
+// Полная очистка очереди (опасно; требует отдельной привилегии).
+message PurgeQueueRequest {
+  string parent = 1;
+  bool hard = 2; // если true — удаление безвозвратно
+}
+
+message PurgeQueueResponse {
+  uint64 deleted = 1;
+}
+
+// -----------------------------------------------------------------------------
+// gRPC-сервис
+// -----------------------------------------------------------------------------
+
+service TaskService {
+  rpc CreateTask (CreateTaskRequest) returns (Task);
+  rpc GetTask    (GetTaskRequest)    returns (Task);
+  rpc UpdateTask (UpdateTaskRequest) returns (Task);
+  rpc DeleteTask (DeleteTaskRequest) returns (Empty);
+
+  rpc ListTasks  (ListTasksRequest)  returns (ListTasksResponse);
+
+  rpc LeaseTasks       (LeaseTasksRequest)  returns (LeaseTasksResponse);
+  rpc AcknowledgeTask  (AcknowledgeTaskRequest) returns (Empty);
+  rpc RejectTask       (RejectTaskRequest)  returns (Empty);
+  rpc RenewLease       (RenewLeaseRequest)  returns (RenewLeaseResponse);
+
+  rpc RunTask          (RunTaskRequest)     returns (Task);
+  rpc PeekTask         (PeekTaskRequest)    returns (PeekTaskResponse);
+
+  rpc PurgeQueue       (PurgeQueueRequest)  returns (PurgeQueueResponse);
+}

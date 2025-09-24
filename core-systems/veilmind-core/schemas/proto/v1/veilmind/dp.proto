@@ -1,0 +1,343 @@
+// SPDX-License-Identifier: Apache-2.0
+// VeilMind Core — Data/Decision Plane API
+// Производственный контракт между PEP (enforcer) и сервисами PDP/RateLimit/Telemetry.
+
+syntax = "proto3";
+
+package veilmind.v1;
+
+option go_package        = "github.com/aethernova/veilmind-core/gen/veilmind/v1;veilmindv1";
+option java_multiple_files = true;
+option java_package      = "com.aethernova.veilmind.v1";
+option csharp_namespace  = "Aethernova.Veilmind.V1";
+option objc_class_prefix = "VM";
+option ruby_package      = "Aethernova::Veilmind::V1";
+option php_namespace     = "Aethernova\\Veilmind\\V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// ------------------------------- Common Models -------------------------------
+
+// Уникальные ключ-значения с семантикой обязательств/метаданных.
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+// Унифицированная модель субъекта (пользователь/сервис).
+message Subject {
+  // Уникальный идентификатор субъекта (sub).
+  string id = 1;
+  // Идентификатор арендатора/пространства.
+  string tenant_id = 2;
+  // Роли RBAC.
+  repeated string roles = 3;
+  // Привязанные identity-провайдеры (например, "oidc:issuer#clientId").
+  repeated string principals = 4;
+  // Произвольные утверждения (claims), безопасные для политики.
+  map<string, google.protobuf.Value> claims = 5;
+  // Время аутентификации (для политики reauth/MFA).
+  google.protobuf.Timestamp auth_time = 6;
+
+  // Расширяемость.
+  map<string, google.protobuf.Value> attributes = 100;
+
+  reserved 7, 8, 9; // зарезервировано под future-idp поля
+}
+
+// Ресурс (объект доступа) в терминах ABAC/RBAC.
+message Resource {
+  // Тип ресурса (например, "document", "payment", "feature").
+  string type = 1;
+  // Уникальный идентификатор ресурса.
+  string id = 2;
+  // Метки ресурса.
+  map<string, string> labels = 3;
+  // Атрибуты ресурса (owner_id, classification, region и т.д.).
+  map<string, google.protobuf.Value> attributes = 4;
+
+  // Иерархический родитель (для policy inheritance), опционально.
+  string parent_id = 5;
+  string parent_type = 6;
+
+  reserved 7, 8, 9;
+}
+
+// Действие над ресурсом.
+message Action {
+  // Категория: READ/WRITE/DELETE/ADMIN/EXECUTE/CONNECT и т.д.
+  string category = 1;
+  // Операция (business verb), напр. "invoice.pay" или "doc.share".
+  string operation = 2;
+
+  // Протокольные атрибуты — при наличии.
+  string http_method = 10;
+  string http_path   = 11;
+  string grpc_service = 12;
+  string grpc_method  = 13;
+
+  reserved 3, 4, 5, 6, 7, 8, 9;
+}
+
+// Сигналы окружения запроса для Zero-Trust.
+message RequestContext {
+  // Идентификатор запроса для трассировки/аудита.
+  string request_id = 1;
+  // Исходный IP (формат IPv4/IPv6).
+  string source_ip = 2;
+  // User-Agent, fingerprint и т.п.
+  string user_agent = 3;
+
+  // Постура устройства.
+  message Device {
+    string os = 1;
+    string os_version = 2;
+    string device_id = 3;
+    bool attested = 4;            // пройдена ли аттестация
+    bool jailbroken = 5;          // компрометация
+    map<string, google.protobuf.Value> attributes = 100;
+  }
+  Device device = 4;
+
+  // Гео/сеть.
+  message Network {
+    string asn = 1;
+    bool vpn  = 2;
+    bool tor  = 3;
+    string country = 4; // ISO 3166-1 alpha-2
+    string city = 5;
+    double latitude = 6;
+    double longitude = 7;
+    map<string, google.protobuf.Value> attributes = 100;
+  }
+  Network network = 5;
+
+  // Факторы риска/сессии/MFA.
+  double risk_score = 6;                 // 0.0 .. 1.0
+  bool mfa_present = 7;
+  string session_id = 8;
+
+  // Произвольные рантайм-атрибуты для политики.
+  map<string, google.protobuf.Value> attributes = 100;
+}
+
+// Решение по доступу.
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  ALLOW = 1;
+  DENY = 2;
+  CHALLENGE = 3; // требуется дополнительная проверка (например, MFA)
+}
+
+// Причины/эффекты для аудита и наблюдаемости.
+enum EffectReason {
+  EFFECT_REASON_UNSPECIFIED = 0;
+  POLICY_MATCH = 1;
+  NO_MATCH = 2;
+  RISK_TOO_HIGH = 3;
+  RATE_LIMITED = 4;
+  TOKEN_INVALID = 5;
+  CONTEXT_INSUFFICIENT = 6;
+}
+
+// Типы челленджа (для CHALLENGE).
+enum ChallengeType {
+  CHALLENGE_TYPE_UNSPECIFIED = 0;
+  MFA_TOTP = 1;
+  MFA_WEBAUTHN = 2;
+  REAUTH_PASSWORD = 3;
+  STEP_UP_OIDC = 4;
+}
+
+// Обязательства (Obligations) — инструкции для PEP.
+message Obligation {
+  string id = 1; // напр. "inject-header", "mask-fields", "redirect"
+  repeated KeyValue params = 2;
+
+  // Удобные поля для распространенных кейсов.
+  map<string, string> set_headers = 10;   // заголовки к ответу
+  string redirect_url = 11;               // куда редиректить для CHALLENGE/reauth
+  ChallengeType challenge = 12;           // тип требуемого челленджа
+
+  reserved 3, 4, 5, 6, 7, 8, 9;
+}
+
+// --------------------------- Authorization Service ---------------------------
+
+// Запрос авторизации.
+message AuthorizeRequest {
+  string request_id = 1;
+  Subject subject = 2;
+  Resource resource = 3;
+  Action action = 4;
+  RequestContext context = 5;
+
+  // Подсказка по кэшированию положительного решения на стороне PEP.
+  google.protobuf.Duration cache_ttl_hint = 6;
+
+  // Динамический контекст политики (внешние атрибуты).
+  map<string, google.protobuf.Value> policy_context = 7;
+
+  google.protobuf.Timestamp request_time = 8;
+
+  reserved 9, 10, 11;
+}
+
+// Индивидуальное решение.
+message AuthorizeResponse {
+  Decision decision = 1;
+  EffectReason reason = 2;
+  // Время, в течение которого решение может кэшироваться PEP.
+  google.protobuf.Duration ttl = 3;
+
+  // Применимые обязательства (заголовки, редирект, step-up и т.п.).
+  repeated Obligation obligations = 4;
+
+  // Политика/правило, сработавшее в последнюю очередь (для аудита).
+  string policy_id = 5;
+  string rule_id = 6;
+
+  // Идентификатор записи аудита на стороне PDP.
+  string audit_id = 7;
+
+  // Диагностика (не содержать секреты).
+  map<string, string> diagnostics = 8;
+
+  reserved 9, 10, 11;
+}
+
+// Батч-оценка — для высокой пропускной способности.
+message BatchAuthorizeRequest {
+  repeated AuthorizeRequest requests = 1;
+}
+
+message BatchAuthorizeResponse {
+  // Порядок соответствует запросам.
+  repeated AuthorizeResponse responses = 1;
+}
+
+// Сервис принятия решений.
+service DataPlane {
+  // Быстрая проверка прав доступа (PDP).
+  rpc Check(AuthorizeRequest) returns (AuthorizeResponse);
+
+  // Батч-версия Check.
+  rpc CheckBatch(BatchAuthorizeRequest) returns (BatchAuthorizeResponse);
+}
+
+// ------------------------------ RateLimit API --------------------------------
+
+// Descriptor — описание лимитируемого ключа (набор меток).
+message RateLimitDescriptor {
+  map<string, string> entries = 1;
+}
+
+// Статус лимита.
+enum RateLimitCode {
+  RATE_LIMIT_CODE_UNSPECIFIED = 0;
+  OK = 1;
+  OVER_LIMIT = 2;
+  NEAR_LIMIT = 3;
+}
+
+// Параметры лимита в ответе.
+message RateLimit {
+  string name = 1; // логическое имя лимита/политики
+  uint64 limit = 2; // запросов за период
+  uint64 remaining = 3;
+  google.protobuf.Duration window = 4;
+  google.protobuf.Timestamp reset_at = 5;
+}
+
+// Запрос проверки лимитов.
+message RateLimitRequest {
+  string request_id = 1;
+  // Несколько дескрипторов могут оцениваться одновременно (AND/OR в политике).
+  repeated RateLimitDescriptor descriptors = 2;
+  // Сколько единиц "стоимости" списать (по умолчанию 1).
+  uint32 hits = 3;
+  // Подсказка для шардинга/консистентного хеширования.
+  string shard_key = 4;
+
+  google.protobuf.Timestamp request_time = 5;
+
+  reserved 6, 7, 8;
+}
+
+// Ответ по лимиту.
+message RateLimitResponse {
+  RateLimitCode code = 1;
+  repeated RateLimit limits = 2;
+  // Диагностические метаданные (не секретные).
+  map<string, string> metadata = 3;
+
+  reserved 4, 5, 6;
+}
+
+// Сервис лимитирования.
+service RateLimiter {
+  rpc ShouldRateLimit(RateLimitRequest) returns (RateLimitResponse);
+}
+
+// ------------------------------ Telemetry API --------------------------------
+
+// Единичное событие доступа/исполнения.
+message AccessReport {
+  string event_id = 1;
+  string request_id = 2;
+
+  // Отражаем входные данные (для корреляции).
+  Subject subject = 3;
+  Resource resource = 4;
+  Action action = 5;
+  RequestContext context = 6;
+
+  // Факт решения и результирующие параметры ответа.
+  Decision decision = 7;
+  EffectReason reason = 8;
+  uint32 http_status = 9;
+  // Наблюдаемые метрики.
+  uint64 bytes_in = 10;
+  uint64 bytes_out = 11;
+  google.protobuf.Duration latency = 12;
+
+  // Тайминги.
+  google.protobuf.Timestamp started_at = 13;
+  google.protobuf.Timestamp finished_at = 14;
+
+  // Удобные поля маршрутирования/бэкенда.
+  string route = 15;
+  string upstream_cluster = 16;
+
+  // Кастомные метрики/метки.
+  map<string, string> labels = 50;
+  map<string, google.protobuf.Value> metrics = 51;
+
+  reserved 17, 18, 19, 20;
+}
+
+// Батч событий.
+message BatchAccessReport {
+  repeated AccessReport events = 1;
+}
+
+// Подтверждение приема телеметрии.
+message ReportAck {
+  string ack_id = 1;
+  // Рекомендованная задержка перед следующим пушем при перегрузке.
+  google.protobuf.Duration backoff_hint = 2;
+}
+
+// Сервис телеметрии (прием событий).
+service Telemetry {
+  // Одно событие.
+  rpc ReportAccess(AccessReport) returns (ReportAck);
+
+  // Батч событий.
+  rpc ReportBatch(BatchAccessReport) returns (ReportAck);
+
+  // Клиентский поток для высокой пропускной способности.
+  rpc StreamAccess(stream AccessReport) returns (ReportAck);
+}

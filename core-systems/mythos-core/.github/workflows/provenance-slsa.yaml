@@ -1,0 +1,139 @@
+name: provenance-slsa
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write          # нужен для релизов и загрузки артефактов
+  id-token: write          # нужен для OIDC-подписи аттестаций
+  attestations: write      # публикация Build Provenance
+  actions: read
+
+concurrency:
+  group: provenance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARCHIVE_NAME: mythos-core-src
+  DIST_DIR: dist
+  # Метка детерминированного времени архива: берём время последнего коммита
+  # Будет вычислено на шаге build.
+
+jobs:
+  build-and-attest:
+    name: Build deterministic tarball and attest SLSA
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - { name: "python", setup: "3.11" }
+          - { name: "python", setup: "3.12" }
+
+    steps:
+      - name: Checkout (full history for reproducible metadata)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive deterministic timestamp (UTC) from last commit
+        id: ts
+        run: |
+          TS=$(git log -1 --pretty=%cI)
+          echo "SOURCE_DATE_EPOCH=$(date -u -d "$TS" +%s)" >> $GITHUB_ENV
+          echo "iso=$TS" >> $GITHUB_OUTPUT
+
+      - name: Setup Python (for potential packaging tools)
+        if: matrix.toolchain.name == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.toolchain.setup }}
+          cache: 'pip'
+
+      - name: Prepare dist directory
+        run: |
+          rm -rf "${DIST_DIR}"
+          mkdir -p "${DIST_DIR}"
+
+      - name: Create deterministic tar (git archive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Зафиксируем путь репозитория для корня архива
+          ROOT_DIR="mythos-core"
+          # Определим дату на базе SOURCE_DATE_EPOCH
+          : "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH must be set}"
+          export TZ=UTC
+          FIXED_DATE="$(date -u -d "@${SOURCE_DATE_EPOCH}" "+%Y-%m-%d %H:%M:%S +0000")"
+
+          # Создаём детерминированный TAR: фиксируем владельца/группу и время
+          # Примечание: GNU tar поддерживает параметры владельцев и времени с --mtime.
+          git archive --format=tar --prefix="${ROOT_DIR}/" --output "${DIST_DIR}/${ARCHIVE_NAME}.tar" HEAD
+          # Перепакуем в детерминированный tar.gz с фиксированным mtime и uid/gid 0/0
+          tar --numeric-owner --owner=0 --group=0 --mtime="${FIXED_DATE}" -cf "${DIST_DIR}/${ARCHIVE_NAME}.norm.tar" -C "${DIST_DIR}" "${ARCHIVE_NAME}.tar"
+          # Сжимаем без сохранения оригинальных времён
+          gzip -n -9 < "${DIST_DIR}/${ARCHIVE_NAME}.norm.tar" > "${DIST_DIR}/${ARCHIVE_NAME}.tar.gz"
+          rm -f "${DIST_DIR}/${ARCHIVE_NAME}.tar" "${DIST_DIR}/${ARCHIVE_NAME}.norm.tar"
+
+      - name: Generate SHA256 checksums
+        id: sha
+        run: |
+          set -euo pipefail
+          shasum -a 256 "${DIST_DIR}/${ARCHIVE_NAME}.tar.gz" | awk '{print $1}' > "${DIST_DIR}/${ARCHIVE_NAME}.tar.gz.sha256"
+          echo "sha256=$(cat "${DIST_DIR}/${ARCHIVE_NAME}.tar.gz.sha256")" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifact (tarball)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}-${{ github.sha }}-${{ matrix.toolchain.setup }}
+          path: |
+            ${{ env.DIST_DIR }}/${{ env.ARCHIVE_NAME }}.tar.gz
+            ${{ env.DIST_DIR }}/${{ env.ARCHIVE_NAME }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest SLSA build provenance (DSSE)
+        # Формирует SLSA Provenance для указанных файлов на основе GitHub OIDC
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            ${{ env.DIST_DIR }}/${{ env.ARCHIVE_NAME }}.tar.gz
+
+      - name: Attach assets to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.DIST_DIR }}/${{ env.ARCHIVE_NAME }}.tar.gz
+            ${{ env.DIST_DIR }}/${{ env.ARCHIVE_NAME }}.tar.gz.sha256
+          generate_release_notes: true
+
+  # Дополнительно: верификация артефакта (самопроверка по sha256) как отдельная job
+  verify:
+    name: Verify artifact checksum
+    runs-on: ubuntu-latest
+    needs: [ build-and-attest ]
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}-${{ github.sha }}-3.12
+          path: verify
+
+      - name: Verify SHA256
+        run: |
+          set -euo pipefail
+          pushd verify >/dev/null
+          ACTUAL=$(shasum -a 256 "${ARCHIVE_NAME}.tar.gz" | awk '{print $1}')
+          EXPECTED=$(cat "${ARCHIVE_NAME}.tar.gz.sha256")
+          echo "Expected: $EXPECTED"
+          echo "Actual  : $ACTUAL"
+          test "$ACTUAL" = "$EXPECTED"
+          popd >/dev/null

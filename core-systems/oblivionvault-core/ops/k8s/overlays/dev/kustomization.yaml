@@ -1,0 +1,192 @@
+# oblivionvault-core/ops/k8s/overlays/dev/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Базовые манифесты
+resources:
+  - ../../base
+
+# Идентификация окружения
+namespace: oblivionvault-dev
+namePrefix: dev-
+
+commonLabels:
+  app.kubernetes.io/part-of: oblivionvault-core
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/instance: dev
+  environment: dev
+
+commonAnnotations:
+  observability/enabled: "true"
+  reloader.stakater.com/auto: "true"
+
+# Генераторы конфигураций (dev-настройки)
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    config/checksum: "enabled"
+
+configMapGenerator:
+  - name: app-config
+    behavior: merge
+    envs:
+      # Файл формата KEY=VALUE. Положите рядом или укажите корректный путь.
+      - ../../.env.dev
+    literals:
+      - APP_ENV=development
+      - LOG_LEVEL=DEBUG
+      - ENABLE_PROMETHEUS=true
+      # PUBLIC_HOSTNAME используется replacement'ом для Ingress:
+      - PUBLIC_HOSTNAME=api.dev.oblivionvault.local
+
+secretGenerator:
+  - name: app-secrets
+    behavior: merge
+    type: Opaque
+    envs:
+      # Формат KEY=VALUE, например API_TOKEN=..., SENTRY_DSN=...
+      - ../../.secrets.dev.env
+
+# Переопределения образов (замените name/newName/newTag под ваши реестры)
+images:
+  - name: ghcr.io/CHANGE_ME/oblivionvault-api
+    newName: ghcr.io/CHANGE_ME/oblivionvault-api
+    newTag: dev
+  - name: ghcr.io/CHANGE_ME/oblivionvault-worker
+    newName: ghcr.io/CHANGE_ME/oblivionvault-worker
+    newTag: dev
+
+# Масштабирование для dev
+replicas:
+  - name: oblivionvault-api
+    count: 2
+  - name: oblivionvault-worker
+    count: 1
+
+# Патчи (JSON6902 и стратегические) для кастомизации dev
+patches:
+  # Service: тип для dev — ClusterIP
+  - target:
+      version: v1
+      kind: Service
+      name: oblivionvault-api
+    patch: |-
+      - op: replace
+        path: /spec/type
+        value: ClusterIP
+
+  # Ingress: аннотации и хост (значение также подставляется через replacements ниже)
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: oblivionvault-api
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          kubernetes.io/ingress.class: "nginx"
+          cert-manager.io/cluster-issuer: "letsencrypt-staging"
+          nginx.ingress.kubernetes.io/proxy-body-size: "25m"
+          nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+      - op: replace
+        path: /spec/rules/0/host
+        value: api.dev.oblivionvault.local
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: api.dev.oblivionvault.local
+
+  # Deployment API: ресурсы, аннотации, nodeSelector/tolerations/anti-affinity, env из ConfigMap
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: oblivionvault-api
+    patch: |-
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          checksum/configmap: "app-config"
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          kubernetes.io/os: linux
+          kubernetes.io/arch: amd64
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - key: "workload"
+            operator: "Equal"
+            value: "dev"
+            effect: "NoSchedule"
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: oblivionvault-api
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: APP_ENV
+          value: development
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: LOG_LEVEL
+
+  # Deployment Worker: ресурсы и базовая конфигурация
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: oblivionvault-worker
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "250m"
+            memory: "256Mi"
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: CMD_POLL_INTERVAL
+          value: "2.0"
+
+# Подстановка значений из ConfigMap в Ingress (dev-домен)
+replacements:
+  - source:
+      kind: ConfigMap
+      name: app-config
+      fieldPath: data.PUBLIC_HOSTNAME
+    targets:
+      - select:
+          kind: Ingress
+          name: oblivionvault-api
+        fieldPaths:
+          - spec.rules.0.host
+          - spec.tls.0.hosts.0

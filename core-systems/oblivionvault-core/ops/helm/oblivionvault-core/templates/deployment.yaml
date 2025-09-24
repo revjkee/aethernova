@@ -1,0 +1,271 @@
+{{- /*
+Industrial-grade Deployment for oblivionvault-core.
+Self-contained: does not rely on helpers. Tune via values.yaml.
+*/ -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- $fullname := printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- $labels := dict
+      "app.kubernetes.io/name" $name
+      "app.kubernetes.io/instance" .Release.Name
+      "app.kubernetes.io/component" (default "api" .Values.component)
+      "app.kubernetes.io/part-of" (default "oblivionvault" .Values.partOf)
+      "app.kubernetes.io/version" .Chart.AppVersion
+      "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version)
+      "app.kubernetes.io/managed-by" .Release.Service
+-}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- range $k, $v := $labels }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+    {{- with .Values.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  replicas: {{ default 3 .Values.replicaCount }}
+  revisionHistoryLimit: {{ default 10 .Values.revisionHistoryLimit }}
+  strategy:
+    type: {{ default "RollingUpdate" .Values.strategy.type }}
+    {{- if ne (default "RollingUpdate" .Values.strategy.type) "Recreate" }}
+    rollingUpdate:
+      maxUnavailable: {{ default 0 .Values.strategy.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ default "25%" .Values.strategy.rollingUpdate.maxSurge | quote }}
+    {{- end }}
+  progressDeadlineSeconds: {{ default 600 .Values.progressDeadlineSeconds }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+  template:
+    metadata:
+      labels:
+        {{- range $k, $v := $labels }}
+        {{ $k }}: {{ $v | quote }}
+        {{- end }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.metrics.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/path: {{ default "/metrics" .Values.metrics.path | quote }}
+        prometheus.io/port: {{ default "9090" .Values.metrics.port | quote }}
+        {{- end }}
+        {{- if .Values.checksumAnnotations.enabled }}
+        {{- with .Values.checksumAnnotations.config }}
+        checksum/config: {{ . | quote }}
+        {{- end }}
+        {{- with .Values.checksumAnnotations.secret }}
+        checksum/secret: {{ . | quote }}
+        {{- end }}
+        {{- end }}
+    spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ default $fullname .Values.serviceAccount.name }}
+      {{- else if .Values.serviceAccount.name }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- end }}
+      automountServiceAccountToken: {{ default false .Values.serviceAccount.automount }}
+      enableServiceLinks: {{ default false .Values.enableServiceLinks }}
+      priorityClassName: {{ default "" .Values.priorityClassName | quote }}
+      terminationGracePeriodSeconds: {{ default 30 .Values.terminationGracePeriodSeconds }}
+      dnsPolicy: {{ default "ClusterFirst" .Values.dnsPolicy }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ .name | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: {{ $name | quote }}
+                    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $name | quote }}
+              app.kubernetes.io/instance: {{ .Release.Name | quote }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $name | quote }}
+              app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: {{ default true .Values.podSecurityContext.runAsNonRoot }}
+        runAsUser: {{ default 10001 .Values.podSecurityContext.runAsUser }}
+        runAsGroup: {{ default 10001 .Values.podSecurityContext.runAsGroup }}
+        fsGroup: {{ default 10001 .Values.podSecurityContext.fsGroup }}
+        fsGroupChangePolicy: {{ default "OnRootMismatch" .Values.podSecurityContext.fsGroupChangePolicy | quote }}
+        seccompProfile:
+          type: {{ default "RuntimeDefault" .Values.podSecurityContext.seccompProfile.type }}
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: app
+          image: "{{ required "image.repository is required" .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ default "IfNotPresent" .Values.image.pullPolicy }}
+          {{- with .Values.command }}
+          command: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ default 8080 .Values.containerPorts.http }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ default 9090 .Values.containerPorts.metrics }}
+              protocol: TCP
+            {{- end }}
+            {{- with .Values.extraPorts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: APP_ENV
+              value: {{ default "production" .Values.env.APP_ENV | quote }}
+            - name: LOG_LEVEL
+              value: {{ default "info" .Values.env.LOG_LEVEL | quote }}
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- if .Values.resources }}
+            {{- toYaml .Values.resources | nindent 12 }}
+            {{- else }}
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+              ephemeral-storage: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: {{ default false .Values.securityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ default true .Values.securityContext.readOnlyRootFilesystem }}
+            capabilities:
+              drop: {{ default (list "ALL") .Values.securityContext.capabilities.drop | toYaml | nindent 14 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/app
+            {{- if .Values.persistence.enabled }}
+            - name: data
+              mountPath: {{ default "/var/lib/oblivionvault" .Values.persistence.mountPath }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ default "/healthz" .Values.probes.startup.path | quote }}
+              port: {{ default "http" .Values.probes.startup.port | quote }}
+            initialDelaySeconds: {{ default 0 .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ default 5 .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ default 2 .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ default 30 .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ default "/healthz" .Values.probes.liveness.path | quote }}
+              port: {{ default "http" .Values.probes.liveness.port | quote }}
+            initialDelaySeconds: {{ default 20 .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ default 10 .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ default 2 .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ default 3 .Values.probes.liveness.failureThreshold }}
+            successThreshold: {{ default 1 .Values.probes.liveness.successThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ default "/readyz" .Values.probes.readiness.path | quote }}
+              port: {{ default "http" .Values.probes.readiness.port | quote }}
+            initialDelaySeconds: {{ default 10 .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ default 5 .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ default 2 .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ default 6 .Values.probes.readiness.failureThreshold }}
+            successThreshold: {{ default 1 .Values.probes.readiness.successThreshold }}
+          {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command: {{ default (list "sh" "-c" "sleep 10") .Values.lifecycle.preStop.command | toYaml | nindent 16 }}
+        {{- with .Values.sidecars }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: "256Mi"
+            medium: Memory
+        - name: cache
+          emptyDir:
+            sizeLimit: "256Mi"
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          {{- if .Values.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

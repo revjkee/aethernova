@@ -1,0 +1,220 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+// ===== Language / SDK options (настройте префиксы под ваш репозиторий)
+option go_package = "github.com/ledger/ledger-core/schemas/proto/v1;ledgerv1";
+option java_multiple_files = true;
+option java_package = "com.ledger.core.v1";
+option csharp_namespace = "Ledger.Core.V1";
+option objc_class_prefix = "LED";
+
+// Важно: этот контракт должен быть wire‑совместимым. Используйте reserved
+// для удаляемых/переименованных полей, НЕ переиспользуйте номера полей.
+
+// -----------------------------------------------------------------------------
+// Базовая модель ошибки
+// -----------------------------------------------------------------------------
+message Error {
+  // Машиночитаемый код, стабильный во времени (SCREAMING_SNAKE_CASE).
+  // Примеры: "VALIDATION_FAILED", "UNAUTHENTICATED", "PERMISSION_DENIED",
+  // "NOT_FOUND", "CONFLICT", "RATE_LIMITED", "INTERNAL", "UPSTREAM_UNAVAILABLE".
+  string code = 1;
+
+  // Человекочитаемое сообщение по умолчанию (английский).
+  string message = 2;
+
+  // Корреляционный идентификатор запроса/трассировки (BCP‑47 insensitive).
+  string correlation_id = 3;
+
+  // Критичность/категория.
+  Severity severity = 4;
+
+  // HTTP‑статус, соответствующий ошибке (например, 400/401/403/404/409/429/500).
+  uint32 http_status = 5;
+
+  // Повторяемость запроса без изменений (true => клиент может безопасно ретраить).
+  bool retryable = 6;
+
+  // Детали, типизированные под распространенные причины ошибок.
+  repeated Detail details = 7;
+
+  // Небольшие парные атрибуты (без PII/секретов): ключи поиска, теги и т.п.
+  map<string, string> metadata = 8;
+
+  // Локализованное сообщение (по возможности).
+  Localized localized = 9;
+
+  // Для будущей эволюции (НЕ переиспользовать номера).
+  reserved 10, 11, 12;
+  reserved "deprecated_field", "legacy_code";
+}
+
+// Для батч‑эндпоинтов и агрегированных ошибок.
+message ErrorList {
+  repeated Error errors = 1;
+}
+
+// Локализованная форма человекочитаемого сообщения.
+message Localized {
+  // BCP‑47: например "en", "en-GB", "ru".
+  string locale = 1;
+  // Переведенное сообщение (желательно без чувствительных данных).
+  string message = 2;
+
+  reserved 3;
+}
+
+// Уровень критичности для маршрутизации/логирования.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO = 1;     // например, мягкая валидация
+  SEVERITY_WARNING = 2;  // деградация, но обработано
+  SEVERITY_ERROR = 3;    // стандартная ошибка клиента/сервера
+  SEVERITY_CRITICAL = 4; // инцидент (будет пейджить on-call)
+}
+
+// Типизированные детали. Ровно один вариант на элемент.
+message Detail {
+  oneof kind {
+    FieldViolation field_violation = 1;
+    AuthViolation auth_violation = 2;
+    QuotaViolation quota_violation = 3;
+    RateLimit rate_limit = 4;
+    Conflict conflict = 5;
+    ResourceNotFound not_found = 6;
+    Upstream upstream = 7;
+    // Дополнительные доменные детали (например, платежи, проводки и т.п.)
+    DomainViolation domain_violation = 8;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Детали (часто встречающиеся причины)
+// -----------------------------------------------------------------------------
+
+// Нарушение валидации входных данных.
+message FieldViolation {
+  // Имя поля в нотации JSON Pointer или dot‑path (например: "user.email" или "/user/email").
+  string field = 1;
+  // Человекочитаемое пояснение (короткое).
+  string description = 2;
+  // Сырое значение (обфусцированное/усеченное, если PII).
+  string value = 3;
+
+  reserved 4;
+}
+
+// Ошибки аутентификации/авторизации.
+message AuthViolation {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_UNAUTHENTICATED = 1;   // нет/неверный токен
+    REASON_PERMISSION_DENIED = 2; // роль/политика не позволяет
+    REASON_EXPIRED = 3;           // истекший токен/сессия
+    REASON_MFA_REQUIRED = 4;      // требуется MFA
+    REASON_MFA_FAILED = 5;        // провал MFA
+  }
+  Reason reason = 1;
+  string subject = 2;     // id пользователя/клиента (если уместно)
+  string resource = 3;    // защищаемый ресурс/операция
+  string policy_hint = 4; // подсказка по политике/роли (без утечки секретов)
+
+  reserved 5;
+}
+
+// Нарушение квоты/лимитов использования.
+message QuotaViolation {
+  string subject = 1; // владелец квоты (tenant/user/project)
+  string metric = 2;  // метрика квоты (например: "requests_per_day")
+  uint64 limit = 3;   // максимально допустимое значение
+  uint64 current = 4; // текущий счетчик
+  string window = 5;  // окно измерения (например: "1d")
+
+  reserved 6;
+}
+
+// Rate‑limit (оперативное ограничение).
+message RateLimit {
+  uint64 limit = 1;        // токенов/сек (или аналог)
+  uint64 remaining = 2;    // сколько осталось
+  int64 reset_at_unix = 3; // когда обновится (UTC секундный unix timestamp)
+  string scope = 4;        // ключ/пространство лимита (ip, user, token)
+
+  reserved 5;
+}
+
+// Конфликт версий/состояний ресурса (оптимистичная блокировка).
+message Conflict {
+  string resource_type = 1;
+  string resource_id = 2;
+  string expected_version = 3;
+  string actual_version = 4;
+
+  reserved 5;
+}
+
+// Ресурс не найден.
+message ResourceNotFound {
+  string resource_type = 1;
+  string resource_id = 2;
+
+  reserved 3;
+}
+
+// Сбой/недоступность апстрима (внешняя/внутренняя зависимость).
+message Upstream {
+  string system = 1;        // имя системы/сервиса (например: "postgres", "redis", "payments")
+  uint32 status_code = 2;   // код (HTTP/gRPC/драйвера) если есть
+  string endpoint = 3;      // URL/DSN/ресурс
+  string operation = 4;     // вызываемая операция/метод
+
+  reserved 5;
+}
+
+// Доменные ограничения (пример: бухгалтерские проводки).
+message DomainViolation {
+  string domain = 1;      // "ledger", "payments", ...
+  string rule = 2;        // имя/ид правила
+  string description = 3; // краткое пояснение
+
+  reserved 4;
+}
+
+// -----------------------------------------------------------------------------
+// Рекомендуемый маппинг Error.code → HTTP статус (документировано для клиентов)
+// -----------------------------------------------------------------------------
+// VALIDATION_FAILED      → 400 Bad Request
+// UNAUTHENTICATED        → 401 Unauthorized
+// PERMISSION_DENIED      → 403 Forbidden
+// NOT_FOUND              → 404 Not Found
+// CONFLICT               → 409 Conflict
+// RATE_LIMITED           → 429 Too Many Requests
+// UPSTREAM_UNAVAILABLE   → 503 Service Unavailable
+// INTERNAL               → 500 Internal Server Error
+//
+// Поле http_status обязательно дублирует фактический статус ответа.
+// Клиенты должны руководствоваться как http_status, так и code.
+//
+// -----------------------------------------------------------------------------
+// Пример JSON‑представления Error (REST):
+// {
+//   "code": "VALIDATION_FAILED",
+//   "message": "amount must be greater than zero",
+//   "correlation_id": "req-01J8A6Q3Y3Z0TNM6M5YH0JZPXK",
+//   "severity": "SEVERITY_ERROR",
+//   "http_status": 400,
+//   "retryable": false,
+//   "details": [
+//     {
+//       "fieldViolation": {
+//         "field": "amount",
+//         "description": "must be > 0",
+//         "value": "-1"
+//       }
+//     }
+//   ],
+//   "metadata": { "endpoint": "/api/v1/tx" },
+//   "localized": { "locale": "ru", "message": "сумма должна быть больше нуля" }
+// }
+// -----------------------------------------------------------------------------

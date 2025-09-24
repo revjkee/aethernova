@@ -1,0 +1,245 @@
+# chronowatch-core/configs/windows.yaml
+apiVersion: chronowatch.core/v1
+kind: WindowsConfig
+metadata:
+  app: chronowatch-core
+  schemaVersion: 1
+  description: >
+    Базовая конфигурация Windows-развертывания для chronowatch-core: сервис, логирование,
+    телеметрия, сеть, безопасность, обслуживание.
+
+# Якорь с безопасными значениями по умолчанию
+defaults: &defaults
+  environment: "prod"                     # prod | staging | dev
+  paths:
+    baseDir: "%PROGRAMDATA%\\ChronowatchCore"
+    binDir:  "%PROGRAMFILES%\\ChronowatchCore"
+    dataDir: "%PROGRAMDATA%\\ChronowatchCore\\data"
+    logDir:  "%PROGRAMDATA%\\ChronowatchCore\\logs"
+    tempDir: "%LOCALAPPDATA%\\ChronowatchCore\\tmp"
+  service:
+    name: "ChronowatchCore"
+    displayName: "Chronowatch Core Service"
+    description: "Chronowatch Core — Windows служба основного API/воркеров."
+    startType: "Automatic"               # Automatic | AutomaticDelayed | Manual | Disabled
+    delayedAutoStart: true
+    failureActions:                      # Recovery-политика
+      resetPeriodSec: 86400
+      actions:
+        - { type: "restart", delaySec: 15 }
+        - { type: "restart", delaySec: 60 }
+        - { type: "none",    delaySec: 0 }
+    identity:
+      # Рекомендовано LocalService. Для сетевого доступа используйте отдельный сервис-аккаунт домена.
+      account: "NT AUTHORITY\\LocalService"
+      passwordSecretRef: null            # { provider: "DPAPI|CredMan", name: "svc-chronowatch-core" }
+    sidType: "Unrestricted"              # Unrestricted | Restricted
+    privileges:                          # Минимально необходимый набор; оставьте пустым для дефолта
+      - SeChangeNotifyPrivilege
+    workingDirectory: "%PROGRAMFILES%\\ChronowatchCore"
+    executable: "%PROGRAMFILES%\\ChronowatchCore\\chronowatch-core.exe"
+    arguments: []
+    env:
+      CHRONO_ENV: "prod"
+      CHRONO_DATA_DIR: "%PROGRAMDATA%\\ChronowatchCore\\data"
+      CHRONO_LOG_DIR: "%PROGRAMDATA%\\ChronowatchCore\\logs"
+    stopTimeoutSec: 30
+
+  security:
+    createDirectories: true
+    directoriesAcl:
+      - path: "%PROGRAMDATA%\\ChronowatchCore"
+        inherit: true
+        entries:
+          - { sid: "SYSTEM",         rights: "FullControl" }
+          - { sid: "BUILTIN\\Administrators", rights: "FullControl" }
+          - { sid: "NT AUTHORITY\\LocalService", rights: "Modify" }
+    secrets:
+      # Никогда не хранить секреты в открытом виде; используйте DPAPI/Credential Manager.
+      providers:
+        - { kind: "CredMan", defaultPrefix: "chronowatch/" }
+        - { kind: "DPAPI",   scope: "LocalMachine" }
+    fipsMode: auto                       # auto | enabled | disabled
+
+  logging:
+    level: "Info"                        # Trace | Debug | Info | Warn | Error
+    json: true
+    sinks:
+      file:
+        enabled: true
+        path: "%PROGRAMDATA%\\ChronowatchCore\\logs\\app.log"
+        maxSizeMB: 100
+        maxBackups: 10
+        maxAgeDays: 14
+        compress: true
+      eventLog:
+        enabled: true
+        logName: "Application"
+        source: "ChronowatchCore"
+        createSourceIfMissing: true
+      etw:
+        enabled: false
+        providerName: "ChronowatchCore"
+        providerGuid: "{00000000-0000-0000-0000-000000000000}"
+
+  telemetry:
+    metrics:
+      enabled: true
+      exporter: "otlp"                   # otlp | none
+      otlp:
+        protocol: "grpc"                 # grpc | http
+        endpoint: "http://127.0.0.1:4317"
+        # Для HTTP: endpoint: "http://127.0.0.1:4318/v1/metrics"
+      interval: "15s"
+      resource:
+        service.name: "chronowatch-core"
+        service.namespace: "chronowatch"
+        service.version: "0.0.0"
+        telemetry.distro: "windows"
+      windowsCounters:                   # Доп. сбор host-метрик через Performance Counters
+        enabled: true
+        include:
+          - "\\Processor(_Total)\\% Processor Time"
+          - "\\Memory\\Available MBytes"
+          - "\\LogicalDisk(_Total)\\% Free Space"
+          - "\\Process(chronowatch-core)\\Working Set - Private"
+    tracing:
+      enabled: true
+      exporter: "otlp"
+      otlp:
+        protocol: "grpc"
+        endpoint: "http://127.0.0.1:4317"
+      sampler:
+        type: "parentbased_traceidratio"
+        ratio: 0.05
+      resource:
+        service.instance.id: "${COMPUTERNAME}"
+      propagate:
+        - tracecontext
+        - baggage
+
+  http:
+    enabled: true
+    host: "0.0.0.0"
+    port: 8080
+    # Для prod предпочтительно TLS c хранением ключа в Windows Cert Store
+    tls:
+      enabled: true
+      minVersion: "1.2"
+      source: "windows_store"            # windows_store | file
+      windowsStore:
+        location: "LocalMachine"         # LocalMachine | CurrentUser
+        storeName: "My"                  # Personal
+        findBy: "subject"                # subject | thumbprint
+        subject: "CN=chronowatch.local"
+        thumbprint: null
+      file:
+        certPath: null
+        keyPath: null
+    timeouts:
+      readMs: 30000
+      writeMs: 30000
+      idleMs: 60000
+    limits:
+      maxHeaderBytes: 1048576
+
+  health:
+    liveness:
+      enabled: true
+      path: "/health/live"
+    readiness:
+      enabled: true
+      path: "/health/ready"
+
+  network:
+    proxy:
+      useSystemProxy: true               # WinHTTP/IE настройки
+      httpProxy: null
+      httpsProxy: null
+      noProxy: [ "127.0.0.1", "localhost" ]
+    firewall:
+      manageRules: true                  # Если true — инсталлятор/скрипт применит правила
+      rules:
+        - name: "ChronowatchCore-HTTP"
+          direction: "inbound"
+          action: "allow"
+          protocol: "TCP"
+          localPorts: [ 8080 ]
+          profiles: [ "Domain", "Private" ]
+          enabled: true
+
+  defender:
+    exclusions:
+      enabled: false                     # Включайте только при ложных срабатываниях AV
+      paths:
+        - "%PROGRAMDATA%\\ChronowatchCore\\logs"
+        - "%PROGRAMDATA%\\ChronowatchCore\\data"
+      processes:
+        - "%PROGRAMFILES%\\ChronowatchCore\\chronowatch-core.exe"
+
+  crashes:
+    werIntegration: true                 # Windows Error Reporting
+    dump:
+      kind: "mini"                       # mini | full
+      directory: "%PROGRAMDATA%\\ChronowatchCore\\dumps"
+      maxDumps: 5
+
+  maintenance:
+    tasks:                               # Плановые задачи (через Task Scheduler)
+      - name: "ChronowatchCore-LogRotate"
+        schedule: "daily@03:15"          # синтаксис упрощён; интерпретируется инсталлятором
+        action: "rotateLogs"
+      - name: "ChronowatchCore-Backup"
+        schedule: "sun@02:00"
+        action: "backup"
+        args:
+          target: "%PROGRAMDATA%\\ChronowatchCore\\backup"
+          keepDays: 7
+
+  features:
+    flags:
+      enableBackgroundWorkers: true
+      enableApi: true
+      strictContentSecurity: true
+
+# Профили окружений с переопределениями
+profiles:
+  prod:
+    <<: *defaults
+
+  staging:
+    <<: *defaults
+    environment: "staging"
+    logging:
+      level: "Debug"
+    telemetry:
+      tracing:
+        sampler:
+          ratio: 0.1
+    http:
+      tls:
+        enabled: true
+    features:
+      flags:
+        strictContentSecurity: true
+
+  dev:
+    <<: *defaults
+    environment: "dev"
+    service:
+      startType: "Manual"
+      delayedAutoStart: false
+      env:
+        CHRONO_ENV: "dev"
+    logging:
+      level: "Debug"
+      json: false
+    telemetry:
+      tracing:
+        sampler:
+          ratio: 1.0
+    http:
+      tls:
+        enabled: false
+    firewall:
+      manageRules: false                 # В dev обычно управляют вручную

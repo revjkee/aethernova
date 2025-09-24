@@ -1,0 +1,234 @@
+---
+# Firewall management for omnimind-core
+# Supports: UFW (Debian/Ubuntu), firewalld (RHEL/CentOS/Rocky), optional nftables fallback.
+# Variables (from vars/defaults):
+#   omnimind_core_security.firewall.manage (bool)
+#   omnimind_core_security.firewall.provider (ufw|firewalld|nftables|auto|none)
+#   omnimind_core_security.firewall.allowed_tcp (list[int])
+#   omnimind_core_security.firewall.allowed_udp (list[int])
+#   omnimind_core_network.outbound_cidrs (optional for egress shaping, firewalld rich rules)
+#   omnimind_core_ports.bind_address (optional limit to specific interface)
+
+- name: "Firewall | Skip if management disabled"
+  ansible.builtin.meta: end_host
+  when: not (omnimind_core_security.firewall.manage | default(true) | bool)
+
+- name: "Firewall | Detect provider if 'auto'"
+  ansible.builtin.set_fact:
+    _omni_fw_provider: >-
+      {{
+        (omnimind_core_security.firewall.provider | default('auto')) if
+        (omnimind_core_security.firewall.provider | default('auto')) != 'auto'
+        else (
+          'firewalld' if (ansible_facts.services is defined and ('firewalld.service' in ansible_facts.services))
+          else ('ufw' if (ansible_facts.packages is defined and ansible_facts.packages.ufw is defined) else
+                ('firewalld' if (ansible_facts.os_family == 'RedHat') else
+                 'ufw'))
+        )
+      }}
+  when: _omni_fw_provider is not defined
+
+- name: "Firewall | Fact summary"
+  ansible.builtin.debug:
+    msg:
+      provider: "{{ _omni_fw_provider }}"
+      os_family: "{{ ansible_facts.os_family }}"
+      allowed_tcp: "{{ omnimind_core_security.firewall.allowed_tcp | default([]) }}"
+      allowed_udp: "{{ omnimind_core_security.firewall.allowed_udp | default([]) }}"
+  verbosity: 1
+
+# --------------------------------------------------------------------
+# UFW PROVIDER
+# --------------------------------------------------------------------
+- name: "UFW | Ensure package installed (Debian/Ubuntu)"
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: true
+  when:
+    - _omni_fw_provider == 'ufw'
+    - ansible_facts.os_family == "Debian"
+
+- name: "UFW | Enable and set default policy"
+  community.general.ufw:
+    state: enabled
+    policy: deny
+    direction: incoming
+  when: _omni_fw_provider == 'ufw'
+
+- name: "UFW | Set default allow outgoing"
+  community.general.ufw:
+    state: enabled
+    policy: allow
+    direction: outgoing
+  when: _omni_fw_provider == 'ufw'
+
+- name: "UFW | Allow loopback"
+  community.general.ufw:
+    rule: allow
+    direction: in
+    interface: lo
+  when: _omni_fw_provider == 'ufw'
+
+- name: "UFW | Allow established/related (implicit in UFW, task is no-op)"
+  ansible.builtin.debug:
+    msg: "UFW tracks stateful connections by default"
+  when: _omni_fw_provider == 'ufw'
+  changed_when: false
+
+- name: "UFW | Allow TCP ports"
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+    from_ip: "any"
+    to_ip: "{{ omnimind_core_ports.bind_address | default('any') }}"
+  loop: "{{ omnimind_core_security.firewall.allowed_tcp | default([]) }}"
+  when: _omni_fw_provider == 'ufw'
+
+- name: "UFW | Allow UDP ports"
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: udp
+    from_ip: "any"
+    to_ip: "{{ omnimind_core_ports.bind_address | default('any') }}"
+  loop: "{{ omnimind_core_security.firewall.allowed_udp | default([]) }}"
+  when: _omni_fw_provider == 'ufw'
+
+- name: "UFW | Deny all other incoming (explicit tighten)"
+  community.general.ufw:
+    rule: deny
+    direction: in
+    to_ip: "{{ omnimind_core_ports.bind_address | default(omit) }}"
+  when: _omni_fw_provider == 'ufw'
+
+# --------------------------------------------------------------------
+# FIREWALLD PROVIDER
+# --------------------------------------------------------------------
+- name: "Firewalld | Ensure package/service"
+  ansible.builtin.package:
+    name: firewalld
+    state: present
+  when: _omni_fw_provider == 'firewalld'
+
+- name: "Firewalld | Start and enable"
+  ansible.builtin.service:
+    name: firewalld
+    state: started
+    enabled: true
+  when: _omni_fw_provider == 'firewalld'
+
+- name: "Firewalld | Gather active zone"
+  ansible.builtin.command: firewall-cmd --get-default-zone
+  register: fw_default_zone
+  changed_when: false
+  when: _omni_fw_provider == 'firewalld'
+
+- name: "Firewalld | Set default deny for input (drop zone policy)"
+  ansible.posix.firewalld:
+    zone: "{{ fw_default_zone.stdout | default('public') }}"
+    state: enabled
+    target: DROP
+    permanent: true
+    immediate: true
+  when: _omni_fw_provider == 'firewalld'
+
+- name: "Firewalld | Allow established/related"
+  ansible.posix.firewalld:
+    rich_rule: 'rule family="ipv4" protocol value="tcp" accept'
+    state: enabled
+    permanent: true
+  when: false  # firewalld stateful by default; rule not needed
+
+- name: "Firewalld | Allow TCP ports"
+  ansible.posix.firewalld:
+    zone: "{{ fw_default_zone.stdout | default('public') }}"
+    port: "{{ item }}/tcp"
+    permanent: true
+    state: enabled
+    immediate: true
+  loop: "{{ omnimind_core_security.firewall.allowed_tcp | default([]) }}"
+  when: _omni_fw_provider == 'firewalld'
+
+- name: "Firewalld | Allow UDP ports"
+  ansible.posix.firewalld:
+    zone: "{{ fw_default_zone.stdout | default('public') }}"
+    port: "{{ item }}/udp"
+    permanent: true
+    state: enabled
+    immediate: true
+  loop: "{{ omnimind_core_security.firewall.allowed_udp | default([]) }}"
+  when: _omni_fw_provider == 'firewalld'
+
+- name: "Firewalld | Optional egress whitelist by CIDR to 443"
+  ansible.posix.firewalld:
+    rich_rule: >-
+      rule family="ipv4" destination address="{{ item }}" port port="443" protocol="tcp" accept
+    zone: "{{ fw_default_zone.stdout | default('public') }}"
+    state: enabled
+    permanent: true
+    immediate: true
+  loop: "{{ omnimind_core_network.outbound_cidrs | default([]) }}"
+  when:
+    - _omni_fw_provider == 'firewalld'
+    - (omnimind_core_network.outbound_cidrs | default([]) | length) > 0
+
+- name: "Firewalld | Reload to apply"
+  ansible.posix.firewalld:
+    state: reloaded
+    immediate: true
+  when: _omni_fw_provider == 'firewalld'
+
+# --------------------------------------------------------------------
+# NFTABLES (OPTIONAL FALLBACK) — minimal ruleset
+# --------------------------------------------------------------------
+- name: "NFT | Ensure nftables package"
+  ansible.builtin.package:
+    name: nftables
+    state: present
+  when: _omni_fw_provider == 'nftables'
+
+- name: "NFT | Deploy base ruleset with default drop on input"
+  ansible.builtin.copy:
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      flush ruleset
+      table inet filter {
+        sets {
+          allowed_tcp_ports { type inet_service; elements = { {{ (omnimind_core_security.firewall.allowed_tcp | default([])) | join(", ") }} } }
+          allowed_udp_ports { type inet_service; elements = { {{ (omnimind_core_security.firewall.allowed_udp | default([])) | join(", ") }} } }
+        }
+        chains {
+          input {
+            type filter hook input priority 0;
+            ct state established,related accept
+            iifname "lo" accept
+            ip protocol icmp accept
+            ip6 nexthdr icmpv6 accept
+            tcp dport @allowed_tcp_ports {{ 'ip daddr ' ~ omnimind_core_ports.bind_address ~ ' ' if omnimind_core_ports.bind_address is defined and omnimind_core_ports.bind_address != '0.0.0.0' else '' }}accept
+            udp dport @allowed_udp_ports {{ 'ip daddr ' ~ omnimind_core_ports.bind_address ~ ' ' if omnimind_core_ports.bind_address is defined and omnimind_core_ports.bind_address != '0.0.0.0' else '' }}accept
+            reject with icmpx type admin-prohibited
+          }
+          forward { type filter hook forward priority 0; policy drop; }
+          output  { type filter hook output  priority 0; policy accept; }
+        }
+      }
+  notify: restart nftables
+  when: _omni_fw_provider == 'nftables'
+
+- name: "NFT | Enable and start"
+  ansible.builtin.service:
+    name: nftables
+    state: started
+    enabled: true
+  when: _omni_fw_provider == 'nftables'
+
+# --------------------------------------------------------------------
+# Handlers local to this task file (scoped)
+# --------------------------------------------------------------------
+- name: "Register handler: restart nftables"
+  ansible.builtin.meta: flush_handlers

@@ -1,0 +1,122 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Базовые манифесты
+resources:
+  - ../../base
+
+# Пространство имён и суффикс инстанса
+namespace: cybersecurity-core-staging
+nameSuffix: -staging
+
+# Автоматическая метка "managed-by"
+buildMetadata:
+  - managedByLabel
+
+# Единые метки и аннотации для всего оверлея
+commonLabels:
+  app.kubernetes.io/part-of: cybersecurity-core
+  app.kubernetes.io/instance: staging
+  app.kubernetes.io/environment: staging
+  environment: staging
+
+commonAnnotations:
+  org.aethernova/stage: staging
+  org.aethernova/contact: security-team
+  org.aethernova/managed-by: kustomize
+
+# Настройки генераторов и их собственные метки/аннотации
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/instance: staging
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    org.aethernova/stage: staging
+
+# Конфигурация приложения (сливается с базой)
+configMapGenerator:
+  - name: app-config
+    behavior: merge
+    literals:
+      - ENV=staging
+      - LOG_LEVEL=info
+      - FEATURE_FLAGS=enable_metrics,disable_debug
+      - TRACE_SAMPLING=0.05
+      - HTTP_SERVER_TIMEOUTS=read:10s,write:10s,idle:60s
+
+# Секреты приложения (сливаются с базой)
+# Файл env.staging — стандартный .env-формат (KEY=VALUE), хранить в закрытом хранилище/репозитории с секретами.
+secretGenerator:
+  - name: app-secrets
+    behavior: merge
+    envs:
+      - secrets/env.staging
+    type: Opaque
+
+# Патчи с таргетингом по меткам (без предположений о конкретных именах объектов)
+patches:
+  # 1) Deployment: безопасные дефолты Pod и 2 реплики в staging
+  - target:
+      kind: Deployment
+      labelSelector: "app.kubernetes.io/part-of=cybersecurity-core"
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        replicas: 2
+        template:
+          spec:
+            # Безопасные настройки пода
+            automountServiceAccountToken: false
+            enableServiceLinks: false
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+              fsGroupChangePolicy: OnRootMismatch
+            # Распределение подов по хостам (минимизирует «сваливание» на один узел)
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: kubernetes.io/hostname
+                whenUnsatisfiable: ScheduleAnyway
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/part-of: cybersecurity-core
+
+  # 2) Service: гарантируем тип ClusterIP для staging, если в базе не задан иначе
+  - target:
+      kind: Service
+      labelSelector: "app.kubernetes.io/part-of=cybersecurity-core"
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      spec:
+        type: ClusterIP
+
+  # 3) HPA: минимальные/максимальные границы для staging (если есть HPA в базе)
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      labelSelector: "app.kubernetes.io/part-of=cybersecurity-core"
+    patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      spec:
+        minReplicas: 2
+        maxReplicas: 6
+        behavior:
+          scaleUp:
+            stabilizationWindowSeconds: 60
+            policies:
+              - type: Percent
+                value: 100
+                periodSeconds: 60
+          scaleDown:
+            stabilizationWindowSeconds: 120
+            policies:
+              - type: Percent
+                value: 50
+                periodSeconds: 60

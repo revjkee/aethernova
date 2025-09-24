@@ -1,0 +1,147 @@
+# datafabric-core/configs/logging.yaml
+# Production-конфигурация Python logging (dictConfig) с JSON-форматом и ротацией.
+# Требует пакет: python-json-logger
+
+version: 1
+disable_existing_loggers: true
+
+formatters:
+  json:
+    # Структурированный JSON формат — стабилен для парсеров (Loki/FluentBit/Filebeat)
+    (): pythonjsonlogger.jsonlogger.JsonFormatter
+    # Поля выставлены явно, порядок сохраняется большинством обработчиков
+    format: >
+      {"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s",
+       "msg":"%(message)s","module":"%(module)s","func":"%(funcName)s","line":%(lineno)d,
+       "process":%(process)d,"thread":%(thread)d,"pathname":"%(pathname)s",
+       "trace_id":"%(trace_id)s","span_id":"%(span_id)s"}
+    # ISO 8601 с таймзоной; лучше хранить в UTC
+    datefmt: "%Y-%m-%dT%H:%M:%S%z"
+
+  json_with_exc:
+    # Для ошибок/исключений — включаем traceback
+    (): pythonjsonlogger.jsonlogger.JsonFormatter
+    format: >
+      {"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s",
+       "msg":"%(message)s","exc_info":"%(exc_text)s","stack_info":"%(stack_info)s",
+       "module":"%(module)s","func":"%(funcName)s","line":%(lineno)d,
+       "process":%(process)d,"thread":%(thread)d,"pathname":"%(pathname)s",
+       "trace_id":"%(trace_id)s","span_id":"%(span_id)s"}
+    datefmt: "%Y-%m-%dT%H:%M:%S%z"
+
+  plain:
+    # Читаемый текстовый формат для локальной отладки (не рекомендуется в проде)
+    format: "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: json
+    stream: ext://sys.stdout
+
+  console_debug:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: plain
+    stream: ext://sys.stdout
+
+  file_app:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: json
+    filename: /var/log/datafabric/app.log
+    maxBytes: 10485760        # 10 MiB
+    backupCount: 10
+    encoding: utf-8
+    delay: true
+
+  file_error:
+    class: logging.handlers.RotatingFileHandler
+    level: ERROR
+    formatter: json_with_exc
+    filename: /var/log/datafabric/error.log
+    maxBytes: 10485760
+    backupCount: 20
+    encoding: utf-8
+    delay: true
+
+  # Вариант ежедневной ротации (альтернатива RotatingFileHandler):
+  # file_daily:
+  #   class: logging.handlers.TimedRotatingFileHandler
+  #   level: INFO
+  #   formatter: json
+  #   filename: /var/log/datafabric/app-%Y-%m-%d.log
+  #   when: midnight
+  #   backupCount: 14
+  #   encoding: utf-8
+  #   delay: true
+  #   utc: true
+
+  syslog:
+    # Опционально — отправка в локальный/удалённый syslog (RFC5424/3164 зависят от демона)
+    class: logging.handlers.SysLogHandler
+    level: INFO
+    formatter: json
+    address: ["127.0.0.1", 514]
+    socktype: 2  # 2=SOCK_DGRAM (UDP), 1=SOCK_STREAM (TCP)
+    # Для journald лучше писать в stdout JSON и собирать через systemd-journald
+
+loggers:
+  # Шумные библиотеки — поднять пороги
+  urllib3:
+    level: WARNING
+    handlers: [console]
+    propagate: false
+
+  botocore:
+    level: WARNING
+    handlers: [console]
+    propagate: false
+
+  boto3:
+    level: WARNING
+    handlers: [console]
+    propagate: false
+
+  sqlalchemy.engine:
+    level: WARNING
+    handlers: [console]
+    propagate: false
+
+  # Пример для веб‑сервера (если используется uvicorn/gunicorn)
+  uvicorn:
+    level: INFO
+    handlers: [console]
+    propagate: false
+  uvicorn.error:
+    level: INFO
+    handlers: [console]
+    propagate: false
+  uvicorn.access:
+    level: INFO
+    handlers: [console]
+    propagate: false
+
+  # Логгер приложения (пример)
+  engine:
+    level: INFO
+    handlers: [console, file_app]
+    propagate: false
+
+  engine.errors:
+    level: ERROR
+    handlers: [console, file_error]
+    propagate: false
+
+root:
+  # Root-логгер — только stdout JSON по умолчанию, чтобы не дублировать записи
+  level: INFO
+  handlers: [console]
+
+# Примечания по эксплуатации:
+# 1) В Kubernetes оставьте основной трафик в stdout (handlers.console).
+# 2) Файлы /var/log/datafabric/* монтируйте на hostPath/PVC при реальной потребности.
+# 3) Поля trace_id/span_id появятся, если вы добавляете их в LogRecord (например, через logging.LoggerAdapter
+#    или middleware, который вставляет extra={"trace_id": "...", "span_id": "..."}). Отсутствие полей не ломает формат.
+# 4) Для DEV можно переключить root.handlers на [console_debug], чтобы видеть человекочитаемые логи.

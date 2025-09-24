@@ -1,0 +1,297 @@
+# File: veilmind-core/ops/docker/docker-compose.yaml
+# Industrial-grade compose for Veilmind Core
+# Профили: dev (локальная разработка), prod (минимальный прод), monitoring (телеметрия)
+# Требуется .env (см. примечания внизу)
+
+version: "3.9"
+
+x-healthcheck: &default-health
+  interval: 10s
+  timeout: 3s
+  retries: 10
+  start_period: 15s
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+    compress: "true"
+    labels: "service"
+
+x-security: &default-security
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+x-resources: &default-resources
+  deploy:
+    resources:
+      limits:
+        cpus: "1.00"
+        memory: "512M"
+      reservations:
+        cpus: "0.10"
+        memory: "128M"
+
+x-env-common: &env-common
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel:4317"
+  OTEL_SERVICE_NAME: "${OTEL_SERVICE_NAME:-veilmind-core}"
+
+networks:
+  edge:
+    driver: bridge
+  backend:
+    driver: bridge
+  observability:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  appstate:
+  nginxcache:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  api_secret_key:
+    file: ./secrets/api_secret_key.txt
+
+configs:
+  nginx_conf:
+    file: ./nginx/nginx.conf
+
+services:
+
+  # -----------------------------
+  # Reverse proxy / TLS terminator
+  # -----------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    profiles: ["dev","prod"]
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${NGINX_HTTP_PORT:-8080}:80"
+      # - "8443:443"  # при необходимости TLS
+    networks: ["edge","backend"]
+    configs:
+      - source: nginx_conf
+        target: /etc/nginx/nginx.conf
+        mode: 0444
+    volumes:
+      - nginxcache:/var/cache/nginx:rw
+    environment:
+      NGINX_ENTRYPOINT_QUIET_LOGS: "1"
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/health || exit 1"]
+      <<: *default-health
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+  # -----------------------------
+  # Application API (FastAPI/ASGI)
+  # -----------------------------
+  api:
+    image: ${API_IMAGE:-ghcr.io/yourorg/veilmind-core-api}:${API_TAG:-latest}
+    profiles: ["dev","prod"]
+    build:
+      context: ../..
+      dockerfile: ./ops/docker/Dockerfile.api
+    env_file:
+      - ./env/api.env
+    environment:
+      <<: *env-common
+      DB_HOST: "postgres"
+      DB_PORT: "5432"
+      DB_NAME: "${POSTGRES_DB:-veilmind}"
+      DB_USER: "${POSTGRES_USER:-veilmind}"
+      DB_PASSWORD_FILE: "/run/secrets/postgres_password"
+      REDIS_URL: "redis://redis:6379/0"
+      API_SECRET_KEY_FILE: "/run/secrets/api_secret_key"
+      UVICORN_WORKERS: "${UVICORN_WORKERS:-2}"
+      UVICORN_TIMEOUT: "${UVICORN_TIMEOUT:-60}"
+    secrets:
+      - postgres_password
+      - api_secret_key
+    expose:
+      - "8000"
+    networks: ["backend","observability"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/health || exit 1"]
+      <<: *default-health
+    <<: *default-resources
+    logging: *default-logging
+    restart: unless-stopped
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - appstate:/var/lib/veilmind:rw # state/cache если требуется
+
+  # -----------------------------
+  # Background worker (Celery/RQ/custom)
+  # -----------------------------
+  worker:
+    image: ${WORKER_IMAGE:-ghcr.io/yourorg/veilmind-core-worker}:${WORKER_TAG:-latest}
+    profiles: ["dev","prod"]
+    build:
+      context: ../..
+      dockerfile: ./ops/docker/Dockerfile.worker
+    env_file:
+      - ./env/worker.env
+    environment:
+      <<: *env-common
+      DB_HOST: "postgres"
+      DB_PORT: "5432"
+      DB_NAME: "${POSTGRES_DB:-veilmind}"
+      DB_USER: "${POSTGRES_USER:-veilmind}"
+      DB_PASSWORD_FILE: "/run/secrets/postgres_password"
+      REDIS_URL: "redis://redis:6379/0"
+    secrets:
+      - postgres_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks: ["backend","observability"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'print(\"ok\")' || exit 1"]
+      <<: *default-health
+    <<: *default-resources
+    logging: *default-logging
+    restart: unless-stopped
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    <<: *default-security
+
+  # -----------------------------
+  # PostgreSQL
+  # -----------------------------
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["dev","prod"]
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-veilmind}"
+      POSTGRES_USER: "${POSTGRES_USER:-veilmind}"
+      POSTGRES_PASSWORD_FILE: "/run/secrets/postgres_password"
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    secrets:
+      - postgres_password
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB", "-c", "wal_compression=on"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: ["backend"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-veilmind} -d ${POSTGRES_DB:-veilmind} -h 127.0.0.1"]
+      <<: *default-health
+    logging: *default-logging
+    restart: unless-stopped
+    sysctls:
+      net.core.somaxconn: 1024
+
+  # -----------------------------
+  # Redis (кэш/очередь)
+  # -----------------------------
+  redis:
+    image: redis:7-alpine
+    profiles: ["dev","prod"]
+    command: ["redis-server","--save","","--appendonly","no","--maxmemory","256mb","--maxmemory-policy","allkeys-lru"]
+    volumes:
+      - redisdata:/data
+    networks: ["backend"]
+    healthcheck:
+      test: ["CMD","redis-cli","ping"]
+      <<: *default-health
+    logging: *default-logging
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+
+  # -----------------------------
+  # OpenTelemetry Collector
+  # -----------------------------
+  otel:
+    image: otel/opentelemetry-collector:0.104.0
+    profiles: ["monitoring"]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel/config.yaml:/etc/otelcol/config.yaml:ro
+    networks: ["observability"]
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:13133/ || exit 1"]
+      <<: *default-health
+    logging: *default-logging
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+
+  # -----------------------------
+  # Миграции БД (однократный job)
+  # -----------------------------
+  migrate:
+    image: ${API_IMAGE:-ghcr.io/yourorg/veilmind-core-api}:${API_TAG:-latest}
+    profiles: ["dev","prod"]
+    entrypoint: ["/bin/sh","-c"]
+    command: >
+      "alembic upgrade head"
+    env_file:
+      - ./env/api.env
+    environment:
+      DB_HOST: "postgres"
+      DB_PORT: "5432"
+      DB_NAME: "${POSTGRES_DB:-veilmind}"
+      DB_USER: "${POSTGRES_USER:-veilmind}"
+      DB_PASSWORD_FILE: "/run/secrets/postgres_password"
+    secrets:
+      - postgres_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: ["backend"]
+    logging: *default-logging
+    restart: "no"
+
+  # -----------------------------
+  # Smoke‑тест API (однократный job)
+  # -----------------------------
+  smoke:
+    image: curlimages/curl:8.10.1
+    profiles: ["dev","prod"]
+    depends_on:
+      api:
+        condition: service_healthy
+    entrypoint: ["sh","-c"]
+    command: >
+      "curl -fsS http://api:8000/health && echo OK"
+    networks: ["backend"]
+    logging: *default-logging
+    restart: "no"

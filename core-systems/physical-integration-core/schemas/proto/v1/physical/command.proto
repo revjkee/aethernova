@@ -1,0 +1,323 @@
+syntax = "proto3";
+
+package aethernova.neurocity.physical.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// Локали генерации артефактов
+option go_package    = "github.com/neurocity/physical-integration-core/schemas/gen/go/aethernova/neurocity/physical/v1;physicalv1";
+option java_package  = "ai.neurocity.physical.v1";
+option java_multiple_files = true;
+option csharp_namespace    = "NeuroCity.Physical.V1";
+option objc_class_prefix   = "NCP";
+option swift_prefix        = "NCP";
+
+// =========================== Общие перечисления ===========================
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW         = 1;
+  PRIORITY_NORMAL      = 2;
+  PRIORITY_HIGH        = 3;
+  PRIORITY_CRITICAL    = 4; // Для S3/S4 инцидентов и защитных действий
+}
+
+enum QoS {
+  QOS_UNSPECIFIED = 0;
+  QOS_AT_MOST_ONCE = 1;   // Fire-and-forget
+  QOS_AT_LEAST_ONCE = 2;  // Повтор с идемпотентностью
+  QOS_EXACTLY_ONCE = 3;   // Требует согласования и журналирования
+}
+
+enum OperationMode {
+  MODE_UNSPECIFIED = 0;
+  MODE_MANUAL      = 1;
+  MODE_AUTO        = 2;
+  MODE_TEACH       = 3;
+  MODE_MAINTENANCE = 4;
+  MODE_SAFE        = 5; // Ограниченный безопасный режим
+}
+
+enum StopCategory {
+  STOP_CAT_UNSPECIFIED = 0;
+  STOP_CATEGORY_0      = 1; // Немедленное снятие энергии
+  STOP_CATEGORY_1      = 2; // Контролируемая остановка, затем снятие энергии
+  STOP_CATEGORY_2      = 3; // Контролируемая остановка, источник энергии подключен
+}
+
+enum MotionType {
+  MOTION_TYPE_UNSPECIFIED = 0;
+  MOTION_JOINT            = 1; // По суставам
+  MOTION_LINEAR           = 2; // В декартовом пространстве
+  MOTION_CIRCULAR         = 3; // Дуговая интерполяция
+}
+
+enum VelocityProfile {
+  VEL_PROFILE_UNSPECIFIED = 0;
+  VEL_TRAPEZOIDAL         = 1;
+  VEL_S_CURVE              = 2;
+}
+
+enum PowerAction {
+  POWER_ACTION_UNSPECIFIED = 0;
+  POWER_ON                 = 1;
+  POWER_OFF                = 2;
+  POWER_CYCLE              = 3;
+}
+
+enum IOAction {
+  IO_ACTION_UNSPECIFIED = 0;
+  IO_SET_DIGITAL        = 1;
+  IO_PULSE_DIGITAL      = 2;
+  IO_SET_ANALOG         = 3;
+  IO_READ_DIGITAL       = 4;
+  IO_READ_ANALOG        = 5;
+}
+
+enum SafetyBypassLevel {
+  SAFETY_BYPASS_UNSPECIFIED = 0;
+  SAFETY_BYPASS_INTERLOCK    = 1; // Временное обходирование блокировки
+  SAFETY_BYPASS_GUARD        = 2; // Обход охранного устройства
+  SAFETY_BYPASS_ZONE         = 3; // Обход безопасной зоны/SSM
+}
+
+// =========================== Базовые структуры ===========================
+
+message Address {
+  // Иерархия адресации оборудования и контроллеров
+  string site_id       = 1; // Завод/площадка
+  string area_id       = 2; // Участок/цех
+  string cell_id       = 3; // Ячейка/робо-клетка/линия
+  string asset_id      = 4; // Конкретный агрегат/робот/станция
+  string controller_id = 5; // PLC/RobotController/Drive
+  string subject       = 6; // Логическая сущность (например, "motion", "io", "safety")
+  // Полный URI (например, "urn:nc:site:...:asset:...") для однозначности
+  string urn           = 10;
+}
+
+message Identity {
+  // Кто инициировал команду
+  string operator_id   = 1; // Учетная запись/табельный номер
+  string role          = 2; // Роль доступа (operator, maintainer, integrator)
+  string client_id     = 3; // Идентификатор клиента/станции инженерии
+  string session_id    = 4; // Сеанс
+}
+
+message Security {
+  // Поля для криптографической целостности и невскрываемости
+  string signature_alg = 1;   // Пример: "ed25519", "rsa-pss-sha256"
+  bytes  signature     = 2;   // Подпись конверта
+  string key_id        = 3;   // Идентификатор ключа/сертификата
+  bytes  digest        = 4;   // Хэш полезной нагрузки (SHA-256)
+  bytes  nonce         = 5;   // Нонcе для защиты от повторов
+  bool   detached      = 6;   // True если подпись оторвана (detached)
+}
+
+message Compliance {
+  // Связь с производственными процедурами и безопасностью работ
+  string permit_id            = 1; // Номер разрешения на работы
+  string work_order_id        = 2; // Заказ-наряд
+  string jsa_id               = 3; // Анализ безопасности работ
+  bool   loto_applied         = 4; // Применен ли LOTO
+  string loto_tag             = 5; // Метка/замок
+  string risk_assessment_ref  = 6; // Ссылка на оценку риска
+}
+
+message Limits {
+  // Ограничители для команд движения/скорости
+  double max_speed_percent  = 1; // 0..100
+  double max_accel_percent  = 2; // 0..100
+  double max_jerk_percent   = 3; // 0..100
+  double stop_distance_mm   = 4; // Для SSM/ограждений
+}
+
+// Поза и кинематика
+message Pose {
+  // Позиция в миллиметрах
+  double x_mm = 1;
+  double y_mm = 2;
+  double z_mm = 3;
+
+  // Ориентация в кватернионе
+  double qx = 10;
+  double qy = 11;
+  double qz = 12;
+  double qw = 13;
+
+  // Идентификатор системы координат ("base", "world", "tool", "user:U1")
+  string frame_id = 20;
+}
+
+// =========================== Команды (payload) ===========================
+
+message EmergencyStopCommand {
+  // Немедленное безопасное останавливание. Сбрасывается отдельной процедурой.
+  StopCategory category = 1; // Обычно STOP_CATEGORY_0
+  string reason         = 2; // Краткая причина/контекст
+}
+
+message StopCommand {
+  StopCategory category = 1; // 0/1/2 в зависимости от процесса
+  string reason         = 2;
+}
+
+message ModeCommand {
+  OperationMode mode = 1; // AUTO/MANUAL/TEACH/...
+  bool guarded       = 2; // True, если охрана/интерлоки активны
+  string reason      = 3;
+}
+
+message MotionCommand {
+  MotionType type               = 1;
+  VelocityProfile profile       = 2;
+  double speed_ratio_percent    = 3; // 0..100 глобальный скейлинг
+  double accel_ratio_percent    = 4; // 0..100
+  double jerk_ratio_percent     = 5; // 0..100
+  google.protobuf.Duration blend_time = 6; // Время сглаживания траектории
+
+  // Для JOINT: список целевых углов в градусах
+  repeated double joint_deg     = 20;
+
+  // Для LINEAR/CIRCULAR: декартовые цели
+  Pose target                   = 30; // Основная цель
+  Pose via                      = 31; // Для круговых/проходных точек (опционально)
+
+  // Ограничители безопасности
+  Limits limits                 = 40;
+
+  // Явно указать безопасную скорость, если требуется стандартом
+  optional double safe_speed_mm_per_s = 50;
+}
+
+message IOCommand {
+  IOAction action = 1;
+
+  // Идентификатор канала/адрес IO
+  string io_path  = 2; // Пример: "rack0.slot1.ch12" или "do/door_lock"
+
+  // Полезная нагрузка для установки значений
+  oneof value {
+    bool   bool_value   = 10; // Для цифровых
+    double analog_value = 11; // Для аналоговых (инженерные единицы)
+  }
+
+  // Для импульсной установки
+  google.protobuf.Duration pulse_width = 20;
+}
+
+message PowerCommand {
+  PowerAction action = 1;
+  string reason      = 2;
+}
+
+message ParameterReadCommand {
+  // Ключи параметров (например, "robot.tool.tcp", "drive.1.max_speed")
+  repeated string keys = 1;
+}
+
+message ParameterWriteCommand {
+  message Entry {
+    string key = 1;
+    oneof value {
+      string s  = 10;
+      double f  = 11;
+      int64  i  = 12;
+      bool   b  = 13;
+    }
+    // Скоуп применения
+    bool volatile_only = 20; // Не сохранять в NVRAM, если true
+  }
+  repeated Entry entries = 1;
+  string reason          = 2;
+}
+
+message CalibrationCommand {
+  // Типы: "tcp", "encoder_zero", "force_sensor", "vision_extrinsics", ...
+  string type   = 1;
+  string target = 2; // К какому узлу применяется
+  map<string, string> params = 3; // Калибровочные параметры
+}
+
+message HomeCommand {
+  // Оси/группы, если применимо
+  repeated string axes = 1; // Пример: ["J1","J2","J3"] или ["X","Y","Z"]
+  string method       = 2; // "absolute_switch", "incremental", "index"
+}
+
+message SafetyBypassCommand {
+  SafetyBypassLevel level = 1;
+  string target           = 2; // Что обходится: "guard_door_A", "zone_SSM1", ...
+  google.protobuf.Duration duration = 3; // Жесткий лимит времени обхода
+  string reason           = 4; // Обоснование
+  // Требуемые подтверждения и контроль
+  bool dual_authorization_required = 10;
+  repeated string approver_ids     = 11; // Кто утвердил
+}
+
+// =========================== Конверт команды ===========================
+
+message CommandEnvelope {
+  // Идентификаторы и время
+  string id                         = 1;  // UUID (рекоменд. v7)
+  string correlation_id             = 2;  // Связь с транзакцией/серией
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp not_before  = 4; // Не исполнять до
+  google.protobuf.Duration   ttl        = 5; // Срок годности
+
+  // Качество обслуживания и приоритет
+  Priority priority = 6;
+  QoS      qos      = 7;
+
+  // Адресация
+  Address from = 8;
+  Address to   = 9;
+
+  // Инициатор и безопасность
+  Identity identity = 10;
+  Security security = 11;
+
+  // Соответствие процедурам безопасности производства
+  Compliance compliance = 12;
+
+  // Идемпотентность/повторы
+  uint32 max_retries     = 13; // Допустимые повторы на транспорте
+  bool   idempotent      = 14; // Должна быть идемпотентной
+
+  // Полезная нагрузка команды
+  oneof payload {
+    EmergencyStopCommand estop        = 100;
+    StopCommand          stop         = 101;
+    ModeCommand          mode         = 102;
+    MotionCommand        motion       = 103;
+    IOCommand            io           = 104;
+    PowerCommand         power        = 105;
+    ParameterReadCommand  param_read  = 106;
+    ParameterWriteCommand param_write = 107;
+    CalibrationCommand    calibrate   = 108;
+    HomeCommand           home        = 109;
+    SafetyBypassCommand   safety_bypass = 110; // Требует повышенных прав
+  }
+
+  // Резерв для будущих расширений (сохранение совместимости)
+  // reserved 200 to 299;
+}
+
+// =========================== Подтверждение (ACK) ===========================
+// Примечание: ответы обычно в отдельном response.proto, но ACK включен
+// для минимально достаточного цикла подтверждения.
+
+enum AckStatus {
+  ACK_STATUS_UNSPECIFIED = 0;
+  ACK_ACCEPTED           = 1; // Принято к исполнению
+  ACK_REJECTED           = 2; // Отклонено (см. code/reason)
+  ACK_DUPLICATE_IGNORED  = 3; // Дубликат, проигнорировано
+}
+
+message CommandAck {
+  string command_id = 1; // Ссылка на CommandEnvelope.id
+  AckStatus status  = 2;
+  string code       = 3; // Короткий машинный код причины
+  string reason     = 4; // Человекочитаемое описание
+  google.protobuf.Timestamp at = 5; // Время фиксации ACK
+}

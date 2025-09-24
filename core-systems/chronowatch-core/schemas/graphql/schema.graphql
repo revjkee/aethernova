@@ -1,0 +1,484 @@
+"""========================
+ ChronoWatch Core — GraphQL Schema (Production)
+ Version: 1.0.0
+ Updated: 2025-08-28
+=========================="""
+
+# -----------------------
+# Scalars
+# -----------------------
+scalar DateTime     # RFC3339 UTC
+scalar Date         # YYYY-MM-DD
+scalar Duration     # ISO-8601 duration, e.g. "PT30S", "PT2H"
+scalar JSON         # JSON object/array/scalar
+scalar UUID         # RFC 4122 UUID, lowercase hyphenated
+scalar BigInt       # 64-bit signed integer
+scalar Cursor       # Base64-encoded opaque cursor
+
+# -----------------------
+# Security & Validation Directives
+# -----------------------
+directive @auth(roles: [Role!]!, any: Boolean = false) on OBJECT | FIELD_DEFINITION
+directive @rateLimit(limit: Int!, duration: Duration!, key: String) on FIELD_DEFINITION
+directive @sensitive(on: Boolean = true, strategy: RedactionStrategy = MASK) on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+directive @constraint(
+  minLength: Int,
+  maxLength: Int,
+  pattern: String,
+  min: Float,
+  max: Float
+) on ARGUMENT_DEFINITION | INPUT_FIELD_DEFINITION
+directive @cost(value: Int!, complexity: Int = 1) on FIELD_DEFINITION
+directive @deprecated(reason: String = "Deprecated") on FIELD_DEFINITION | ENUM_VALUE
+
+enum RedactionStrategy { MASK HASH DROP }
+
+enum Role { viewer operator admin }
+
+# -----------------------
+# SQL Mapping Directives (vendor-neutral)
+# -----------------------
+directive @db(table: String!, schema: String = "public") on OBJECT
+directive @column(
+  name: String,
+  type: String,
+  primaryKey: Boolean,
+  unique: Boolean,
+  nullable: Boolean,
+  default: String
+) on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+directive @index(name: String, unique: Boolean = false, fields: [String!]!) on OBJECT
+directive @fk(
+  name: String,
+  fields: [String!]!,
+  references: [String!]!,
+  onDelete: FKAction = RESTRICT,
+  onUpdate: FKAction = CASCADE
+) on OBJECT
+
+enum FKAction { RESTRICT CASCADE SET_NULL SET_DEFAULT NO_ACTION }
+
+# -----------------------
+# Relay Interfaces & PageInfo
+# -----------------------
+interface Node { id: ID! }
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: Cursor
+  endCursor: Cursor
+}
+
+enum OrderDirection { ASC DESC }
+
+# -----------------------
+# Domain Enums
+# -----------------------
+enum JobStatus { PENDING SCHEDULED RUNNING SUCCEEDED FAILED CANCELLED DEADLETTER RETRY WAITING }
+enum Priority { LOW NORMAL HIGH CRITICAL }
+enum ScheduleType { CRON INTERVAL FIXED_TIME }
+enum WorkerStatus { IDLE BUSY DRAINING OFFLINE }
+enum ActorType { USER SERVICE }
+enum AuditAction { CREATE UPDATE DELETE EXECUTE LOGIN LOGOUT CONFIG_CHANGE PERMISSION_CHANGE BACKUP_RESTORE }
+
+# -----------------------
+# Common Types
+# -----------------------
+type Error {
+  code: ErrorCode!
+  message: String!
+  details: JSON
+}
+
+enum ErrorCode {
+  NOT_FOUND
+  UNAUTHORIZED
+  FORBIDDEN
+  VALIDATION
+  FAILED_PRECONDITION
+  CONFLICT
+  RATE_LIMIT
+  INTERNAL
+}
+
+type Actor {
+  id: UUID
+  type: ActorType!
+  email: String @sensitive
+  service: String
+}
+
+# -----------------------
+# Schedule
+# -----------------------
+"""Периодическая или одноразовая задача планировщика."""
+type Schedule implements Node @db(table: "schedules") @index(name: "idx_schedules_active", fields: ["isActive"]) {
+  id: ID! @column(type: "uuid", primaryKey: true)
+  name: String! @constraint(minLength: 3, maxLength: 128) @column(type: "text")
+  description: String @column(type: "text")
+  type: ScheduleType! @column(type: "schedule_type")
+  cron: String @column(type: "text")
+  interval: Duration @column(type: "interval")
+  fixedTime: DateTime @column(type: "timestamptz")
+  timezone: String! @column(type: "text", default: "Europe/Stockholm")
+  graceSeconds: Int! @column(type: "int", default: "30")
+  isActive: Boolean! @column(type: "bool", default: "true")
+  lastRunAt: DateTime @column(type: "timestamptz")
+  nextRunAt: DateTime @column(type: "timestamptz")
+  createdAt: DateTime! @column(type: "timestamptz", default: "now()")
+  updatedAt: DateTime! @column(type: "timestamptz", default: "now()")
+  createdBy: Actor
+}
+
+type ScheduleEdge { node: Schedule!, cursor: Cursor! }
+type ScheduleConnection {
+  edges: [ScheduleEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+input ScheduleFilter {
+  isActive: Boolean
+  typeIn: [ScheduleType!]
+  nameContains: String @constraint(minLength: 2, maxLength: 128)
+  createdFrom: DateTime
+  createdTo: DateTime
+}
+
+enum ScheduleOrderField { CREATED_AT UPDATED_AT NAME NEXT_RUN_AT }
+input ScheduleOrder { field: ScheduleOrderField! = UPDATED_AT, direction: OrderDirection! = DESC }
+
+input ScheduleCreateInput {
+  name: String! @constraint(minLength: 3, maxLength: 128)
+  description: String
+  type: ScheduleType!
+  cron: String
+  interval: Duration
+  fixedTime: DateTime
+  timezone: String = "Europe/Stockholm"
+  graceSeconds: Int = 30
+  isActive: Boolean = true
+}
+
+input ScheduleUpdateInput {
+  name: String @constraint(minLength: 3, maxLength: 128)
+  description: String
+  type: ScheduleType
+  cron: String
+  interval: Duration
+  fixedTime: DateTime
+  timezone: String
+  graceSeconds: Int
+  isActive: Boolean
+}
+
+type ScheduleResult { ok: Boolean!, error: Error, schedule: Schedule }
+
+# -----------------------
+# Job
+# -----------------------
+"""Экземпляр выполняемой работы, связанный с очередью/расписанием."""
+type Job implements Node
+  @db(table: "jobs")
+  @index(name: "idx_jobs_status_queue", fields: ["status", "queue"])
+  @fk(name: "jobs_schedule_id_fkey", fields: ["scheduleId"], references: ["id"], onDelete: SET_NULL) {
+
+  id: ID! @column(type: "uuid", primaryKey: true)
+  key: String @column(unique: true)
+  status: JobStatus! @column(type: "job_status")
+  queue: String! @column(type: "text")
+  priority: Priority! @column(type: "priority", default: "NORMAL")
+  attempts: Int! @column(type: "int", default: "0")
+  maxAttempts: Int! @column(type: "int", default: "5")
+  timeoutSec: Int! @column(type: "int", default: "120")
+  dedupKey: String @column(type: "text")
+  payload: JSON @sensitive(strategy: HASH) @column(type: "jsonb")
+  result: JSON @column(type: "jsonb")
+  error: JSON @column(type: "jsonb")
+  scheduledAt: DateTime @column(type: "timestamptz")
+  startedAt: DateTime @column(type: "timestamptz")
+  finishedAt: DateTime @column(type: "timestamptz")
+  lastHeartbeatAt: DateTime @column(type: "timestamptz")
+  scheduleId: UUID @column(type: "uuid")
+  schedule: Schedule
+  createdBy: Actor
+  createdAt: DateTime! @column(type: "timestamptz", default: "now()")
+  updatedAt: DateTime! @column(type: "timestamptz", default: "now()")
+}
+
+type JobEdge { node: Job!, cursor: Cursor! }
+type JobConnection {
+  edges: [JobEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+input JobFilter {
+  statusIn: [JobStatus!]
+  queueIn: [String!]
+  priorityIn: [Priority!]
+  createdFrom: DateTime
+  createdTo: DateTime
+  scheduledFrom: DateTime
+  scheduledTo: DateTime
+  finishedFrom: DateTime
+  finishedTo: DateTime
+  text: String @constraint(minLength: 2, maxLength: 128)
+  dedupKey: String
+  scheduleId: UUID
+}
+
+enum JobOrderField { CREATED_AT UPDATED_AT PRIORITY STATUS SCHEDULED_AT FINISHED_AT }
+input JobOrder { field: JobOrderField! = CREATED_AT, direction: OrderDirection! = DESC }
+
+input JobEnqueueInput {
+  queue: String! @constraint(minLength: 1, maxLength: 80)
+  priority: Priority = NORMAL
+  payload: JSON @sensitive(strategy: HASH)
+  delaySeconds: Int = 0
+  timeoutSec: Int = 120
+  dedupKey: String
+  scheduleId: UUID
+}
+
+type JobResult { ok: Boolean!, error: Error, job: Job }
+
+# -----------------------
+# Queue
+# -----------------------
+"""Настройки и срез состояния очереди."""
+type Queue implements Node @db(table: "queues") {
+  id: ID! @column(type: "uuid", primaryKey: true)
+  name: String! @column(unique: true)
+  backlog: BigInt! @column(type: "bigint", default: "0")
+  rateLimitPerSec: Int @column(type: "int")
+  burst: Int @column(type: "int")
+  dlqName: String @column(type: "text")
+  paused: Boolean! @column(type: "bool", default: "false")
+  updatedAt: DateTime! @column(type: "timestamptz", default: "now()")
+}
+
+type QueueEdge { node: Queue!, cursor: Cursor! }
+type QueueConnection {
+  edges: [QueueEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type QueueResult { ok: Boolean!, error: Error, queue: Queue }
+
+# -----------------------
+# Worker
+# -----------------------
+"""Исполнитель фоновых джоб."""
+type Worker implements Node @db(table: "workers") {
+  id: ID! @column(type: "uuid", primaryKey: true)
+  nodeName: String! @column(type: "text")
+  version: String! @column(type: "text")
+  status: WorkerStatus! @column(type: "worker_status", default: "IDLE")
+  queues: [String!]! @column(type: "text[]")
+  concurrency: Int! @column(type: "int", default: "4")
+  startedAt: DateTime @column(type: "timestamptz")
+  lastSeenAt: DateTime @column(type: "timestamptz")
+}
+
+type WorkerEdge { node: Worker!, cursor: Cursor! }
+type WorkerConnection {
+  edges: [WorkerEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type WorkerResult { ok: Boolean!, error: Error, worker: Worker }
+
+# -----------------------
+# Time Sync / Drift
+# -----------------------
+"""Измерения дрейфа времени относительно эталона (NTP)."""
+type TimeSync implements Node @db(table: "time_sync") {
+  id: ID! @column(type: "uuid", primaryKey: true)
+  nodeName: String! @column(type: "text")
+  measuredAt: DateTime! @column(type: "timestamptz", default: "now()")
+  driftMs: Int! @column(type: "int")
+  source: String! @column(type: "text")
+  withinThreshold: Boolean! @column(type: "bool")
+}
+
+type TimeSyncEdge { node: TimeSync!, cursor: Cursor! }
+type TimeSyncConnection {
+  edges: [TimeSyncEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+input TimeSyncFilter {
+  withinThreshold: Boolean
+  nodeNameIn: [String!]
+  measuredFrom: DateTime
+  measuredTo: DateTime
+}
+enum TimeSyncOrderField { MEASURED_AT DRIFT_MS NODE_NAME }
+input TimeSyncOrder { field: TimeSyncOrderField! = MEASURED_AT, direction: OrderDirection! = DESC }
+
+# -----------------------
+# Audit Log
+# -----------------------
+"""Аудит действий пользователей/сервисов."""
+type AuditLog implements Node
+  @db(table: "audit_logs")
+  @index(name: "idx_audit_time", fields: ["createdAt"]) {
+
+  id: ID! @column(type: "uuid", primaryKey: true)
+  actorType: ActorType! @column(type: "text")
+  actorId: UUID @column(type: "uuid")
+  action: AuditAction! @column(type: "text")
+  resourceType: String! @column(type: "text")
+  resourceId: UUID @column(type: "uuid")
+  ip: String @sensitive @column(type: "inet")
+  userAgent: String @column(type: "text")
+  details: JSON @sensitive(strategy: MASK) @column(type: "jsonb")
+  createdAt: DateTime! @column(type: "timestamptz", default: "now()")
+}
+
+type AuditLogEdge { node: AuditLog!, cursor: Cursor! }
+type AuditLogConnection {
+  edges: [AuditLogEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+input AuditLogFilter {
+  actionIn: [AuditAction!]
+  resourceTypeIn: [String!]
+  createdFrom: DateTime
+  createdTo: DateTime
+  actorType: ActorType
+  actorId: UUID
+}
+enum AuditLogOrderField { CREATED_AT ACTION RESOURCE_TYPE }
+input AuditLogOrder { field: AuditLogOrderField! = CREATED_AT, direction: OrderDirection! = DESC }
+
+# -----------------------
+# Root Query
+# -----------------------
+type Query {
+  node(id: ID!): Node @auth(roles: [viewer, operator, admin], any: true)
+
+  job(id: ID!): Job @auth(roles: [viewer, operator, admin], any: true)
+  jobs(
+    filter: JobFilter,
+    orderBy: [JobOrder!],
+    first: Int = 20,
+    after: Cursor
+  ): JobConnection
+    @auth(roles: [viewer, operator, admin], any: true)
+    @rateLimit(limit: 120, duration: "PT1M")
+    @cost(value: 5)
+
+  schedule(id: ID!): Schedule @auth(roles: [viewer, operator, admin], any: true)
+  schedules(
+    filter: ScheduleFilter,
+    orderBy: [ScheduleOrder!],
+    first: Int = 20,
+    after: Cursor
+  ): ScheduleConnection
+    @auth(roles: [viewer, operator, admin], any: true)
+    @rateLimit(limit: 60, duration: "PT1M")
+
+  worker(id: ID!): Worker @auth(roles: [viewer, operator, admin], any: true)
+  workers(
+    filter: WorkerFilter,
+    orderBy: [WorkerOrder!],
+    first: Int = 20,
+    after: Cursor
+  ): WorkerConnection
+    @auth(roles: [viewer, operator, admin], any: true)
+
+  queue(name: String!): Queue @auth(roles: [viewer, operator, admin], any: true)
+  queues(first: Int = 20, after: Cursor): QueueConnection
+    @auth(roles: [viewer, operator, admin], any: true)
+
+  auditLogs(
+    filter: AuditLogFilter,
+    orderBy: [AuditLogOrder!],
+    first: Int = 50,
+    after: Cursor
+  ): AuditLogConnection
+    @auth(roles: [admin])
+
+  timeSync(
+    filter: TimeSyncFilter,
+    orderBy: [TimeSyncOrder!],
+    first: Int = 50,
+    after: Cursor
+  ): TimeSyncConnection
+    @auth(roles: [viewer, operator, admin], any: true)
+}
+
+# Дополнительные фильтры/сортировки для Worker
+input WorkerFilter {
+  statusIn: [WorkerStatus!]
+  nodeNameIn: [String!]
+  queueIn: [String!]
+  lastSeenFrom: DateTime
+  lastSeenTo: DateTime
+}
+enum WorkerOrderField { STARTED_AT LAST_SEEN NODE_NAME STATUS }
+input WorkerOrder { field: WorkerOrderField! = LAST_SEEN, direction: OrderDirection! = DESC }
+
+# -----------------------
+# Root Mutation
+# -----------------------
+type Mutation {
+  # Schedule lifecycle
+  scheduleCreate(input: ScheduleCreateInput!): ScheduleResult
+    @auth(roles: [operator, admin], any: true)
+  scheduleUpdate(id: ID!, input: ScheduleUpdateInput!): ScheduleResult
+    @auth(roles: [operator, admin], any: true)
+  scheduleDelete(id: ID!): DeleteResult
+    @auth(roles: [admin])
+
+  # Jobs
+  jobEnqueue(input: JobEnqueueInput!): JobResult
+    @auth(roles: [operator, admin], any: true)
+  jobCancel(id: ID!, reason: String): JobResult
+    @auth(roles: [operator, admin], any: true)
+  jobRetry(id: ID!): JobResult
+    @auth(roles: [operator, admin], any: true)
+
+  # Queues
+  queuePause(name: String!): QueueResult
+    @auth(roles: [operator, admin], any: true)
+  queueResume(name: String!): QueueResult
+    @auth(roles: [operator, admin], any: true)
+  queueDrain(name: String!, limit: Int = 1000): QueueResult
+    @auth(roles: [operator, admin], any: true)
+
+  # Workers
+  workerDrain(id: ID!, enable: Boolean!): WorkerResult
+    @auth(roles: [operator, admin], any: true)
+}
+
+type DeleteResult { ok: Boolean!, error: Error }
+
+# -----------------------
+# Subscriptions
+# -----------------------
+type Subscription {
+  jobStatus(id: ID!): Job
+    @auth(roles: [viewer, operator, admin], any: true)
+  queueBacklog(name: String!): Queue
+    @auth(roles: [viewer, operator, admin], any: true)
+  timeDriftAlerts(thresholdMs: Int = 200): TimeSync
+    @auth(roles: [viewer, operator, admin], any: true)
+}
+
+# -----------------------
+# Schema Root
+# -----------------------
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}

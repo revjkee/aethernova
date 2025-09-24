@@ -1,0 +1,121 @@
+name: 🚀 Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  packages: read
+  deployments: write
+
+env:
+  PROJECT_NAME: TeslaAI
+  ENVIRONMENT: production
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEPLOYMENT_TAG: ${{ github.sha }}
+  DEPLOY_ENV_FILE: .env.production
+
+jobs:
+  validate:
+    name: 🔍 Validate and Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate YAML
+        uses: ibiqlik/action-yamllint@v3
+
+      - name: Run linter (Python)
+        uses: github/super-linter@v6
+        env:
+          VALIDATE_PYTHON: true
+          PYTHON_VERSION: 3.11
+
+  build-and-push:
+    name: 🛠️ Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEPLOYMENT_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            ENV=${{ env.ENVIRONMENT }}
+
+  deploy:
+    name: 📦 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download deploy script
+        run: |
+          curl -sSfL https://example.com/scripts/deploy-prod.sh -o deploy.sh
+          chmod +x deploy.sh
+
+      - name: Deploy using SSH
+        env:
+          SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          IMAGE: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEPLOYMENT_TAG }}
+        run: |
+          echo "$SSH_KEY" > key.pem
+          chmod 600 key.pem
+          ssh -o StrictHostKeyChecking=no -i key.pem $SSH_USER@$SSH_HOST "bash -s" < ./deploy.sh $IMAGE
+        id: deploy
+
+  notify:
+    name: 📣 Notify Team
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [deploy]
+    steps:
+      - name: Notify via Telegram
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ✅ TeslaAI успешно развернут на Production!
+            📦 Образ: `${{ env.IMAGE_NAME }}`
+            🏷️ Тег: `${{ env.DEPLOYMENT_TAG }}`
+            🔗 Коммит: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+
+      - name: Notify on Failure
+        if: failure()
+        run: echo "❌ Deploy failed. Check logs."

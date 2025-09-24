@@ -1,0 +1,434 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: physical-integration-core-rules
+  namespace: physical-integration-core
+  labels:
+    app.kubernetes.io/name: physical-integration-core
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/component: observability
+    role: alert-rules
+    rule_version: "1.0.0"
+spec:
+  groups:
+
+  # =========================
+  # Recording: агрегаты и SLO
+  # =========================
+  - name: recording.slo.physical-integration-core
+    interval: 30s
+    rules:
+      # Доля доступности шлюзов за 5 минут (1 = доступен)
+      - record: pi:gateway:availability:ratio_5m
+        expr: avg_over_time(pi_gateway_up{namespace="physical-integration-core"}[5m])
+
+      # Ошибки устройств в сек, агрегированные по device_id
+      - record: pi:device:error_rate_per_s_5m
+        expr: sum by (device_id) (
+                rate(pi_device_errors_total{namespace="physical-integration-core"}[5m])
+              )
+
+      # P95 RTT устройств
+      - record: pi:device:latency_p95_seconds_5m
+        expr: histogram_quantile(
+                0.95,
+                sum by (le, device_id) (
+                  rate(pi_device_rtt_seconds_bucket{namespace="physical-integration-core"}[5m])
+                )
+              )
+
+      # Ошибочная доля доступности шлюзов (1 - доступность)
+      - record: pi:gateway:error_ratio_5m
+        expr: 1 - pi:gateway:availability:ratio_5m
+
+      # P95 latency inference на периферии
+      - record: pi:edge_inference:latency_p95_seconds_10m
+        expr: histogram_quantile(
+                0.95,
+                sum by (le, model, node) (
+                  rate(pi_inference_latency_seconds_bucket{namespace="physical-integration-core"}[10m])
+                )
+              )
+
+  # =========================
+  # SLO Burn Rate (пример 99.9%)
+  # =========================
+  - name: alerts.slo-burn.physical-integration-core
+    interval: 30s
+    rules:
+      # Быстрое и медленное окно для 99.9% SLO по доступности шлюзов
+      # error_budget = 0.001
+      - alert: PIGatewayErrorBudgetBurnHigh
+        expr: |
+          (
+            (sum by (gateway_id) (1 - avg_over_time(pi_gateway_up{namespace="physical-integration-core"}[5m])) / 0.001) > 14.4
+          )
+          and
+          (
+            (sum by (gateway_id) (1 - avg_over_time(pi_gateway_up{namespace="physical-integration-core"}[1h])) / 0.001) > 6
+          )
+        for: 10m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: slo
+          namespace: physical-integration-core
+        annotations:
+          summary: Быстрый расход SLO по доступности шлюза
+          description: |
+            У шлюза {{ $labels.gateway_id }} фиксируется высокий burn‑rate ошибки доступности.
+            Быстрое окно (5m) и медленное (1h) одновременно превышают пороги SRE.
+          impact: Риск нарушения договоренного уровня доступности.
+          runbook: ops/runbooks/physical-integration-core/SLO_Gateway_Availability.md
+
+  # =========================
+  # Безопасность и техника
+  # =========================
+  - name: alerts.safety.physical-integration-core
+    interval: 15s
+    rules:
+      - alert: PISafetyEStopActive
+        expr: pi_safety_estop_active{namespace="physical-integration-core"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          service: physical-integration-core
+          component: safety
+          namespace: physical-integration-core
+        annotations:
+          summary: Аварийный останов активен
+          description: В ячейке {{ $labels.cell_id }} активирован аварийный останов (E-Stop).
+          impact: Немедленная остановка оборудования и линии.
+          runbook: ops/runbooks/physical-integration-core/Safety_EStop.md
+
+      - alert: PISafetyInterlockOpen
+        expr: pi_safety_interlock_open{namespace="physical-integration-core"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          service: physical-integration-core
+          component: safety
+          namespace: physical-integration-core
+        annotations:
+          summary: Разомкнута защитная межблокировка
+          description: Межблокировка открыта на участке {{ $labels.section_id }}.
+          impact: Риск нештатного доступа и травм.
+          runbook: ops/runbooks/physical-integration-core/Safety_Interlock.md
+
+      - alert: PIPlcHeartbeatMissing
+        expr: avg_over_time(pi_plc_heartbeat_up{namespace="physical-integration-core"}[2m]) < 1
+        for: 2m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: plc
+          namespace: physical-integration-core
+        annotations:
+          summary: Отсутствует heartbeat PLC
+          description: Не поступает heartbeat от PLC {{ $labels.plc_id }}.
+          impact: Потеря управления исполнительными механизмами.
+          runbook: ops/runbooks/physical-integration-core/PLC_Heartbeat.md
+
+  # =========================
+  # Полевые устройства и телеметрия
+  # =========================
+  - name: alerts.devices.physical-integration-core
+    interval: 30s
+    rules:
+      - alert: PIGatewayDown
+        expr: avg_over_time(pi_gateway_up{namespace="physical-integration-core"}[5m]) < 0.1
+        for: 5m
+        labels:
+          severity: critical
+          service: physical-integration-core
+          component: gateway
+          namespace: physical-integration-core
+        annotations:
+          summary: Шлюз недоступен
+          description: Шлюз {{ $labels.gateway_id }} недоступен более 5 минут.
+          impact: Потеря связи с множеством полевых устройств.
+          runbook: ops/runbooks/physical-integration-core/Gateway_Down.md
+
+      - alert: PIDeviceUnreachable
+        expr: (time() - pi_device_last_seen_seconds{namespace="physical-integration-core"}) > 120
+        for: 2m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: device
+          namespace: physical-integration-core
+        annotations:
+          summary: Устройство недоступно
+          description: Последний сигнал от {{ $labels.device_id }} был более 2 минут назад.
+          impact: Потеря данных и контроля.
+          runbook: ops/runbooks/physical-integration-core/Device_Unreachable.md
+
+      - alert: PIDeviceErrorRateHigh
+        expr: sum by (device_id) (rate(pi_device_errors_total{namespace="physical-integration-core"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: device
+          namespace: physical-integration-core
+        annotations:
+          summary: Высокая скорость ошибок устройства
+          description: Ошибки на {{ $labels.device_id }} превышают 0.1/s.
+          impact: Деградация сервиса и потери данных.
+          runbook: ops/runbooks/physical-integration-core/Device_Errors.md
+
+      - alert: PIDeviceLatencyP95High
+        expr: pi:device:latency_p95_seconds_5m{device_id!=""} > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: device
+          namespace: physical-integration-core
+        annotations:
+          summary: Высокая задержка P95 по устройству
+          description: P95 RTT {{ $labels.device_id }} превышает 0.5 s.
+          impact: Замедление контуров управления и телеметрии.
+          runbook: ops/runbooks/physical-integration-core/Device_Latency.md
+
+      - alert: PISensorBatteryLow
+        expr: pi_sensor_battery_percent{namespace="physical-integration-core"} < 10
+        for: 15m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: sensor
+          namespace: physical-integration-core
+        annotations:
+          summary: Низкий заряд батареи датчика
+          description: Заряд у датчика {{ $labels.sensor_id }} ниже 10%.
+          impact: Риск скорого отключения и потери данных.
+          runbook: ops/runbooks/physical-integration-core/Sensor_Battery.md
+
+      - alert: PISensorDriftOutOfRange
+        expr: pi_sensor_drift_ppm{namespace="physical-integration-core"} > 5000
+        for: 15m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: sensor
+          namespace: physical-integration-core
+        annotations:
+          summary: Дрейф датчика вне допуска
+          description: Дрейф у {{ $labels.sensor_id }} превысил 5000 ppm.
+          impact: Некорректные показания и ухудшение качества регулирования.
+          runbook: ops/runbooks/physical-integration-core/Sensor_Drift.md
+
+      - alert: PIPowerVoltageOutOfRange
+        expr: (pi_power_voltage_volts{namespace="physical-integration-core"} < 11) or (pi_power_voltage_volts{namespace="physical-integration-core"} > 13)
+        for: 5m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: power
+          namespace: physical-integration-core
+        annotations:
+          summary: Напряжение питания вне допуска
+          description: Напряжение на {{ $labels.unit_id }} вне диапазона 11–13 V.
+          impact: Сбои оборудования и деградация ресурса.
+          runbook: ops/runbooks/physical-integration-core/Power_Supply.md
+
+  # =========================
+  # Протоколы и каналы связи
+  # =========================
+  - name: alerts.comms.physical-integration-core
+    interval: 30s
+    rules:
+      - alert: PIMqttDisconnected
+        expr: avg_over_time(pi_mqtt_client_connected{namespace="physical-integration-core"}[1m]) < 1
+        for: 2m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: mqtt
+          namespace: physical-integration-core
+        annotations:
+          summary: MQTT-клиент отключен
+          description: Клиент {{ $labels.client_id }} отключен от брокера MQTT.
+          impact: Потеря доставки телеметрии и команд.
+          runbook: ops/runbooks/physical-integration-core/MQTT_Disconnect.md
+
+      - alert: PIMqttBacklogGrowing
+        expr: (pi_mqtt_message_backlog{namespace="physical-integration-core"} > 1000) and (delta(pi_mqtt_message_backlog{namespace="physical-integration-core"}[5m]) > 0)
+        for: 10m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: mqtt
+          namespace: physical-integration-core
+        annotations:
+          summary: Рост очереди MQTT-сообщений
+          description: Бэклог сообщений у {{ $labels.client_id }} растет и превысил 1000.
+          impact: Риск задержек и потерь сообщений.
+          runbook: ops/runbooks/physical-integration-core/MQTT_Backlog.md
+
+      - alert: PIKafkaConsumerLagHigh
+        expr: sum by (consumer_group) (pi_kafka_consumer_lag{namespace="physical-integration-core"}) > 10000
+        for: 5m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: kafka
+          namespace: physical-integration-core
+        annotations:
+          summary: Высокий лаг Kafka consumer
+          description: Лаг группы {{ $labels.consumer_group }} превышает 10k сообщений.
+          impact: Задержки обработки потоков данных.
+          runbook: ops/runbooks/physical-integration-core/Kafka_Lag.md
+
+      - alert: PIOpcUaSessionDown
+        expr: avg_over_time(opcua_session_active{namespace="physical-integration-core"}[1m]) < 1
+        for: 2m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: opcua
+          namespace: physical-integration-core
+        annotations:
+          summary: Сессия OPC UA неактивна
+          description: Сессия OPC UA к {{ $labels.endpoint }} неактивна.
+          impact: Потеря доступа к данным/узлам PLC.
+          runbook: ops/runbooks/physical-integration-core/OPCUA_Session.md
+
+      - alert: PIModbusErrorRateHigh
+        expr: rate(modbus_request_errors_total{namespace="physical-integration-core"}[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: modbus
+          namespace: physical-integration-core
+        annotations:
+          summary: Высокая доля ошибок Modbus
+          description: Ошибки Modbus на {{ $labels.endpoint }} превышают 5% запросов.
+          impact: Пропуски данных и нестабильная телеметрия.
+          runbook: ops/runbooks/physical-integration-core/Modbus_Errors.md
+
+  # =========================
+  # Периферийные вычисления (Edge AI/Видео)
+  # =========================
+  - name: alerts.edge.physical-integration-core
+    interval: 30s
+    rules:
+      - alert: PIEdgeInferenceLatencyP95High
+        expr: pi:edge_inference:latency_p95_seconds_10m > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: edge-inference
+          namespace: physical-integration-core
+        annotations:
+          summary: Высокая P95 задержка инференса на периферии
+          description: P95 latency модели {{ $labels.model }} на узле {{ $labels.node }} превышает 200 ms.
+          impact: Задержки принятия решений в реальном времени.
+          runbook: ops/runbooks/physical-integration-core/Edge_Inference_Latency.md
+
+      - alert: PIEdgeInferenceAccuracyLow
+        expr: avg_over_time(pi_inference_accuracy_ratio{namespace="physical-integration-core"}[15m]) < 0.85
+        for: 15m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: edge-inference
+          namespace: physical-integration-core
+        annotations:
+          summary: Падение точности инференса
+          description: Средняя точность инференса ниже 0.85 на {{ $labels.model }}.
+          impact: Рост ложных действий/тревог.
+          runbook: ops/runbooks/physical-integration-core/Edge_Inference_Accuracy.md
+
+      - alert: PICameraFrameDropHigh
+        expr: pi_camera_frame_drop_ratio{namespace="physical-integration-core"} > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: vision
+          namespace: physical-integration-core
+        annotations:
+          summary: Высокая доля пропусков кадров
+          description: Камера {{ $labels.camera_id }} теряет более 10% кадров.
+          impact: Деградация качества видеоаналитики.
+          runbook: ops/runbooks/physical-integration-core/Camera_FrameDrop.md
+
+  # =========================
+  # Эксплуатация в Kubernetes (namespace‑scoped)
+  # =========================
+  - name: alerts.k8s-runtime.physical-integration-core
+    interval: 30s
+    rules:
+      - alert: PIPodCrashLooping
+        expr: increase(kube_pod_container_status_restarts_total{namespace="physical-integration-core"}[5m]) > 3
+        for: 5m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: k8s
+          namespace: physical-integration-core
+        annotations:
+          summary: Частые рестарты контейнера
+          description: Под {{ $labels.pod }} контейнер {{ $labels.container }} часто рестартует.
+          impact: Нестабильность сервиса и возможная недоступность.
+          runbook: ops/runbooks/physical-integration-core/K8s_CrashLoop.md
+
+      - alert: PIPodNotReady
+        expr: sum by (pod, namespace) (kube_pod_status_ready{condition="true", namespace="physical-integration-core"} == 0) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: k8s
+          namespace: physical-integration-core
+        annotations:
+          summary: Под не готов
+          description: Под {{ $labels.pod }} не выходит в состояние Ready.
+          impact: Снижение способности обрабатывать нагрузку.
+          runbook: ops/runbooks/physical-integration-core/K8s_PodNotReady.md
+
+      - alert: PIImagePullBackOff
+        expr: sum by (pod, container) (kube_pod_container_status_waiting_reason{namespace="physical-integration-core",reason=~"ImagePullBackOff|ErrImagePull"}) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: k8s
+          namespace: physical-integration-core
+        annotations:
+          summary: Проблема с загрузкой образа
+          description: Под {{ $labels.pod }} контейнер {{ $labels.container }} в состоянии ImagePullBackOff/ErrImagePull.
+          impact: Задержка релизов и восстановления.
+          runbook: ops/runbooks/physical-integration-core/K8s_ImagePull.md
+
+      - alert: PIPvcFillingUp
+        expr: (kubelet_volume_stats_available_bytes{namespace="physical-integration-core"} / kubelet_volume_stats_capacity_bytes{namespace="physical-integration-core"}) < 0.1
+        for: 15m
+        labels:
+          severity: warning
+          service: physical-integration-core
+          component: storage
+          namespace: physical-integration-core
+        annotations:
+          summary: PVC почти заполнен
+          description: PVC {{ $labels.persistentvolumeclaim }} имеет менее 10% свободного места.
+          impact: Риск отказов записи и падения подов.
+          runbook: ops/runbooks/physical-integration-core/K8s_PVC_Space.md
+
+      - alert: PIContainerOOMKills
+        expr: increase(container_oom_events_total{namespace="physical-integration-core"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: high
+          service: physical-integration-core
+          component: k8s
+          namespace: physical-integration-core
+        annotations:
+          summary: Фиксируются OOM‑события
+          description: Контейнеры в namespace выбрасываются по OOM.
+          impact: Потеря состояния и недоступность функций.
+          runbook: ops/runbooks/physical-integration-core/K8s_OOM.md

@@ -1,0 +1,328 @@
+version: 1
+app:
+  name: engine-core
+  env: ${APP_ENV:production}          # production, staging, development
+  sdk:
+    poll_interval_seconds: 15         # период опроса провайдера конфигов
+    cache_ttl_seconds: 30
+    stickiness_attr: user_id          # ключ для стабильной доли при раскатке
+    fallback_to_defaults: true
+
+defaults:
+  required_approvals: 2               # по умолчанию нужно 2 одобрения на изменение
+  change_freeze_windows: []           # окна заморозки релизов, формат ISO 8601
+  exposure_event_name: feature_exposed
+
+segments:
+  # Предопределенные сегменты для таргетинга
+  - key: internal_staff
+    description: Внутренняя команда и QA
+    rules:
+      include_emails_suffix: ["@example.com"]
+      allow_user_ids: []
+  - key: high_value_accounts
+    description: Крупные клиенты по ARR
+    rules:
+      account_plan_in: ["enterprise", "platinum"]
+      min_mrr_usd: 10000
+  - key: eu_region
+    description: Пользователи в ЕС
+    rules:
+      country_in: ["SE","DE","FR","NL","IT","ES","PL","FI","DK","NO","IE","AT","BE","PT","CZ","HU","RO","SK","SI","EE","LV","LT","LU","MT","CY","BG","HR","GR"]
+
+governance:
+  owners:
+    - team: core-platform
+      emails: ["platform-lead@example.com"]
+    - team: security
+      emails: ["sec-lead@example.com"]
+  audit:
+    enabled: true
+    redact_fields: ["email","ip","token"]
+  approvals:
+    required_for:
+      - production
+      - toggle_kill_switch
+  notifications:
+    on_change: ["ops-alerts@example.com", "release-managers@example.com"]
+
+integrations:
+  webhooks:
+    - name: ci-cd-guard
+      url_env: FEATURES_WEBHOOK_CICD_URL
+      events: ["feature.updated","experiment.started","killswitch.triggered"]
+      secret_env: FEATURES_WEBHOOK_SECRET
+      timeout_ms: 3000
+  metrics:
+    provider: otel
+    otlp_endpoint_env: OTEL_EXPORTER_OTLP_ENDPOINT
+    counters:
+      - name: feature_exposures_total
+      - name: experiment_exposures_total
+    histograms:
+      - name: api_latency_ms
+
+features:
+  # 1) Пример boolean‑флага с поэтапной раскаткой
+  - key: ui.new_navigation
+    description: Новый верхний навбар
+    type: boolean
+    owners: ["platform-lead@example.com"]
+    tags: ["ui","gradual-rollout"]
+    state:
+      production:
+        enabled: true
+        rollout:
+          percentage: 30                 # 30% аудитории
+          stickiness_attr: user_id
+          salt: "ui.new_navigation.v1"
+        segments_allow: ["internal_staff"]
+        prerequisites: []
+        conflicts: []
+        schedule:
+          start: "2025-08-12T08:00:00Z"
+          end: null
+      staging:
+        enabled: true
+        rollout:
+          percentage: 100
+          stickiness_attr: user_id
+          salt: "ui.new_navigation.v1-stg"
+      development:
+        enabled: true
+        rollout:
+          percentage: 100
+          stickiness_attr: user_id
+    killswitch:
+      enabled: true
+      metric_guard:
+        error_rate_threshold: 0.02        # 2% ошибок
+        latency_p95_ms_threshold: 350
+        evaluation_window_sec: 300
+        action: disable_feature
+
+  # 2) Строковый флаг выбора провайдера модели
+  - key: ml.llm_provider
+    description: Выбор провайдера LLM для inference
+    type: string
+    owners: ["platform-lead@example.com","sec-lead@example.com"]
+    tags: ["ml","routing"]
+    variants:
+      - value: "provider_a"
+      - value: "provider_b"
+      - value: "provider_fallback"
+    state:
+      production:
+        enabled: true
+        value: "provider_a"
+        constraints:
+          allowed_regions: ["eu-west-1","eu-north-1"]
+        dependencies:
+          requires_network_hosts:
+            - "api.provider-a.example:443"
+        fallback: "provider_fallback"
+      staging:
+        enabled: true
+        value: "provider_b"
+      development:
+        enabled: true
+        value: "provider_b"
+
+  # 3) Числовой флаг лимитов для API
+  - key: throttle.api_rps_limit
+    description: Лимит RPS для публичного API
+    type: number
+    owners: ["platform-lead@example.com"]
+    tags: ["rate-limit","sre"]
+    state:
+      production:
+        enabled: true
+        value: 100
+        min: 10
+        max: 1000
+        segments_overrides:
+          internal_staff: 500
+          high_value_accounts: 300
+      staging:
+        enabled: true
+        value: 50
+      development:
+        enabled: true
+        value: 1000
+
+  # 4) Флаг режимов безопасности только для чтения
+  - key: security.read_only_mode
+    description: Перевод сервисов в read-only при инциденте
+    type: boolean
+    owners: ["sec-lead@example.com"]
+    tags: ["security","incident"]
+    state:
+      production:
+        enabled: false
+        rollout: { percentage: 0, stickiness_attr: user_id, salt: "sec.ro.v1" }
+        prerequisites: []
+      staging:
+        enabled: false
+      development:
+        enabled: false
+    killswitch:
+      enabled: true
+      manual_only: true
+
+  # 5) Флаг загрузок с контролем расширений и размера через dynamic_config
+  - key: uploads.policy_v2
+    description: Новая политика загрузок
+    type: boolean
+    owners: ["sec-lead@example.com"]
+    tags: ["uploads","security"]
+    state:
+      production:
+        enabled: true
+        rollout:
+          percentage: 100
+          stickiness_attr: user_id
+          salt: "upl.v2"
+        dynamic_config_ref: "cfg.uploads.policy_v2"
+      staging:
+        enabled: true
+        dynamic_config_ref: "cfg.uploads.policy_v2_stg"
+      development:
+        enabled: true
+        dynamic_config_ref: "cfg.uploads.policy_v2_dev"
+
+  # 6) Многовариантная фича с весами
+  - key: search.rerank_version
+    description: Версия переранжировщика результатов поиска
+    type: multivariant
+    owners: ["ml-lead@example.com"]
+    tags: ["search","ml","gradual-rollout"]
+    variants:
+      - value: "v1"
+        weight: 50
+      - value: "v2"
+        weight: 40
+      - value: "control"
+        weight: 10
+    state:
+      production:
+        enabled: true
+        rollout:
+          percentage: 50
+          stickiness_attr: user_id
+          salt: "search.rr.v2"
+        segments_allow: ["eu_region","high_value_accounts"]
+      staging:
+        enabled: true
+        rollout:
+          percentage: 100
+          stickiness_attr: user_id
+          salt: "search.rr.v2-stg"
+      development:
+        enabled: true
+        rollout:
+          percentage: 100
+          stickiness_attr: user_id
+
+experiments:
+  # A/B эксперимент с четкими метриками и стоп‑правилами
+  - key: exp.checkout_button_text
+    description: Тест текста кнопки Checkout
+    owners: ["growth-lead@example.com"]
+    hypothesis: Увеличение конверсии оплаты
+    population:
+      include_segments: ["eu_region","high_value_accounts"]
+      exclude_segments: ["internal_staff"]
+      traffic_allocation_pct: 60           # на эксперимент идет 60% аудитории
+      stickiness_attr: user_id
+      salt: "exp.chk.text.v1"
+    variants:
+      - key: control
+        weight: 50
+        payload:
+          button_text: "Checkout"
+      - key: variant_a
+        weight: 50
+        payload:
+          button_text: "Pay now"
+    metrics:
+      primary:
+        - name: purchase_conversion
+          type: rate
+          direction: increase
+      guardrails:
+        - name: refund_rate
+          type: rate
+          direction: decrease
+        - name: latency_p95_ms
+          type: latency
+          threshold: 400
+    duration:
+      start: "2025-08-12T09:00:00Z"
+      end: "2025-08-26T09:00:00Z"
+    stopping_rules:
+      - type: p_value
+        metric: purchase_conversion
+        threshold: 0.05
+      - type: min_samples
+        per_variant: 5000
+      - type: guardrail_breach
+        metric: refund_rate
+        threshold: 0.04
+    exposure:
+      require_explicit_call: true          # экспозиция учитывается только при явном вызове SDK
+
+dynamic_config:
+  # Централизованные конфиги, на которые ссылаются фичи
+  - key: cfg.uploads.policy_v2
+    schema_version: 1
+    payload:
+      max_file_bytes: 10485760
+      allowed_extensions: [".jpg",".jpeg",".png",".pdf"]
+      mime_detect_from_content: true
+      antivirus:
+        enabled: true
+        timeout_ms: 3000
+  - key: cfg.uploads.policy_v2_stg
+    schema_version: 1
+    payload:
+      max_file_bytes: 5242880
+      allowed_extensions: [".jpg",".jpeg",".png",".pdf"]
+      mime_detect_from_content: true
+      antivirus:
+        enabled: true
+        timeout_ms: 3000
+  - key: cfg.uploads.policy_v2_dev
+    schema_version: 1
+    payload:
+      max_file_bytes: 2097152
+      allowed_extensions: [".jpg",".jpeg",".png"]
+      mime_detect_from_content: true
+      antivirus:
+        enabled: false
+
+overrides:
+  # Точечные переопределения для критических клиентов или инцидентов
+  per_account:
+    - account_id: "acc_123456"
+      features:
+        ui.new_navigation:
+          force_enabled: true
+        throttle.api_rps_limit:
+          value: 400
+  per_user:
+    - user_id: "user_internal_1"
+      features:
+        ui.new_navigation:
+          force_enabled: true
+
+environments:
+  production:
+    freeze_windows:
+      - "2025-12-20T00:00:00Z/2026-01-05T23:59:59Z"
+    required_approvals: 2
+  staging:
+    freeze_windows: []
+    required_approvals: 1
+  development:
+    freeze_windows: []
+    required_approvals: 0

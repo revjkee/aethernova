@@ -1,0 +1,218 @@
+name: SLSA Provenance (Artifacts & OCI)
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [created, published]
+  workflow_dispatch:
+    inputs:
+      build_container:
+        description: "Build container and generate container provenance"
+        type: boolean
+        default: false
+      image_name:
+        description: "Container image name (ghcr.io/owner/repo)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: slsa-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DIST_DIR: dist
+  # Переопределите по необходимости
+  BUILD_CMD: |
+    echo "Implement project build here"
+    mkdir -p dist
+    # Примеры артефактов:
+    # tar -czf dist/cli-linux-amd64.tgz ./cli
+    # tar -czf dist/lib-wheels.tgz ./wheelhouse
+    # echo "hello" > dist/example.txt
+
+jobs:
+  build_and_hash:
+    name: Build artifacts and compute digests
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write     # для загрузки артефактов в релиз
+      actions: read
+      id-token: write
+
+    outputs:
+      subjects_b64: ${{ steps.subjects.outputs.b64 }}
+      release_upload_url: ${{ steps.rel.outputs.upload_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up build environment
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq coreutils
+
+      - name: Build
+        shell: bash
+        run: $BUILD_CMD
+
+      - name: Verify dist exists and non-empty
+        run: |
+          test -d "$DIST_DIR" || { echo "dist dir missing"; exit 1; }
+          ls -la "$DIST_DIR"
+          test -n "$(find "$DIST_DIR" -type f -maxdepth 1 -print -quit)" || { echo "no artifacts found"; exit 1; }
+
+      - name: Compute SHA256 subjects (SLSA)
+        id: subjects
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$DIST_DIR"
+          mapfile -t FILES < <(find . -maxdepth 1 -type f -printf '%P\n' | sort)
+          [[ ${#FILES[@]} -gt 0 ]] || { echo "no files"; exit 1; }
+          arr=()
+          for f in "${FILES[@]}"; do
+            sha=$(sha256sum "$f" | awk '{print $1}')
+            arr+=("{\"name\":\"$f\",\"digest\":{\"sha256\":\"$sha\"}}")
+          done
+          json="[$(IFS=,; echo "${arr[*]}")]"
+          b64=$(printf '%s' "$json" | base64 -w0)
+          echo "b64=$b64" >> "$GITHUB_OUTPUT"
+          echo "Subjects:"
+          printf '%s\n' "$json" | jq -r
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: ${{ env.DIST_DIR }}/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create or get GitHub Release
+        id: rel
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            ${{ env.DIST_DIR }}/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  slsa_provenance:
+    name: Generate SLSA v3 provenance (generic)
+    needs: [build_and_hash]
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout (minimal)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Generate provenance (generic)
+        id: prov
+        uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2
+        with:
+          base64-subjects: ${{ needs.build_and_hash.outputs.subjects_b64 }}
+
+      - name: Download provenance
+        # артефакт, созданный генератором, доступен как artifact 'slsa-provenance'
+        uses: actions/download-artifact@v4
+        with:
+          name: slsa-provenance
+          path: provenance
+
+      - name: Attach provenance to Release (if tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: provenance/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  container_provenance:
+    name: Build OCI image and generate container provenance
+    if: ${{ inputs.build_container || (github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/')) }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      packages: write
+
+    env:
+      IMAGE_NAME: ${{ inputs.image_name != '' && inputs.image_name || format('ghcr.io/{0}/{1}', github.repository_owner, github.event.repository.name) }}
+      TAG: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          provenance: false
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+
+      - name: Generate SLSA container provenance
+        id: container-prov
+        uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+
+      - name: Store attestation as artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: slsa-provenance
+          path: provenance-container
+
+      - name: Summarize
+        run: |
+          echo "Image: $IMAGE_NAME:$TAG" >> $GITHUB_STEP_SUMMARY
+          echo "Provenance files:" >> $GITHUB_STEP_SUMMARY
+          ls -la provenance-container >> $GITHUB_STEP_SUMMARY

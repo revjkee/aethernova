@@ -1,0 +1,138 @@
+# neuroforge-core/ops/k8s/base/ingress.yaml
+# Базовые, безопасные Ingress-правила для NGINX Ingress Controller + cert-manager.
+# Минимальные требования:
+#   - установлен ingress-nginx
+#   - установлен cert-manager (для автоматических сертификатов)
+#   - существует Service neuroforge-api (port 8080) и neuroforge-metrics (port 9090)
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: neuroforge-api
+  labels:
+    app.kubernetes.io/name: neuroforge
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: neuroforge-core
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+
+    # TLS и HSTS
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"     # замените при необходимости
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/ssl-protocols: "TLSv1.3 TLSv1.2"
+    nginx.ingress.kubernetes.io/ssl-prefer-server-ciphers: "true"
+    nginx.ingress.kubernetes.io/ssl-ciphers: >-
+      ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:
+      ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:
+      ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"   # 1 год
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+
+    # Производительность и стабильность
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "8"
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "15"
+    nginx.ingress.kubernetes.io/keep-alive: "180"
+    nginx.ingress.kubernetes.io/upstream-keepalive: "64"
+
+    # Rate limit (подберите значения под RPS)
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-burst: "200"
+    # nginx.ingress.kubernetes.io/limit-whitelist: "10.0.0.0/8,192.168.0.0/16"
+
+    # Безопасность HTTP-заголовков и скрытие серверной информации
+    nginx.ingress.kubernetes.io/server-snippet: |
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+      add_header Permissions-Policy "geolocation=(), camera=(), microphone=()" always;
+      add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'" always;
+      more_clear_headers "Server";
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Expect "";
+      proxy_set_header X-Request-Start t=${msec};
+
+    # Кастомные страницы ошибок (если есть error-service)
+    # nginx.ingress.kubernetes.io/custom-http-errors: "400,401,403,404,429,500,502,503,504"
+
+    # Включение ModSecurity (если собран ingress-nginx с модулем и есть правила CRS)
+    # nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    # nginx.ingress.kubernetes.io/modsecurity-snippet: |
+    #   SecRuleEngine On
+    #   Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.example.com            # замените на ваш домен
+      secretName: neuroforge-api-tls # создастся cert-manager'ом
+  rules:
+    - host: api.example.com          # замените на ваш домен
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: neuroforge-api
+                port:
+                  number: 8080
+
+---
+# Отдельный Ingress для метрик/служебных эндпоинтов:
+#   - BasicAuth (секрет 'metrics-basic-auth' должен существовать: kubectl create secret generic metrics-basic-auth --from-literal=auth="user:hashedpass" -n <ns>)
+#   - Ограниченный доступ по CIDR (внутренние сети/VPN)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: neuroforge-metrics
+  labels:
+    app.kubernetes.io/name: neuroforge
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: neuroforge-core
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # Basic Auth только для метрик
+    nginx.ingress.kubernetes.io/auth-type: "basic"
+    nginx.ingress.kubernetes.io/auth-secret: "metrics-basic-auth"
+    nginx.ingress.kubernetes.io/auth-realm: "Restricted"
+
+    # Разрешить доступ только из внутренних сетей (замените на ваши CIDR)
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16,172.16.0.0/12"
+
+    # Таймауты/буферы для стримящих метрик
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/upstream-keepalive: "32"
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - metrics.example.com          # замените на ваш домен
+      secretName: neuroforge-metrics-tls
+  rules:
+    - host: metrics.example.com        # замените на ваш домен
+      http:
+        paths:
+          - path: /metrics
+            pathType: Prefix
+            backend:
+              service:
+                name: neuroforge-metrics
+                port:
+                  number: 9090

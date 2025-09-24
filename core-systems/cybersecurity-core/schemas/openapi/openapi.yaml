@@ -1,0 +1,702 @@
+openapi: 3.1.0
+info:
+  title: Cybersecurity Core Schema Registry API
+  version: "1.0.0"
+  summary: Registry and validator for cybersecurity JSON Schemas (v1)
+  description: |
+    Industrial-grade API to publish, discover, version, and validate cybersecurity JSON Schemas:
+    Threat Intelligence Indicators, IDS Events, and EDR Actions. Supports JSON Schema 2020-12,
+    secure access, pagination, rate limiting, and RFC7807 problem details.
+  termsOfService: https://api.neurocity.dev/terms
+  contact:
+    name: NeuroCity Security Core
+    url: https://api.neurocity.dev/security
+    email: security-core@neurocity.dev
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+
+servers:
+  - url: https://api.neurocity.dev/cybersecurity-core/v1
+    description: Production
+  - url: https://staging.api.neurocity.dev/cybersecurity-core/v1
+    description: Staging
+
+tags:
+  - name: Schemas
+    description: Manage and retrieve JSON Schemas
+  - name: Validation
+    description: Validate payloads against registered schemas
+  - name: Metadata
+    description: Health checks and API metadata
+
+security:
+  - OAuth2: [read:schemas]
+  - ApiKeyAuth: []
+  - mTLS: []
+
+paths:
+  /schemas:
+    get:
+      tags: [Schemas]
+      operationId: listSchemas
+      summary: List available schemas
+      parameters:
+        - $ref: '#/components/parameters/TypeFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A paginated list of schema descriptors
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaList'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Schemas]
+      operationId: createSchema
+      summary: Publish a new schema (admin-only)
+      security:
+        - OAuth2: [write:schemas]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SchemaCreateRequest' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchemaDescriptor' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /schemas/{name}:
+    get:
+      tags: [Schemas]
+      operationId: getSchema
+      summary: Get latest schema by name (descriptor or JSON Schema by content negotiation)
+      parameters:
+        - $ref: '#/components/parameters/Name'
+      responses:
+        '200':
+          description: Latest schema
+          headers:
+            ETag:
+              description: Entity tag of the schema artifact
+              schema: { type: string }
+            Last-Modified:
+              description: Last modification datetime (RFC1123)
+              schema: { type: string }
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchemaDescriptor' }
+            application/schema+json:
+              schema: { $ref: '#/components/schemas/JSONSchema' }
+        '304':
+          description: Not Modified
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /schemas/{name}/versions:
+    get:
+      tags: [Schemas]
+      operationId: listSchemaVersions
+      summary: List versions of a schema
+      parameters:
+        - $ref: '#/components/parameters/Name'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Versions
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchemaVersionList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /schemas/{name}/versions/{version}:
+    get:
+      tags: [Schemas]
+      operationId: getSchemaVersion
+      summary: Get specific schema version
+      parameters:
+        - $ref: '#/components/parameters/Name'
+        - $ref: '#/components/parameters/Version'
+      responses:
+        '200':
+          description: Schema version
+          headers:
+            ETag:
+              description: Entity tag of the schema artifact
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchemaDescriptor' }
+            application/schema+json:
+              schema: { $ref: '#/components/schemas/JSONSchema' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /validate:
+    post:
+      tags: [Validation]
+      operationId: validatePayload
+      summary: Validate a payload against a registered schema
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ValidateRequest' }
+            examples:
+              edrAction:
+                summary: Validate EDR Action payload
+                value:
+                  schema:
+                    name: edr_action
+                    version: "1.0.0"
+                  payload:
+                    id: "a5f9e2d0-4b2b-4d2e-9b6b-3a8c9f1f1c10"
+                    timestamp: "2025-09-03T08:55:12Z"
+                    action_type: "quarantine_file"
+                    target_type: "file"
+                    target: { path: "C:/Windows/Temp/mal.exe", sha256: "8d969e..." }
+                    host: { hostname: "wkst-001", os: "Windows 11", ip: "10.0.1.15" }
+                    user: { name: "alice", sid: "S-1-5-21-..." }
+                    status: "completed"
+                  strict: true
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidateResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /examples/generate:
+    post:
+      tags: [Validation]
+      operationId: generateExample
+      summary: Generate an example payload from a schema
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExampleRequest' }
+      responses:
+        '200':
+          description: Example payload
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /health/live:
+    get:
+      tags: [Metadata]
+      operationId: live
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { status: { type: string, enum: [ok] } }
+  /health/ready:
+    get:
+      tags: [Metadata]
+      operationId: ready
+      summary: Readiness probe
+      responses:
+        '200':
+          description: Service ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+                  dependencies:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        status: { type: string, enum: [ok, degraded] }
+
+components:
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.neurocity.dev/oauth2/token
+          scopes:
+            read:schemas: Read schemas
+            write:schemas: Publish schemas
+        authorizationCode:
+          authorizationUrl: https://auth.neurocity.dev/oauth2/authorize
+          tokenUrl: https://auth.neurocity.dev/oauth2/token
+          scopes:
+            read:schemas: Read schemas
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    mTLS:
+      type: mutualTLS
+
+  headers:
+    RateLimit-Limit:
+      description: Request limit for the current window
+      required: false
+      schema: { type: integer, format: int32 }
+    RateLimit-Remaining:
+      description: Remaining requests in the current window
+      required: false
+      schema: { type: integer, format: int32 }
+    RateLimit-Reset:
+      description: UTC epoch seconds when the window resets
+      required: false
+      schema: { type: integer, format: int64 }
+
+  parameters:
+    Name:
+      name: name
+      in: path
+      required: true
+      description: Canonical schema name (e.g., ti_indicator, ids_event, edr_action)
+      schema:
+        type: string
+        pattern: '^[a-z][a-z0-9_]*$'
+    Version:
+      name: version
+      in: path
+      required: true
+      description: Semantic version of schema
+      schema:
+        type: string
+        pattern: '^\d+\.\d+\.\d+(-[A-Za-z0-9\.-]+)?$'
+    TypeFilter:
+      name: type
+      in: query
+      required: false
+      description: Filter by schema type
+      schema:
+        type: string
+        enum: [ti_indicator, ids_event, edr_action]
+    StatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Filter by publication status
+      schema:
+        type: string
+        enum: [active, deprecated, experimental]
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      description: Page size
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string }
+      description: Cursor for pagination
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Conflict
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    TooManyRequests:
+      description: Too many requests
+      headers:
+        Retry-After:
+          description: Seconds until retry is allowed
+          schema: { type: integer, format: int32 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UnprocessableEntity:
+      description: Payload failed validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ValidateResponse' }
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  requestBodies:
+    JSONSchemaBody:
+      required: true
+      content:
+        application/schema+json:
+          schema: { $ref: '#/components/schemas/JSONSchema' }
+
+  schemas:
+    JSONSchema:
+      type: object
+      description: A JSON Schema document (draft 2020-12)
+      additionalProperties: true
+
+    Problem:
+      type: object
+      description: RFC7807 Problem Details
+      properties:
+        type: { type: string, format: uri, default: about:blank }
+        title: { type: string }
+        status: { type: integer, format: int32 }
+        detail: { type: string }
+        instance: { type: string, format: uri }
+        traceId: { type: string }
+      required: [title, status]
+
+    Pagination:
+      type: object
+      properties:
+        limit: { type: integer, minimum: 1, maximum: 500 }
+        next_cursor: { type: string, nullable: true }
+        prev_cursor: { type: string, nullable: true }
+
+    SchemaDescriptor:
+      type: object
+      properties:
+        name:
+          type: string
+          examples: ["ti_indicator", "ids_event", "edr_action"]
+        title: { type: string }
+        version:
+          type: string
+          description: Semantic version
+        type:
+          type: string
+          enum: [ti_indicator, ids_event, edr_action]
+        dialect:
+          type: string
+          enum:
+            - https://json-schema.org/draft/2020-12/schema
+        mediaType:
+          type: string
+          enum: [application/schema+json]
+        uri:
+          type: string
+          format: uri
+        checksum:
+          type: object
+          properties:
+            sha256: { type: string, pattern: "^[A-Fa-f0-9]{64}$" }
+        status:
+          type: string
+          enum: [active, deprecated, experimental]
+          default: active
+        createdAt: { type: string, format: date-time }
+        deprecatedAt: { type: string, format: date-time, nullable: true }
+        description: { type: string }
+      required: [name, version, type, dialect, mediaType, uri, checksum, status, createdAt]
+
+    SchemaList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/SchemaDescriptor' }
+        page: { $ref: '#/components/schemas/Pagination' }
+      required: [items]
+
+    SchemaVersionList:
+      type: object
+      properties:
+        name: { type: string }
+        versions:
+          type: array
+          items:
+            type: object
+            properties:
+              version: { type: string }
+              createdAt: { type: string, format: date-time }
+              status: { type: string, enum: [active, deprecated, experimental] }
+            required: [version, createdAt, status]
+
+    SchemaCreateRequest:
+      type: object
+      properties:
+        descriptor: { $ref: '#/components/schemas/SchemaDescriptor' }
+        schema: { $ref: '#/components/schemas/JSONSchema' }
+      required: [descriptor, schema]
+
+    ValidateRequest:
+      type: object
+      properties:
+        schema:
+          type: object
+          properties:
+            name: { type: string }
+            version:
+              type: string
+              description: Optional; latest if omitted
+          required: [name]
+        payload:
+          type: object
+          additionalProperties: true
+        strict:
+          type: boolean
+          description: If true, forbids unknown properties where schemas define `additionalProperties: false`
+          default: false
+      required: [schema, payload]
+
+    ValidateError:
+      type: object
+      properties:
+        instancePath: { type: string, description: JSON Pointer to offending instance path }
+        schemaPath: { type: string, description: JSON Pointer within schema }
+        keyword: { type: string, description: Violated keyword (e.g., type, enum, pattern) }
+        message: { type: string }
+      required: [instancePath, keyword, message]
+
+    ValidateResponse:
+      type: object
+      properties:
+        valid: { type: boolean }
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/ValidateError' }
+        schema:
+          type: object
+          properties:
+            name: { type: string }
+            version: { type: string }
+      required: [valid]
+
+    # --- Canonical cybersecurity payload schemas (documentation-friendly mirrors) ---
+    ThreatIndicator:
+      type: object
+      description: Threat Intelligence indicator (TI)
+      properties:
+        id: { type: string, format: uuid }
+        type:
+          type: string
+          enum: [ipv4, ipv6, domain, url, file_hash, email, mutex, registry_key]
+        pattern_type:
+          type: string
+          enum: [stix, ioc, sigma]
+        pattern: { type: string, description: Pattern or selector }
+        confidence: { type: integer, minimum: 0, maximum: 100 }
+        severity: { type: string, enum: [low, medium, high, critical] }
+        valid_from: { type: string, format: date-time }
+        valid_until: { type: string, format: date-time, nullable: true }
+        labels:
+          type: array
+          items: { type: string }
+        description: { type: string }
+        created_by: { type: string }
+        external_references:
+          type: array
+          items:
+            type: object
+            properties:
+              source_name: { type: string }
+              url: { type: string, format: uri }
+              external_id: { type: string }
+        spec_version:
+          type: string
+          default: "1.0.0"
+      required: [id, type, pattern_type, pattern, confidence, severity, valid_from]
+
+    IDSEvent:
+      type: object
+      description: Intrusion Detection System event
+      properties:
+        id: { type: string, format: uuid }
+        timestamp: { type: string, format: date-time }
+        product:
+          type: object
+          properties:
+            name: { type: string }
+            version: { type: string }
+        category: { type: string, enum: [network, host, application] }
+        action: { type: string, enum: [alert, block, allow, drop] }
+        severity: { type: string, enum: [low, medium, high, critical] }
+        signature_id: { type: string }
+        message: { type: string }
+        src_ip: { type: string }
+        src_port: { type: integer, minimum: 0, maximum: 65535 }
+        dst_ip: { type: string }
+        dst_port: { type: integer, minimum: 0, maximum: 65535 }
+        protocol: { type: string, enum: [tcp, udp, icmp, other] }
+        http:
+          type: object
+          properties:
+            method: { type: string }
+            host: { type: string }
+            url: { type: string }
+            status: { type: integer }
+        tags:
+          type: array
+          items: { type: string }
+        enrichment:
+          type: object
+          properties:
+            geoip:
+              type: object
+              properties:
+                country: { type: string }
+                city: { type: string }
+            asn:
+              type: object
+              properties:
+                number: { type: integer }
+                org: { type: string }
+      required: [id, timestamp, category, action, severity, src_ip, dst_ip, protocol]
+
+    EDRAction:
+      type: object
+      description: Endpoint Detection & Response action record
+      properties:
+        id: { type: string, format: uuid }
+        timestamp: { type: string, format: date-time }
+        host:
+          type: object
+          properties:
+            hostname: { type: string }
+            os: { type: string }
+            ip: { type: string }
+        user:
+          type: object
+          properties:
+            name: { type: string }
+            sid: { type: string }
+        action_type:
+          type: string
+          enum: [quarantine_file, kill_process, isolate_host, unblock, scan]
+        target_type:
+          type: string
+          enum: [file, process, registry, network, service]
+        target:
+          type: object
+          properties:
+            path: { type: string }
+            sha256: { type: string, pattern: "^[A-Fa-f0-9]{64}$" }
+            pid: { type: integer }
+            registry_key: { type: string }
+            port: { type: integer, minimum: 0, maximum: 65535 }
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        reason: { type: string }
+        correlation_id: { type: string }
+      required: [id, timestamp, action_type, target_type, status]
+
+  examples:
+    ThreatIndicatorExample:
+      summary: TI indicator sample
+      value:
+        id: "f7db4f2e-5e08-4d0b-9d7f-1db8f1b5c7a2"
+        type: "domain"
+        pattern_type: "stix"
+        pattern: "[domain-name:value = 'malicious.example']"
+        confidence: 85
+        severity: "high"
+        valid_from: "2025-09-03T09:10:00Z"
+        labels: ["phishing", "c2"]
+        description: "Known C2 domain"
+        created_by: "intel-team@neurocity.dev"
+        external_references:
+          - source_name: "MISP"
+            url: "https://misp.instance/attributes/view/12345"
+            external_id: "MISP-12345"
+
+    IDSEventExample:
+      summary: IDS event sample
+      value:
+        id: "a9b2c3d4-e5f6-47a8-9b0c-d1e2f3a4b5c6"
+        timestamp: "2025-09-03T08:59:01Z"
+        product: { name: "Suricata", version: "7.0.0" }
+        category: "network"
+        action: "alert"
+        severity: "critical"
+        signature_id: "ETPRO TROJAN Observed Malicious JA3"
+        message: "Potential C2 traffic detected"
+        src_ip: "192.0.2.10"
+        src_port: 54321
+        dst_ip: "198.51.100.20"
+        dst_port: 443
+        protocol: "tcp"
+        http: { method: "GET", host: "malicious.example", url: "/index" }
+        tags: ["c2", "tls", "ja3"]
+        enrichment:
+          geoip: { country: "SE", city: "Stockholm" }
+          asn: { number: 64500, org: "ExampleNet" }
+
+    EDRActionExample:
+      summary: EDR action sample
+      value:
+        id: "a5f9e2d0-4b2b-4d2e-9b6b-3a8c9f1f1c10"
+        timestamp: "2025-09-03T08:55:12Z"
+        host: { hostname: "wkst-001", os: "Windows 11", ip: "10.0.1.15" }
+        user: { name: "alice", sid: "S-1-5-21-..." }
+        action_type: "quarantine_file"
+        target_type: "file"
+        target: { path: "C:/Windows/Temp/mal.exe", sha256: "8d969eef6ecad3c29a3a629280e686cf..." }
+        status: "completed"
+        reason: "Detected by ML engine"
+        correlation_id: "corr-7c1c2b"
+
+x-reference:
+  schemas:
+    - name: ti_indicator
+      latestVersion: "1.0.0"
+      componentRef: "#/components/schemas/ThreatIndicator"
+    - name: ids_event
+      latestVersion: "1.0.0"
+      componentRef: "#/components/schemas/IDSEvent"
+    - name: edr_action
+      latestVersion: "1.0.0"
+      componentRef: "#/components/schemas/EDRAction"

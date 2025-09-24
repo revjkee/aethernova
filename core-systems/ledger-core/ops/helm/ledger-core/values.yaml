@@ -1,0 +1,373 @@
+# ledger-core/ops/helm/ledger-core/values.yaml
+
+# -----------------------------
+# Контейнер/образ
+# -----------------------------
+image:
+  repository: ghcr.io/aethernova/ledger-core
+  tag: ""               # по умолчанию берётся из Chart.appVersion, можно переопределить
+  pullPolicy: IfNotPresent
+imagePullSecrets: []    # - name: regcred
+
+# -----------------------------
+# Приложение
+# -----------------------------
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 3
+
+command: []             # например: ["python","-m","ledger_core.api"]
+args: []                # например: ["--workers","2"]
+workingDir: ""
+
+# Основные переменные окружения
+env:
+  LEDGER_ENV: "prod"
+  LOG_LEVEL: "INFO"
+  # БД и внешние ресурсы задавайте через секреты
+  # DATABASE_URL и т.п. не хранить в values — используйте existingSecret
+envFrom: []             # - secretRef: { name: my-app-env }
+extraEnv: []            # - name: FEATURE_FLAG  value: "on"
+
+config:
+  # Встраиваемый конфиг (ConfigMap). Не класть секреты сюда.
+  enabled: true
+  data: {}
+  #  application.yaml: |
+  #    api:
+  #      port: 8000
+
+secrets:
+  # Способ 1: использовать уже существующий секрет
+  existingSecret: ""    # пример: ledger-core-secrets
+  # Способ 2: создать секрет из values (не рекомендуется для prod)
+  create: false
+  data: {}              # key: base64-encoded
+
+externalSecrets:
+  enabled: false
+  # Если используете ExternalSecrets Operator
+  spec: {}
+  #  refreshInterval: 1h
+  #  secretStoreRef: { name: vault, kind: ClusterSecretStore }
+  #  target: { name: ledger-core-secrets, creationPolicy: Owner }
+  #  data:
+  #    - secretKey: DATABASE_URL
+  #      remoteRef: { key: kv/ledger-core, property: DATABASE_URL }
+
+# -----------------------------
+# Сервис/Ingress
+# -----------------------------
+service:
+  type: ClusterIP
+  port: 8000
+  annotations: {}
+  labels: {}
+  extraPorts: []        # - name: metrics  port: 9090  targetPort: 9090  protocol: TCP
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: ledger.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []               # - secretName: ledger-tls  hosts: [ledger.example.com]
+
+# -----------------------------
+# Пробы и порты
+# -----------------------------
+containerPorts:
+  http: 8000
+  metrics: 9090
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 3
+startupProbe:
+  enabled: false
+  httpGet:
+    path: /startup
+    port: http
+  periodSeconds: 5
+  failureThreshold: 60
+
+# -----------------------------
+# Ресурсы/лимиты
+# -----------------------------
+resources:
+  requests:
+    cpu: "200m"
+    memory: "256Mi"
+  limits:
+    cpu: "1"
+    memory: "1Gi"
+
+# -----------------------------
+# Планировщик/топология
+# -----------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints:
+  enabled: true
+  rules:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector: {}
+
+priorityClassName: ""
+
+# -----------------------------
+# Безопасность
+# -----------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# -----------------------------
+# Стратегия деплоя/PDB
+# -----------------------------
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# -----------------------------
+# HPA (autoscaling)
+# -----------------------------
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  behavior: {}
+  #  scaleUp:
+  #    policies:
+  #      - type: Percent  value: 100  periodSeconds: 60
+  #  scaleDown:
+  #    stabilizationWindowSeconds: 300
+
+keda:
+  enabled: false
+  triggers: []
+  #  - type: prometheus
+  #    metadata:
+  #      serverAddress: http://prometheus-server.monitoring.svc.cluster.local
+  #      metricName: http_requests_per_second
+  #      threshold: "100"
+
+# -----------------------------
+# Мониторинг/метрики/алерты
+# -----------------------------
+serviceMonitor:
+  enabled: true
+  namespace: ""         # по умолчанию текущий ns
+  interval: 30s
+  scrapeTimeout: 10s
+  scheme: http
+  path: /metrics
+  selector: {}
+  labels: {}
+  annotations: {}
+  relabelings: []
+  metricRelabelings: []
+
+prometheusRule:
+  enabled: true
+  namespace: ""         # прометеевский ns
+  additionalLabels: {}
+  groups:
+    - name: ledger-core.rules
+      rules:
+        - alert: LedgerCoreHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{app_kubernetes_io_name="ledger-core",code=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{app_kubernetes_io_name="ledger-core"}[5m])) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Высокая доля 5xx на ledger-core"
+            description: "Больше 5% 5xx за 5m."
+        - alert: LedgerCorePodRestarting
+          expr: increase(kube_pod_container_status_restarts_total{container="ledger-core"}[10m]) > 3
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Частые рестарты контейнера ledger-core"
+
+# -----------------------------
+# Логи, трассировка, фичи
+# -----------------------------
+opentelemetry:
+  enabled: false
+  # Экспортёр OTLP
+  endpoint: "http://otel-collector.observability:4317"
+  headers: {}
+  # Доп. env для SDK
+  extraEnv: {}
+  #  OTEL_SERVICE_NAME автоматически выставляется шаблоном
+
+logging:
+  json: true
+  level: "INFO"
+
+# -----------------------------
+# Volumes/Init/Sidecars
+# -----------------------------
+persistence:
+  enabled: false
+  storageClass: ""
+  accessModes: ["ReadWriteOnce"]
+  size: 1Gi
+  mountPath: /data
+
+extraVolumes: []        # - name: tmp  emptyDir: {}
+extraVolumeMounts: []   # - name: tmp  mountPath: /tmp
+initContainers: []      # - name: wait-db  image: busybox:1.36  command: ["sh","-c","/bin/nc -zv postgres 5432"]
+sidecars: []            # - name: oauth-proxy  image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0 ...
+
+# -----------------------------
+# ServiceAccount/RBAC
+# -----------------------------
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: true
+
+rbac:
+  create: true
+  rules: []             # при необходимости добавить доступ к ресурсам
+
+# -----------------------------
+# NetworkPolicy (совместимо с base)
+# -----------------------------
+networkPolicy:
+  enabled: true
+  createDefaultDeny: true
+  allowDns: true
+  allowNamespaceIngress: true
+  allowFromIngressControllers: true
+  allowMetricsFromMonitoringNs: true
+  monitoringNamespaceSelector:
+    matchLabels:
+      monitoring: "true"
+  ingressControllerNsSelector:
+    matchLabels:
+      networking/ingress: "enabled"
+  extra: []             # список дополнительных NetworkPolicy манифестов (raw)
+
+# -----------------------------
+# Аннотации/лейблы
+# -----------------------------
+podAnnotations: {}
+podLabels:
+  app.kubernetes.io/part-of: ledger
+  app.kubernetes.io/component: backend
+
+deploymentAnnotations: {}
+deploymentLabels: {}
+
+# -----------------------------
+# Джобы (миграции/сидинг/cron)
+# -----------------------------
+migrations:
+  enabled: false
+  image: {}
+  command: []           # например: ["python","-m","ledger_core.migrate","upgrade","head"]
+  env: {}
+  envFrom: []
+  resources: {}
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+
+seedJob:
+  enabled: false
+  image: {}
+  command: []           # например: ["python","-m","ledger_core.seed","--demo"]
+  schedule: ""          # если указан — будет CronJob
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  startingDeadlineSeconds: 300
+  resources: {}
+
+# -----------------------------
+# Стратегии релиза/канареек
+# -----------------------------
+podAnnotationsCanary: {}
+canary:
+  enabled: false
+  weight: 20
+  matchHeaders: []      # для ingress/istio в шаблоне, если используется
+
+# -----------------------------
+# Шаблон контейнера (дополнительно)
+# -----------------------------
+extraContainerArgs: []  # - "--flag=value"
+extraContainerEnvFrom: []
+extraContainerPorts: [] # - name: admin  containerPort: 9001
+
+# -----------------------------
+# Временные файлы и /tmp
+# -----------------------------
+tmpVolume:
+  enabled: true
+  medium: Memory
+  sizeLimit: 64Mi
+
+# -----------------------------
+# Кастомные шаблоны/оверлеи
+# -----------------------------
+extraManifests: []      # Raw YAML манифесты, встроятся через tpl
+# - |
+#   apiVersion: v1
+#   kind: ConfigMap
+#   metadata: { name: extra-config }
+#   data: { foo: "bar" }
+
+# -----------------------------
+# Диагностика
+# -----------------------------
+debug:
+  enabled: false
+  command: []
+  args: []

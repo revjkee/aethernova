@@ -1,0 +1,253 @@
+syntax = "proto3";
+
+package physical.v1;
+
+option go_package = "github.com/neurocity/physical-integration-core/gen/proto/physical/v1;physicalv1";
+option java_multiple_files = true;
+option java_package = "dev.neurocity.physical.v1";
+option csharp_namespace = "NeuroCity.Physical.V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// Основной транспортный конверт. Может нести как нормализованное Event,
+// так и оригинальную полезную нагрузку (payload) с описанием кодека/сжатия.
+message Envelope {
+  // Идентификатор конверта (генерируется на ingestion), должен быть уникален.
+  string envelope_id = 1;
+
+  // Ключ партиционирования для шины (например, Kafka).
+  string partition_key = 2;
+
+  // Временная метка приёма системой (ingestion).
+  google.protobuf.Timestamp ingest_time = 3;
+
+  // Корреляция запросов/команд/ответов между системами.
+  string correlation_id = 4;
+
+  // Трасс‑контекст для сквозной наблюдаемости.
+  TraceContext trace = 5;
+
+  // Многоарендность и аудит.
+  Audit audit = 6;
+
+  // Нормализованное событие. Может отсутствовать, если передаём только сырой payload.
+  Event event = 7;
+
+  // Оригинальная полезная нагрузка (сырые данные, как пришли с поля).
+  bytes payload = 8;
+
+  // MIME‑тип payload (например, "application/json", "application/octet-stream").
+  string payload_content_type = 9;
+
+  // Схема кодирования payload (JSON/CBOR/PROTO/AVRO и т. п.).
+  Encoding payload_encoding = 10;
+
+  // Сжатие payload.
+  Compression payload_compression = 11;
+
+  // Криптографический отпечаток (например, SHA‑256 в hex/base64).
+  string payload_hash = 12;
+
+  // Пометка о попадании в DLQ и причина.
+  bool dlq = 13;
+  ErrorInfo dlq_reason = 14;
+
+  // Маршрутизация (подсказки для шины/коннекторов).
+  Routing routing = 15;
+
+  // Резерв на будущее расширение.
+  reserved 1000 to 1999;
+}
+
+// Бизнес‑событие после базовой нормализации/валидации.
+message Event {
+  // Уникальный идентификатор события (идемпотентность).
+  string event_id = 1;
+
+  // Тип события (см. EventType).
+  EventType type = 2;
+
+  // Источник (например, mqtt://broker/topic, opc.tcp://host:port).
+  string source = 3;
+
+  // Предмет/категория внутри источника (например, топик/путь/узел).
+  string subject = 4;
+
+  // Связанное устройство/агрегат.
+  Device device = 5;
+
+  // Список метрик (нормализованные значения).
+  repeated Metric metrics = 6;
+
+  // Произвольные атрибуты события (ключ/значение).
+  map<string, string> attributes = 7;
+
+  // Полезная нагрузка события (нормализованная), если требуется передавать вместе.
+  google.protobuf.Struct normalized_payload = 8;
+
+  // Время, заданное источником (датчиком).
+  google.protobuf.Timestamp event_time = 9;
+
+  // Время, когда событие сформировано сервисом.
+  google.protobuf.Timestamp observed_time = 10;
+
+  // Уровень важности/серьёзности.
+  Severity severity = 11;
+
+  // Версия схемы нормализации.
+  string schema_version = 12;
+
+  // Ревизия события (для апдейтов/переизданий).
+  uint32 revision = 13;
+
+  // Ссылка на родительское событие (для цепочек/агрегаций).
+  string parent_event_id = 14;
+
+  // Хэш нормализованного содержания для идемпотентности.
+  string content_hash = 15;
+
+  // Резерв на будущее расширение.
+  reserved 1000 to 1999;
+}
+
+// Данные об устройстве/агрегате.
+message Device {
+  string device_id = 1;       // Уникальный ID устройства в реестре.
+  string model = 2;           // Модель.
+  string firmware = 3;        // Версия прошивки.
+  string site = 4;            // Площадка/завод.
+  string line = 5;            // Линия/участок.
+  map<string, string> tags = 6; // Доп. метки (например, "zone", "vendor").
+  reserved 1000 to 1999;
+}
+
+// Метрическое значение. Поддержка нескольких типов единиц и форматов.
+message Metric {
+  string name = 1;              // Имя (snake_case), например "temperature_c".
+  string unit = 2;              // Единица измерения (SI/инженерные), например "C", "kPa".
+  ValueType value_type = 3;     // Тип значения (для быстрого фильтра на потребителе).
+
+  // Значение.
+  oneof value {
+    double double_value = 4;
+    int64  int_value    = 5;
+    bool   bool_value   = 6;
+    string string_value = 7;
+    bytes  bytes_value  = 8;
+  }
+
+  // Качество/валидность.
+  Quality quality = 9;
+
+  // Статус измерения (OK/WARNING/ERROR/OUT_OF_RANGE...).
+  string status = 10;
+
+  // Метки метрики (локальные атрибуты).
+  map<string, string> labels = 11;
+
+  // Время измерения (если отличается от event_time).
+  google.protobuf.Timestamp sample_time = 12;
+
+  reserved 1000 to 1999;
+}
+
+// Качество измерения.
+message Quality {
+  // Истина, если данные достоверны (по мнению источника).
+  bool valid = 1;
+
+  // Доп. сведения о качестве (например, "clamped", "estimated", "raw").
+  repeated string flags = 2;
+
+  // Доверительный интервал/погрешность (если есть).
+  double uncertainty = 3;
+
+  reserved 100 to 199;
+}
+
+// Контекст трассировки для сквозной наблюдаемости.
+message TraceContext {
+  string trace_id = 1;        // 16‑байтовый (hex) для совместимости с W3C/OTel.
+  string span_id = 2;         // 8‑байтовый (hex).
+  string parent_span_id = 3;  // Родительский span, если есть.
+  bool sampled = 4;           // Признак участия в сэмплинге.
+  map<string, string> baggage = 5; // Доп. ключи W3C baggage.
+  reserved 100 to 199;
+}
+
+// Аудит и многоарендность.
+message Audit {
+  string tenant_id = 1;       // Идентификатор арендатора.
+  string created_by = 2;      // Кто создал (субъект/сервис).
+  string source_ip = 3;       // Источник IP (если применимо).
+  map<string, string> labels = 4; // Доп. атрибуты аудита.
+  reserved 100 to 199;
+}
+
+// Ошибка/причина (для DLQ и диагностики).
+message ErrorInfo {
+  string code = 1;            // Короткий код (например, "SCHEMA_VALIDATION_FAILED").
+  string message = 2;         // Описание.
+  string details = 3;         // Детали (усечённые/редактированные).
+  reserved 100 to 199;
+}
+
+// Подсказки маршрутизации сообщения в шине/конвейере.
+message Routing {
+  repeated string topics = 1; // Список целевых топиков/каналов.
+  string priority = 2;        // Приоритет (например, "low"|"normal"|"high").
+  map<string, string> headers = 3; // Доп. заголовки для брокера/коннектора.
+  reserved 100 to 199;
+}
+
+// Тип события.
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_TELEMETRY   = 1;  // Периодические измерения.
+  EVENT_TYPE_ALERT       = 2;  // Аварии/алерты.
+  EVENT_TYPE_STATE       = 3;  // Снимок/состояние.
+  EVENT_TYPE_COMMAND     = 4;  // Командные сообщения.
+  EVENT_TYPE_AUDIT       = 5;  // Аудитные записи.
+  EVENT_TYPE_DIAGNOSTIC  = 6;  // Диагностические события.
+}
+
+// Уровень серьёзности события.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_TRACE       = 1;
+  SEVERITY_DEBUG       = 2;
+  SEVERITY_INFO        = 3;
+  SEVERITY_WARN        = 4;
+  SEVERITY_ERROR       = 5;
+  SEVERITY_FATAL       = 6;
+}
+
+// Тип значения метрики.
+enum ValueType {
+  VALUE_TYPE_UNSPECIFIED = 0;
+  VALUE_TYPE_DOUBLE      = 1;
+  VALUE_TYPE_INT64       = 2;
+  VALUE_TYPE_BOOL        = 3;
+  VALUE_TYPE_STRING      = 4;
+  VALUE_TYPE_BYTES       = 5;
+}
+
+// Кодирование полезной нагрузки.
+enum Encoding {
+  ENCODING_UNSPECIFIED = 0;
+  ENCODING_JSON        = 1;
+  ENCODING_CBOR        = 2;
+  ENCODING_PROTOBUF    = 3;
+  ENCODING_AVRO        = 4;
+  ENCODING_PLAIN       = 5; // Произвольные бинарные данные.
+}
+
+// Сжатие полезной нагрузки.
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_NONE        = 1;
+  COMPRESSION_GZIP        = 2;
+  COMPRESSION_ZSTD        = 3;
+  COMPRESSION_SNAPPY      = 4;
+}

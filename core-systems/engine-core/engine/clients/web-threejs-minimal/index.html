@@ -1,0 +1,303 @@
+<!-- engine-core/engine/clients/web-threejs-minimal/index.html -->
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"
+  />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>engine-core · threejs minimal client</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #0e0f12; /* near-black */
+      color: #d8dbe0;
+      font: 14px/1.3 -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+    }
+    #app {
+      position: fixed;
+      inset: 0;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      outline: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    /* Simple top-left HUD for debug */
+    #hud {
+      position: fixed;
+      top: 8px;
+      left: 10px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.45);
+      color: #c7cedb;
+      font-size: 12px;
+      letter-spacing: .2px;
+      pointer-events: none;
+      opacity: 0.85;
+    }
+    #error-overlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,.8);
+      color: #fff;
+      z-index: 9999;
+      padding: 24px;
+      box-sizing: border-box;
+      white-space: pre-wrap;
+      text-align: left;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+    }
+    a, a:visited { color: #9bd; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="hud" aria-hidden="true"></div>
+  <div id="error-overlay"></div>
+
+  <script type="module">
+    // -------- Config / URL flags --------
+    const params = new URLSearchParams(location.search);
+    const DEBUG = params.get('debug') === '1';
+    const ORBIT = params.get('orbit') !== '0'; // enable by default; ?orbit=0 to disable
+    const MAX_DPR = Math.min(2.0, Number(params.get('maxDpr')) || window.devicePixelRatio || 1);
+    const TONEMAP = (params.get('tonemap') || 'ACES').toUpperCase();
+
+    // -------- Imports (pinned major version recommended) --------
+    import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+
+    // -------- DOM / Canvas --------
+    const $app = document.getElementById('app');
+    const $hud = document.getElementById('hud');
+    const $overlay = document.getElementById('error-overlay');
+
+    const canvas = document.createElement('canvas');
+    canvas.setAttribute('id', 'viewport');
+    canvas.setAttribute('tabindex', '0'); // focusable for keyboard
+    $app.appendChild(canvas);
+
+    // -------- Renderer (WebGL2 with robust defaults) --------
+    /** @type {THREE.WebGLRenderer} */
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,            // MSAA (decent default; disable on very weak GPUs with ?aa=0)
+      alpha: false,
+      powerPreference: 'high-performance',
+      depth: true,
+      stencil: false,
+      logarithmicDepthBuffer: false
+    });
+    renderer.debug.checkShaderErrors = DEBUG;
+    renderer.autoClear = true;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = TONEMAP === 'ACES' ? THREE.ACESFilmicToneMapping :
+                           TONEMAP === 'REINHARD' ? THREE.ReinhardToneMapping :
+                           TONEMAP === 'CINEON' ? THREE.CineonToneMapping :
+                           THREE.NoToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    renderer.outputColorSpace = THREE.SRGBColorSpace; // correct output transform
+    renderer.setPixelRatio(Math.min(MAX_DPR, window.devicePixelRatio || 1));
+
+    // -------- Scene / Camera --------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0e0f12);
+
+    const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 2000);
+    camera.position.set(6, 4, 8);
+    camera.lookAt(0, 0, 0);
+
+    // -------- Controls (optional) --------
+    let controls = null;
+    if (ORBIT) {
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.maxPolarAngle = Math.PI * 0.495;
+      controls.minDistance = 1.5;
+      controls.maxDistance = 50;
+    }
+
+    // -------- Lights --------
+    scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.05);
+    dirLight.position.set(5, 8, 3);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(1024, 1024);
+    dirLight.shadow.camera.near = 0.5;
+    dirLight.shadow.camera.far = 50;
+    dirLight.shadow.radius = 2;
+    scene.add(dirLight);
+
+    // -------- Helpers / Ground --------
+    const grid = new THREE.GridHelper(50, 50, 0x2b2f36, 0x1a1d22);
+    grid.material.opacity = 0.35;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    const axes = new THREE.AxesHelper(1.2);
+    axes.renderOrder = 999; // draw on top
+    scene.add(axes);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(100, 100),
+      new THREE.ShadowMaterial({ opacity: 0.18 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // -------- Demo content (safe default mesh) --------
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x4aa3ff,
+      metalness: 0.05,
+      roughness: 0.4
+    });
+    const cube = new THREE.Mesh(new THREE.BoxGeometry(1.2, 1.2, 1.2), mat);
+    cube.position.set(0, 0.6, 0);
+    cube.castShadow = true;
+    cube.receiveShadow = false;
+    scene.add(cube);
+
+    // -------- Resize handling (ResizeObserver + fallback) --------
+    const resize = () => {
+      const w = $app.clientWidth || window.innerWidth;
+      const h = $app.clientHeight || window.innerHeight;
+      camera.aspect = Math.max(0.0001, w / Math.max(1, h));
+      camera.updateProjectionMatrix();
+      renderer.setPixelRatio(Math.min(MAX_DPR, window.devicePixelRatio || 1));
+      renderer.setSize(w, h, false); // no CSS resize, canvas remains device pixels
+    };
+    resize();
+
+    let ro;
+    if ('ResizeObserver' in window) {
+      ro = new ResizeObserver(resize);
+      ro.observe($app);
+    } else {
+      window.addEventListener('resize', resize, { passive: true });
+    }
+
+    // -------- Visibility / lifecycle --------
+    let running = true;
+    const onVisibility = () => {
+      running = document.visibilityState !== 'hidden';
+      if (running) requestRender();
+    };
+    document.addEventListener('visibilitychange', onVisibility, false);
+
+    // -------- Context loss / restore safety --------
+    const onContextLost = (e) => {
+      e.preventDefault();
+      running = false;
+      showError('WebGL контекст потерян. Ожидание восстановления…');
+    };
+    const onContextRestored = () => {
+      hideError();
+      running = true;
+      resize();
+      requestRender();
+    };
+    canvas.addEventListener('webglcontextlost', onContextLost, false);
+    canvas.addEventListener('webglcontextrestored', onContextRestored, false);
+
+    // -------- Minimal telemetry (debug HUD) --------
+    let lastFrameT = performance.now();
+    let fps = 0;
+    function updateHUD(dt) {
+      if (!DEBUG) { $hud.style.display = 'none'; return; }
+      fps = 0.9 * fps + 0.1 * (1000 / Math.max(1e-3, dt));
+      $hud.textContent = `FPS: ${fps.toFixed(1)} · DPR: ${renderer.getPixelRatio().toFixed(2)} · ${renderer.info.render.triangles} tris`;
+      $hud.style.display = 'block';
+    }
+
+    // -------- Render loop (stable, pause-aware) --------
+    let rafId = 0;
+    function render(now) {
+      if (!running) return;
+      const dt = now - lastFrameT;
+      lastFrameT = now;
+
+      // Demo animation
+      cube.rotation.y += Math.min(0.033, dt / 1000) * 0.8;
+      cube.rotation.x += Math.min(0.033, dt / 1000) * 0.25;
+
+      if (controls) controls.update();
+      renderer.render(scene, camera);
+      updateHUD(dt);
+
+      rafId = requestAnimationFrame(render);
+    }
+    function requestRender() {
+      cancelAnimationFrame(rafId);
+      lastFrameT = performance.now();
+      rafId = requestAnimationFrame(render);
+    }
+    requestRender();
+
+    // -------- Engine bridge (stubs to integrate later) --------
+    function sendEngineEvent(name, payload = {}) {
+      // TODO: подключить WebSocket/WebTransport/DataChannel
+      if (DEBUG) console.debug('[engine->]', name, payload);
+    }
+    function onEngineMessage(msg) {
+      // TODO: маршаллинг событий из движка
+      if (DEBUG) console.debug('[engine<-]', msg);
+    }
+    // Пример: имитация входящего события
+    setTimeout(() => onEngineMessage({ type: 'hello', t: Date.now() }), 1000);
+
+    // -------- Error handling overlay --------
+    window.addEventListener('error', (e) => showError(formatError(e.error || e.message)), true);
+    window.addEventListener('unhandledrejection', (e) => showError(formatError(e.reason)), true);
+
+    function formatError(err) {
+      if (!err) return 'Неизвестная ошибка';
+      if (typeof err === 'string') return err;
+      const stack = err.stack || String(err);
+      return stack;
+    }
+    function showError(text) {
+      $overlay.style.display = 'flex';
+      $overlay.textContent = 'Ошибка:\n\n' + text;
+    }
+    function hideError() {
+      $overlay.style.display = 'none';
+      $overlay.textContent = '';
+    }
+
+    // -------- Cleanup (if this page embeds in SPA shell) --------
+    function destroy() {
+      running = false;
+      cancelAnimationFrame(rafId);
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (ro) ro.disconnect();
+      canvas.removeEventListener('webglcontextlost', onContextLost);
+      canvas.removeEventListener('webglcontextrestored', onContextRestored);
+      renderer.dispose();
+      grid.geometry.dispose();
+      grid.material.dispose();
+      ground.geometry.dispose();
+      ground.material.dispose();
+      cube.geometry.dispose();
+      mat.dispose();
+      if (controls) controls.dispose();
+      scene.clear();
+    }
+    // export for debugging
+    Object.assign(window, { THREE, scene, camera, renderer, destroy });
+  </script>
+</body>
+</html>

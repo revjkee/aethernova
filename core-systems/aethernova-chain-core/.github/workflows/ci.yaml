@@ -1,0 +1,488 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+  workflow_dispatch:
+
+# На уровне workflow — жесткие ограничения прав по умолчанию
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '20'
+  GO_VERSION: '1.22'
+  RUST_TOOLCHAIN: 'stable'
+  CACHE_VERSION: 'v1'
+  DOCKER_METADATA_IMAGE: ${{ github.repository }}
+  DOCKER_PLATFORMS: linux/amd64
+  # Имя основного образа (можно переопределить секретами/vars)
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || github.repository }}
+  # Директории по умолчанию (подстройте под ваш моно/репозиторий)
+  PY_DIRS: 'backend python scripts'
+  GO_DIRS: 'go'
+  RUST_DIRS: 'rust'
+  NODE_DIRS: 'webapp frontend ui'
+  SOLIDITY_DIRS: 'onchain solidity contracts'
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-24.04
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      go: ${{ steps.filter.outputs.go }}
+      rust: ${{ steps.filter.outputs.rust }}
+      node: ${{ steps.filter.outputs.node }}
+      solidity: ${{ steps.filter.outputs.solidity }}
+      docker: ${{ steps.filter.outputs.docker }}
+      docs: ${{ steps.filter.outputs.docs }}
+      any_code: ${{ steps.filter.outputs.any_code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Paths filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filters: |
+            python:
+              - '${{ env.PY_DIRS }}/**'
+              - '**/*.py'
+              - 'pyproject.toml'
+              - 'poetry.lock'
+              - 'requirements*.txt'
+              - '.ruff.toml'
+              - 'mypy.ini'
+            go:
+              - '${{ env.GO_DIRS }}/**'
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+            rust:
+              - '${{ env.RUST_DIRS }}/**'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '**/*.rs'
+              - 'rust-toolchain*'
+            node:
+              - '${{ env.NODE_DIRS }}/**'
+              - '**/package.json'
+              - '**/pnpm-lock.yaml'
+              - '**/yarn.lock'
+              - '**/eslint*'
+              - '**/*.ts'
+              - '**/*.tsx'
+              - '**/*.js'
+            solidity:
+              - '${{ env.SOLIDITY_DIRS }}/**'
+              - '**/*.sol'
+              - 'foundry.toml'
+              - 'hardhat.config.*'
+            docker:
+              - '**/Dockerfile'
+              - '**/docker-compose*.yml'
+              - '**/docker/**'
+            docs:
+              - 'docs/**'
+              - '**/*.md'
+            any_code:
+              - '!docs/**'
+              - '!**/*.md'
+              - '**/*'
+
+  lint_python:
+    name: Python · lint+typecheck+tests
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'poetry.lock') }}
+          restore-keys: |
+            pip-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install tooling
+        run: |
+          pip install -U pip
+          pip install ruff mypy pytest pytest-cov
+
+      - name: Install project deps (best-effort)
+        run: |
+          if [ -f "pyproject.toml" ]; then
+            pip install -e .
+          fi
+          if ls requirements*.txt >/dev/null 2>&1; then
+            pip install -r requirements.txt || true
+          fi
+
+      - name: Ruff (lint+format check)
+        run: |
+          ruff version
+          ruff check $PY_DIRS
+          ruff format --check $PY_DIRS
+        env:
+          PY_DIRS: ${{ env.PY_DIRS }}
+
+      - name: Mypy (type-check)
+        run: |
+          mypy --version
+          mypy $PY_DIRS
+        env:
+          PY_DIRS: ${{ env.PY_DIRS }}
+
+      - name: Pytest
+        run: |
+          pytest -q --maxfail=1 --disable-warnings --cov --cov-report=xml:coverage.xml || pytest -q --maxfail=1 --disable-warnings
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  lint_go:
+    name: Go · vet+lint+tests
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ env.GO_VERSION }}-
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.60.1
+          args: --timeout=5m
+          only-new-issues: false
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test
+        run: go test ./... -count=1 -race -coverprofile=coverage.out || go test ./... -count=1 -coverprofile=coverage.out
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: coverage.out
+          if-no-files-found: ignore
+          retention-days: 7
+
+  lint_rust:
+    name: Rust · fmt+clippy+tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+          cache: true
+
+      - name: Cargo fmt check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --all --locked --all-features --no-fail-fast
+
+  lint_node:
+    name: Node · lint+tests
+    needs: changes
+    if: needs.changes.outputs.node == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile || pnpm install
+
+      - name: Lint
+        run: |
+          if [ -f "package.json" ] && jq -e '.scripts.lint' package.json >/dev/null 2>&1; then
+            pnpm lint
+          else
+            echo "No lint script found"
+          fi
+
+      - name: Test
+        run: |
+          if [ -f "package.json" ] && jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+            pnpm test -- --ci --reporters=default --reporters=jest-junit || pnpm test
+          else
+            echo "No test script found"
+          fi
+      - name: Upload junit
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-junit
+          path: '**/junit.xml'
+          if-no-files-found: ignore
+          retention-days: 7
+
+  solidity_foundry:
+    name: Solidity (Foundry) · fmt+build+tests
+    needs: changes
+    if: needs.changes.outputs.solidity == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+
+      - name: Forge fmt check
+        run: |
+          if [ -f "foundry.toml" ]; then
+            forge fmt --check
+          else
+            echo "foundry.toml not found, skipping fmt"
+          fi
+
+      - name: Forge build
+        run: |
+          if [ -f "foundry.toml" ]; then
+            forge build --sizes -vvv
+          fi
+
+      - name: Forge test
+        run: |
+          if [ -f "foundry.toml" ]; then
+            forge test -vvv
+          fi
+
+  docker_build:
+    name: Docker · build(+optional push) + SBOM
+    needs: changes
+    if: needs.changes.outputs.docker == 'true' || needs.changes.outputs.any_code == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR (if token provided)
+        if: ${{ secrets.GITHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ env.DOCKER_METADATA_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build (and optionally push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.DOCKER_PLATFORMS }}
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ env.CACHE_VERSION }}
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_VERSION }}
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/syft-action@v0.17.0
+        with:
+          image: ${{ fromJSON(steps.meta.outputs.json).tags[0] || 'localbuild:latest' }}
+          format: spdx-json
+          output: sbom.spdx.json
+        continue-on-error: true
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  security_scans:
+    name: Security · CodeQL + Trivy + Grype + Semgrep
+    needs: [changes]
+    if: needs.changes.outputs.any_code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tool: codeql
+          - tool: trivy
+          - tool: grype
+          - tool: semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CodeQL Init
+        if: matrix.tool == 'codeql'
+        uses: github/codeql-action/init@v3
+        with:
+          languages: |
+            javascript, typescript, python, go, ruby, java, csharp, cpp, rust
+          queries: +security-and-quality
+
+      - name: Autobuild
+        if: matrix.tool == 'codeql'
+        uses: github/codeql-action/autobuild@v3
+
+      - name: CodeQL Analyze
+        if: matrix.tool == 'codeql'
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:multi'
+
+      - name: Trivy FS scan
+        if: matrix.tool == 'trivy'
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: 'fs'
+          scanners: 'vuln,secret,misconfig,license'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+      - name: Upload Trivy SARIF
+        if: matrix.tool == 'trivy'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Grype (SBOM vuln scan)
+        if: matrix.tool == 'grype'
+        uses: anchore/scan-action@v4
+        with:
+          path: .
+          fail-build: false
+          severity-cutoff: high
+      - name: Upload Grype SARIF
+        if: matrix.tool == 'grype'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+
+      - name: Semgrep scan
+        if: matrix.tool == 'semgrep'
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >
+            p/owasp-top-ten p/ci p/security-audit
+          generateSarif: "1"
+          auditOn: push
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN || '' }}
+
+  summary:
+    name: CI Summary
+    needs:
+      - changes
+      - lint_python
+      - lint_go
+      - lint_rust
+      - lint_node
+      - solidity_foundry
+      - docker_build
+      - security_scans
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report
+        run: |
+          echo "CI finished with:"
+          echo "  Python:   ${{ needs.lint_python.result || 'skipped' }}"
+          echo "  Go:       ${{ needs.lint_go.result || 'skipped' }}"
+          echo "  Rust:     ${{ needs.lint_rust.result || 'skipped' }}"
+          echo "  Node:     ${{ needs.lint_node.result || 'skipped' }}"
+          echo "  Solidity: ${{ needs.solidity_foundry.result || 'skipped' }}"
+          echo "  Docker:   ${{ needs.docker_build.result || 'skipped' }}"
+          echo "  Security: ${{ needs.security_scans.result || 'skipped' }}"

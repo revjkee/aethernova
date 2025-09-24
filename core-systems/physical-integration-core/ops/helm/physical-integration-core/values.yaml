@@ -1,0 +1,401 @@
+# =====================================================================
+# physical-integration-core — industrial values.yaml
+# Совместим с Kubernetes >= 1.25 и Prometheus Operator CRD
+# Профили: dev/staging/prod через .global.env и overrides
+# =====================================================================
+
+global:
+  env: "prod"                       # dev | staging | prod
+  domain: "cluster.local"           # Базовый домен
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets: []              # e.g. [{ name: regcred }]
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------
+# Контейнер и репликация
+# ---------------------------------------------------------------------
+replicaCount: 3
+
+image:
+  repository: ghcr.io/neurocity/physical-integration-core
+  tag: "1.12.0"
+  pullPolicy: null                  # переопределяется global.imagePullPolicy
+
+command: []                         # кастомная команда
+args: []                            # кастомные аргументы
+env:
+  - name: ENV
+    valueFrom:
+      fieldRef: { fieldPath: metadata.namespace }
+  - name: LOG_LEVEL
+    value: "info"
+  - name: METRICS_SAMPLING
+    value: "normal"
+
+envFrom:
+  configMaps: []                    # e.g. ["{{ include \"pic.fullname\" . }}-config"]
+  secrets: []                       # e.g. ["{{ include \"pic.fullname\" . }}-secrets"]
+
+config:
+  enabled: true
+  data:                             # попадёт в ConfigMap
+    APPLICATION__FEATURE_FLAGS: "ingestion,device-bridge,mlp"
+    APPLICATION__HTTP__PORT: "8080"
+    APPLICATION__METRICS__PORT: "9090"
+    APPLICATION__OTEL__ENABLED: "true"
+    APPLICATION__OTEL__ENDPOINT: "http://otel-collector.observability:4317"
+
+secrets:
+  enabled: true
+  data: {}                          # ключ: base64 (или stringData ниже)
+  stringData:
+    # Пример (заменить значениями или оставить пустым)
+    # API_TOKEN: "REDACTED"
+    # TLS_PASSPHRASE: "REDACTED"
+
+# ---------------------------------------------------------------------
+# Порты, Service и Ingress
+# ---------------------------------------------------------------------
+service:
+  enabled: true
+  type: ClusterIP
+  annotations: {}
+  labels: {}
+  ports:
+    http:
+      enabled: true
+      port: 80
+      targetPort: 8080
+    metrics:
+      enabled: true
+      port: 9090
+      targetPort: 9090
+    grpc:
+      enabled: false
+      port: 9000
+      targetPort: 9000
+  # Именованные порты для ServiceMonitor (должны совпадать с шаблонами)
+  portNames:
+    http: "http"
+    metrics: "metrics"
+    grpc: "grpc"
+
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: "physical-integration-core.example.com"
+      paths:
+        - path: /
+          pathType: Prefix
+          servicePortRef: "http"   # http|grpc
+  tls:
+    enabled: false
+    secretName: ""                 # если пусто — генерируется внешними средствами
+
+# ---------------------------------------------------------------------
+# Пробы и ресурсы
+# ---------------------------------------------------------------------
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 6
+
+startupProbe:
+  enabled: true
+  httpGet:
+    path: /startup
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 30
+
+resources:
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
+  limits:
+    cpu: "1000m"
+    memory: "1Gi"
+
+# ---------------------------------------------------------------------
+# Безопасность подов и контейнеров (Restricted)
+# ---------------------------------------------------------------------
+podSecurityContext:
+  fsGroup: 2000
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  runAsUser: 1000
+  runAsGroup: 1000
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: true
+
+# ---------------------------------------------------------------------
+# Обновления, PDB, HPA, приоритет
+# ---------------------------------------------------------------------
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 12
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 75
+  # Доп. метрики (пример):
+  # additionalMetrics:
+  #   - type: Pods
+  #     pods:
+  #       metric:
+  #         name: http_requests_per_second
+  #       target:
+  #         type: AverageValue
+  #         averageValue: "50"
+
+priorityClassName: ""               # например, "system-cluster-critical"
+
+# ---------------------------------------------------------------------
+# Размещение и устойчивость
+# ---------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: "kubernetes.io/hostname"
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: physical-integration-core
+
+topologySpreadConstraints:
+  enabled: true
+  rules:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: physical-integration-core
+
+# ---------------------------------------------------------------------
+# Томa и персистентность
+# ---------------------------------------------------------------------
+persistence:
+  enabled: false
+  storageClassName: ""
+  accessModes: ["ReadWriteOnce"]
+  size: 10Gi
+  annotations: {}
+  labels: {}
+
+extraVolumes: []                    # доп. тома
+extraVolumeMounts: []               # доп. маунты
+
+# ---------------------------------------------------------------------
+# ServiceAccount и RBAC
+# ---------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+rbac:
+  create: true
+  # дополнительные правила при необходимости
+  extraRules: []
+  # - apiGroups: [""]
+  #   resources: ["configmaps"]
+  #   verbs: ["get","list","watch"]
+
+# ---------------------------------------------------------------------
+# Наблюдаемость: Prometheus, OTel, Tracing, Logs
+# ---------------------------------------------------------------------
+serviceMonitor:
+  enabled: true
+  namespace: "monitoring"
+  labels:
+    app.kubernetes.io/part-of: physical-integration-core
+    monitoring.neurocity.dev/profile: prod
+  interval: 30s
+  scrapeTimeout: 10s
+  schema:
+    http: true
+    https: true
+  tls:
+    enabled: false
+    serverName: ""
+    caSecret: ""                    # secret name с ключом ca.crt
+    clientCertSecret: ""            # secret c tls.crt/tls.key
+  bearerTokenSecret: ""             # secret c ключом token
+  additionalRelabelings: []
+  podTargetLabels:
+    - topology.kubernetes.io/zone
+    - security.neurocity.dev/zone
+  targetLabels:
+    - app.kubernetes.io/instance
+    - app.kubernetes.io/version
+    - app.kubernetes.io/component
+    - app.kubernetes.io/name
+
+prometheus:
+  annotations:                      # для автосбора, если нет ServiceMonitor
+    enabled: false
+    port: "9090"
+    path: "/metrics"
+
+opentelemetry:
+  enabled: true
+  exporter: "otlp"                  # otlp|jaeger|zipkin
+  endpoint: "http://otel-collector.observability:4317"
+  resource:
+    serviceName: "physical-integration-core"
+    serviceNamespace: "physical-integration"
+    attributes: {}
+  sampling:
+    ratio: 0.1
+
+tracing:
+  enabled: true
+  provider: "tempo"                 # tempo|jaeger|zipkin
+  endpoint: "http://tempo-distributor.observability:4317"
+
+logging:
+  level: "info"
+  json: true
+  sidecar:
+    enabled: false
+    type: "fluent-bit"              # fluent-bit|vector
+    image:
+      repository: cr.fluentbit.io/fluent/fluent-bit
+      tag: "2.2.0"
+      pullPolicy: IfNotPresent
+    resources:
+      requests: { cpu: "50m", memory: "64Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }
+    config: {}                      # конфиг sidecar‑логгера (ConfigMap)
+
+# ---------------------------------------------------------------------
+# Сеть и безопасность трафика
+# ---------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - podSelector: {}           # разрешить внутри неймспейса
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 9090
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector: {}     # по умолчанию разрешить DNS/OTel
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 4317
+          protocol: TCP
+
+mtls:
+  enabled: false
+  # Если включено — требуется sidecar/прокси (envoy/istio/cilium) или собственная TLS‑конфигурация
+  spiffe:
+    enabled: false
+  istio:
+    peerAuthentication: "STRICT"
+
+# ---------------------------------------------------------------------
+# Аннотации/метки и подставляемые шаблоном значения
+# ---------------------------------------------------------------------
+podAnnotations:
+  checksum/config: ""               # будет выставляться хелпером шаблона
+  checksum/secrets: ""
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: "/metrics"
+
+podLabels:
+  app.kubernetes.io/part-of: physical-integration-core
+  app.kubernetes.io/component: ingestion
+
+# ---------------------------------------------------------------------
+# Доп. контейнеры
+# ---------------------------------------------------------------------
+initContainers: []
+# - name: wait-for-deps
+#   image: busybox:1.36
+#   command: ["sh","-c","until nc -z otel-collector.observability 4317; do sleep 2; done"]
+#   securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true }
+
+sidecars: []
+# - name: envoy
+#   image: envoyproxy/envoy:v1.31.0
+#   args: ["-c","/etc/envoy/envoy.yaml"]
+#   ports:
+#     - containerPort: 8443
+#       name: https
+#   volumeMounts:
+#     - name: envoy-config
+#       mountPath: /etc/envoy
+
+# ---------------------------------------------------------------------
+# Управление релизом
+# ---------------------------------------------------------------------
+revisionHistoryLimit: 10
+terminationGracePeriodSeconds: 30
+
+# ---------------------------------------------------------------------
+# Маршрутизация событий/вебхуков (пример)
+# ---------------------------------------------------------------------
+webhooks:
+  enabled: false
+  sinkUrl: ""                       # http(s) endpoint
+  headers: {}
+
+# ---------------------------------------------------------------------
+# Экспорт в внешний мир (пример MQTT/OPC‑UA — опционально)
+# ---------------------------------------------------------------------
+connectors:
+  mqtt:
+    enabled: false
+    brokerUrl: "mqtt://emqx.mqtt:1883"
+    username: ""
+    passwordSecret: ""
+    topicPrefix: "pic/"
+  opcua:
+    enabled: false
+    endpoint: "opc.tcp://opcua-server.sensors:4840"
+    securityPolicy: "Basic256Sha256"
+    messageSigning: true

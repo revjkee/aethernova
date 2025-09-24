@@ -1,0 +1,346 @@
+version: "3.9"
+
+# ChronoWatch Core — Production-grade Compose
+# Профили:
+# - core (по умолчанию): api, worker, scheduler, postgres, redis, otel-collector, prometheus
+# - observability: grafana
+# - edge: caddy (ingress TLS)
+# Запуск примеры:
+#   docker compose --profile core --profile observability --profile edge up -d
+#   docker compose --profile core up -d
+
+name: chronowatch
+
+x-shared-env: &shared-env
+  env_file:
+    - ../../.env
+  # Дополнительные переменные можно пробросить здесь при необходимости
+
+x-shared-deploy: &shared-deploy
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits:
+        cpus: "1.50"
+        memory: 1024M
+      reservations:
+        cpus: "0.25"
+        memory: 128M
+
+x-shared-security: &shared-security
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,mode=1777
+  ulimits:
+    nofile: 65536
+    nproc: 4096
+
+x-health-db: &health-db
+  test: ["CMD-SHELL", "pg_isready -U $$DB_USER -d $$DB_NAME -h 127.0.0.1"]
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 20s
+
+x-health-redis: &health-redis
+  test: ["CMD", "redis-cli", "ping"]
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 10s
+
+x-health-http: &health-http
+  test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 30s
+
+networks:
+  edge:
+    driver: bridge
+  backend:
+    driver: bridge
+  observability:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  backups:
+  prometheus-data:
+  grafana-data:
+  caddy-data:
+  caddy-config:
+
+secrets:
+  jwt_secret:
+    file: ../../secrets/jwt_secret.txt
+  db_password:
+    file: ../../secrets/db_password.txt
+  pii_salt:
+    file: ../../secrets/pii_salt.txt
+
+configs:
+  otel-collector-config:
+    file: ./otel-collector.yaml
+  prometheus-config:
+    file: ./prometheus.yaml
+  caddyfile:
+    file: ./Caddyfile
+
+services:
+
+  # =======================
+  # Core Application (API)
+  # =======================
+  api:
+    <<: [*shared-env, *shared-deploy, *shared-security]
+    image: ghcr.io/neurocity/chronowatch-core:1.0.0
+    command: >
+      sh -c "
+      exec gunicorn app.main:app
+        -k uvicorn.workers.UvicornWorker
+        --workers=${WEB_CONCURRENCY:-4}
+        --threads=${WEB_THREADS:-2}
+        --bind 0.0.0.0:${HTTP_PORT:-8080}
+        --access-logfile - --error-logfile - --keep-alive ${WEB_KEEPALIVE:-75}
+      "
+    ports:
+      - "8080:8080"   # отключите при использовании edge/caddy
+    environment:
+      TZ: ${TZ:-Europe/Stockholm}
+      OTEL_SERVICE_NAME: chronowatch-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck: *health-http
+    networks:
+      - backend
+      - observability
+    secrets:
+      - jwt_secret
+      - pii_salt
+    read_only: true
+    volumes:
+      - type: tmpfs
+        target: /var/tmp
+        tmpfs:
+          size: 64M
+
+  # =======================
+  # Workers (async jobs)
+  # =======================
+  worker:
+    <<: [*shared-env, *shared-deploy, *shared-security]
+    image: ghcr.io/neurocity/chronowatch-core:1.0.0
+    command: >
+      sh -c "
+      exec python -m app.worker
+        --prefetch ${WORKER_PREFETCH:-16}
+        --processes ${WORKER_PROCESSES:-4}
+        --drain-timeout ${WORKER_DRAIN_TIMEOUT_SEC:-25}
+      "
+    environment:
+      TZ: ${TZ:-Europe/Stockholm}
+      OTEL_SERVICE_NAME: chronowatch-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - backend
+      - observability
+    secrets:
+      - jwt_secret
+      - pii_salt
+
+  # =======================
+  # Scheduler (cron/timers)
+  # =======================
+  scheduler:
+    <<: [*shared-env, *shared-deploy, *shared-security]
+    image: ghcr.io/neurocity/chronowatch-core:1.0.0
+    command: >
+      sh -c "
+      exec python -m app.scheduler
+        --tick-ms ${SCHEDULER_TICK_MS:-250}
+        --lock-ttl ${SCHEDULER_LOCK_TTL_SEC:-30}
+        --heartbeat ${SCHEDULER_HEARTBEAT_SEC:-5}
+      "
+    environment:
+      TZ: ${TZ:-Europe/Stockholm}
+      OTEL_SERVICE_NAME: chronowatch-scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - backend
+      - observability
+    secrets:
+      - jwt_secret
+
+  # =======================
+  # PostgreSQL (state)
+  # =======================
+  postgres:
+    image: postgres:16-alpine
+    <<: [*shared-env]
+    environment:
+      POSTGRES_DB: ${DB_NAME:-chronowatch}
+      POSTGRES_USER: ${DB_USER:-chronowatch}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      TZ: ${TZ:-Europe/Stockholm}
+    secrets:
+      - db_password
+    healthcheck: *health-db
+    deploy:
+      resources:
+        limits:
+          cpus: "2.00"
+          memory: 2048M
+        reservations:
+          cpus: "0.50"
+          memory: 512M
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - backups:/backups
+    networks:
+      - backend
+
+  # =======================
+  # Redis (cache/queue)
+  # =======================
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    healthcheck: *health-redis
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - redisdata:/data
+    networks:
+      - backend
+
+  # =======================
+  # OpenTelemetry Collector
+  # =======================
+  otel-collector:
+    image: otel/opentelemetry-collector:0.102.1
+    command: ["--config=/etc/otelcol/config.yaml"]
+    configs:
+      - source: otel-collector-config
+        target: /etc/otelcol/config.yaml
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 512M
+    networks:
+      - observability
+      - backend
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+
+  # =======================
+  # Prometheus (metrics)
+  # =======================
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yaml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    configs:
+      - source: prometheus-config
+        target: /etc/prometheus/prometheus.yaml
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 768M
+    volumes:
+      - prometheus-data:/prometheus
+    networks:
+      - observability
+    ports:
+      - "9090:9090"
+
+  # =======================
+  # Grafana (dashboards)
+  # =======================
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:11.1.4
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SERVER_DOMAIN: ${ALLOWED_HOSTS:-localhost}
+      GF_USERS_DEFAULT_THEME: dark
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - observability
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+
+  # =======================
+  # Caddy (TLS/Ingress)
+  # =======================
+  caddy:
+    profiles: ["edge"]
+    image: caddy:2.8
+    ports:
+      - "80:80"
+      - "443:443"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    environment:
+      TZ: ${TZ:-Europe/Stockholm}
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_started
+    networks:
+      - edge
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M

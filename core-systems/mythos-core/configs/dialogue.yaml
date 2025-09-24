@@ -1,0 +1,383 @@
+# ============================================
+# Mythos Core — Dialogue configuration (industrial)
+# ============================================
+
+apiVersion: mythos.aethernova/v1
+kind: DialogueConfig
+
+metadata:
+  name: default
+  version: 1.0.0
+  environment: ${APP_ENV:production}   # production|staging|dev
+  owners:
+    - team: mythos-core
+      contact: dev@aethernova.local
+  createdAt: "2025-08-27T00:00:00Z"
+
+# --------- Global runtime / i18n / limits ---------
+runtime:
+  language: ru
+  languagesSupported: [ru, en]
+  timezone: Europe/Stockholm
+  character: narrator
+
+  text:
+    normalize: true
+    stripMarkdown: false
+    input:
+      maxChars: 4000
+      maxAttachments: 3
+    output:
+      maxChars: 1500
+      ensureFinalPunctuation: true
+
+  concurrency:
+    maxConcurrentRequests: 64
+    queue:
+      enabled: true
+      maxSize: 1024
+      rejectOnOverflow: true
+
+  timeouts:
+    requestTotalMs: 25000
+    nluMs: 4000
+    ragMs: 6000
+    llmMs: 18000
+
+# --------- Anchors / reusable constants ---------
+anchors:
+  thresholds: &thresholds
+    intentConfidence:
+      accept: 0.72
+      low: 0.5
+    entityConfidence:
+      accept: 0.6
+    hallucinationGuard:
+      enabled: true
+      maxUnsupportedClaims: 0
+  safetyDefaults: &safetyDefaults
+    piiScrub:
+      enabled: true
+      rules: [email, phone, ipv4, ipv6, credit_card]
+      replaceWith: "[REDACTED]"
+    toxicity:
+      enabled: true
+      threshold: 0.85        # 0..1
+    jailbreak:
+      enabled: true
+      patterns:
+        - "(?i)ignore.*all.*previous.*instructions"
+        - "(?i)pretend.*you.*are.*not.*an.*ai"
+    topicsBlocklist:
+      enabled: true
+      patterns: []
+  retrieverDefaults: &retrieverDefaults
+    topK: 6
+    minScore: 0.22
+    deduplicate: true
+    maxTokensPerChunk: 512
+
+# --------- Safety policy ---------
+safety:
+  <<: *safetyDefaults
+  outputModeration:
+    enabled: true
+    denyIfUnverifiedFact: false  # текстовая политика; см. fallback ниже
+  rateLimit:
+    enabled: true
+    windowSeconds: 60
+    maxRequestsPerUser: 90
+    maxRequestsPerIP: 300
+
+# --------- NLU pipeline ---------
+nlu:
+  enabled: true
+  language: ${LANGUAGE:ru}
+  thresholds: *thresholds
+  pipeline:
+    - name: normalize
+      lower: true
+      stripPunctuation: true
+    - name: tokenizer
+      kind: basic
+      lang: ${LANGUAGE:ru}
+    - name: embeddings
+      provider: sentence-transformers
+      model: sentence-transformers/paraphrase-multilingual-mpnet-base-v2
+      cache:
+        enabled: true
+        ttlSeconds: 86400
+    - name: intent-classifier
+      type: cosine-knn
+      threshold: 0.62
+      store:
+        kind: file
+        path: data/intents/index.json
+    - name: entity-recognizer
+      provider: spacy
+      model: ru_core_news_md
+      overlap: resolve_longest
+
+  dataset:
+    intentsPath: data/intents/**/*.yml
+    entitiesPath: data/entities/**/*.yml
+
+# --------- Slots / Entities (runtime validation) ---------
+slots:
+  user_name:
+    type: string
+    required: false
+    validate:
+      regex: "^[\\p{L}\\-\\s]{2,64}$"
+  email:
+    type: email
+    required: false
+  locale:
+    type: enum
+    values: [ru, en]
+    default: ru
+
+# --------- Knowledge / Retrieval (RAG) ---------
+knowledge:
+  enabled: true
+  index:
+    kind: faiss
+    path: data/knowledge/index.faiss
+    metadataPath: data/knowledge/meta.jsonl
+  embedding:
+    model: sentence-transformers/paraphrase-multilingual-mpnet-base-v2
+  retriever:
+    <<: *retrieverDefaults
+  responseSynthesizer:
+    citeSources: true
+    maxSnippets: 4
+    template: |
+      На основе документов:
+      {% for s in sources %}- {{ s.title }} ({{ s.url }})
+      {% endfor %}
+      Ответ: {{ answer }}
+
+# --------- LLM policy (provider-agnostic) ---------
+llm:
+  enabled: true
+  provider: ${LLM_PROVIDER:openai}          # openai|azure_openai|anthropic|vertex|local
+  model: ${LLM_MODEL:gpt-4o-mini}           # подставьте свой
+  api:
+    baseUrl: ${LLM_BASE_URL:https://api.openai.com/v1}
+    apiKey: ${LLM_API_KEY:}
+    organization: ${LLM_ORG:}
+  generation:
+    temperature: 0.2
+    top_p: 0.9
+    maxOutputTokens: 800
+    presencePenalty: 0.0
+    frequencyPenalty: 0.0
+  systemPrompt: |
+    Ты — вежливый, точный и сдержанный ассистент Mythos. 
+    Соблюдай политику безопасности и говори на языке пользователя (по умолчанию — русский).
+    Если факт не подтвержден доступными источниками — ответь дословно: "I cannot verify this."
+  guardrails:
+    useFunctionCalling: true
+    enforceJson: false
+    checkUnsupportedClaims: true
+
+# --------- Response templates (i18n) ---------
+responses:
+  default:
+    ru:
+      greeting: "Привет. Я Mythos. Чем помочь?"
+      farewell: "До связи."
+      fallback_low_confidence: "Извините, я не уверен, что правильно понял. Уточните вопрос."
+      not_verified: "I cannot verify this."
+    en:
+      greeting: "Hello. I am Mythos. How can I help?"
+      farewell: "Goodbye."
+      fallback_low_confidence: "Sorry, I am not sure I understood. Could you clarify?"
+      not_verified: "I cannot verify this."
+  intents:
+    greet:
+      ru: "Здравствуйте, {{ slots.user_name | default('') }}".strip
+      en: "Hello {{ slots.user_name | default('') }}".strip
+    goodbye:
+      ru: "До свидания."
+      en: "Goodbye."
+
+# --------- Intents (routing) ---------
+intents:
+  - id: greet
+    examples:
+      - "привет"
+      - "здравствуйте"
+      - "добрый день"
+    handler:
+      kind: template
+      responseKey: intents.greet
+  - id: goodbye
+    examples:
+      - "пока"
+      - "до свидания"
+    handler:
+      kind: template
+      responseKey: intents.goodbye
+  - id: ask_fact
+    examples:
+      - "кто основал [entity:org]?"
+      - "когда появилось [entity:thing]?"
+    handler:
+      kind: rag_then_llm
+      verifyCitations: true
+
+# --------- Policies (priority composition) ---------
+policies:
+  order: [rules, nlu, rag, llm, fallback]
+
+  rules:
+    - when:
+        channel: any
+        match:
+          equals:
+            text: "/health"
+      then:
+        kind: static
+        response: "OK"
+
+    - when:
+        intent: greet
+      then:
+        kind: respond
+        templateKey: intents.greet
+
+    - when:
+        nluConfidenceBelow: 0.5
+      then:
+        kind: respond
+        templateKey: default.fallback_low_confidence
+
+  rag:
+    enabled: true
+    thresholds:
+      minEvidenceScore: 0.25
+    denyIfNoEvidence: false
+    attachCitations: true
+
+  llm:
+    enabled: true
+    preferTools:
+      - retrieve_documents
+    stopOnNotVerifiedPhrase: true   # если LLM вернул "I cannot verify this." — не добавлять доводы
+
+  fallback:
+    strategy: cascade
+    steps:
+      - kind: respond
+        templateKey: default.fallback_low_confidence
+      - kind: respond
+        templateKey: default.not_verified
+
+# --------- Tools / Functions exposed to LLM ---------
+tools:
+  - name: retrieve_documents
+    description: "Поиск релевантных фрагментов в базе знаний."
+    inputSchema:
+      type: object
+      properties:
+        query: { type: string }
+        topK:  { type: integer, minimum: 1, maximum: 10 }
+      required: [query]
+    runtime:
+      kind: rag
+      retrieverRef: knowledge.retriever
+
+# --------- Channels / Connectors ---------
+channels:
+  http:
+    enabled: true
+    port: ${PORT:8080}
+    cors:
+      allowOrigins: ["*"]
+      allowMethods: ["POST","OPTIONS"]
+  slack:
+    enabled: ${SLACK_ENABLED:false}
+    botToken: ${SLACK_BOT_TOKEN:}
+    signingSecret: ${SLACK_SIGNING_SECRET:}
+    rateLimitPerMinute: 60
+  telegram:
+    enabled: ${TG_ENABLED:false}
+    botToken: ${TG_BOT_TOKEN:}
+    webhookSecret: ${TG_WEBHOOK_SECRET:}
+
+# --------- Storage / Caching ---------
+storage:
+  transcripts:
+    enabled: true
+    kind: file
+    path: data/transcripts/
+    rotate:
+      maxSizeMB: 50
+      maxFiles: 20
+
+cache:
+  llm:
+    enabled: true
+    kind: sqlite
+    path: data/cache/llm.sqlite
+    ttlSeconds: 604800
+  rag:
+    enabled: true
+    kind: disk
+    path: data/cache/rag/
+    ttlSeconds: 259200
+
+# --------- Telemetry / Logging ---------
+telemetry:
+  logging:
+    level: ${LOG_LEVEL:INFO}
+    json: true
+    redact:
+      fields: ["slots.email", "pii.*"]
+  tracing:
+    enabled: ${OTEL_ENABLED:false}
+    exporter: otlp
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:}
+    serviceName: mythos-core-dialogue
+  metrics:
+    enabled: true
+    port: ${METRICS_PORT:9090}
+    labels:
+      app.kubernetes.io/name: mythos-core
+
+# --------- Evaluation / Tests ---------
+evaluation:
+  offline:
+    scenariosPath: tests/dialogue/**/*.yaml
+    thresholds:
+      intentF1: 0.88
+      entityF1: 0.8
+  canary:
+    enabled: true
+    trafficPercent: 5
+    shadowCompare:
+      enabled: true
+      logMismatches: true
+
+# --------- Feature flags ---------
+features:
+  allowFunctionCalling: true
+  enableRagCitations: true
+  strictVerificationPhrase: "I cannot verify this."
+
+# --------- Escalation / Handoff ---------
+escalation:
+  enabled: true
+  conditions:
+    - when:
+        userSays: ["оператор", "человек", "поддержка"]
+      routeTo: human
+  handoff:
+    humanQueue: mythos-support
+    attachTranscript: true
+
+# --------- Validation schema hint (optional, local use) ---------
+schema:
+  version: 1
+  enforced: false   # при true рантайм обязан валидировать этот файл перед запуском

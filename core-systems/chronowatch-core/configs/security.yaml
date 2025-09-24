@@ -1,0 +1,347 @@
+apiVersion: security.neurocity.ai/v1
+kind: SecurityConfig
+metadata:
+  service: chronowatch-core
+  owner: team-chronowatch-sre
+  environment: ${APP_ENV:-production}
+  version: 1.0.0
+  updatedAt: "2025-08-28"
+spec:
+  transport:
+    tls:
+      minVersion: TLS1.2
+      preferServerCiphers: true
+      ciphers:
+        - TLS_AES_256_GCM_SHA384
+        - TLS_AES_128_GCM_SHA256
+        - TLS_CHACHA20_POLY1305_SHA256
+      hsts:
+        enabled: true
+        maxAgeSeconds: 31536000
+        includeSubdomains: true
+        preload: true
+      mtls:
+        enabled: false            # включите на internal ingress
+        clientCaBundleRef: ""
+        verifyDepth: 2
+    csp:
+      enabled: true
+      policy:
+        default-src: "'none'"
+        script-src: "'self'"
+        style-src: "'self'"
+        img-src: "'self'"
+        connect-src: "'self'"
+        frame-ancestors: "'none'"
+    cors:
+      allowOrigins:
+        - https://app.neurocity.ai
+        - https://admin.neurocity.ai
+      allowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+      allowHeaders: [Authorization, Content-Type, Accept, Origin]
+      maxAgeSeconds: 600
+    csrf:
+      enabled: true
+      trustedOrigins:
+        - https://app.neurocity.ai
+
+  authz:
+    mode: jwt                      # jwt|oidc|none
+    clockSkewSeconds: 30
+    jwt:
+      issuer: ${JWT_ISSUER}
+      audience: ${JWT_AUDIENCE}
+      jwkSource: "env:JWT_SECRET"  # либо jwks_uri при OIDC
+      accessTokenTtlMinutes: 60
+      refreshTokenTtlMinutes: 43200
+      requiredClaims: [sub, iss, aud, exp, iat]
+    oidc:
+      enabled: false
+      issuerUrl: ${OIDC_ISSUER_URL}
+      clientId: ${OIDC_CLIENT_ID}
+      scopes: [openid, profile, email]
+      jwksCacheTtlSeconds: 3600
+    rbac:
+      defaultRole: viewer
+      roles:
+        - name: viewer
+          description: Read-only доступ к расписанию и метрикам
+          permissions:
+            - schedules:read
+            - jobs:read
+            - metrics:read
+        - name: operator
+          description: Управление заданиями/очередями без доступа к политике безопасности
+          permissions:
+            - schedules:read
+            - schedules:create
+            - schedules:update
+            - jobs:read
+            - jobs:retry
+            - jobs:cancel
+            - queues:drain
+        - name: admin
+          description: Полные права, включая политику безопасности и экспорт данных
+          permissions: ["*"]
+      bindings:
+        - subjectType: user
+          subjectId: admin@neurocity.ai
+          role: admin
+    abac:
+      enabled: true
+      rules:
+        - resource: schedules
+          effect: allow
+          condition: 'claims["org_id"] == resource.org_id'
+        - resource: jobs
+          effect: allow
+          condition: 'claims["org_id"] == resource.org_id'
+    apiScopes:
+      enabled: true
+      mapping:
+        schedules:read: [GET:/v1/schedules, GET:/v1/schedules/*]
+        schedules:write: [POST:/v1/schedules, PUT:/v1/schedules/*, PATCH:/v1/schedules/*, DELETE:/v1/schedules/*]
+        jobs:operate: [POST:/v1/jobs/*/retry, POST:/v1/jobs/*/cancel]
+
+  apiProtection:
+    requestLimits:
+      maxBodyBytes: 10485760         # 10MB
+      maxHeaderBytes: 32768
+      timeoutSeconds: 15
+    rateLimit:
+      global:
+        rps: 200
+        burst: 400
+      perIp:
+        rps: 50
+        burst: 100
+      perUser:
+        rps: 40
+        burst: 80
+    spikeArrest:
+      enabled: true
+      windowSeconds: 5
+      factor: 3.0
+    schemaValidation:
+      enabled: true
+      mode: strict                   # strict|permissive
+    uploadGuard:
+      enabled: true
+      allowedMime:
+        - application/json
+        - text/csv
+      antivirus:
+        enabled: false
+        clamavHost: "clamav:3310"
+    ipProtection:
+      defaultAction: allow
+      denyCidrs: []
+      allowCidrs: []
+    headers:
+      add:
+        X-Content-Type-Options: nosniff
+        X-Frame-Options: DENY
+        Referrer-Policy: no-referrer
+        Permissions-Policy: geolocation=(), camera=(), microphone=()
+    idempotency:
+      enabled: true
+      ttlSeconds: 600
+      headerName: Idempotency-Key
+
+  dataProtection:
+    pii:
+      minimization: true
+      hashing:
+        enabled: true
+        algo: sha256
+        saltRef: "env:PII_SALT"
+      masking:
+        enabled: true
+        fields:
+          - email
+          - phone
+          - ip_address
+    encryptionAtRest:
+      enabled: true
+      engine: aes-256-gcm
+      kms:
+        provider: none               # aws|gcp|azure|vault|none
+        keyId: ""
+        endpoint: ""
+        cacheTtlSeconds: 300
+    secrets:
+      rotationDays: 90
+      policy:
+        forbidInlineSecrets: true
+        sources:
+          - env
+          - vault
+    retention:
+      jobsDays: 30
+      logsDays: 14
+      auditDays: 365
+    exportDelete:
+      gdprMode: true
+      exportEnabled: true
+      deleteWindowDays: 30
+
+  auditLogging:
+    enabled: true
+    redact:
+      enabled: true
+      rules:
+        - jsonpath: "$..password"
+        - jsonpath: "$..token"
+        - jsonpath: "$..authorization"
+        - jsonpath: "$..email"
+    destinations:
+      - type: otlp
+        endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+      - type: file
+        path: /var/log/chronowatch/audit.log
+    include:
+      claimsSubset: [sub, org_id, role]
+      request:
+        headers: [x-request-id, user-agent, x-forwarded-for]
+        body: true
+      response:
+        body: false
+    immutability:
+      enabled: true
+      backend: s3
+      bucket: nc-chronowatch-audit
+      region: eu-north-1
+      objectLock:
+        mode: GOVERNANCE
+        retentionDays: 365
+
+  observabilitySecurity:
+    otel:
+      sampleRate: 0.2
+      scrubAttributes:
+        - http.request.body
+        - http.response.body
+        - db.statement
+        - rpc.request.metadata.authorization
+      blockAttributesIfPresent: [password, token, secret]
+    prometheus:
+      enableAuthz: true
+      allowedRoles: [admin, viewer]
+
+  infraPolicies:
+    container:
+      runAsUser: 10001
+      runAsNonRoot: true
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      seccompProfile: runtime/default
+      capabilitiesDropAll: true
+      cpuLimits: "1500m"
+      memLimits: "1024Mi"
+    kubernetes:
+      podSecurityStandard: restricted
+      imagePullPolicy: IfNotPresent
+      topologySpread:
+        enabled: true
+        maxSkew: 1
+        whenUnsatisfiable: ScheduleAnyway
+      disruption:
+        pdbRequiredForReplicasGt: 1
+      networkPolicies:
+        defaultDeny:
+          ingress: true
+          egress: true
+        allowIngressFrom:
+          - namespaceSelector:
+              matchLabels:
+                name: edge
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: chronowatch-core
+        allowEgressTo:
+          - dns
+          - otel-collector
+          - redis
+          - postgres
+    supplyChain:
+      sbom:
+        required: true
+        format: cyclonedx-json
+      vulnerabilityPolicy:
+        blockOnSeverities: [CRITICAL, HIGH]
+        maxAgeDaysUnpatched: 14
+        allowlistCves: []
+      signatures:
+        cosign:
+          required: true
+          keyRef: "k8s://neurocity/cosign-pub"
+      provenance:
+        slsaLevel: 3
+
+  backups:
+    s3:
+      endpoint: ${S3_ENDPOINT}
+      region: ${S3_REGION}
+      bucket: ${S3_BUCKET}
+      encryption: server-side       # server-side|client-side
+      pathStyle: ${S3_PATH_STYLE}
+      lifecycle:
+        transitions:
+          - afterDays: 30
+            storageClass: GLACIER
+        expirationDays: 365
+      immutability:
+        enabled: true
+        days: 30
+    schedule:
+      cron: "0 2 * * *"            # синхрон с BACKUP_CRON
+      verifyRestoreWeekly: true
+
+  incidentResponse:
+    runbooks:
+      api: https://docs.neurocity.ai/chronowatch/runbooks/api
+      worker: https://docs.neurocity.ai/chronowatch/runbooks/worker
+      scheduler: https://docs.neurocity.ai/chronowatch/runbooks/scheduler
+      security: https://docs.neurocity.ai/chronowatch/runbooks/security
+    pagerDuty:
+      enabled: false
+      serviceId: ""
+    alerts:
+      onTimeDrift: true
+      onJobFailure: true
+      onMisfire: true
+      onQueueBacklog: true
+      backlogThreshold: 1000
+      misfireGraceSeconds: 30
+
+  compliance:
+    frameworks:
+      - name: GDPR
+        enabled: true
+      - name: ISO27001
+        enabled: true
+      - name: SOC2
+        enabled: false
+    dataLocalization:
+      regionLock:
+        enabled: false
+        allowedRegions: [eu-north-1]
+    logging:
+      timezone: Europe/Stockholm
+
+  testing:
+    dast:
+      tool: zap
+      failOn: [HIGH, CRITICAL]
+      timeoutMinutes: 30
+    sast:
+      tool: codeql
+      failOn: [HIGH, CRITICAL]
+    secretsScan:
+      tool: trufflehog
+      failOnFinding: true
+    policyAsCode:
+      tool: conftest
+      bundles:
+        - name: k8s-restricted
+          source: oci://registry.neurocity.ai/policies/k8s-restricted:1.0.0

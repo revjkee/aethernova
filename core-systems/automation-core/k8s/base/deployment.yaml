@@ -1,0 +1,170 @@
+# automation-core/k8s/base/deployment.yaml
+# Промышленный Deployment для сервиса "automation-core".
+# Ссылки на официальные рекомендации:
+# - Deployment: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+# - Probes (liveness/readiness/startup): https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/
+# - Security Context: https://kubernetes.io/docs/tasks/configure-pod-container/security-context/
+# - Pod Security Standards (Restricted): https://kubernetes.io/docs/concepts/security/pod-security-standards/
+# - Topology Spread Constraints: https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/
+# - ConfigMap/Secret envFrom: 
+#   https://kubernetes.io/docs/tasks/configure-pod-container/configure-pod-configmap/
+#   https://kubernetes.io/docs/tasks/inject-data-application/distribute-credentials-secure/
+#   https://kubernetes.io/docs/tasks/inject-data-application/define-environment-variable-container/
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: automation-core
+  labels:
+    app.kubernetes.io/name: automation-core
+    app.kubernetes.io/instance: default
+    app.kubernetes.io/part-of: automation-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  minReadySeconds: 5
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: automation-core
+      app.kubernetes.io/instance: default
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: automation-core
+        app.kubernetes.io/instance: default
+        app.kubernetes.io/part-of: automation-core
+        app.kubernetes.io/component: api
+        app.kubernetes.io/version: "1.0.0"
+      annotations:
+        # Пример аннотации для прометей-скрейпа (если используется ServiceMonitor — можно убрать)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        # Для kustomize можно подставлять checksum config/secret
+        checksum/config: "REPLACEME"
+    spec:
+      # ServiceAccount должен быть определен в base или overlay
+      serviceAccountName: automation-core
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      # Pod-level securityContext (усиление безопасности)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Разведение подов по узлам/зонам для отказоустойчивости
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: automation-core
+              app.kubernetes.io/instance: default
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values: ["automation-core"]
+                topologyKey: kubernetes.io/hostname
+      # Если образ приватный — укажите imagePullSecrets
+      imagePullSecrets:
+        - name: ghcr-credentials
+      # Примечание: namespace намеренно не задан в base (определяется overlay-слоем)
+      containers:
+        - name: automation-core
+          # Рекомендуется использовать иммутабельный образ по digest
+          image: ghcr.io/your-org/automation-core@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # Команда/аргументы демонстрационные
+          args: ["--serve", "--config", "/etc/automation/config.yaml"]
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+          # Массовая подгрузка конфигурации и секретов через envFrom (см. оф. доки)
+          envFrom:
+            - configMapRef:
+                name: automation-core
+            - secretRef:
+                name: automation-core
+          # Пробные зондировки: startup → readiness → liveness
+          startupProbe:
+            httpGet: { path: /startupz, port: http }
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              httpGet: { path: /shutdown, port: http }
+          # Ограничения и запросы ресурсов
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          # Усиление безопасности на уровне контейнера
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/automation
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/automation
+            - name: data
+              mountPath: /var/lib/automation
+      volumes:
+        - name: config
+          configMap:
+            name: automation-core
+            # при необходимости можно включить избирательное маппирование ключей
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: "128Mi"
+        - name: cache
+          emptyDir: {}
+        - name: data
+          emptyDir: {}

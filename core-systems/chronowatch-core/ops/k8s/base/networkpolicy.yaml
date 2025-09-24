@@ -1,0 +1,235 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-namespace-default-deny-ingress
+  namespace: chronowatch-core
+  labels:
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/name: chronowatch-core
+spec:
+  podSelector: {}                  # все Pod'ы namespace
+  policyTypes:
+    - Ingress                      # запрет всего входящего по умолчанию
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-namespace-default-deny-egress
+  namespace: chronowatch-core
+  labels:
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/name: chronowatch-core
+spec:
+  podSelector: {}                  # все Pod'ы namespace
+  policyTypes:
+    - Egress                       # запрет всего исходящего по умолчанию
+---
+# Разрешаем входящий трафик только к приложению chronowatch-core от шлюзов Ingress/Service Mesh и Observability.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-chronowatch-core-ingress
+  namespace: chronowatch-core
+  labels:
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/name: chronowatch-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: chronowatch-core
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    # 1) HTTP(S) трафик от ingress-контроллеров (nginx / istio-gateway).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gateway
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8443
+    # 2) Сбор метрик Prometheus из неймспейса observability (уточните порт метрик вашего приложения).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 9464    # предполагаемый HTTP /metrics порт экспозиции. I cannot verify this.
+    # 3) Внутри-namespace сервисное общение (sidecar'ы, init-контейнеры и т.п.).
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9464    # локальный доступ к метрикам при необходимости. I cannot verify this.
+        - protocol: TCP
+          port: 8080    # сервисный HTTP внутри namespace. I cannot verify this.
+    # 4) Пробы kubelet (liveness/readiness) — при строгих политиках иногда требуется разрешить с node CIDR.
+    #    Укажите сетевой блок узлов кластера (пример: 10.0.0.0/8). I cannot verify this.
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/32   # PLACEHOLDER. Замените на реальный nodeCIDR кластера. I cannot verify this.
+      ports:
+        - protocol: TCP
+          port: 8080          # порт приложения, который зондирует kubelet. I cannot verify this.
+---
+# Разрешенный исходящий трафик приложения chronowatch-core (Zero-Trust egress).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-chronowatch-core-egress
+  namespace: chronowatch-core
+  labels:
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/name: chronowatch-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: chronowatch-core
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Egress
+  egress:
+    # 1) DNS к kube-dns в kube-system.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # 2) OTLP трассировка/метрики к observability-стеку (OTLP gRPC/HTTP, Jaeger collector).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 4317     # OTLP gRPC
+        - protocol: TCP
+          port: 4318     # OTLP HTTP
+        - protocol: TCP
+          port: 14250    # Jaeger gRPC collector
+        - protocol: TCP
+          port: 9093     # Alertmanager (опционально отправка алертов). I cannot verify this.
+
+    # 3) Доступ к data-неймспейсу: PostgreSQL, Redis, MinIO, NATS (уточните лейблы/порты).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9001
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nats
+      ports:
+        - protocol: TCP
+          port: 4222
+        - protocol: TCP
+          port: 6222
+        - protocol: TCP
+          port: 8222
+
+    # 4) Синхронизация времени (NTP). Уточните IP-пулы ваших NTP-серверов.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0     # открыто, т.к. NTP часто внешний. Рекомендуется сузить. I cannot verify this.
+      ports:
+        - protocol: UDP
+          port: 123
+
+    # 5) Исходящий интернет только на 80/443 и только внешним адресатам (исключаем RFC1918).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+
+    # 6) Внутри-namespace сервисные вызовы (микросервисы в chronowatch-core).
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080    # сервисный HTTP внутри namespace. I cannot verify this.
+        - protocol: TCP
+          port: 9464    # локальный экспорт метрик, если требуется pull/push. I cannot verify this.
+---
+# (Опционально) Разрешаем Prometheus из observability опрашивать ЛЮБЫЕ pod'ы namespace chronowatch-core на порту метрик.
+# Оставлено отдельной политикой для явной управляемости.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-chronowatch-core-metrics-ingress
+  namespace: chronowatch-core
+  labels:
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/name: chronowatch-core
+spec:
+  podSelector: {}     # все Pod'ы в namespace, если экспонируют метрики
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 9464   # единый порт экспозиции /metrics. I cannot verify this.

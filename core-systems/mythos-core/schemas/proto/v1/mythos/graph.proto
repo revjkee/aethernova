@@ -1,0 +1,466 @@
+syntax = "proto3";
+
+package mythos.v1;
+
+option go_package        = "github.com/yourorg/mythos-core/gen/go/mythos/v1;mythosv1";
+option java_multiple_files = true;
+option java_package       = "com.mythos.v1";
+option csharp_namespace   = "Mythos.V1";
+option php_namespace      = "Mythos\\V1";
+option objc_class_prefix  = "MYV";
+option ruby_package       = "Mythos::V1";
+
+// -----------------------------
+// Импорты well-known типов
+// -----------------------------
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/any.proto";
+
+// -----------------------------
+// Общие типы и перечисления
+// -----------------------------
+
+// Коды статусов для унифицированных ответов.
+enum StatusCode {
+  STATUS_CODE_UNSPECIFIED = 0;
+  OK                      = 1;
+  CREATED                 = 2;
+  ACCEPTED                = 3;
+  INVALID_ARGUMENT        = 4;
+  NOT_FOUND               = 5;
+  ALREADY_EXISTS          = 6;
+  CONFLICT                = 7;  // etag/version конфликт
+  FAILED_PRECONDITION     = 8;
+  PERMISSION_DENIED       = 9;
+  UNAUTHENTICATED         = 10;
+  RESOURCE_EXHAUSTED      = 11;
+  INTERNAL                = 12;
+  UNAVAILABLE             = 13;
+  TIMEOUT                 = 14;
+}
+
+// Направление ребра при выборке соседей.
+enum EdgeDirection {
+  EDGE_DIRECTION_UNSPECIFIED = 0;
+  OUT = 1;   // исходящее из узла
+  IN  = 2;   // входящее в узел
+  ANY = 3;   // любое
+}
+
+// Согласованность чтения для запросов.
+enum ReadConsistency {
+  READ_CONSISTENCY_UNSPECIFIED = 0;
+  EVENTUAL = 1;
+  STRONG   = 2;
+}
+
+// Тип запуска вычислительного алгоритма.
+enum AlgoType {
+  ALGO_TYPE_UNSPECIFIED = 0;
+  SHORTEST_PATH = 1;
+  PAGERANK      = 2;
+  CONNECTED_COMPONENTS = 3;
+}
+
+// Универсальный тип значения свойства.
+message Value {
+  oneof kind {
+    string s   = 1;
+    int64  i   = 2;
+    double d   = 3;
+    bool   b   = 4;
+    bytes  by  = 5;
+  }
+}
+
+// Ключ-значение для свойств.
+message Property {
+  string key = 1;
+  Value  val = 2;
+}
+
+// Набор свойств как map-представление.
+message Properties {
+  map<string, Value> entries = 1;
+}
+
+// Общая ошибка.
+message ErrorDetail {
+  StatusCode code = 1;
+  string     message = 2;
+  // Произвольные детали (например, нарушенный индекс/ограничение).
+  repeated google.protobuf.Any details = 3;
+}
+
+// Унифицированный статус операции.
+message Status {
+  StatusCode code = 1;
+  string     message = 2;
+  ErrorDetail error = 3;
+}
+
+// Идентификатор ресурса (строковый и/или UUID-представление).
+message ResourceId {
+  string id   = 1;        // человекочитаемый ID/ULID
+  bytes  uuid = 2;        // 16 байт UUIDv4/v7 (опционально)
+}
+
+// Пагинация.
+message PageCursor {
+  string token = 1;
+  int32  size  = 2;   // запрошенный размер страницы
+}
+
+// Аудит и версии.
+message Audit {
+  google.protobuf.Timestamp created_at = 1;
+  google.protobuf.Timestamp updated_at = 2;
+  string created_by = 3;
+  string updated_by = 4;
+  int64  version    = 5;   // монотонно растущий
+  string etag       = 6;   // для If-Match/оптимистичной блокировки
+}
+
+// Метки (labels/tags) для ресурсов.
+message Labels {
+  map<string, string> entries = 1;
+}
+
+// -----------------------------
+// Модель графа
+// -----------------------------
+
+message Node {
+  ResourceId resource = 1;
+  string     kind     = 2;           // тип вершины (например: "user","doc")
+  Properties props    = 3;
+  Labels     labels   = 4;
+  Audit      audit    = 5;
+}
+
+message Edge {
+  ResourceId resource = 1;
+  // Концы ребра:
+  ResourceId src = 2;
+  ResourceId dst = 3;
+  string     type = 4;               // тип ребра (например: "follows","relates")
+  Properties props = 5;
+  Labels     labels = 6;
+  Audit      audit  = 7;
+  // Директность ребра
+  bool directed = 8;
+}
+
+// Для пакетных результатов.
+message NodeResult { Node node = 1; Status status = 2; }
+message EdgeResult { Edge edge = 1; Status status = 2; }
+
+// -----------------------------
+// Запросы/фильтры
+// -----------------------------
+
+// Фильтры по свойствам/меткам/типам.
+message Filter {
+  // Совпадение по ключам свойств (точное).
+  map<string, Value> equals = 1;
+  // Сравнители (например, >, <). Ключ — имя свойства, значение — сравниваемое.
+  map<string, Value> gte = 2;
+  map<string, Value> lte = 3;
+  map<string, Value> gt  = 4;
+  map<string, Value> lt  = 5;
+
+  // Префиксное совпадение строк.
+  map<string, string> prefix = 6;
+
+  // Метки.
+  map<string, string> labels = 7;
+
+  // Ограничение по типу.
+  repeated string kinds = 8;
+  repeated string edge_types = 9;
+}
+
+// Параметры чтения.
+message ReadOptions {
+  ReadConsistency consistency = 1;
+  bool include_props = 2;   // включать ли свойства (иногда нужны только ID)
+  bool include_labels = 3;
+}
+
+// -----------------------------
+// CRUD и пакетные мутации
+// -----------------------------
+
+// Create/Upsert Node
+message UpsertNodeRequest {
+  Node node = 1;
+  // Если передан etag/version, будет применена оптимистичная блокировка.
+  bool allow_create = 2; // если false — только update
+}
+message UpsertNodeResponse {
+  Node   node   = 1;
+  Status status = 2;
+}
+
+// Read Node
+message GetNodeRequest {
+  ResourceId     id     = 1;
+  ReadOptions    read   = 2;
+}
+message GetNodeResponse {
+  Node   node   = 1;
+  Status status = 2;
+}
+
+// Delete Node
+message DeleteNodeRequest {
+  ResourceId id   = 1;
+  string     etag = 2; // If-Match
+}
+message DeleteNodeResponse {
+  Status status = 1;
+}
+
+// Create/Upsert Edge
+message UpsertEdgeRequest {
+  Edge edge = 1;
+  bool allow_create = 2;
+}
+message UpsertEdgeResponse {
+  Edge   edge   = 1;
+  Status status = 2;
+}
+
+// Read Edge
+message GetEdgeRequest {
+  ResourceId id   = 1;
+  ReadOptions read = 2;
+}
+message GetEdgeResponse {
+  Edge   edge   = 1;
+  Status status = 2;
+}
+
+// Delete Edge
+message DeleteEdgeRequest {
+  ResourceId id   = 1;
+  string     etag = 2;
+}
+message DeleteEdgeResponse {
+  Status status = 1;
+}
+
+// Пакетные мутации
+message BatchMutateRequest {
+  repeated UpsertNodeRequest upsert_nodes = 1;
+  repeated UpsertEdgeRequest upsert_edges = 2;
+  repeated DeleteNodeRequest delete_nodes = 3;
+  repeated DeleteEdgeRequest delete_edges = 4;
+
+  // Транзакционная семантика (если бэкенд поддерживает):
+  bool transactional = 10;
+}
+message BatchMutateResponse {
+  repeated NodeResult node_results = 1;
+  repeated EdgeResult edge_results = 2;
+  Status status = 3; // общий статус транзакции
+}
+
+// -----------------------------
+// Навигация и алгоритмы
+// -----------------------------
+
+message GetNeighborsRequest {
+  ResourceId   id          = 1;    // от какой вершины
+  EdgeDirection direction  = 2;
+  // Фильтры на ребра/вершины.
+  Filter       edge_filter = 3;
+  Filter       node_filter = 4;
+  // Глубина обхода (1 = непосредственные соседи).
+  int32        depth       = 5;
+  PageCursor   page        = 6;
+  ReadOptions  read        = 7;
+}
+
+message Neighbor {
+  Node node = 1;
+  Edge via  = 2;  // ребро, через которое достигнут сосед (для depth=1)
+}
+
+message GetNeighborsResponse {
+  repeated Neighbor neighbors = 1;
+  PageCursor next_page = 2;
+  Status status = 3;
+}
+
+// Кратчайший путь (ориентированный/неориентированный — по флагу directed в рёбрах).
+message ShortestPathRequest {
+  ResourceId src = 1;
+  ResourceId dst = 2;
+  // Необязательные веса (имя свойства ребра с весом).
+  string edge_weight_property = 3;
+  // Ограничения.
+  Filter edge_filter = 4;
+  int32  max_hops    = 5; // 0 = без ограничения
+}
+
+message PathStep {
+  ResourceId node_id = 1;
+  ResourceId edge_id = 2; // ребро, которым пришли на node_id; пусто для первой вершины
+}
+
+message ShortestPathResponse {
+  repeated PathStep steps = 1;
+  double total_weight = 2;
+  Status status = 3;
+}
+
+// Старт вычислительного задания (пример: PageRank).
+message StartAlgoJobRequest {
+  AlgoType algo = 1;
+  // Параметры алгоритма как произвольные пары (например, damping=0.85, iterations=20).
+  map<string, Value> params = 2;
+  // Ограничение области графа.
+  Filter scope = 3;
+}
+
+message Operation {
+  // Идентификатор операции.
+  string name = 1;
+  bool   done = 2;
+  // Если ошибка, то заполнено error.
+  ErrorDetail error = 3;
+  // Когда done=true и нет ошибки — результат.
+  google.protobuf.Any response = 4;
+  // Промежуточные метаданные (прогресс и т.п.).
+  google.protobuf.Any metadata = 5;
+}
+
+message StartAlgoJobResponse {
+  Operation op = 1;
+}
+
+message GetOperationRequest {
+  string name = 1;
+}
+
+message CancelOperationRequest {
+  string name = 1;
+}
+
+message ListOperationsRequest {
+  PageCursor page = 1;
+}
+
+message ListOperationsResponse {
+  repeated Operation operations = 1;
+  PageCursor next_page = 2;
+}
+
+// -----------------------------
+// Поисковые запросы
+// -----------------------------
+
+message QueryNodesRequest {
+  Filter     filter = 1;
+  PageCursor page   = 2;
+  ReadOptions read  = 3;
+}
+message QueryNodesResponse {
+  repeated Node nodes = 1;
+  PageCursor next_page = 2;
+  Status status = 3;
+}
+
+message QueryEdgesRequest {
+  Filter     filter = 1;
+  PageCursor page   = 2;
+  ReadOptions read  = 3;
+}
+message QueryEdgesResponse {
+  repeated Edge edges = 1;
+  PageCursor next_page = 2;
+  Status status = 3;
+}
+
+// -----------------------------
+// Потоки и импорт/экспорт
+// -----------------------------
+
+// Поток событий изменения графа (CDC).
+message GraphEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    NODE_CREATED = 1;
+    NODE_UPDATED = 2;
+    NODE_DELETED = 3;
+    EDGE_CREATED = 4;
+    EDGE_UPDATED = 5;
+    EDGE_DELETED = 6;
+  }
+  Kind kind = 1;
+  google.protobuf.Timestamp ts = 2;
+  // Заполняется соответствующим ресурсом (node/edge).
+  oneof resource {
+    Node node = 3;
+    Edge edge = 4;
+  }
+}
+
+// Client-stream: импорт пакета узлов/рёбер.
+message ImportChunk {
+  repeated Node nodes = 1;
+  repeated Edge edges = 2;
+  bool eof = 3;      // признак завершения потока
+}
+
+message ImportSummary {
+  int64 nodes_created = 1;
+  int64 nodes_updated = 2;
+  int64 edges_created = 3;
+  int64 edges_updated = 4;
+  int64 errors        = 5;
+}
+
+message ExportRequest {
+  // Ограничение набора экспорта.
+  Filter filter = 1;
+  // Пакетный размер (подсказка серверу).
+  int32  chunk_size = 2;
+}
+
+// -----------------------------
+// Сервис
+// -----------------------------
+
+service MythosGraph {
+  // CRUD Node
+  rpc UpsertNode (UpsertNodeRequest) returns (UpsertNodeResponse);
+  rpc GetNode    (GetNodeRequest)    returns (GetNodeResponse);
+  rpc DeleteNode (DeleteNodeRequest) returns (DeleteNodeResponse);
+
+  // CRUD Edge
+  rpc UpsertEdge (UpsertEdgeRequest) returns (UpsertEdgeResponse);
+  rpc GetEdge    (GetEdgeRequest)    returns (GetEdgeResponse);
+  rpc DeleteEdge (DeleteEdgeRequest) returns (DeleteEdgeResponse);
+
+  // Пакетные мутации
+  rpc BatchMutate (BatchMutateRequest) returns (BatchMutateResponse);
+
+  // Поиск и навигация
+  rpc QueryNodes    (QueryNodesRequest)    returns (QueryNodesResponse);
+  rpc QueryEdges    (QueryEdgesRequest)    returns (QueryEdgesResponse);
+  rpc GetNeighbors  (GetNeighborsRequest)  returns (GetNeighborsResponse);
+  rpc ShortestPath  (ShortestPathRequest)  returns (ShortestPathResponse);
+
+  // Асинхронные алгоритмы
+  rpc StartAlgoJob     (StartAlgoJobRequest) returns (StartAlgoJobResponse);
+  rpc GetOperation     (GetOperationRequest) returns (Operation);
+  rpc ListOperations   (ListOperationsRequest) returns (ListOperationsResponse);
+  rpc CancelOperation  (CancelOperationRequest) returns (Status);
+
+  // Потоки и импорт/экспорт
+  rpc StreamEvents (google.protobuf.Any) returns (stream GraphEvent); // фильтр можно передать в Any как Filter
+  rpc ImportGraph  (stream ImportChunk) returns (ImportSummary);
+  rpc ExportGraph  (ExportRequest) returns (stream ImportChunk); // экспорт теми же чанками
+}

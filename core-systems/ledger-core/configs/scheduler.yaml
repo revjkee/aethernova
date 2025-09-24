@@ -1,0 +1,266 @@
+# ledger-core/ops/configs/scheduler.yaml
+# Промышленная конфигурация для встроенного/внешнего планировщика ledger-core.
+# Поддерживает периодические задания (cron), повторяемые задачи, очереди, приоритеты,
+# дед-литтер, ограничения конкуррентности, ретраи, окна доступности и нотификации.
+
+version: 1
+
+runtime:
+  timezone: ${SCHED_TZ:Europe/Stockholm}
+  # Источник времени: system|ntp|cloud (если поддерживается рантаймом)
+  time_source: system
+  # Источник идемпотентности/распределенных локов: redis|db
+  lock_backend:
+    type: ${SCHED_LOCK_BACKEND:redis}
+    redis:
+      url: ${REDIS_URL:redis://ledger-redis:6379/3}
+      key_prefix: ledger:sched:lock:
+      ttl_sec: 600
+    db:
+      dsn: ${DB_DSN:postgresql://ledger@ledger-postgres:5432/ledger}
+      table: sched_locks
+  # Глобальные ограничения
+  limits:
+    max_concurrent_global: 64
+    max_concurrent_per_queue: 16
+    max_concurrent_per_job: 4
+    rate_limits:
+      # Формат: <ключ>: "<кол-во>/<интервал>"
+      default: "200/1s"
+      backups: "2/1m"
+      dlp_scans: "5/10s"
+  # Джиттер для предотвращения «трэшинга» по минутным границам
+  jitter:
+    enabled: true
+    max_ms: 5000
+
+observability:
+  metrics:
+    enabled: true
+    # Имена метрик будут префиксированы: ledger_scheduler_*
+    namespace: ledger_scheduler
+  tracing:
+    enabled: true
+    sample_ratio: ${OTEL_TRACES_SAMPLING_RATIO:0.1}
+  logging:
+    level: ${SCHED_LOG_LEVEL:INFO}
+    json: true
+    redact_keys: ["password", "token", "authorization", "secret"]
+
+notifications:
+  # Каналы уведомлений при сбоях/эскалациях; секреты — из ENV/Secrets
+  channels:
+    slack:
+      enabled: ${SCHED_SLACK_ENABLED:false}
+      webhook_url: ${SCHED_SLACK_WEBHOOK_URL:}
+      default_channel: ${SCHED_SLACK_CHANNEL:#ops-alerts}
+    webhook:
+      enabled: ${SCHED_WEBHOOK_ENABLED:false}
+      url: ${SCHED_WEBHOOK_URL:}
+      headers:
+        X-Signature: ${SCHED_WEBHOOK_SIGN:}
+    email:
+      enabled: ${SCHED_EMAIL_ENABLED:false}
+      smtp_host: ${SMTP_HOST:}
+      smtp_port: ${SMTP_PORT:587}
+      username: ${SMTP_USER:}
+      password: ${SMTP_PASS:}
+      from: "ledger-core <noreply@ledger.local>"
+      to: ["ops@ledger.local"]
+
+queues:
+  # Очереди с приоритетами и размерами воркеров (могут скейлиться горизонтально)
+  - name: critical
+    priority: 100
+    workers: ${SCHED_WORKERS_CRITICAL:8}
+    prefetch: 32
+  - name: default
+    priority: 50
+    workers: ${SCHED_WORKERS_DEFAULT:12}
+    prefetch: 64
+  - name: low
+    priority: 10
+    workers: ${SCHED_WORKERS_LOW:4}
+    prefetch: 16
+
+dead_letter:
+  enabled: true
+  queue: dead-letter
+  retention_days: 7
+  # Авто-ретраи из DLQ по расписанию
+  requeue:
+    cron: "0 * * * *"      # каждый час
+    max_retries: 3
+    backoff: "exponential"
+    backoff_min_sec: 30
+    backoff_max_sec: 900
+    notify_on_exhausted: ["slack", "webhook"]
+
+defaults:
+  # Политики по умолчанию для заданий (можно переопределить на уровне job)
+  concurrency_policy: Forbid       # Allow|Forbid|Replace
+  start_deadline_sec: 120          # misfire/окно запуска до отказа старта
+  active_deadline_sec: 1800        # принудительный kill по истечении времени
+  retry:
+    attempts: 5
+    backoff: exponential            # none|constant|exponential|decorrelated-jitter
+    backoff_min_sec: 5
+    backoff_max_sec: 600
+    retry_on:
+      - TRANSIENT_ERROR
+      - DEADLINE_EXCEEDED
+      - RATE_LIMIT
+  window:
+    # Окна доступности запуска (24h формат, локальный TZ)
+    allow: ["00:05-23:55"]          # запретить ровно на смене суток
+    deny:  []                       # например, ["02:00-03:00"] для бэкапов snap
+  resources:
+    cpu_milli: 200
+    memory_mb: 256
+  env:
+    APP_ENV: ${APP_ENV:dev}
+    OTEL_SERVICE_NAME: ledger-scheduler
+
+jobs:
+  # 1) Компакция/агрегация аудита
+  - name: audit-compaction
+    description: "Пакетная компакция таблиц аудита и пересчёт индексов"
+    queue: default
+    cron: "17 */2 * * *"          # каждые 2 часа в :17
+    command: ["ledger-core", "maintenance", "audit", "--compact", "--max-age=30d"]
+    idempotency:
+      # Ключ предотвращает дубликаты: <job>:<datehour>
+      key_template: "audit-compaction:${{ now_utc('%Y%m%d%H') }}"
+      ttl_sec: 5400
+    resources:
+      cpu_milli: 300
+      memory_mb: 512
+    retry:
+      attempts: 4
+      backoff: decorrelated-jitter
+      backoff_min_sec: 10
+      backoff_max_sec: 300
+    sla:
+      p95_duration_ms: 120000
+    notify:
+      on_fail: ["slack"]
+      on_exhausted: ["slack","webhook"]
+
+  # 2) Ночные бэкапы Postgres (logical + verify)
+  - name: pg-backup
+    description: "Ночной бэкап БД с проверкой восстановления"
+    queue: critical
+    cron: "0 1 * * *"             # ежедневно 01:00
+    window:
+      allow: ["00:30-04:00"]
+    concurrency_policy: Forbid
+    start_deadline_sec: 900
+    command:
+      - "/bin/bash"
+      - "-lc"
+      - >
+        pg_dump --format=directory --jobs=4 --file=/backups/ledger-$(date -u +%Y%m%d).dump &&
+        ledger-core maintenance verify-restore --path /backups/ledger-$(date -u +%Y%m%d).dump
+    env:
+      PGPASSWORD: ${PGPASSWORD:}
+      PGHOST: ${PGHOST:ledger-postgres}
+      PGUSER: ${PGUSER:ledger}
+      PGDATABASE: ${PGDATABASE:ledger}
+    resources:
+      cpu_milli: 500
+      memory_mb: 1024
+    retry:
+      attempts: 2
+      backoff: constant
+      backoff_min_sec: 120
+    sla:
+      p99_duration_ms: 5400000     # 90 минут
+    notify:
+      on_fail: ["slack","email"]
+      on_exhausted: ["slack","webhook","email"]
+
+  # 3) DLP‑скан новых записей (инкрементальный)
+  - name: dlp-incremental-scan
+    description: "Инкрементальный DLP‑скан свежих записей"
+    queue: default
+    every: "10m"                   # альтернатива cron
+    jitter:
+      max_ms: 30000
+    command: ["ledger-core", "dlp", "scan", "--since=10m", "--fail-on-high"]
+    retry:
+      attempts: 6
+      backoff: exponential
+      backoff_min_sec: 10
+      backoff_max_sec: 600
+    limits:
+      rate: "5/10s"                # локальный rate-limit задания
+    sla:
+      p95_duration_ms: 300000
+    notify:
+      on_fail: ["slack"]
+
+  # 4) Экспорт технических метрик/снапшотов
+  - name: metrics-export
+    description: "Экспорт метрик/состояния в хранилище наблюдаемости"
+    queue: low
+    cron: "*/5 * * * *"
+    command: ["ledger-core", "metrics", "export", "--target=s3://ledger-metrics/${APP_ENV}"]
+    idempotency:
+      key_template: "metrics-export:${{ now_utc('%Y%m%d%H%M') }}"
+      ttl_sec: 600
+    retry:
+      attempts: 3
+      backoff: exponential
+      backoff_min_sec: 5
+      backoff_max_sec: 60
+    resources:
+      cpu_milli: 100
+      memory_mb: 128
+
+  # 5) TTL‑очистка кэша/сессий
+  - name: cache-ttl-gc
+    description: "Очистка устаревших ключей Redis/сессий"
+    queue: low
+    every: "30m"
+    command: ["ledger-core", "cache", "gc", "--ttl=7d", "--batch=1000"]
+    concurrency_policy: Replace
+    active_deadline_sec: 600
+    retry:
+      attempts: 3
+      backoff: none
+    resources:
+      cpu_milli: 50
+      memory_mb: 64
+
+dependencies:
+  # Возможные зависимости (если рантайм поддерживает DAG):
+  # Пример: dlp-incremental-scan после успешной компакции аудита
+  - after: audit-compaction
+    then: dlp-incremental-scan
+    type: soft   # soft: не блокирует, hard: запрещает запуск if failed
+
+security:
+  # Ограничения окружения для команд (если поддерживается launch‑контейнер)
+  seccomp_profile: "runtime/default"
+  allowlist_syscalls: []
+  drop_caps: ["ALL"]
+  fs:
+    read_only_root: true
+    tmpfs_size_mb: 64
+  network:
+    egress_allow_cidrs: ["0.0.0.0/0"]
+    ingress_block_all: true
+
+health:
+  # Проброс параметров для liveness/readiness планировщика
+  liveness:
+    failure_threshold: 3
+    period_sec: 10
+  readiness:
+    initial_delay_sec: 5
+    period_sec: 10
+
+# Конфигурация импорта внешних расписаний (если требуется)
+imports:
+  enabled: false
+  sources: []

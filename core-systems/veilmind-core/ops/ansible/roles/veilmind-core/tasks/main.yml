@@ -1,0 +1,345 @@
+---
+# Роль: veilmind-core
+# Поддерживаемые режимы:
+#   - native  : установка бинаря/архива и запуск через systemd
+#   - container: запуск контейнера (docker|podman) через systemd unit
+#
+# Переменные по умолчанию (пример, задайте в defaults/main.yml):
+# veilmind_core_mode: "native"         # native|container
+# veilmind_core_version: "1.2.0"
+# veilmind_core_user: "veilmind"
+# veilmind_core_group: "veilmind"
+# veilmind_core_home: "/var/lib/veilmind"
+# veilmind_core_conf_dir: "/etc/veilmind"
+# veilmind_core_log_dir: "/var/log/veilmind"
+# veilmind_core_bin_dir: "/usr/local/bin"
+# veilmind_core_service_name: "veilmind-core"
+# veilmind_core_download_url: "https://artifacts.example.com/veilmind-core/{{ veilmind_core_version }}/veilmind-core-linux-amd64.tar.gz"
+# veilmind_core_checksum_url: "https://artifacts.example.com/veilmind-core/{{ veilmind_core_version }}/checksums.txt"
+# veilmind_core_sig_url: "https://artifacts.example.com/veilmind-core/{{ veilmind_core_version }}/checksums.txt.sig"
+# veilmind_core_gpg_key_url: "https://artifacts.example.com/keys/release.pub"
+# veilmind_core_validate_signature: false
+# veilmind_core_container_runtime: "docker"   # docker|podman
+# veilmind_core_image: "ghcr.io/your-org/veilmind-core:{{ veilmind_core_version }}"
+# veilmind_core_container_env: {}             # карта ENV
+# veilmind_core_container_ports:
+#   - "8080:8080"
+#   - "9109:9109"
+# veilmind_core_config_inline: ""             # если пусто — используем шаблон
+# veilmind_core_config_template: "config.yaml.j2"
+# veilmind_core_extra_env_file: ""            # путь к доп. env‑файлу (опц.)
+# veilmind_core_health_url: "http://127.0.0.1:8080/healthz"
+# veilmind_core_enable_firewalld_rules: true
+# veilmind_core_open_ports: [8080, 9109]
+# veilmind_core_selinux_booleans: []          # напр. - { name: "container_manage_cgroup", state: "yes", persistent: true }
+
+- name: "Detect OS family and set package facts"
+  ansible.builtin.set_fact:
+    _is_debian: "{{ ansible_os_family | lower == 'debian' }}"
+    _is_redhat: "{{ ansible_os_family | lower == 'redhat' }}"
+  tags: [always]
+
+- name: "Install prerequisites (Debian)"
+  when: _is_debian
+  tags: [packages,setup]
+  block:
+    - ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - tar
+          - gzip
+          - gnupg
+        update_cache: true
+        state: present
+
+- name: "Install prerequisites (RedHat)"
+  when: _is_redhat
+  tags: [packages,setup]
+  block:
+    - ansible.builtin.yum:
+        name:
+          - ca-certificates
+          - curl
+          - tar
+          - gzip
+          - gnupg2
+        state: present
+
+- name: "Ensure group exists"
+  ansible.builtin.group:
+    name: "{{ veilmind_core_group }}"
+    system: true
+    state: present
+  tags: [users,setup]
+
+- name: "Ensure user exists"
+  ansible.builtin.user:
+    name: "{{ veilmind_core_user }}"
+    group: "{{ veilmind_core_group }}"
+    home: "{{ veilmind_core_home }}"
+    shell: /usr/sbin/nologin
+    create_home: true
+    system: true
+    state: present
+  tags: [users,setup]
+
+- name: "Create directories"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ veilmind_core_user }}"
+    group: "{{ veilmind_core_group }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop:
+    - { path: "{{ veilmind_core_home }}", mode: "0750" }
+    - { path: "{{ veilmind_core_conf_dir }}", mode: "0750" }
+    - { path: "{{ veilmind_core_log_dir }}", mode: "0750" }
+    - { path: "{{ veilmind_core_bin_dir }}", mode: "0755" }
+  tags: [filesystem,setup]
+
+- name: "Download checksums file"
+  when: veilmind_core_checksum_url is defined and veilmind_core_checksum_url|length > 0
+  ansible.builtin.get_url:
+    url: "{{ veilmind_core_checksum_url }}"
+    dest: "/tmp/veilmind-core-{{ veilmind_core_version }}-checksums.txt"
+    mode: "0644"
+  tags: [download,verify]
+
+- name: "Optionally download GPG public key"
+  when: veilmind_core_validate_signature | bool
+  ansible.builtin.get_url:
+    url: "{{ veilmind_core_gpg_key_url }}"
+    dest: "/tmp/veilmind-core-release.pub"
+    mode: "0644"
+  tags: [download,verify]
+
+- name: "Optionally download signature for checksums"
+  when: veilmind_core_validate_signature | bool
+  ansible.builtin.get_url:
+    url: "{{ veilmind_core_sig_url }}"
+    dest: "/tmp/veilmind-core-{{ veilmind_core_version }}-checksums.txt.sig"
+    mode: "0644"
+  tags: [download,verify]
+
+- name: "Verify checksum signature (GPG)"
+  when: veilmind_core_validate_signature | bool
+  tags: [verify]
+  block:
+    - name: "Import GPG key (keybox)"
+      ansible.builtin.command:
+        cmd: "gpg --import /tmp/veilmind-core-release.pub"
+      changed_when: false
+
+    - name: "Verify signature"
+      ansible.builtin.command:
+        cmd: "gpg --verify /tmp/veilmind-core-{{ veilmind_core_version }}-checksums.txt.sig /tmp/veilmind-core-{{ veilmind_core_version }}-checksums.txt"
+      changed_when: false
+
+- name: "Download veilmind-core archive (native mode)"
+  when: veilmind_core_mode == 'native'
+  tags: [download,install]
+  ansible.builtin.get_url:
+    url: "{{ veilmind_core_download_url }}"
+    dest: "/tmp/veilmind-core-{{ veilmind_core_version }}.tar.gz"
+    mode: "0644"
+    checksum: >-
+      {{ lookup('ansible.builtin.url', veilmind_core_checksum_url)
+         | regex_search('(?m)^([a-fA-F0-9]{64})\\s+\\*?veilmind-core-linux-amd64\\.tar\\.gz$', '\\1') | first
+         if (veilmind_core_checksum_url | default('')) | length > 0 else omit }}
+
+- name: "Unpack binary (native mode)"
+  when: veilmind_core_mode == 'native'
+  tags: [install]
+  ansible.builtin.unarchive:
+    src: "/tmp/veilmind-core-{{ veilmind_core_version }}.tar.gz"
+    dest: "{{ veilmind_core_bin_dir }}"
+    owner: "root"
+    group: "root"
+    mode: "0755"
+    extra_opts:
+      - "--no-same-owner"
+
+- name: "Ensure binary symlink"
+  when: veilmind_core_mode == 'native'
+  tags: [install]
+  ansible.builtin.file:
+    src: "{{ veilmind_core_bin_dir }}/veilmind-core"
+    dest: "/usr/bin/veilmind-core"
+    state: link
+    force: true
+
+- name: "Render config (inline or template)"
+  tags: [config]
+  block:
+    - name: "Write inline config"
+      when: veilmind_core_config_inline | length > 0
+      ansible.builtin.copy:
+        dest: "{{ veilmind_core_conf_dir }}/config.yaml"
+        content: "{{ veilmind_core_config_inline }}"
+        owner: "{{ veilmind_core_user }}"
+        group: "{{ veilmind_core_group }}"
+        mode: "0640"
+
+    - name: "Render config from template"
+      when: veilmind_core_config_inline | length == 0
+      ansible.builtin.template:
+        src: "{{ veilmind_core_config_template }}"
+        dest: "{{ veilmind_core_conf_dir }}/config.yaml"
+        owner: "{{ veilmind_core_user }}"
+        group: "{{ veilmind_core_group }}"
+        mode: "0640"
+
+- name: "Optional extra env file"
+  when: veilmind_core_extra_env_file | length > 0
+  tags: [config]
+  ansible.builtin.copy:
+    src: "{{ veilmind_core_extra_env_file }}"
+    dest: "{{ veilmind_core_conf_dir }}/.env"
+    owner: "{{ veilmind_core_user }}"
+    group: "{{ veilmind_core_group }}"
+    mode: "0640"
+
+- name: "Systemd unit (native)"
+  when: veilmind_core_mode == 'native'
+  tags: [systemd]
+  ansible.builtin.template:
+    src: "veilmind-core.service.native.j2"
+    dest: "/etc/systemd/system/{{ veilmind_core_service_name }}.service"
+    owner: "root"
+    group: "root"
+    mode: "0644"
+  notify: ["restart veilmind-core"]
+
+- name: "Install container runtime packages (if container mode)"
+  when: veilmind_core_mode == 'container'
+  tags: [packages,container]
+  block:
+    - name: "Install Docker (Debian)"
+      when: _is_debian and veilmind_core_container_runtime == 'docker'
+      ansible.builtin.apt:
+        name: [ docker.io ]
+        state: present
+        update_cache: true
+    - name: "Install Podman (RedHat)"
+      when: _is_redhat and veilmind_core_container_runtime == 'podman'
+      ansible.builtin.yum:
+        name: [ podman ]
+        state: present
+
+- name: "Pull container image"
+  when: veilmind_core_mode == 'container'
+  tags: [container]
+  ansible.builtin.command:
+    cmd: "{{ veilmind_core_container_runtime }} pull {{ veilmind_core_image }}"
+  changed_when: "'Downloaded newer' in (pull_result.stdout | default(''))"
+  register: pull_result
+
+- name: "Render container env file"
+  when: veilmind_core_mode == 'container'
+  tags: [container,config]
+  ansible.builtin.copy:
+    dest: "{{ veilmind_core_conf_dir }}/container.env"
+    content: |
+      {% for k, v in (veilmind_core_container_env | default({})).items() -%}
+      {{ k }}={{ v }}
+      {% endfor -%}
+    owner: "{{ veilmind_core_user }}"
+    group: "{{ veilmind_core_group }}"
+    mode: "0640"
+
+- name: "Systemd unit (container)"
+  when: veilmind_core_mode == 'container'
+  tags: [systemd,container]
+  ansible.builtin.template:
+    src: "veilmind-core.service.container.j2"
+    dest: "/etc/systemd/system/{{ veilmind_core_service_name }}.service"
+    owner: "root"
+    group: "root"
+    mode: "0644"
+  notify: ["restart veilmind-core"]
+
+- name: "SELinux booleans"
+  when: veilmind_core_selinux_booleans | length > 0
+  tags: [security,selinux]
+  ansible.posix.seboolean:
+    name: "{{ item.name }}"
+    state: "{{ item.state | default('yes') }}"
+    persistent: "{{ item.persistent | default(true) }}"
+  loop: "{{ veilmind_core_selinux_booleans }}"
+
+- name: "Open firewalld ports (RedHat family)"
+  when: _is_redhat and veilmind_core_enable_firewalld_rules | bool
+  tags: [security,firewall]
+  block:
+    - name: "Ensure firewalld installed and running"
+      ansible.builtin.yum:
+        name: firewalld
+        state: present
+    - ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: true
+    - name: "Open required ports"
+      ansible.posix.firewalld:
+        port: "{{ item }}/tcp"
+        permanent: true
+        state: enabled
+        immediate: true
+      loop: "{{ veilmind_core_open_ports | default([]) }}"
+
+- name: "Systemd daemon-reload"
+  tags: [systemd]
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: "Enable and start service"
+  tags: [systemd]
+  ansible.builtin.service:
+    name: "{{ veilmind_core_service_name }}"
+    state: started
+    enabled: true
+
+- name: "Wait for service to be listening"
+  tags: [health]
+  ansible.builtin.wait_for:
+    host: "127.0.0.1"
+    port: 8080
+    delay: 1
+    timeout: 60
+  when: veilmind_core_mode in ['native','container']
+
+- name: "HTTP health check"
+  tags: [health,verify]
+  block:
+    - name: "Probe health endpoint"
+      ansible.builtin.uri:
+        url: "{{ veilmind_core_health_url }}"
+        method: GET
+        return_content: false
+        status_code: 200
+        timeout: 10
+      register: health
+      retries: 6
+      delay: 5
+      until: health.status == 200
+  rescue:
+    - name: "Collect service logs on failure"
+      ansible.builtin.command: "journalctl -u {{ veilmind_core_service_name }} --no-pager -n 200"
+      register: svc_logs
+      changed_when: false
+    - name: "Fail with logs"
+      ansible.builtin.fail:
+        msg: "veilmind-core health check failed. Last logs:\n{{ svc_logs.stdout }}"
+
+# -----------------------
+# Конфигурационная проверка без перезапуска (идемпотентность)
+# -----------------------
+- name: "Validate config syntax (dry-run)"
+  tags: [config,verify]
+  ansible.builtin.command:
+    cmd: "/usr/bin/veilmind-core --config {{ veilmind_core_conf_dir }}/config.yaml --validate"
+  register: cfg_validate
+  changed_when: false
+  failed_when: cfg_validate.rc not in [0, 2]
+  when: veilmind_core_mode == 'native'

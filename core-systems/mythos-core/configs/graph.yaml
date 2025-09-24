@@ -1,0 +1,426 @@
+# mythos-core/configs/graph.yaml
+kind: ServiceGraphConfig
+schema:
+  version: 1
+  uri: https://mythos-core.org/schemas/graph/1-0
+meta:
+  app: mythos-core
+  owner: core-platform
+  generatedBy: ops
+  annotations:
+    purpose: "service dependency graph and runtime policies"
+    rolloutTrigger: "${GRAPH_ROLLOUT_SHA:-unset}"   # подставляется в CI для триггера деплоя
+
+# -------------------------
+# Глобальные политики (якоря)
+# -------------------------
+defaults:
+  timeouts: &timeouts_default
+    connect_ms: 300
+    read_ms: 800
+    write_ms: 800
+    total_budget_ms: 1000
+
+  retry: &retry_default
+    enabled: true
+    max_attempts: 3
+    backoff:
+      strategy: exponential
+      base_ms: 50
+      max_ms: 400
+      jitter: full          # full | equal | none
+    retry_on:
+      - connect-failure
+      - retriable-5xx       # 502/503/504
+      - idempotent-429
+    respect_idempotency: true
+
+  circuitBreaker: &cb_default
+    enabled: true
+    failure_rate_threshold: 50      # %
+    slow_call_rate_threshold: 50    # %
+    slow_call_duration_ms: 600
+    sliding_window:
+      type: time
+      size_seconds: 60
+      min_calls: 50
+    open_state_duration_ms: 30000
+    half_open_max_calls: 10
+    permitted_number_of_calls_in_half_open_state: 10
+    automatic_transition_from_open_to_half_open_enabled: true
+
+  rateLimit: &rate_default
+    enabled: true
+    strategy: token-bucket
+    capacity: 200
+    fill_rate_per_sec: 100
+    burst: 50
+    key: "client-ip"   # или "api-key" / "user-id" — зависит от middleware
+
+  hedging: &hedge_default
+    enabled: false
+    at_ms: 300
+    max_hedges: 1
+    cancel_on_first_response: true
+
+  tls: &tls_default
+    enabled: ${MYTHOS_TLS_ENABLED:-true}
+    verify_peer: true
+    ca_file: "${MYTHOS_TLS_CA:-/etc/pki/ca.crt}"
+    cert_file: "${MYTHOS_TLS_CERT:-}"
+    key_file: "${MYTHOS_TLS_KEY:-}"
+
+  observability: &obs_default
+    tracing:
+      enabled: ${MYTHOS_TRACING_ENABLED:-false}
+      kind: otlp
+      endpoint: "${OTLP_ENDPOINT:-http://otel-collector:4317}"
+      sample_ratio: 0.1
+    metrics:
+      enabled: ${MYTHOS_METRICS_ENABLED:-true}
+      exporter: prometheus
+    logs:
+      level: ${MYTHOS_LOG_LEVEL:-INFO}
+      json: ${MYTHOS_LOG_FORMAT_JSON:-true}
+
+# -------------------------
+# Профили окружений
+# -------------------------
+profiles:
+  dev:
+    overrides:
+      defaults:
+        timeouts:
+          <<: *timeouts_default
+          total_budget_ms: 1500
+        retry:
+          <<: *retry_default
+          max_attempts: 2
+        circuitBreaker:
+          <<: *cb_default
+          min_calls: 10
+      nodes:
+        - name: queue
+          config:
+            brokers: "${KAFKA_BROKERS:-kafka:9092}"
+            acks: all
+            topic_prefix: "dev."
+  staging:
+    overrides:
+      defaults:
+        timeouts:
+          <<: *timeouts_default
+          total_budget_ms: 1200
+        retry:
+          <<: *retry_default
+          max_attempts: 3
+  prod:
+    overrides:
+      defaults:
+        timeouts:
+          <<: *timeouts_default
+        retry:
+          <<: *retry_default
+          max_attempts: 4
+        circuitBreaker:
+          <<: *cb_default
+        rateLimit:
+          <<: *rate_default
+          capacity: 1000
+          fill_rate_per_sec: 500
+          burst: 200
+
+# -------------------------
+# Узлы графа (ресурсы)
+# -------------------------
+nodes:
+  # Входной HTTP API
+  - name: api
+    type: http
+    role: entrypoint
+    listen:
+      host: "0.0.0.0"
+      port: ${MYTHOS_HTTP_PORT:-8080}
+      idle_timeout_ms: 60000
+    security:
+      authn: "bearer-optional"   # none|bearer-required|bearer-optional|mtls
+      cors:
+        enabled: ${MYTHOS_CORS_ENABLED:-false}
+        allow_origins: []
+    observability: *obs_default
+
+  # Внутренний gRPC Feature Store
+  - name: feature-store
+    type: grpc
+    endpoint: "${FS_ENDPOINT:-dns:///feature-store:7070}"
+    pool:
+      max_conns: 64
+      idle_conns: 16
+    healthCheck:
+      kind: grpc
+      method: "healthpb.Health/Check"
+      interval_ms: 5000
+      timeout_ms: 300
+    tls: *tls_default
+    observability: *obs_default
+    defaults:
+      timeouts: *timeouts_default
+      retry: *retry_default
+      circuitBreaker: *cb_default
+      hedging: *hedge_default
+
+  # Сервис генерации идентификаторов (локальный модуль)
+  - name: id-service
+    type: module
+    module: "neuroforge.utils.idgen.IDGenerator"
+    config:
+      default_type: ${NEUROFORGE_ID_TYPE:-ulid}
+      ulid:
+        monotonic: ${NEUROFORGE_ULID_MONO:-true}
+
+  # PostgreSQL
+  - name: postgres-primary
+    type: postgres
+    dsn: "${MYTHOS_PG_DSN:-postgresql://mythos:mythos@postgres:5432/mythos?sslmode=disable}"
+    pool:
+      max_open: 50
+      max_idle: 10
+      conn_max_lifetime_s: 300
+    healthCheck:
+      kind: sql
+      query: "SELECT 1"
+      interval_ms: 5000
+      timeout_ms: 300
+
+  # Redis кэш
+  - name: redis-cache
+    type: redis
+    url: "${REDIS_URL:-redis://redis:6379/0}"
+    pool:
+      size: 32
+      min_idle: 4
+    healthCheck:
+      kind: ping
+      interval_ms: 5000
+      timeout_ms: 100
+
+  # Очередь сообщений (Kafka)
+  - name: queue
+    type: kafka
+    brokers: "${KAFKA_BROKERS:-kafka:9092}"
+    sasl:
+      enabled: ${KAFKA_SASL_ENABLED:-false}
+      mechanism: "${KAFKA_SASL_MECH:-PLAIN}"
+      username: "${KAFKA_SASL_USER:-}"
+      passwordEnv: "KAFKA_SASL_PASSWORD"   # секрет берется из env в рантайме
+    tls:
+      enabled: ${KAFKA_TLS_ENABLED:-false}
+      insecure_skip_verify: ${KAFKA_TLS_INSECURE_SKIP_VERIFY:-false}
+
+  # Объектное хранилище (S3-совместимое)
+  - name: object-store
+    type: s3
+    bucket: "${MYTHOS_BUCKET:-mythos-core-prod}"
+    region: "${AWS_REGION:-eu-west-1}"
+    endpoint: "${S3_ENDPOINT:-}"         # пусто для AWS, заполнить для MinIO/совместимых
+    accel: false
+
+# -------------------------
+# Ребра графа (вызовы)
+# -------------------------
+edges:
+  # API → Feature Store: чтение фич
+  - from: api
+    to: feature-store
+    operations:
+      - name: GetUserFeatures
+        protocol: http -> grpc
+        http:
+          method: GET
+          path: /v1/features
+          query_to: ["user_id", "as_of"]
+        grpc:
+          service: "mythos.features.v1.FeatureService"
+          method: "GetUserFeatures"
+        policies:
+          timeouts: *timeouts_default
+          retry: *retry_default
+          circuitBreaker: *cb_default
+          rateLimit:
+            <<: *rate_default
+            key: "user-id"      # ограничивать по пользователю
+          deadline_ms: 900
+          fallback:
+            kind: cache
+            node: redis-cache
+            key_template: "features:{user_id}:{as_of}"
+            ttl_seconds: 60
+            on_miss: "error"    # error|empty
+      - name: UpsertUserFeatures
+        protocol: http -> grpc
+        http:
+          method: POST
+          path: /v1/features:upsert
+          body: json
+          idempotency_key_header: "Idempotency-Key"
+        grpc:
+          service: "mythos.features.v1.FeatureService"
+          method: "UpsertUserFeatures"
+        policies:
+          timeouts:
+            <<: *timeouts_default
+            total_budget_ms: 1500
+          retry:
+            <<: *retry_default
+            # Писать по умолчанию не ретраим, только явные сбоии соединения
+            retry_on: ["connect-failure"]
+            max_attempts: 2
+          circuitBreaker: *cb_default
+          rateLimit:
+            <<: *rate_default
+            capacity: 300
+            fill_rate_per_sec: 150
+          deadline_ms: 1400
+          fallback:
+            kind: "none"
+
+  # Feature Store → Postgres: оффлайн хранение
+  - from: feature-store
+    to: postgres-primary
+    operations:
+      - name: ReadPointInTime
+        protocol: sql
+        sql:
+          prepared: true
+          stmt: "/* pit */ SELECT ... -- заглушка, определяется приложением"
+        policies:
+          timeouts:
+            connect_ms: 300
+            read_ms: 1200
+            write_ms: 1200
+            total_budget_ms: 1500
+          retry:
+            <<: *retry_default
+            retry_on: ["connect-failure", "deadlock"]
+            max_attempts: 3
+          circuitBreaker: *cb_default
+      - name: UpsertOnline
+        protocol: sql
+        sql:
+          prepared: true
+          stmt: "/* upsert */ INSERT ... ON CONFLICT ... -- заглушка"
+        policies:
+          timeouts:
+            connect_ms: 300
+            read_ms: 800
+            write_ms: 800
+            total_budget_ms: 1000
+          retry:
+            <<: *retry_default
+            retry_on: ["connect-failure", "deadlock"]
+            max_attempts: 4
+          circuitBreaker: *cb_default
+
+  # Feature Store → Redis: онлайн кэш
+  - from: feature-store
+    to: redis-cache
+    operations:
+      - name: CacheGet
+        protocol: redis
+        redis:
+          command: GET
+          key_template: "fs:{table}:{key}"
+        policies:
+          timeouts:
+            connect_ms: 100
+            read_ms: 50
+            write_ms: 50
+            total_budget_ms: 80
+          retry:
+            enabled: false
+          circuitBreaker:
+            enabled: true
+            failure_rate_threshold: 70
+            sliding_window:
+              type: count
+              size_seconds: 30
+              min_calls: 20
+      - name: CacheSet
+        protocol: redis
+        redis:
+          command: SETEX
+          ttl_seconds: 120
+          key_template: "fs:{table}:{key}"
+        policies:
+          timeouts:
+            connect_ms: 100
+            read_ms: 50
+            write_ms: 50
+            total_budget_ms: 80
+          retry:
+            enabled: true
+            max_attempts: 2
+            backoff:
+              strategy: fixed
+              base_ms: 20
+          circuitBreaker:
+            enabled: true
+            failure_rate_threshold: 70
+
+  # API → ID-сервис: краткие ID для клиентских ответов
+  - from: api
+    to: id-service
+    operations:
+      - name: NewShortID
+        protocol: inproc
+        module:
+          func: "short_from_uuid7"
+          args:
+            encoding: "base62"
+        policies:
+          timeouts:
+            total_budget_ms: 20
+          retry:
+            enabled: false
+          circuitBreaker:
+            enabled: false
+
+  # Воркеры → очередь
+  - from: worker
+    to: queue
+    operations:
+      - name: PublishBackfillJob
+        protocol: kafka
+        kafka:
+          topic: "${KAFKA_TOPIC_BACKFILL:-mythos.backfill}"
+          acks: all
+          compression: lz4
+          key_template: "{entity}:{id}"
+        policies:
+          timeouts:
+            total_budget_ms: 500
+          retry:
+            <<: *retry_default
+            max_attempts: 5
+            backoff:
+              strategy: exponential
+              base_ms: 100
+              max_ms: 2000
+          circuitBreaker: *cb_default
+
+# -------------------------
+# Валидация графа (подсказки рантайму)
+# -------------------------
+validation:
+  require_existing_nodes: true
+  require_operations: true
+  forbid_self_loops: true
+  unique_edge_names: true
+  max_path_length: 8
+
+# -------------------------
+# Примечания по переменным
+# -------------------------
+# - Подстановки вида ${ENV:-default} НЕ выполняются самим YAML.
+#   Они применяются либо на этапе сборки (helm/kustomize/envsubst), либо читаются приложением из env.
+# - Поля sql.stmt — заглушки, конкретные запросы задаются в коде/шаблонах репозитория данных.

@@ -1,0 +1,1450 @@
+openapi: 3.1.0
+info:
+  title: security-core API
+  version: 1.0.0
+  description: >
+    Industrial-grade security-core API: audit logging (ingest/search/stream),
+    integrity verification (hash/signature/transparency proofs), transparency log,
+    CA CSR templates management and rendering, CSR generation via KMS/HSM.
+    Secure by default: mTLS + OAuth2, idempotency, RBAC scopes, SSE for real-time streams.
+
+servers:
+  - url: https://api.yourorg.com/security-core
+    description: Production
+  - url: https://staging.yourorg.com/security-core
+    description: Staging
+
+tags:
+  - name: Audit
+    description: Audit events ingestion, search and streaming
+  - name: Integrity
+    description: Cryptographic verification and transparency proofs
+  - name: Transparency
+    description: Append-only transparency log access
+  - name: CA
+    description: CA CSR templates, rendering and CSR generation
+  - name: System
+    description: Health/readiness/metrics
+
+paths:
+  /v1/audit/events:
+    post:
+      tags: [Audit]
+      summary: Ingest audit events (single or batch)
+      description: >
+        Accepts a single AuditEvent or an array (batch). Use Idempotency-Key header to avoid duplicates.
+      operationId: AuditIngest
+      security:
+        - mtls: []
+          oauth2:
+            - audit:write
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/AuditEvent'
+                - type: array
+                  items:
+                    $ref: '#/components/schemas/AuditEvent'
+            examples:
+              single:
+                summary: Single event
+                value:
+                  event_id: "1b8e2f2e-1c2d-4b5a-9c1d-3a2b1c4d5e6f"
+                  sequence: 42
+                  timestamp: "2025-08-20T06:00:00Z"
+                  type: AUTHN_SUCCESS
+                  action: CREATE
+                  outcome: SUCCESS
+                  severity: INFO
+                  category: "auth"
+                  tenant_id: "t-001"
+                  org_id: "o-001"
+                  project_id: "p-sec"
+                  environment: "prod"
+                  trace_id: "4f7c2a..."
+                  span_id: "9af1..."
+                  actor:
+                    type: HUMAN
+                    actor_id: "u-1001"
+                    principal: "user@yourorg.com"
+                    display_name: "Alice"
+                    roles: ["admin"]
+                    authn:
+                      methods: ["password","webauthn"]
+                      mfa_used: true
+                      mfa_type: "webauthn"
+                      issuer: "https://idp.yourorg.com"
+                  target:
+                    resource:
+                      type: "secret"
+                      id: "sec-42"
+                      urn: "urn:yourorg:secret:sec-42"
+                      name: "prod/api-key"
+                  source:
+                    service_name: "auth-service"
+                    service_version: "1.4.2"
+                    instance_id: "pod-abc"
+                    region: "eu-north-1"
+                    cluster: "k8s-prod"
+                  client:
+                    user_agent: "Mozilla/5.0"
+                    os: "Windows 11"
+                  network:
+                    src_ip: "203.0.113.10"
+                    src_port: 55123
+                    dst_ip: "198.51.100.20"
+                    dst_port: 443
+                    protocol: "https"
+                    geo:
+                      country: "SE"
+                      city: "Stockholm"
+                  policy:
+                    policy_id: "opa-authz-v12"
+                    policy_version: "12"
+                    allow: true
+                    matched_rules: ["allow_admins"]
+                  data_classification: INTERNAL
+                  details:
+                    reason: "login_success"
+                  tags: ["auth","login"]
+                  labels:
+                    workspace: "primary"
+      responses:
+        '202':
+          description: Accepted
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted_count:
+                    type: integer
+                    minimum: 1
+                  received_at:
+                    type: string
+                    format: date-time
+              examples:
+                ok:
+                  value:
+                    accepted_count: 1
+                    received_at: "2025-08-20T06:00:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Conflict (idempotency)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    get:
+      tags: [Audit]
+      summary: Search audit events (paged)
+      operationId: AuditQueryPaged
+      security:
+        - mtls: []
+          oauth2:
+            - audit:read
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/StartTime'
+        - $ref: '#/components/parameters/EndTime'
+        - $ref: '#/components/parameters/Types'
+        - $ref: '#/components/parameters/Actions'
+        - $ref: '#/components/parameters/Outcomes'
+        - $ref: '#/components/parameters/Severities'
+        - $ref: '#/components/parameters/TenantIds'
+        - $ref: '#/components/parameters/OrgIds'
+        - $ref: '#/components/parameters/ProjectIds'
+        - $ref: '#/components/parameters/Categories'
+        - $ref: '#/components/parameters/Tags'
+        - $ref: '#/components/parameters/Text'
+        - $ref: '#/components/parameters/Labels'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+        - $ref: '#/components/parameters/OrderBy'
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditQueryResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/audit/events/stream:
+    get:
+      tags: [Audit]
+      summary: Stream audit events via Server-Sent Events
+      operationId: AuditStream
+      security:
+        - mtls: []
+          oauth2:
+            - audit:read
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/StartTime'
+        - $ref: '#/components/parameters/Types'
+        - $ref: '#/components/parameters/Actions'
+        - $ref: '#/components/parameters/Outcomes'
+        - $ref: '#/components/parameters/Severities'
+        - $ref: '#/components/parameters/TenantIds'
+        - $ref: '#/components/parameters/OrgIds'
+        - $ref: '#/components/parameters/ProjectIds'
+        - $ref: '#/components/parameters/Categories'
+        - $ref: '#/components/parameters/Tags'
+      responses:
+        '200':
+          description: text/event-stream of AuditEnvelope
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/AuditEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/audit/events/{event_id}:
+    get:
+      tags: [Audit]
+      summary: Get audit event by id
+      operationId: AuditGetById
+      security:
+        - mtls: []
+          oauth2:
+            - audit:read
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Audit event
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEvent'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/audit/events/{event_id}/verify:
+    post:
+      tags: [Integrity]
+      summary: Verify hash/signature/transparency inclusion for an event
+      operationId: AuditVerify
+      security:
+        - mtls: []
+          oauth2:
+            - audit:read
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/transparency/entries:
+    get:
+      tags: [Transparency]
+      summary: List transparency log entries (paged)
+      operationId: TransparencyList
+      security:
+        - mtls: []
+          oauth2:
+            - transparency:read
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+      responses:
+        '200':
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TransparencyEntry'
+                  next_page_token:
+                    type: string
+
+  /v1/transparency/proofs/{leaf_index}:
+    get:
+      tags: [Transparency]
+      summary: Get Merkle proof by leaf index
+      operationId: TransparencyProofGet
+      security:
+        - mtls: []
+          oauth2:
+            - transparency:read
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: leaf_index
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransparencyProof'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/ca/csr/templates:
+    get:
+      tags: [CA]
+      summary: List CA CSR templates
+      operationId: CaCsrTemplatesList
+      security:
+        - mtls: []
+          oauth2:
+            - ca:read
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Templates
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CaCsrTemplateMeta'
+    post:
+      tags: [CA]
+      summary: Create a CA CSR template
+      operationId: CaCsrTemplateCreate
+      security:
+        - mtls: []
+          oauth2:
+            - ca:admin
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaCsrTemplate'
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location:
+              description: URL of created template
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaCsrTemplateMeta'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Template already exists
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /v1/ca/csr/templates/{template_id}:
+    get:
+      tags: [CA]
+      summary: Get CA CSR template by id
+      operationId: CaCsrTemplateGet
+      security:
+        - mtls: []
+          oauth2:
+            - ca:read
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: template_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Template
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaCsrTemplate'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [CA]
+      summary: Update CA CSR template
+      operationId: CaCsrTemplateUpdate
+      security:
+        - mtls: []
+          oauth2:
+            - ca:admin
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: template_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaCsrTemplate'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaCsrTemplateMeta'
+    delete:
+      tags: [CA]
+      summary: Delete CA CSR template
+      operationId: CaCsrTemplateDelete
+      security:
+        - mtls: []
+          oauth2:
+            - ca:admin
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - name: template_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Deleted
+
+  /v1/ca/csr/render:
+    post:
+      tags: [CA]
+      summary: Render CA CSR template with overrides
+      operationId: CaCsrRender
+      security:
+        - mtls: []
+          oauth2:
+            - ca:write
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                template_id:
+                  type: string
+                overrides:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Rendered config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaCsrRendered'
+
+  /v1/ca/csr/generate:
+    post:
+      tags: [CA]
+      summary: Generate CSR via KMS/HSM from rendered template
+      description: >
+        Generates CSR and stores private key in KMS/HSM (never returned).
+        Returns CSR PEM and a key reference (key_ref).
+      operationId: CaCsrGenerate
+      security:
+        - mtls: []
+          oauth2:
+            - ca:write
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaCsrRenderInput'
+      responses:
+        '201':
+          description: CSR generated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaCsrGenerateResult'
+        '422':
+          description: Unprocessable template
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /v1/healthz:
+    get:
+      tags: [System]
+      summary: Liveness probe
+      operationId: Healthz
+      responses:
+        '200':
+          description: OK (empty body)
+
+  /v1/readyz:
+    get:
+      tags: [System]
+      summary: Readiness probe
+      operationId: Readyz
+      responses:
+        '200':
+          description: Ready (empty body)
+        '503':
+          description: Not ready
+
+  /metrics:
+    get:
+      tags: [System]
+      summary: Prometheus metrics
+      operationId: Metrics
+      responses:
+        '200':
+          description: Prometheus exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    mtls:
+      type: mutualTLS
+      description: Mutual TLS required for all non-public operations
+    oauth2:
+      type: oauth2
+      description: OAuth2 client credentials with RBAC scopes
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.yourorg.com/oauth2/token
+          scopes:
+            audit:read: Read audit events
+            audit:write: Ingest audit events
+            audit:admin: Administer audit pipeline
+            transparency:read: Read transparency log
+            ca:read: Read CA CSR templates
+            ca:write: Render/generate CSR
+            ca:admin: Manage CA CSR templates
+    signature:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: Optional HTTP message signature (detached) for additional verification
+
+  parameters:
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema:
+        type: string
+      description: Caller-supplied correlation id
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+      description: Idempotency key for POST requests
+    StartTime:
+      name: start_time
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date-time
+    EndTime:
+      name: end_time
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date-time
+    Types:
+      name: type
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          $ref: '#/components/schemas/EventType'
+      style: form
+      explode: true
+    Actions:
+      name: action
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          $ref: '#/components/schemas/Action'
+      style: form
+      explode: true
+    Outcomes:
+      name: outcome
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          $ref: '#/components/schemas/Outcome'
+      style: form
+      explode: true
+    Severities:
+      name: severity
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          $ref: '#/components/schemas/Severity'
+      style: form
+      explode: true
+    TenantIds:
+      name: tenant_id
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          type: string
+      style: form
+      explode: true
+    OrgIds:
+      name: org_id
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          type: string
+      style: form
+      explode: true
+    ProjectIds:
+      name: project_id
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          type: string
+      style: form
+      explode: true
+    Categories:
+      name: category
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          type: string
+      style: form
+      explode: true
+    Tags:
+      name: tag
+      in: query
+      required: false
+      schema:
+        type: array
+        items:
+          type: string
+      style: form
+      explode: true
+    Text:
+      name: text
+      in: query
+      required: false
+      schema:
+        type: string
+    Labels:
+      name: label
+      in: query
+      description: Repeatable key=value label filter
+      required: false
+      schema:
+        type: array
+        items:
+          type: string
+          pattern: "^[^=]+=[^=]+$"
+      style: form
+      explode: true
+    PageSize:
+      name: page_size
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    PageToken:
+      name: page_token
+      in: query
+      schema:
+        type: string
+    OrderBy:
+      name: order_by
+      in: query
+      schema:
+        type: string
+        example: "timestamp desc"
+
+  headers:
+    XRequestId:
+      description: Server-assigned request id
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    # ---------- Enums (string) ----------
+    EventType:
+      type: string
+      enum: [AUTHN_SUCCESS, AUTHN_FAILURE, AUTHZ_ALLOW, AUTHZ_DENY, POLICY_CHANGE, CONFIG_CHANGE, SECRET_ACCESS, SECRET_ROTATION, CRYPTO_KEY_USE, DATA_READ, DATA_WRITE, DATA_DELETE, SYSTEM_START, SYSTEM_SHUTDOWN, INCIDENT_CREATE, INCIDENT_UPDATE, INCIDENT_CLOSE, ANOMALY_DETECTED, CERT_ISSUED, CERT_REVOKED, IAM_CREATE, IAM_UPDATE, IAM_DELETE, ROLE_ASSIGNMENT, API_CALL, JOB_SCHEDULED, JOB_EXECUTED, RESOURCE_ACCESS, RESOURCE_CHANGED]
+    Action:
+      type: string
+      enum: [CREATE, READ, UPDATE, DELETE, EXECUTE, LIST, APPROVE, DENY, ROTATE, ISSUE, REVOKE]
+    Outcome:
+      type: string
+      enum: [SUCCESS, FAILURE, ERROR, PARTIAL]
+    Severity:
+      type: string
+      enum: [INFO, LOW, MEDIUM, HIGH, CRITICAL]
+    DataClassification:
+      type: string
+      enum: [PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED, SECRET]
+    HashAlgorithm:
+      type: string
+      enum: [SHA256, SHA384, SHA512, BLAKE2B_256, BLAKE2B_512]
+    SignatureAlgorithm:
+      type: string
+      enum: [RSA_PSS_SHA256, RSA_PSS_SHA384, RSA_PSS_SHA512, ECDSA_P256_SHA256, ECDSA_P384_SHA384, ECDSA_P521_SHA512, ED25519]
+
+    # ---------- Core types ----------
+    AuditEvent:
+      type: object
+      required: [event_id, timestamp, type, action, outcome, severity]
+      properties:
+        event_id:
+          type: string
+          description: UUIDv4
+        sequence:
+          type: integer
+          format: int64
+        timestamp:
+          type: string
+          format: date-time
+        type:
+          $ref: '#/components/schemas/EventType'
+        action:
+          $ref: '#/components/schemas/Action'
+        outcome:
+          $ref: '#/components/schemas/Outcome'
+        severity:
+          $ref: '#/components/schemas/Severity'
+        category:
+          type: string
+        risk_score:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+        tenant_id:
+          type: string
+        org_id:
+          type: string
+        project_id:
+          type: string
+        environment:
+          type: string
+          example: prod
+        trace_id:
+          type: string
+        span_id:
+          type: string
+        correlation_id:
+          type: string
+        actor:
+          $ref: '#/components/schemas/Actor'
+        target:
+          $ref: '#/components/schemas/Target'
+        source:
+          $ref: '#/components/schemas/Source'
+        client:
+          $ref: '#/components/schemas/ClientInfo'
+        network:
+          $ref: '#/components/schemas/NetworkContext'
+        policy:
+          $ref: '#/components/schemas/PolicyDecision'
+        compliance:
+          $ref: '#/components/schemas/Compliance'
+        data_classification:
+          $ref: '#/components/schemas/DataClassification'
+        details:
+          type: object
+          additionalProperties: true
+        tags:
+          type: array
+          items:
+            type: string
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        related_event_ids:
+          type: array
+          items:
+            type: string
+        retention:
+          $ref: '#/components/schemas/Retention'
+        integrity:
+          $ref: '#/components/schemas/IntegrityBlock'
+        received_at:
+          type: string
+          format: date-time
+
+    AuditEnvelope:
+      type: object
+      properties:
+        event:
+          $ref: '#/components/schemas/AuditEvent'
+
+    AuditQueryResult:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEnvelope'
+        next_page_token:
+          type: string
+
+    Actor:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [HUMAN, SERVICE, MACHINE]
+        actor_id:
+          type: string
+        principal:
+          type: string
+        display_name:
+          type: string
+        email:
+          type: string
+          format: email
+        roles:
+          type: array
+          items:
+            type: string
+        authn:
+          $ref: '#/components/schemas/AuthnContext'
+
+    AuthnContext:
+      type: object
+      properties:
+        methods:
+          type: array
+          items:
+            type: string
+        mfa_used:
+          type: boolean
+        mfa_type:
+          type: string
+        issuer:
+          type: string
+        session_id:
+          type: string
+        auth_time:
+          type: string
+        claims:
+          type: object
+          additionalProperties:
+            type: string
+
+    Target:
+      type: object
+      properties:
+        resource:
+          $ref: '#/components/schemas/Resource'
+        permissions:
+          type: array
+          items:
+            type: string
+        operation:
+          type: string
+
+    Resource:
+      type: object
+      properties:
+        type:
+          type: string
+        id:
+          type: string
+        urn:
+          type: string
+        name:
+          type: string
+        attributes:
+          type: object
+          additionalProperties:
+            type: string
+
+    Source:
+      type: object
+      properties:
+        service_name:
+          type: string
+        service_version:
+          type: string
+        instance_id:
+          type: string
+        region:
+          type: string
+        zone:
+          type: string
+        cluster:
+          type: string
+        node:
+          type: string
+        pod:
+          type: string
+
+    ClientInfo:
+      type: object
+      properties:
+        user_agent:
+          type: string
+        device_id:
+          type: string
+        os:
+          type: string
+        app:
+          type: string
+
+    NetworkContext:
+      type: object
+      properties:
+        src_ip:
+          type: string
+        src_port:
+          type: integer
+        dst_ip:
+          type: string
+        dst_port:
+          type: integer
+        protocol:
+          type: string
+        geo:
+          $ref: '#/components/schemas/GeoInfo'
+
+    GeoInfo:
+      type: object
+      properties:
+        country:
+          type: string
+        city:
+          type: string
+        latitude:
+          type: number
+          format: double
+        longitude:
+          type: number
+          format: double
+        asn:
+          type: string
+        isp:
+          type: string
+
+    PolicyDecision:
+      type: object
+      properties:
+        policy_id:
+          type: string
+        policy_version:
+          type: string
+        allow:
+          type: boolean
+        matched_rules:
+          type: array
+          items:
+            type: string
+        obligations:
+          type: object
+          additionalProperties: true
+        input:
+          type: object
+          additionalProperties: true
+        evaluator:
+          type: string
+        score:
+          type: number
+          format: double
+
+    Compliance:
+      type: object
+      properties:
+        frameworks:
+          type: array
+          items:
+            type: string
+        controls:
+          type: array
+          items:
+            type: string
+        violations:
+          type: array
+          items:
+            type: string
+
+    Retention:
+      type: object
+      properties:
+        ttl_seconds:
+          type: integer
+          format: int64
+        delete_after:
+          type: string
+          format: date-time
+        policy_id:
+          type: string
+
+    IntegrityBlock:
+      type: object
+      properties:
+        hash_algo:
+          $ref: '#/components/schemas/HashAlgorithm'
+        event_hash:
+          type: string
+          format: byte
+        sig_algo:
+          $ref: '#/components/schemas/SignatureAlgorithm'
+        signature:
+          type: string
+          format: byte
+        signer_key_id:
+          type: string
+        certificate_chain_pem:
+          type: string
+        transparency:
+          $ref: '#/components/schemas/TransparencyProof'
+        previous_event_hash:
+          type: string
+          format: byte
+
+    TransparencyProof:
+      type: object
+      properties:
+        leaf_hash:
+          type: string
+          format: byte
+        merkle_root:
+          type: string
+          format: byte
+        audit_path:
+          type: array
+          items:
+            type: string
+            format: byte
+        tree_size:
+          type: integer
+          format: int64
+        leaf_index:
+          type: integer
+          format: int64
+
+    TransparencyEntry:
+      type: object
+      properties:
+        leaf_index:
+          type: integer
+        leaf_hash:
+          type: string
+          format: byte
+        timestamp:
+          type: string
+          format: date-time
+
+    VerificationResult:
+      type: object
+      properties:
+        signature_ok:
+          type: boolean
+        hash_ok:
+          type: boolean
+        inclusion_ok:
+          type: boolean
+        errors:
+          type: array
+          items:
+            type: string
+
+    # ---------- CA CSR ----------
+    CaCsrTemplateMeta:
+      type: object
+      properties:
+        template_id:
+          type: string
+        owner:
+          type: string
+          format: email
+        description:
+          type: string
+        created_at:
+            type: string
+            format: date-time
+        revision:
+          type: integer
+
+    CaCsrTemplate:
+      type: object
+      required: [metadata, profile, subject, key, validity, extensions]
+      properties:
+        apiVersion:
+          type: string
+          example: security-core/v1
+        kind:
+          type: string
+          example: CaCsrTemplate
+        metadata:
+          type: object
+          properties:
+            template_id:
+              type: string
+            owner:
+              type: string
+            description:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+            revision:
+              type: integer
+        profile:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [root-ca, intermediate-ca]
+        subject:
+          type: object
+          properties:
+            country: { type: string }
+            state: { type: string }
+            locality: { type: string }
+            organization: { type: string }
+            organizational_unit: { type: string }
+            common_name: { type: string }
+        key:
+          type: object
+          properties:
+            algorithm:
+              type: string
+              enum: [ECDSA, RSA, ED25519]
+            rsa:
+              type: object
+              properties:
+                bits: { type: integer }
+                public_exponent: { type: integer }
+            ecdsa:
+              type: object
+              properties:
+                curve:
+                  type: string
+                  enum: [P-256, P-384, P-521]
+            ed25519:
+              type: object
+              properties:
+                pure: { type: boolean }
+            protect_private_key:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                cipher: { type: string }
+                kdf: { type: string }
+            provider:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                type: { type: string }
+                slot: { type: string }
+                key_label: { type: string }
+                module_path: { type: string }
+                key_id: { type: string }
+        signature:
+          type: object
+          properties:
+            digest:
+              type: string
+              enum: [sha256, sha384, sha512]
+            serial_number:
+              type: object
+              properties:
+                random: { type: boolean }
+                length_bytes: { type: integer }
+        validity:
+          type: object
+          properties:
+            not_before: { type: string }
+            duration: { type: string }
+            not_after: { type: string }
+        extensions:
+          type: object
+          properties:
+            basic_constraints:
+              type: object
+              properties:
+                critical: { type: boolean }
+                ca: { type: boolean }
+                path_len: { type: integer }
+            key_usage:
+              type: object
+              properties:
+                critical: { type: boolean }
+                usages:
+                  type: array
+                  items: { type: string }
+            extended_key_usage:
+              type: object
+              properties:
+                critical: { type:boolean }
+                usages:
+                  type: array
+                  items: { type: string }
+            subject_key_identifier:
+              type: object
+              properties:
+                enabled: { type: boolean }
+            authority_key_identifier:
+              type: object
+              properties:
+                enabled: { type: boolean }
+            name_constraints:
+              type: object
+              properties:
+                critical: { type: boolean }
+                permitted:
+                  type: object
+                  properties:
+                    dns: { type: array, items: { type: string } }
+                    email: { type: array, items: { type: string } }
+                    ip: { type: array, items: { type: string } }
+                    uri: { type: array, items: { type: string } }
+                excluded:
+                  type: object
+                  properties:
+                    dns: { type: array, items: { type: string } }
+                    email: { type: array, items: { type: string } }
+                    ip: { type: array, items: { type: string } }
+                    uri: { type: array, items: { type: string } }
+            certificate_policies:
+              type: object
+              properties:
+                critical: { type: boolean }
+                policies:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      oid: { type: string }
+                      cps_uri: { type: string }
+                      user_notice:
+                        type: object
+                        properties:
+                          explicit_text: { type: string }
+            aia:
+              type: object
+              properties:
+                ca_issuers:
+                  type: array
+                  items: { type: string }
+                ocsp:
+                  type: array
+                  items: { type: string }
+            crl_distribution_points:
+              type: array
+              items: { type: string }
+            subject_alt_name:
+              type: object
+              properties:
+                critical: { type: boolean }
+                dns: { type: array, items: { type: string } }
+                email: { type: array, items: { type: string } }
+                uri: { type: array, items: { type: string } }
+                ip: { type: array, items: { type: string } }
+        compliance:
+          type: object
+          properties:
+            enforce_min_key_size: { type: boolean }
+            allowed_key_algs: { type: array, items: { type: string } }
+            min_rsa_bits: { type: integer }
+            allowed_ecdsa_curves: { type: array, items: { type: string } }
+            allowed_hashes: { type: array, items: { type: string } }
+            lint:
+              type: object
+              properties:
+                x509lint: { type: boolean }
+                zlint: { type: boolean }
+                cab_forum_tls_server_profile: { type: boolean }
+        output:
+          type: object
+          properties:
+            format: { type: string }
+            directory: { type: string }
+            files:
+              type: object
+              properties:
+                csr: { type: string }
+                key: { type: string }
+                meta: { type: string }
+            permissions:
+              type: object
+              properties:
+                key_file_mode: { type: string }
+                csr_file_mode: { type: string }
+            overwrite: { type: boolean }
+        observability:
+          type: object
+          properties:
+            audit_log:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                sink: { type: string }
+                file_path: { type: string }
+            metrics:
+              type: object
+              properties:
+                enabled: { type: boolean }
+        redaction:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            fields:
+              type: array
+              items: { type: string }
+        profiles:
+          type: object
+          additionalProperties: true
+
+    CaCsrRendered:
+      type: object
+      properties:
+        template_id: { type: string }
+        rendered:
+          type: object
+          additionalProperties: true
+
+    CaCsrRenderInput:
+      type: object
+      required: [template_id]
+      properties:
+        template_id: { type: string }
+        overrides:
+          type: object
+          additionalProperties: true
+
+    CaCsrGenerateResult:
+      type: object
+      properties:
+        key_ref:
+          type: string
+          description: Opaque reference to key stored in KMS/HSM
+        csr_pem:
+          type: string
+          description: PEM-encoded CSR
+        metadata:
+          type: object
+          additionalProperties: true
+
+    # ---------- Errors ----------
+    Problem:
+      type: object
+      description: RFC 7807 Problem Details
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+      additionalProperties: true
+
+security:
+  - mtls: []
+    oauth2: []

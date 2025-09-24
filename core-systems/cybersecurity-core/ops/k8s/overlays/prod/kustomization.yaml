@@ -1,0 +1,227 @@
+# cybersecurity-core/ops/k8s/overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Базовый слой приложения
+resources:
+  - ../../base
+
+# Имя пространства, префикс/суффикс для прод
+namespace: security
+nameSuffix: -prod
+
+# Единые метки и аннотации для отслеживаемости и политик
+commonLabels:
+  app.kubernetes.io/name: cybersecurity-core
+  app.kubernetes.io/instance: cybersecurity-core
+  app.kubernetes.io/part-of: cybersecurity-core
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/component: api
+  env: prod
+
+commonAnnotations:
+  security.aethernova.io/hardening-level: "strict"
+  security.aethernova.io/policy: "baseline"
+  rollout.strategy: "rolling"
+  owner.team: "platform-security"
+  support.contact: "security@aethernova.example"
+
+# Пинning образа по digest для детерминизма поставки
+images:
+  - name: cybersecurity-core
+    newName: registry.example.com/cybersecurity-core/cybersecurity-core
+    # Укажите реальный digest вашего релиза:
+    digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+
+# Масштабирование в проде
+replicas:
+  - name: cybersecurity-core
+    count: 3
+
+# Патчи безопасности, стабильности и сетевых параметров
+patches:
+  # 1) Усиление Deployment: ресурсы, probes, securityContext, стратегия, topology spread
+  - target:
+      version: v1
+      kind: Deployment
+      name: cybersecurity-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: cybersecurity-core
+      spec:
+        revisionHistoryLimit: 10
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxSurge: 25%
+            maxUnavailable: 0
+        template:
+          metadata:
+            annotations:
+              container.apparmor.security.beta.kubernetes.io/cybersecurity-core: runtime/default
+          spec:
+            # Глобальный pod-level securityContext
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 10001
+              runAsGroup: 10001
+              fsGroup: 10001
+              seccompProfile:
+                type: RuntimeDefault
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: topology.kubernetes.io/zone
+                whenUnsatisfiable: ScheduleAnyway
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: cybersecurity-core
+            containers:
+              - name: cybersecurity-core
+                # Образ подменится через поле images выше (digest)
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "250m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "1000m"
+                    memory: "512Mi"
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                ports:
+                  - name: http
+                    containerPort: 8080
+                livenessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: http
+                  initialDelaySeconds: 15
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /readyz
+                    port: http
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  failureThreshold: 6
+                startupProbe:
+                  httpGet:
+                    path: /startupz
+                    port: http
+                  failureThreshold: 30
+                  periodSeconds: 2
+                env:
+                  - name: ENV
+                    value: prod
+                volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+            volumes:
+              - name: tmp
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 64Mi
+
+  # 2) Сервис: явные порты, строгий селектор
+  - target:
+      version: v1
+      kind: Service
+      name: cybersecurity-core
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: cybersecurity-core
+        annotations:
+          service.kubernetes.io/topology-aware-hints: "auto"
+      spec:
+        type: ClusterIP
+        selector:
+          app.kubernetes.io/name: cybersecurity-core
+          app.kubernetes.io/instance: cybersecurity-core
+        ports:
+          - name: http
+            port: 80
+            targetPort: http
+
+  # 3) Ingress: класс, TLS, строгие аннотации
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: cybersecurity-core
+    patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: cybersecurity-core
+        annotations:
+          kubernetes.io/ingress.class: "nginx"
+          nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+          nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          nginx.ingress.kubernetes.io/hsts: "true"
+          nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+          nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+          nginx.ingress.kubernetes.io/hsts-preload: "true"
+      spec:
+        tls:
+          - hosts:
+              - cybersecurity-core.example.com
+            secretName: cybersecurity-core-tls
+        rules:
+          - host: cybersecurity-core.example.com
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: cybersecurity-core
+                      port:
+                        number: 80
+
+  # 4) NetworkPolicy (inline patch предполагает наличие ресурса в базе; если его нет, добавьте в base)
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: NetworkPolicy
+      name: cybersecurity-core
+    patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: cybersecurity-core
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: cybersecurity-core
+        policyTypes: ["Ingress","Egress"]
+        ingress:
+          - from:
+              - namespaceSelector:
+                  matchLabels:
+                    name: security
+              - podSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: cybersecurity-core
+            ports:
+              - protocol: TCP
+                port: 8080
+        egress:
+          - to:
+              - namespaceSelector: {}   # ограничьте по необходимости
+            ports:
+              - protocol: TCP
+                port: 443
+
+# Опции генераторов (если используются в base) — сохраняем hash, чтобы фиксировать изменения содержимого
+generatorOptions:
+  disableNameSuffixHash: false

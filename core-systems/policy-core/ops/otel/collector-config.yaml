@@ -1,0 +1,285 @@
+# policy-core/ops/otel/collector-config.yaml
+# Требуется дистрибутив otel-collector-contrib (из-за filelog, loki, k8sattributes, spanmetrics, prometheusremotewrite)
+
+receivers:
+  # Основной приёмник телеметрии из сервисов (traces/metrics/logs)
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 64
+        auth:
+          authenticator: basicauth/server # опционально через extension
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins: ["*"]
+          max_age: 600
+
+  # Сбор метрик самим коллектором и сервисами (если нет отдельного Prometheus)
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: "otel-collector"
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:OTEL_COLLECTOR_PROM_ENDPOINT:0.0.0.0:8888}"]
+        - job_name: "policy-core"
+          honor_labels: true
+          scrape_interval: 15s
+          kubernetes_sd_configs:
+            - role: pod
+          relabel_configs:
+            - action: keep
+              source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              regex: "true"
+            - action: replace
+              source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+              target: __metrics_path__
+              regex: "(.+)"
+            - action: replace
+              source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+              target: __address__
+              regex: "(.+)"
+              replacement: "$${1}"
+            - action: replace
+              source_labels: [__meta_kubernetes_namespace]
+              target: namespace
+            - action: replace
+              source_labels: [__meta_kubernetes_pod_name]
+              target: pod
+            - action: keep
+              source_labels: [__meta_kubernetes_pod_label_app,__meta_kubernetes_pod_label_app_kubernetes_io_name]
+              regex: "(policy-core|policy-core)"
+          metric_relabel_configs:
+            - action: drop
+              source_labels: [__name__]
+              regex: "go_.*|process_.*"  # при необходимости убрать метрики рантайма
+
+  # Сбор логов контейнеров Policy Core (формат Kubernetes)
+  filelog:
+    include:
+      - /var/log/pods/*/policy-core/*.log
+    start_at: end
+    operators:
+      - type: json_parser
+        id: k8s_json
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: 2006-01-02T15:04:05.000Z07:00
+        severity:
+          parse_from: attributes.severity
+      - type: move
+        from: attributes.log
+        to: body
+      - type: regex_parser
+        # Пример маскировки email в теле
+        regex: '(?P<masked>[^@\s]+)@[^@\s]+'
+        parse_from: body
+        on_error: "skip"
+
+processors:
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+  batch:
+    timeout: 2s
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    filter:
+      node_from_env_var: KUBE_NODE_NAME
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.namespace.name
+        - k8s.deployment.name
+        - k8s.pod.uid
+        - k8s.node.name
+      labels:
+        - key: app
+        - key: app.kubernetes.io/name
+        - key: app.kubernetes.io/component
+        - key: app.kubernetes.io/instance
+        - key: version
+
+  resourcedetection:
+    detectors: [env, system, k8s, eks, gcp, azure, ec2]
+    timeout: 5s
+    override: false
+
+  resource:
+    attributes:
+      - action: upsert
+        key: service.name
+        value: policy-core
+      - action: upsert
+        key: service.namespace
+        value: ${env:SERVICE_NAMESPACE:default}
+      - action: upsert
+        key: deployment.environment
+        value: ${env:DEPLOY_ENV:prod}
+
+  # Удаляем чувствительные заголовки / нормализуем атрибуты
+  attributes/sanitize:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: http.response.header.set-cookie
+        action: delete
+      - key: user.email
+        action: hash
+      - key: enduser.id
+        action: delete
+
+  # Отфильтровать паразитные health-запросы из трейсов
+  filter/health:
+    traces:
+      span:
+        - 'attributes["http.target"] == "/health" or attributes["url.path"] == "/health"'
+
+  # Tail-sampling: сохраняем ошибки, медленные трейс-деревья, остальное — вероятностно
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 250000
+    expected_new_traces_per_sec: 1000
+    policies:
+      - name: error-spans
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: high-latency
+        type: latency
+        latency:
+          threshold_ms: 500
+      - name: policy-core-keep
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values: ["policy-core"]
+          enabled_regex_matching: false
+      - name: prob-sample
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 5
+
+  # Трансформации (минимальные примеры)
+  transform:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["otel.dropped_pii"], true) where attributes["user.ssn"] != nil
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["policy.slo"], "gold") where IsMatch(name, "http.server.duration")
+    log_statements:
+      - context: log
+        statements:
+          - delete_key(attributes, "password") where attributes["password"] != nil
+
+  # Генерация метрик из трейсов (RPS/latency/коды)
+  spanmetrics:
+    metrics_flush_interval: 30s
+    histogram:
+      explicit:
+        buckets: [0.005,0.01,0.025,0.05,0.1,0.25,0.5,1,2,5]
+    dimensions:
+      - name: http.method
+      - name: http.status_code
+      - name: service.name
+    dimensions_cache_size: 10000
+
+exporters:
+  # Универсальный OTLP экспорт в вашу APM/TSDB/темпо
+  otlp:
+    endpoint: ${env:OTLP_ENDPOINT:otel-collector.otlp.svc:4317}
+    tls:
+      insecure: ${env:OTLP_INSECURE:false}
+      insecure_skip_verify: ${env:OTLP_INSECURE_SKIP_VERIFY:false}
+    headers:
+      Authorization: ${env:OTLP_AUTH:}
+
+  otlphttp:
+    endpoint: ${env:OTLP_HTTP_ENDPOINT:}
+    headers:
+      Authorization: ${env:OTLP_HTTP_AUTH:}
+
+  # Локальная экспозиция прометей-метрик, если требуется
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    const_labels:
+      service: policy-core
+
+  # Отправка метрик в удалённый Prometheus-совместимый TSDB
+  prometheusremotewrite:
+    endpoint: ${env:PRW_ENDPOINT:}
+    tls:
+      insecure_skip_verify: ${env:PRW_TLS_INSECURE_SKIP_VERIFY:false}
+    headers:
+      Authorization: ${env:PRW_AUTH:}
+
+  # Экспорт логов в Loki (требует otelcol-contrib)
+  loki:
+    endpoint: ${env:LOKI_ENDPOINT:http://loki:3100/loki/api/v1/push}
+    headers:
+      X-Scope-OrgID: ${env:LOKI_TENANT_ID:default}
+    default_labels_enabled:
+      exporter: true
+      job: true
+      instance: true
+      level: true
+
+  # Диагностический логгер (оставить включенным на минимальном уровне)
+  logging:
+    loglevel: info
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+  basicauth/server:
+    htpasswd: ${env:OTLP_BASICAUTH_HTPASSWD:} # опционально; если пусто — не активируется
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888
+
+  extensions: [health_check, pprof, zpages, basicauth/server]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, resource, attributes/sanitize, filter/health, tail_sampling, batch]
+      exporters: [otlp, spanmetrics]  # экспорт в OTLP + генерация метрик
+
+    # Метрики из трейсов через spanmetrics-коннектор
+    metrics/spanmetrics:
+      receivers: [spanmetrics]
+      processors: [batch]
+      exporters: [prometheusremotewrite]
+
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, k8sattributes, resourcedetection, resource, batch]
+      exporters: [prometheus, prometheusremotewrite, otlp]
+
+    logs:
+      receivers: [otlp, filelog]
+      processors: [memory_limiter, k8sattributes, resourcedetection, resource, attributes/sanitize, batch]
+      exporters: [loki, otlp, logging]

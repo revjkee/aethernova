@@ -1,0 +1,263 @@
+# cybersecurity-core/configs/features.yaml
+# Версия схемы конфигурации
+version: 1
+
+global:
+  clusterName: "neurocity-prod"
+  environment: "production"            # production | staging | dev
+  owner: "secops"
+  labels: {}                           # дополнительные метки к ресурсам
+  annotations: {}                      # дополнительные аннотации к ресурсам
+  timezone: "UTC"
+
+admissionControl:
+  # Единовременно используйте только один движок политик.
+  engine: "kyverno"                    # kyverno | gatekeeper
+  mode: "enforce"                      # enforce | audit
+  failurePolicy: "Fail"                # Fail | Ignore
+  webhookTimeoutSeconds: 10
+  excludeNamespaces: ["kube-system", "kube-public"]
+  includeNamespaces: ["*"]
+
+  kyverno:
+    enabled: true
+    policySets:
+      podSecurity: "restricted"        # baseline | restricted (Pod Security Standards)
+      baselinePolicies: true           # базовые best-practices
+      restrictedPolicies: true         # строгие запреты (privileged, hostPID/IPC/Net и т.д.)
+      imageVerify: true                # verifyImages c Cosign
+      mutateDefaults: true             # автодобавление безопасных полей (runAsNonRoot и т.п.)
+    verifyImages:
+      enabled: true
+      provider: "cosign"
+      keys:
+        - name: "cosign-public-key"
+          secretRef:
+            name: "cosign-pubkey"
+            key: "cosign.pub"
+      allowedRegistries:
+        - "ghcr.io/yourorg"
+        - "registry.yourcorp.local"
+      blockedRegistries:
+        - "docker.io/library"
+        - "gcr.io/unknown"
+    exceptions:                        # точечные исключения по неймспейсам/приложениям
+      namespaces: []
+      workloads: []                    # список в формате ns/name или labelSelector
+
+  gatekeeper:
+    enabled: false
+    auditIntervalSeconds: 60
+    constraintTemplatesRepo: ""        # при необходимости укажите Git/OCI
+    exceptions:
+      namespaces: []
+      workloads: []
+
+vulnerabilityScanning:
+  trivyOperator:
+    enabled: true
+    severities: ["CRITICAL", "HIGH"]   # CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
+    ignoreUnfixed: true
+    sbom:
+      enabled: true
+      format: "spdx-json"
+    schedules:
+      cluster: "0 */6 * * *"           # скан образов в реестрах
+      workloads: "0 */12 * * *"        # скан запущенных ворклоадов
+    namespaceInclude: ["*"]
+    namespaceExclude: ["kube-system", "monitoring"]
+    reportTTL: "168h"                  # хранение отчетов
+    allowlistCVEs: []                  # например: ["CVE-2023-12345"]
+
+runtimeSecurity:
+  falco:
+    enabled: true
+    driver: "ebpf"                     # ebpf | kernel
+    rulesets:
+      - "default"
+      - "k8s_audit"
+    appendRules: []                    # дополнительные правила в формате YAML
+    excludeNamespaces: ["monitoring"]
+    outputs:
+      stdout: true
+      http:
+        enabled: false
+        url: ""
+      loki:
+        enabled: false                 # если используете Loki, включите ниже logging.loki.enabled
+
+networkSecurity:
+  defaultDeny:
+    enabled: true
+    namespaces: ["*"]                  # генерировать default-deny NetworkPolicy
+  allowlist:
+    # Примеры разрешений поверх default-deny
+    - namespace: "default"
+      toServices:
+        - "kube-dns.kube-system.svc.cluster.local"
+      ports:
+        - 53/UDP
+        - 53/TCP
+    - namespace: "ingress"
+      toCIDRs:
+        - "0.0.0.0/0"
+      ports:
+        - 80/TCP
+        - 443/TCP
+
+supplyChainSecurity:
+  imagePolicy:
+    allowedRegistries:
+      - "ghcr.io/yourorg"
+      - "registry.yourcorp.local"
+    blockedRegistries:
+      - "docker.io/library"
+    signatureVerification:
+      enabled: true
+      provider: "cosign"
+      keys:
+        - secretName: "cosign-pubkey"
+          key: "cosign.pub"
+  provenance:
+    requireSBOM: true
+    attestations:
+      slsaProvenance: true
+      vulnReport: true
+
+rbacHardening:
+  enabled: true
+  requireNonRoot: true
+  disallowPrivilegeEscalation: true
+  dropCapabilities:
+    - "ALL"
+  allowedCapabilities: []              # точечные исключения при необходимости
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  seccompProfile: "RuntimeDefault"
+  appArmorProfile: "runtime/default"
+  tokenAutomount: false
+
+logging:
+  loki:
+    enabled: false
+    retentionDays: 14
+    labels:
+      app: "cybersecurity-core"
+  auditLogs:
+    enabled: true
+    sink:
+      type: "loki"                     # loki | stdout | http
+      url: "http://loki.logging.svc.cluster.local:3100"
+
+observability:
+  prometheus:
+    enabled: false
+    serviceMonitor: true
+  metrics:
+    enabled: true
+    scrapeInterval: "30s"
+
+alerts:
+  enabled: true
+  routes:
+    slack:
+      enabled: false
+      webhookSecretRef:                # секрет должен содержать webhook URL
+        name: "secops-slack-webhook"
+        key: "url"
+      minSeverity: "high"              # info|low|medium|high|critical
+    email:
+      enabled: false
+      to: "secops@yourcorp.local"
+      smtpSecretRef:
+        name: "smtp-credentials"
+        keys:
+          host: "host"
+          port: "port"
+          user: "user"
+          pass: "pass"
+
+ingress:
+  enabled: false
+  className: "nginx"
+  hosts: []                            # примеры: ["security.yourcorp.com"]
+  tls: []                              # примеры: [{hosts:["security.yourcorp.com"], secretName:"security-tls"}]
+
+tenants:
+  # Пер-неймспейс настройки и исключения политик
+  - name: "prod-apps"
+    namespaces:
+      - "payments"
+      - "checkout"
+    policyOverrides:
+      admissionMode: "enforce"
+      exceptions:
+        workloads: []
+        cves: []
+  - name: "platform"
+    namespaces:
+      - "monitoring"
+    policyOverrides:
+      admissionMode: "audit"
+      exceptions:
+        workloads: []
+        cves:
+          - "CVE-0000-EXAMPLE"
+
+exceptions:
+  # Глобальные исключения (fallback)
+  namespaces: []
+  workloads: []
+  ruleWaivers:                          # для Falco: временные отступления
+    - rule: "Write below etc"
+      reason: "Легаси-скрипт, в процессе выноса"
+      expires: "2025-12-31"
+
+webhooks:
+  mutatingTimeoutSeconds: 10
+  validatingTimeoutSeconds: 10
+  failurePolicy: "Fail"
+
+upgradePolicy:
+  strategy: "RollingUpdate"
+  maxUnavailable: 0
+  maxSurge: 1
+
+resourceLimits:
+  kyverno:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+  gatekeeper:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+  trivyOperator:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+  falco:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+# Согласованность с Helm-чартом:
+# - admissionControl.kyverno.enabled  -> dependencies.kyverno.condition
+# - admissionControl.gatekeeper.enabled -> dependencies.gatekeeper.condition
+# - vulnerabilityScanning.trivyOperator.enabled -> dependencies.trivy-operator.condition
+# - runtimeSecurity.falco.enabled -> dependencies.falco.condition
+# - logging.loki.enabled -> dependencies.loki.condition
+# - ingress.enabled -> dependencies.ingress-nginx.condition

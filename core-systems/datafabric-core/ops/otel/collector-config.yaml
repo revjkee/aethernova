@@ -1,0 +1,236 @@
+# datafabric-core / ops / otel / collector-config.yaml
+# OpenTelemetry Collector (contrib) — продакшен-конфиг
+# Требует образ otel/opentelemetry-collector-contrib.
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # tls: {}  # включите при использовании mTLS
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      global:
+        scrape_interval: 30s
+        scrape_timeout: 10s
+        evaluation_interval: 30s
+        external_labels:
+          cluster: ${CLUSTER_NAME:unknown}
+          env: ${ENVIRONMENT:unknown}
+      scrape_configs:
+        - job_name: otel-collector
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
+        - job_name: k8s-pods
+          kubernetes_sd_configs:
+            - role: pod
+          relabel_configs:
+            - action: keep
+              source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              regex: "true"
+            - action: replace
+              source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+              regex: (.+)
+              target_label: __metrics_path__
+            - action: replace
+              source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+              regex: (.+)
+              target_label: __address__
+              replacement: $1
+            - action: labelmap
+              regex: __meta_kubernetes_pod_label_(.+)
+  hostmetrics:
+    collection_interval: 60s
+    scrapers:
+      cpu: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      network: {}
+      load: {}
+      process: {}
+  kubeletstats:
+    collection_interval: 60s
+    auth_type: serviceAccount
+    endpoint: "${KUBELET_ENDPOINT:}"
+    insecure_skip_verify: true
+    metric_groups:
+      - node
+      - pod
+      - container
+  filelog:
+    include: [ "${APP_LOG_PATHS:/var/log/containers/*.log}" ]
+    start_at: beginning
+    include_file_name: false
+    include_file_path: false
+    operators:
+      - type: json_parser
+        timestamp:
+          parse_from: attributes.time
+          layout: '%Y-%m-%dT%H:%M:%S.%fZ'
+        severity:
+          parse_from: attributes.level
+      - type: move
+        from: attributes.message
+        to: body
+      - type: add
+        field: attributes.log.source
+        value: "filelog"
+
+processors:
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch:
+    send_batch_max_size: 8192
+    send_batch_size: 2048
+    timeout: 5s
+  k8sattributes:
+    auth_type: serviceAccount
+    filter:
+      node_from_env_var: KUBE_NODE_NAME
+    passthrough: false
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - k8s.node.name
+      labels:
+        - tag_name: app
+          key: app.kubernetes.io/name
+          from: pod
+        - tag_name: component
+          key: app.kubernetes.io/component
+          from: pod
+  resourcedetection:
+    detectors: [env, system, gcp, azure, ec2, k8s]
+    timeout: 2s
+    override: false
+  attributes/normalize:
+    actions:
+      - key: service.namespace
+        action: upsert
+        value: ${SERVICE_NAMESPACE:datafabric}
+      - key: deployment.environment
+        action: upsert
+        value: ${ENVIRONMENT:staging}
+  transform/logs:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["severity_text"], body) where attributes["level"] != nil and attributes["severity_text"] == nil
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 1000
+    policies:
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: long-latency
+        type: latency
+        latency:
+          threshold_ms: 500
+      - name: important-tenant
+        type: string_attribute
+        string_attribute:
+          key: tenant.id
+          values: ["vip", "gold"]
+          enabled_regex_matching: false
+      - name: always-sample-health
+        type: string_attribute
+        string_attribute:
+          key: http.target
+          values: ["/health", "/readyz"]
+          invert_match: true  # исключить шум
+  spanmetrics:
+    metrics_exporter: prometheusremotewrite
+    aggregation_temporality: "CUMULATIVE"
+    metrics_flush_interval: 15s
+    dimensions:
+      - service.name
+      - http.method
+      - http.route
+      - http.status_code
+      - k8s.namespace.name
+      - k8s.pod.name
+
+exporters:
+  logging:
+    verbosity: normal
+    sampling_initial: 5
+    sampling_thereafter: 200
+  otlp:
+    endpoint: ${OTLP_EXPORTER_ENDPOINT:tempo:4317}
+    tls:
+      insecure: ${OTLP_EXPORTER_INSECURE:true}
+  otlphttp:
+    endpoint: ${OTLP_HTTP_EXPORTER_ENDPOINT:http://tempo:4318}
+    tls:
+      insecure: ${OTLP_HTTP_EXPORTER_INSECURE:true}
+  prometheusremotewrite:
+    endpoint: ${PROM_REMOTE_WRITE_URL:http://prometheus:9090/api/v1/write}
+    external_labels:
+      cluster: ${CLUSTER_NAME:unknown}
+      env: ${ENVIRONMENT:unknown}
+    tls:
+      insecure: ${PROM_RW_INSECURE:true}
+  loki:
+    endpoint: ${LOKI_ENDPOINT:http://loki:3100/loki/api/v1/push}
+    labels:
+      attributes:
+        - service.name
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.container.name
+        - app
+        - component
+    tls:
+      insecure: ${LOKI_INSECURE:true}
+
+connectors:
+  # Коннектор формирует метрики на основе трасс (используется в pipelines.metrics).
+  spanmetrics: {}
+
+service:
+  telemetry:
+    logs:
+      level: info
+  extensions: [health_check, pprof, zpages]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, attributes/normalize, tail_sampling, batch]
+      exporters: [otlp, logging]
+    traces/spanmetrics:   # создаёт метрики из трасс
+      receivers: [spanmetrics]
+      processors: [batch]
+      exporters: [prometheusremotewrite]
+    metrics:
+      receivers: [prometheus, hostmetrics, kubeletstats, spanmetrics]
+      processors: [memory_limiter, k8sattributes, resourcedetection, batch]
+      exporters: [prometheusremotewrite, logging]
+    logs:
+      receivers: [filelog, otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, attributes/normalize, transform/logs, batch]
+      exporters: [loki, otlp, logging]
+
+  # Метрики/зонды самого коллектора доступны на 8888 (Prometheus receiver выше их собирает).
+  # В манифесте Deployment задайте OTEL_RESOURCE_ATTRIBUTES, KUBE_NODE_NAME и переменные экспортеров.

@@ -1,0 +1,527 @@
+syntax = "proto3";
+
+package aethernova.security.v1;
+
+option cc_enable_arenas = true;
+option java_multiple_files = true;
+option java_package = "ai.aethernova.security.v1";
+option csharp_namespace = "Aethernova.Security.V1";
+option php_namespace = "Aethernova\\Security\\V1";
+option ruby_package = "Aethernova::Security::V1";
+option objc_class_prefix = "ANSec";
+option optimize_for = SPEED;
+option go_package = "github.com/aethernova/security-core/gen/go/security/v1;securityv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+
+// ==============================
+// ===== Core Enumerations  =====
+// ==============================
+
+enum AuthMethod {
+  AUTH_METHOD_UNSPECIFIED = 0;
+  AUTH_METHOD_PASSWORD    = 1;
+  AUTH_METHOD_TOTP        = 2;
+  AUTH_METHOD_WEBAUTHN    = 3; // FIDO2 / Passkeys
+  AUTH_METHOD_SMS_OTP     = 4;
+  AUTH_METHOD_EMAIL_OTP   = 5;
+  AUTH_METHOD_MAGIC_LINK  = 6;
+  AUTH_METHOD_OAUTH2_OIDC = 7;
+  AUTH_METHOD_SAML2       = 8;
+  AUTH_METHOD_RECOVERY    = 9;
+}
+
+enum TokenType {
+  TOKEN_TYPE_UNSPECIFIED = 0;
+  TOKEN_TYPE_ACCESS      = 1;
+  TOKEN_TYPE_REFRESH     = 2;
+  TOKEN_TYPE_ID          = 3; // OIDC ID Token semantics
+  TOKEN_TYPE_SESSION     = 4; // opaque session handle
+}
+
+enum SignatureAlg {
+  SIGALG_UNSPECIFIED = 0;
+  SIGALG_ED25519     = 1;
+  SIGALG_ES256       = 2;
+  SIGALG_ES384       = 3;
+  SIGALG_RS256       = 4;
+  SIGALG_RS512       = 5;
+  // Reserved for future PQC:
+  // SIGALG_P256_KYBER etc.
+}
+
+enum DevicePlatform {
+  PLATFORM_UNSPECIFIED = 0;
+  PLATFORM_WEB         = 1;
+  PLATFORM_WINDOWS     = 2;
+  PLATFORM_MACOS       = 3;
+  PLATFORM_LINUX       = 4;
+  PLATFORM_ANDROID     = 5;
+  PLATFORM_IOS         = 6;
+  PLATFORM_IPADOS      = 7;
+  PLATFORM_OTHER       = 99;
+}
+
+enum RiskLevel {
+  RISK_LEVEL_UNSPECIFIED = 0;
+  RISK_LEVEL_LOW         = 1;
+  RISK_LEVEL_MEDIUM      = 2;
+  RISK_LEVEL_HIGH        = 3;
+  RISK_LEVEL_CRITICAL    = 4;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED    = 0;
+  ERROR_INVALID_CREDENTIALS = 1;
+  ERROR_MFA_REQUIRED        = 2;
+  ERROR_ACCOUNT_LOCKED      = 3;
+  ERROR_RATE_LIMITED        = 4;
+  ERROR_TOKEN_EXPIRED       = 5;
+  ERROR_TOKEN_REVOKED       = 6;
+  ERROR_TOKEN_INVALID       = 7;
+  ERROR_CHALLENGE_EXPIRED   = 8;
+  ERROR_CHALLENGE_INVALID   = 9;
+  ERROR_NOT_BEFORE          = 10;
+  ERROR_UNAUTHORIZED_DEVICE = 11;
+  ERROR_POLICY_VIOLATION    = 12;
+}
+
+// ==============================
+// ===== Shared Structures  =====
+// ==============================
+
+message Principal {
+  string id                      = 1;  // stable internal ID (UUID)
+  google.protobuf.StringValue tenant_id  = 2;  // optional multi-tenant
+  google.protobuf.StringValue external_id = 3; // optional external mapping
+  google.protobuf.StringValue username    = 4;
+  google.protobuf.StringValue email       = 5;
+  google.protobuf.StringValue phone_e164  = 6;
+  google.protobuf.StringValue display_name = 7;
+  repeated string roles          = 8;
+  bool disabled                  = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  map<string, string> attributes = 12; // small KV for quick lookups
+
+  // Reserved for future: picture_url(13), locale(14), timezone(15)
+  reserved 13, 14, 15;
+}
+
+message Device {
+  string id                         = 1;  // server-side device id
+  DevicePlatform platform           = 2;
+  google.protobuf.StringValue os_version    = 3;
+  google.protobuf.StringValue model         = 4;
+  google.protobuf.StringValue user_agent    = 5;
+  google.protobuf.StringValue fingerprint   = 6; // stable client-derived fp
+  bool trusted                      = 7;        // admin/user trusted device
+  bool compliant                    = 8;        // MDM/compliance gate
+  bool attested                     = 9;        // device attestation passed
+  google.protobuf.StringValue attestation_provider = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp last_seen_at = 12;
+
+  // Reserved for hardware-bound keys, TPM/SE info:
+  reserved 13, 14, 15;
+}
+
+message RiskSignals {
+  RiskLevel level                   = 1;
+  google.protobuf.FloatValue score  = 2; // 0..1 or 0..100 as per policy
+  google.protobuf.StringValue reason = 3;
+  repeated string anomalies         = 4;
+  google.protobuf.StringValue ip_address = 5;
+  google.protobuf.StringValue geoip_country = 6;
+  google.protobuf.StringValue geoip_city    = 7;
+  bool via_proxy                    = 8;
+  bool via_tor                      = 9;
+  bool velocity_exceeded            = 10;
+  repeated string historical_ips    = 11;
+}
+
+message ClientContext {
+  google.protobuf.StringValue request_id = 1; // correlation id for tracing
+  google.protobuf.StringValue ip_address = 2;
+  google.protobuf.StringValue user_agent = 3;
+  google.protobuf.StringValue locale     = 4;
+  google.protobuf.StringValue timezone   = 5;
+  Device device                          = 6;
+  google.protobuf.Struct headers         = 7; // sanitized headers if needed
+  google.protobuf.Struct extra           = 8; // any additional context
+}
+
+message ApiError {
+  ErrorCode code                 = 1;
+  string message                 = 2;
+  google.protobuf.StringValue correlation_id = 3;
+}
+
+// ==============================
+// ===== Credentials Model  =====
+// ==============================
+
+message PasswordCredential {
+  string kdf              = 1;  // e.g., argon2id, scrypt, pbkdf2
+  string hash_alg         = 2;  // e.g., blake2b, sha256
+  bytes salt              = 3;
+  bytes hash              = 4;
+  uint32 iterations       = 5;  // pbkdf2
+  uint32 memory_kib       = 6;  // argon2/scrypt
+  uint32 parallelism      = 7;  // argon2/scrypt
+  google.protobuf.Timestamp rotated_at = 8;
+  google.protobuf.StringValue version  = 9;  // internal version tag
+}
+
+message TotpCredential {
+  string issuer                 = 1;
+  string label                  = 2;
+  uint32 period_seconds         = 3;  // typical 30
+  uint32 digits                 = 4;  // typical 6
+  string algo                   = 5;  // SHA1/SHA256/SHA512
+  bool verified                 = 6;
+  google.protobuf.Timestamp enrolled_at = 7;
+}
+
+message WebAuthnCredential {
+  string credential_id_b64url = 1;
+  string aaguid               = 2;
+  bytes public_key_cose       = 3;
+  uint32 sign_count           = 4;
+  string attestation_format   = 5; // packed, none, etc.
+  repeated string transports  = 6; // usb, ble, nfc, internal
+  bool user_verification      = 7; // UV performed during registration
+  bool resident_key           = 8; // RK enabled
+  string rp_id                = 9; // relying party id
+  google.protobuf.StringValue name = 10; // friendly name
+  google.protobuf.Timestamp registered_at = 11;
+}
+
+message ExternalAuthBinding {
+  string provider = 1;  // "google", "apple", "github", "saml-acme", etc.
+  string issuer   = 2;
+  string subject  = 3;  // sub at provider
+  google.protobuf.StringValue email = 4;
+  google.protobuf.StringValue profile_url = 5;
+  google.protobuf.Timestamp linked_at = 6;
+}
+
+message Credential {
+  string id                 = 1;
+  string principal_id       = 2;
+  AuthMethod method         = 3;
+  bool revoked              = 4;
+  google.protobuf.StringValue revoke_reason = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+
+  oneof details {
+    PasswordCredential password   = 20;
+    TotpCredential totp           = 21;
+    WebAuthnCredential webauthn   = 22;
+    ExternalAuthBinding external  = 23;
+  }
+
+  // reserve block for future methods
+  reserved 24 to 39;
+}
+
+// ==============================
+// ===== Tokens and Session  =====
+// ==============================
+
+message Token {
+  string id                  = 1; // server side handle/identifier
+  TokenType type             = 2;
+  SignatureAlg alg           = 3;
+  google.protobuf.StringValue key_id = 4; // kid
+  string issuer              = 5;
+  string subject             = 6; // principal id
+  repeated string audience   = 7;
+  google.protobuf.Timestamp issued_at  = 8;
+  google.protobuf.Timestamp expires_at = 9;
+  google.protobuf.Timestamp not_before = 10;
+  repeated string scopes     = 11;
+  google.protobuf.StringValue client_id = 12;
+  google.protobuf.StringValue session_id = 13;
+
+  // Claims container (use sparingly; for rich claims prefer ID token)
+  google.protobuf.Struct claims = 14;
+
+  // Actual representation
+  oneof container {
+    string jwt_compact = 20; // JWS compact form
+    bytes paseto       = 21; // PASETO blob
+    bytes opaque       = 22; // opaque reference
+  }
+}
+
+message Session {
+  string id                      = 1;
+  string principal_id            = 2;
+  repeated AuthMethod methods    = 3; // methods used to establish session
+  Device device                  = 4;
+  google.protobuf.StringValue ip_address = 5;
+  google.protobuf.StringValue user_agent = 6;
+  google.protobuf.StringValue location   = 7;
+  RiskSignals risk              = 8;
+  bool revoked                  = 9;
+  google.protobuf.StringValue revoke_reason = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp last_seen_at = 12;
+  google.protobuf.Timestamp expires_at = 13;
+  google.protobuf.StringValue access_token_id  = 14;
+  google.protobuf.StringValue refresh_token_id = 15;
+}
+
+// ==============================
+// ===== WebAuthn Messages  =====
+// ==============================
+
+message WebAuthnAuthChallenge {
+  string challenge_b64url = 1;
+  string rp_id            = 2;
+  repeated string allow_credentials = 3; // allowed credential ids (b64url)
+  bool user_verification_required   = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message WebAuthnRegisterOptions {
+  string challenge_b64url = 1;
+  string rp_id            = 2;
+  string rp_name          = 3;
+  string user_id_b64url   = 4; // stable id
+  string user_name        = 5; // username
+  string user_display_name = 6;
+  repeated string exclude_credentials = 7; // prevent re-enroll
+  bool resident_key_required          = 8;
+  bool user_verification_required     = 9;
+  google.protobuf.Timestamp expires_at = 10;
+}
+
+message WebAuthnAssertion {
+  string credential_id_b64url = 1;
+  bytes client_data_json      = 2;
+  bytes authenticator_data    = 3;
+  bytes signature             = 4;
+  bytes user_handle           = 5; // may be empty
+}
+
+message WebAuthnAttestation {
+  string credential_id_b64url = 1;
+  bytes client_data_json      = 2;
+  bytes attestation_object    = 3; // CBOR "attestationObject"
+}
+
+// ==============================
+// ===== MFA / Passwordless  =====
+// ==============================
+
+enum OtpChannel {
+  OTP_CHANNEL_UNSPECIFIED = 0;
+  OTP_CHANNEL_SMS         = 1;
+  OTP_CHANNEL_EMAIL       = 2;
+}
+
+message OtpChallenge {
+  string challenge_id           = 1;
+  OtpChannel channel            = 2;
+  string masked_destination     = 3; // e.g., +7******90 or a***@e***.com
+  uint32 code_length            = 4; // default 6
+  google.protobuf.Duration ttl  = 5;
+  google.protobuf.Timestamp expires_at = 6;
+}
+
+enum PasswordlessMethod {
+  PASSWORDLESS_METHOD_UNSPECIFIED = 0;
+  PASSWORDLESS_EMAIL_LINK         = 1;
+  PASSWORDLESS_EMAIL_OTP          = 2;
+  PASSWORDLESS_SMS_OTP            = 3;
+  PASSWORDLESS_WEBAUTHN           = 4;
+}
+
+message MfaChallengeRequired {
+  string challenge_id              = 1;
+  repeated AuthMethod allowed_methods = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  RiskSignals risk                 = 4;
+
+  // Optional nested challenges for UX bootstrap
+  WebAuthnAuthChallenge webauthn   = 10;
+  OtpChallenge otp                 = 11;
+}
+
+// ==============================
+// ====== Auth Flows I/O  =======
+// ==============================
+
+message BeginPasswordAuthRequest {
+  string identifier = 1; // username, email, or phone
+  string password   = 2;
+  ClientContext context = 3;
+}
+
+message AuthSuccess {
+  Principal principal   = 1;
+  Session session       = 2;
+  Token access_token    = 3;
+  Token refresh_token   = 4;
+  // Optional OIDC ID token for rich claims
+  google.protobuf.BoolValue id_token_issued = 5;
+  Token id_token        = 6;
+}
+
+message BeginPasswordAuthResponse {
+  oneof result {
+    AuthSuccess success           = 1;
+    MfaChallengeRequired mfa      = 2;
+  }
+  // If server needs to return soft error with details:
+  google.protobuf.BoolValue has_error = 10;
+  ApiError error                      = 11;
+}
+
+message CompleteMfaRequest {
+  string challenge_id = 1;
+  ClientContext context = 2;
+
+  oneof proof {
+    string totp_code                 = 10;
+    string sms_code                  = 11;
+    string email_code                = 12;
+    string recovery_code             = 13;
+    WebAuthnAssertion webauthn      = 14;
+  }
+}
+
+message CompleteMfaResponse {
+  oneof result {
+    AuthSuccess success = 1;
+  }
+  google.protobuf.BoolValue has_error = 10;
+  ApiError error = 11;
+}
+
+message StartWebAuthnRegistrationRequest {
+  string principal_id = 1;
+  ClientContext context = 2;
+}
+
+message StartWebAuthnRegistrationResponse {
+  WebAuthnRegisterOptions options = 1;
+  google.protobuf.Timestamp expires_at = 2;
+}
+
+message FinishWebAuthnRegistrationRequest {
+  string principal_id = 1;
+  WebAuthnAttestation attestation = 2;
+  ClientContext context = 3;
+}
+
+message FinishWebAuthnRegistrationResponse {
+  WebAuthnCredential credential = 1;
+}
+
+message StartWebAuthnAuthenticationRequest {
+  string identifier = 1; // or empty if using resident keys
+  ClientContext context = 2;
+}
+
+message StartWebAuthnAuthenticationResponse {
+  WebAuthnAuthChallenge challenge = 1;
+}
+
+message FinishWebAuthnAuthenticationRequest {
+  string identifier = 1; // optional, for non-RK
+  WebAuthnAssertion assertion = 2;
+  ClientContext context = 3;
+}
+
+message FinishWebAuthnAuthenticationResponse {
+  oneof result {
+    AuthSuccess success = 1;
+    MfaChallengeRequired mfa = 2; // step-up if policy requires
+  }
+  google.protobuf.BoolValue has_error = 10;
+  ApiError error = 11;
+}
+
+message StartPasswordlessRequest {
+  string identifier = 1; // email or phone
+  PasswordlessMethod method = 2;
+  ClientContext context = 3;
+}
+
+message StartPasswordlessResponse {
+  oneof challenge {
+    OtpChallenge otp = 1;
+    // for email link flow, server may send link out-of-band
+    google.protobuf.StringValue info = 2;
+    WebAuthnAuthChallenge webauthn = 3;
+  }
+}
+
+message CompletePasswordlessRequest {
+  string identifier = 1;
+  ClientContext context = 2;
+
+  oneof proof {
+    string email_link_token = 10;
+    string sms_code         = 11;
+    string email_code       = 12;
+    WebAuthnAssertion webauthn = 13;
+  }
+}
+
+message CompletePasswordlessResponse {
+  oneof result {
+    AuthSuccess success = 1;
+  }
+  google.protobuf.BoolValue has_error = 10;
+  ApiError error = 11;
+}
+
+message RefreshAccessTokenRequest {
+  string refresh_token = 1;
+  ClientContext context = 2;
+}
+
+message RefreshAccessTokenResponse {
+  AuthSuccess success = 1; // may rotate refresh
+}
+
+message IntrospectTokenRequest {
+  string token = 1;     // opaque or JWT/PASETO
+  TokenType assumed_type = 2; // optional hint
+  ClientContext context = 3;
+}
+
+message IntrospectTokenResponse {
+  bool active                  = 1;
+  Token token                  = 2; // normalized view
+  Principal principal          = 3;
+  Session session              = 4;
+  RiskSignals risk             = 5;
+  google.protobuf.Timestamp evaluated_at = 6;
+}
+
+message RevokeTokenRequest {
+  string token = 1;
+  TokenType type = 2;
+  google.protobuf.StringValue reason = 3;
+  ClientContext context = 4;
+}
+
+message RevokeTokenResponse {
+  bool revoked = 1;
+}
+
+message LogoutRequest {
+  string session_id = 1;
+  ClientContext context = 2;
+}
+
+message LogoutRe

@@ -1,0 +1,69 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-default-deny-networkpolicy
+  labels:
+    app.kubernetes.io/managed-by: kyverno
+    app.kubernetes.io/part-of: aethernova-chain-core
+    policy.aethernova.io/category: network
+    policy.aethernova.io/severity: high
+  annotations:
+    policies.kyverno.io/title: "Require Default-Deny NetworkPolicy per Namespace"
+    policies.kyverno.io/subject: "Namespace"
+    policies.kyverno.io/description: >
+      Enforces that each Namespace contains a default-deny NetworkPolicy configuration.
+      Either a single combined policy (deny all Ingress and Egress to all Pods) or a pair
+      of separate policies (default-deny for Ingress and for Egress) must exist.
+      Exceptions: kube-system, kyverno, and any Namespace labeled with
+      policy.aethernova.io/allow-np-bypass=true.
+spec:
+  # Enforce = блокировать создание/изменение Namespace без default-deny
+  validationFailureAction: Enforce
+  background: true
+  failurePolicy: Fail
+  rules:
+    - name: require-default-deny-on-namespace
+      match:
+        any:
+          - resources:
+              kinds:
+                - Namespace
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+          - resources:
+              selector:
+                matchLabels:
+                  policy.aethernova.io/allow-np-bypass: "true"
+
+      # Получаем список NetworkPolicy в целевом Namespace
+      context:
+        - name: existingNetpols
+          apiCall:
+            urlPath: "/apis/networking.k8s.io/v1/namespaces/{{ request.object.metadata.name }}/networkpolicies"
+            jmesPath: "items"
+
+      validate:
+        message: >-
+          A default-deny NetworkPolicy is required in each Namespace: either one combined
+          policy that denies all Ingress and Egress to all Pods, or two separate policies
+          (deny-all Ingress and deny-all Egress). See Kubernetes NetworkPolicy docs.
+        deny:
+          conditions:
+            all:
+              # 1) Нет объединённой default-deny (Ingress+Egress) политики для всех Pod'ов
+              - key: "{{ length(filter(existingNetpols, contains(@.spec.policyTypes, 'Ingress') && contains(@.spec.policyTypes, 'Egress') && length(@.spec.ingress)==`0` && length(@.spec.egress)==`0` && @.spec.podSelector==`{}` )) }}"
+                operator: Equals
+                value: 0
+              # 2) И одновременно НЕТ пары раздельных default-deny: одна с пустым ingress, другая с пустым egress
+              - key: "{{ (length(filter(existingNetpols, contains(@.spec.policyTypes,'Ingress') && length(@.spec.ingress)==`0` && @.spec.podSelector==`{}` )) > `0`) && (length(filter(existingNetpols, contains(@.spec.policyTypes,'Egress') && length(@.spec.egress)==`0` && @.spec.podSelector==`{}` )) > `0`) }}"
+                operator: Equals
+                value: false
+
+# ПРИМЕЧАНИЯ ДЛЯ ЭКСПЛУАТАЦИИ:
+# - Политика проверяет только наличие default-deny; отдельные allow-политики (например, DNS, сервис-меш) добавляются командами приложений.
+# - Для корректной работы необходим CNI-плагин с поддержкой Kubernetes NetworkPolicy. См. официальные docs. 
+# - Для поэтапного внедрения используйте Audit-режим: spec.validationFailureAction: Audit

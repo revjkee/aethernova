@@ -1,0 +1,244 @@
+# VeilMind Core — Quickstart / Production‑ready baseline
+# Все секреты и окружение читаются из ENV. Значения ниже — безопасные дефолты.
+# Для Kubernetes используйте ConfigMap + Secret; для Docker — --env/--env-file.
+
+app:
+  name: veilmind-core
+  env: ${VEILMIND_ENV:-dev}            # dev|staging|prod
+  region: ${VEILMIND_REGION:-eu-west-1}
+  timezone: UTC
+  # Версия подставляется сборкой/CI:
+  version: ${VEILMIND_VERSION:-0.0.0}
+
+server:
+  http:
+    host: ${VM_HTTP_HOST:-0.0.0.0}
+    port: ${VM_HTTP_PORT:-8080}
+    root_path: ${VM_HTTP_ROOT_PATH:-/}
+    # Максимальный размер тела запроса (байт):
+    max_body_bytes: ${VM_HTTP_MAX_BODY:-10485760}   # 10 MiB
+    request_timeout_seconds: ${VM_HTTP_TIMEOUT:-30}
+    # CORS: укажите список фронтендов через запятую или * только в dev
+    cors:
+      allow_origins: ${VM_CORS_ORIGINS:-http://localhost:5173}
+      allow_methods: "GET,POST,PUT,DELETE,OPTIONS"
+      allow_headers: "Authorization,Content-Type,X-Request-ID"
+      allow_credentials: true
+      max_age_seconds: 600
+    # Response headers по умолчанию
+    security_headers:
+      frame_options: "DENY"
+      content_type_options: "nosniff"
+      xss_protection: "0"
+      referrer_policy: "no-referrer"
+      cross_origin_opener_policy: "same-origin"
+      cross_origin_embedder_policy: "require-corp"
+      cross_origin_resource_policy: "same-origin"
+    # CSP рекомендуется выдавать заголовком с nonce; meta в index.html — дублирование
+    csp:
+      enabled: true
+      # Шаблон с плейсхолдером {{nonce}} генерируется на запрос
+      policy: >-
+        default-src 'none'; base-uri 'none'; object-src 'none';
+        frame-ancestors 'none'; img-src 'self' data:; font-src 'self';
+        style-src 'self' 'nonce-{{nonce}}'; script-src 'self' 'nonce-{{nonce}}' 'strict-dynamic';
+        connect-src 'self' https: wss:; manifest-src 'self'; form-action 'self';
+        upgrade-insecure-requests; block-all-mixed-content
+
+  ws:
+    # WebSocket endpoint, должен совпадать с реализацией /v1/ws/channels
+    path: /v1/ws/channels
+    # Проверка Origin: перечислите разрешенные; "*" допустимо только в dev
+    allowed_origins: ${VM_WS_ALLOWED_ORIGINS:-http://localhost:5173}
+    heartbeat_seconds: ${VM_WS_HEARTBEAT_SECONDS:-25}
+    max_message_bytes: ${VM_WS_MAX_MSG_SIZE:-65536}
+    queue_size: ${VM_WS_QUEUE_SIZE:-1000}
+    rate_limit:
+      capacity: ${VM_WS_RATE_CAPACITY:-60}
+      refill_per_second: ${VM_WS_RATE_REFILL_PER_SEC:-1.0}
+    broker:
+      kind: ${VM_WS_BROKER:-memory}     # memory|redis
+      redis_url: ${VEILMIND_REDIS_URL:-}  # redis://host:6379/0
+
+security:
+  auth:
+    # Выберите один из режимов: disable|jwt_hs256|oidc
+    mode: ${VM_AUTH_MODE:-jwt_hs256}
+    disable_for_ws: ${VEILMIND_WS_DISABLE_AUTH:-false}
+    jwt_hs256:
+      secret: ${VEILMIND_AUTH_HS256:-}       # ОБЯЗАТЕЛЕН в prod
+      issuer: ${VM_JWT_ISSUER:-veilmind}
+      audience: ${VM_JWT_AUD:-veilmind-clients}
+      clock_skew_seconds: 60
+    oidc:
+      discovery_url: ${VM_OIDC_DISCOVERY_URL:-}
+      client_id: ${VM_OIDC_CLIENT_ID:-}
+      # Проверка токенов на бэкенде; client_secret не требуется для валидации
+  # API‑ключи (доп. защита внутренних эндпоинтов админки)
+  api_keys:
+    enabled: ${VM_API_KEYS_ENABLED:-false}
+    header: X-API-Key
+    keys: ${VM_API_KEYS_CSV:-}   # "key1,key2,..." через ENV Secret
+  # Лимитирование HTTP
+  rate_limit:
+    enabled: true
+    # Базовый токен‑бакет на IP/токен
+    capacity: ${VM_HTTP_RATE_CAPACITY:-120}
+    refill_per_second: ${VM_HTTP_RATE_REFILL_PER_SEC:-2.0}
+    burst_only_paths: ["/v1/detect","/v1/events"]
+  # Анти‑абьюз для загрузок/детекта
+  quotas:
+    detect_per_minute: ${VM_DETECT_RPM:-300}
+    detect_concurrent: ${VM_DETECT_CONCURRENCY:-16}
+
+logging:
+  level: ${VM_LOG_LEVEL:-INFO}   # DEBUG|INFO|WARN|ERROR
+  json: ${VM_LOG_JSON:-true}
+  # Корреляция
+  correlation:
+    request_header: X-Request-ID
+    response_header: X-Request-ID
+  # Маскирование в логах (best effort)
+  redaction:
+    enabled: true
+    # Путь -> стратегия (имена согласованы с veilmind.redact.strategies)
+    fields:
+      "$.headers.authorization": { name: remove, params: { mode: placeholder } }
+      "$.body.email": { name: hash, params: { algo: sha256, namespace: vmc } }
+      "$.body.ssn": { name: mask, params: { keep_head: 1, keep_tail: 2 } }
+
+telemetry:
+  prometheus:
+    enabled: ${VM_PROM_ENABLED:-true}
+    # Экспозиция /metrics на основном HTTP
+    path: /metrics
+  opentelemetry:
+    enabled: ${VM_OTEL_ENABLED:-false}
+    exporter: ${VM_OTEL_EXPORTER:-otlp}   # otlp
+    otlp:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      headers: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+      insecure: ${OTEL_EXPORTER_OTLP_INSECURE:-true}
+    service_name: veilmind-core
+    service_version: ${VEILMIND_VERSION:-0.0.0}
+    sampling_ratio: ${VM_OTEL_SAMPLING:-0.1}
+
+storage:
+  postgres:
+    dsn: ${VEILMIND_DB_DSN:-postgresql+asyncpg://veilmind:veilmind@localhost:5432/veilmind}
+    schema: ${VEILMIND_DB_SCHEMA:-veilmind}
+    pool:
+      min_size: ${VM_DB_POOL_MIN:-1}
+      max_size: ${VM_DB_POOL_MAX:-10}
+      timeout_seconds: ${VM_DB_TIMEOUT:-10}
+  retention:
+    events_days: ${VM_RETENTION_EVENTS_DAYS:-30}
+
+adapters:
+  aws_comprehend:
+    enabled: ${VM_AC_ENABLED:-false}
+    region: ${VM_AC_REGION:-eu-west-1}
+    endpoint_url: ${VM_AC_ENDPOINT_URL:-}     # для VPC Endpoint
+    role_arn: ${VM_AC_ROLE_ARN:-}
+    role_external_id: ${VM_AC_ROLE_EXTERNAL_ID:-}
+    timeouts:
+      connect_seconds: ${VM_AC_CONNECT_TIMEOUT:-3.0}
+      read_seconds: ${VM_AC_READ_TIMEOUT:-10.0}
+    pool:
+      threads: ${VM_AC_THREAD_POOL:-8}
+      max_retries: ${VM_AC_MAX_RETRIES:-5}
+      backoff_base: ${VM_AC_BACKOFF_BASE:-0.25}
+      backoff_cap: ${VM_AC_BACKOFF_CAP:-5.0}
+    limits:
+      max_input_bytes: ${VM_AC_MAX_INPUT:-8000}
+
+redaction:
+  # Глобальные секреты стратегий берите из ENV‑секретов
+  pii_salt: ${VEILMIND_PII_SALT:-}           # обязательно в prod
+  token_secret: ${VEILMIND_TOKEN_SECRET:-}   # обязательно в prod
+  # Профиль по умолчанию (используется сервером, если не указан явно)
+  default_profile: hash_low_cardinality
+  profiles:
+    # Профиль с низкой кардинальностью для метрик/трасс
+    hash_low_cardinality:
+      default: mask
+      sinks: { logs: mask, traces: hash, metrics: hash }
+      pii: hash
+      sensitive: mask
+      denylist: remove
+      params:
+        hash: { algo: sha256, namespace: vmc }
+        mask: { keep_head: 2, keep_tail: 2, mask_char: "*" }
+        remove: { mode: placeholder }
+        tokenize: { namespace: vmc }
+    # Профиль для строгого логирования (минимум утечек)
+    logs_strict:
+      default: remove
+      sinks: { logs: remove }
+      pii: remove
+      sensitive: mask
+      denylist: remove
+      params:
+        mask: { keep_head: 1, keep_tail: 1 }
+  # Ограничения кардинальности лейблов/длин значений (пост‑обработка)
+  limits:
+    label_cardinality_max: 12
+    value_length_max: 256
+  # Семплирование событий редактирования (для журналов)
+  sampling:
+    enabled: ${VM_REDACT_SAMPLING_ENABLED:-true}
+    rate: ${VM_REDACT_SAMPLING_RATE:-0.5}
+
+risk:
+  l_diversity:
+    enabled: ${VM_LDIV_ENABLED:-true}
+    # Конфигурация по умолчанию; конкретные задания передаются в API
+    default:
+      entropy_log_base: 2.0
+      na_policy: drop            # drop|as_value
+      max_list_violators: 100
+      privacy_preserve: true
+
+detect:
+  # Параметры эндпоинтов /v1/detect (HTTP) и каналов событий
+  max_concurrent: ${VM_DETECT_MAX_CONCURRENCY:-16}
+  timeout_seconds: ${VM_DETECT_TIMEOUT:-12}
+  # Ограничение размера входных документов (байты)
+  max_payload_bytes: ${VM_DETECT_MAX_PAYLOAD:-1048576}
+
+# Экспорт/импорт схем (OpenAPI, Protobuf)
+schemas:
+  openapi_path: ${VM_OPENAPI_PATH:-./schemas/openapi/openapi.yaml}
+  proto_root: ${VM_PROTO_ROOT:-./schemas/proto}
+
+# Клиентская админка (минимальная)
+clients:
+  web_admin:
+    # Для index.html CSP и main.js
+    public_url: ${VM_ADMIN_PUBLIC_URL:-/}
+    enable_live_events: true
+    ws_url: ${VM_ADMIN_WS_URL:-}
+
+# Настройки Docker/Kubernetes (для справки, читаются как ENV или через Helm)
+runtime:
+  docker:
+    user: ${VM_DOCKER_USER:-10001:10001}
+    ulimit_nofile: 65536
+  kubernetes:
+    liveness:
+      path: /healthz
+      initial_delay_seconds: 10
+      timeout_seconds: 2
+      period_seconds: 10
+      failure_threshold: 3
+    readiness:
+      path: /readyz
+      initial_delay_seconds: 5
+      timeout_seconds: 2
+      period_seconds: 5
+      failure_threshold: 3
+
+# Системные флаги для отладки (не использовать в prod)
+debug:
+  echo_errors: ${VM_DEBUG_ECHO_ERRORS:-false}
+  disable_auth: ${VM_DEBUG_DISABLE_AUTH:-false}

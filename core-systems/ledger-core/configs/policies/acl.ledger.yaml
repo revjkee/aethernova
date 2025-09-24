@@ -1,0 +1,441 @@
+# Ledger Core Access Control List (ACL)
+# Schema-agnostic YAML; маппится в OPA/Rego, Cedar, Casbin и др.
+# Стратегия: Deny-Overrides (любой deny побеждает allow).
+schema_version: 1
+policy_id: ledger-core-acl
+policy_version: "2025-08-15"
+defaults:
+  decision_strategy: DENY_OVERRIDES
+  target_environments: ["dev", "staging", "prod"]
+  timezone: "UTC"
+  # Глобальные требования аудита для критичных действий
+  audit:
+    required_for_actions: ["ledger:post", "ledger:revert", "payments:payout", "accounts:close", "keys:rotate"]
+    log_level: "INFO"
+    include_request_payload: false
+    include_response_payload: false
+metadata:
+  owner: "security@ledger.example"
+  reviewers: ["platform@ledger.example", "compliance@ledger.example"]
+  controls:
+    - "ISO-27001 A.9 Access Control"
+    - "SOC2 CC6.1"
+    - "PCI-DSS 7.x"
+  tags: ["security", "acl", "rbac", "abac", "critical"]
+
+principals:
+  # Идентификация субъектов и групп
+  groups:
+    - id: grp-engineering
+      name: Engineering
+    - id: grp-support-l1
+      name: Support L1
+    - id: grp-support-l2
+      name: Support L2
+    - id: grp-finops
+      name: Finance Ops
+    - id: grp-compliance
+      name: Compliance
+    - id: grp-sre
+      name: SRE
+  roles:
+    # Базовые роли
+    - id: role-reader
+      grants:
+        - "ledger:read"
+        - "transactions:read"
+        - "accounts:read"
+        - "balances:read"
+    - id: role-writer
+      grants:
+        - "ledger:post"
+        - "transactions:create"
+    - id: role-approver
+      grants:
+        - "transactions:approve"
+        - "payments:approve"
+    - id: role-admin
+      grants:
+        - "acl:read"
+        - "acl:write"
+        - "keys:rotate"
+        - "accounts:close"
+        - "users:invite"
+    # Доменные роли
+    - id: role-finops
+      grants:
+        - "payments:payout"
+        - "payments:refund"
+        - "reports:export"
+    - id: role-support-l1
+      grants:
+        - "tickets:read"
+        - "customers:read"
+        - "transactions:read"
+    - id: role-support-l2
+      grants:
+        - "support:impersonate-limited"
+        - "transactions:hold"
+        - "transactions:release"
+        - "customers:update-limited"
+    - id: role-compliance
+      grants:
+        - "kyc:read"
+        - "aml:review"
+        - "transactions:suspend"
+        - "transactions:release"
+    - id: role-sre
+      grants:
+        - "ops:read"
+        - "ops:drain"
+        - "ops:restart"
+        - "ops:debug-metrics"
+  assignments:
+    # Пример: связывание групп и ролей (на практике синхронизируется из IdP)
+    - group: grp-engineering
+      roles: [role-reader, role-writer, role-sre]
+    - group: grp-finops
+      roles: [role-reader, role-finops, role-approver]
+    - group: grp-support-l1
+      roles: [role-support-l1, role-reader]
+    - group: grp-support-l2
+      roles: [role-support-l1, role-support-l2, role-reader]
+    - group: grp-compliance
+      roles: [role-compliance, role-reader]
+    - group: grp-sre
+      roles: [role-sre, role-reader]
+    # Break-glass назначается вручную и временно
+    - user: "user-break-glass"
+      roles: [role-admin]
+      constraints:
+        expires_at: "2025-12-31T23:59:59Z"
+
+resources:
+  # Иерархия ресурсов и области
+  - type: ledger:entry
+    actions: ["ledger:read", "ledger:post", "ledger:revert"]
+    attributes:
+      # Атрибуты, используемые в ABAC-предикатах
+      - name: currency
+        type: string
+      - name: amount
+        type: number
+      - name: account_tier
+        type: string   # retail|merchant|vip
+      - name: region
+        type: string   # EU|US|GB|BR|...
+      - name: is_internal
+        type: boolean
+  - type: transactions:tx
+    actions: ["transactions:read", "transactions:create", "transactions:approve", "transactions:hold", "transactions:release", "transactions:suspend"]
+    attributes:
+      - { name: amount, type: number }
+      - { name: currency, type: string }
+      - { name: kyc_status, type: string }   # passed|pending|failed
+      - { name: risk_score, type: number }   # 0..100
+      - { name: region, type: string }
+  - type: accounts:acc
+    actions: ["accounts:read", "accounts:close"]
+    attributes:
+      - { name: owner_id, type: string }
+      - { name: tier, type: string }
+  - type: payments:job
+    actions: ["payments:payout", "payments:refund", "payments:approve"]
+    attributes:
+      - { name: amount, type: number }
+      - { name: currency, type: string }
+      - { name: route, type: string } # sepa|swift|ach|pix
+  - type: acl:policy
+    actions: ["acl:read", "acl:write"]
+  - type: keys:key
+    actions: ["keys:rotate"]
+  - type: ops:system
+    actions: ["ops:read", "ops:drain", "ops:restart", "ops:debug-metrics"]
+
+conditions:
+  # Повторно используемые предикаты
+  - id: cond-business-hours
+    expr: "ctx.time.weekday in [1,2,3,4,5] and ctx.time.hour >= 7 and ctx.time.hour <= 19"
+  - id: cond-trusted-networks
+    expr: "cidr_match(ctx.client_ip, ['10.0.0.0/8','192.168.0.0/16','172.16.0.0/12'])"
+  - id: cond-mfa-required
+    expr: "sub.mfa == true and sub.mfa_level >= 2"
+  - id: cond-env-not-prod
+    expr: "ctx.env in ['dev','staging']"
+  - id: cond-env-prod
+    expr: "ctx.env == 'prod'"
+  - id: cond-kyc-passed
+    expr: "res.kyc_status == 'passed' or res.is_internal == true"
+  - id: cond-low-risk
+    expr: "res.risk_score <= 60"
+  - id: cond-amount-low
+    expr: "res.amount <= 10000"
+  - id: cond-amount-mid
+    expr: "res.amount > 10000 and res.amount <= 100000"
+  - id: cond-eu-region
+    expr: "res.region in ['EU','GB']"
+  - id: cond-requires-approval
+    expr: "res.amount > 10000 or res.currency in ['USD','EUR']"
+  - id: cond-break-glass-window
+    expr: "sub.id == 'user-break-glass' and now() <= '2025-12-31T23:59:59Z'"
+
+rules:
+  # DENY сначала (жёсткие блоки)
+  deny:
+    - id: deny-prod-from-untrusted-net
+      when:
+        all: [cond-env-prod]
+        any: ["not cond-trusted-networks"]
+      actions: ["*"]
+      resources: ["*"]
+      message: "Prod доступ только из доверенных сетей"
+
+    - id: deny-no-mfa-critical
+      when:
+        any: ["not cond-mfa-required"]
+      actions: ["payments:*", "ledger:post", "ledger:revert", "accounts:close", "keys:rotate", "acl:write"]
+      resources: ["*"]
+      message: "MFA обязателен для критичных действий"
+
+    - id: deny-compliance-failed-kyc
+      when:
+        all: [ "cond-env-prod" ]
+        any: [ "not cond-kyc-passed" ]
+      actions: ["transactions:create", "payments:payout", "ledger:post"]
+      resources: ["transactions:*", "payments:*", "ledger:*"]
+      message: "KYC не пройден"
+
+    - id: deny-outside-business-hours-high-risk
+      when:
+        any: [ "not cond-business-hours" ]
+      actions: ["payments:payout", "transactions:approve", "ledger:post", "ledger:revert"]
+      resources: ["*"]
+      message: "Критичные операции вне рабочих часов запрещены"
+
+  allow:
+    # Чтение почти всем с ролью reader
+    - id: allow-readers
+      principals:
+        roles: ["role-reader"]
+      actions: ["ledger:read", "transactions:read", "accounts:read", "balances:read", "ops:read"]
+      resources: ["ledger:*", "transactions:*", "accounts:*", "ops:*"]
+
+    # Создание транзакций с низким риском и суммой до 10k
+    - id: allow-create-low
+      principals:
+        roles: ["role-writer", "role-finops"]
+      actions: ["transactions:create", "ledger:post"]
+      resources: ["transactions:*", "ledger:*"]
+      when:
+        all: ["cond-kyc-passed", "cond-low-risk", "cond-amount-low", "cond-trusted-networks", "cond-mfa-required"]
+
+    # Средние суммы требуют утверждения
+    - id: allow-create-mid-requires-approval
+      principals:
+        roles: ["role-writer", "role-finops"]
+      actions: ["transactions:create", "ledger:post"]
+      resources: ["transactions:*", "ledger:*"]
+      when:
+        all: ["cond-kyc-passed", "cond-amount-mid", "cond-trusted-networks", "cond-mfa-required"]
+      effects:
+        require_approval:
+          approver_roles: ["role-approver", "role-compliance"]
+          sla_minutes: 30
+          policy_reference: "cond-requires-approval"
+
+    # Выплаты FinOps в EU с лимитами
+    - id: allow-payout-eu
+      principals:
+        roles: ["role-finops"]
+      actions: ["payments:payout"]
+      resources: ["payments:*"]
+      when:
+        all: ["cond-eu-region", "cond-mfa-required", "cond-business-hours", "cond-trusted-networks", "cond-amount-mid"]
+
+    # Доступ поддержки L2 к операционным удержаниям/разблокировкам небольших сумм
+    - id: allow-support-hold-release
+      principals:
+        roles: ["role-support-l2"]
+      actions: ["transactions:hold", "transactions:release"]
+      resources: ["transactions:*"]
+      when:
+        all: ["cond-amount-low", "cond-trusted-networks"]
+
+    # Compliance может приостанавливать/возобновлять транзакции
+    - id: allow-compliance-suspend-release
+      principals:
+        roles: ["role-compliance"]
+      actions: ["transactions:suspend", "transactions:release", "aml:review", "kyc:read"]
+      resources: ["transactions:*"]
+
+    # Администрирование политики доступа
+    - id: allow-admin-acl
+      principals:
+        roles: ["role-admin"]
+      actions: ["acl:read", "acl:write"]
+      resources: ["acl:*"]
+      when:
+        all: ["cond-trusted-networks", "cond-mfa-required"]
+
+    # Операции SRE на проде без влияния на данные
+    - id: allow-sre-ops
+      principals:
+        roles: ["role-sre"]
+      actions: ["ops:read", "ops:drain", "ops:restart", "ops:debug-metrics"]
+      resources: ["ops:*"]
+      when:
+        all: ["cond-trusted-networks"]
+
+    # Break-glass строго по окну и аудит-требованиям
+    - id: allow-break-glass
+      principals:
+        users: ["user-break-glass"]
+      actions: ["ledger:post", "ledger:revert", "accounts:close", "keys:rotate"]
+      resources: ["*"]
+      when:
+        all: ["cond-break-glass-window", "cond-trusted-networks"]
+      effects:
+        notify:
+          channels: ["slack:#security-incidents", "email:security@ledger.example"]
+        audit:
+          level: "WARN"
+          require_ticket: true
+          ticket_field: "INCIDENT_ID"
+
+obligations:
+  # Обязательные побочные действия при разрешении
+  - id: audit-append
+    when_actions: ["*"]
+    then:
+      add_audit_trail:
+        include:
+          - principal.id
+          - principal.groups
+          - principal.roles
+          - ctx.request_id
+          - ctx.trace_id
+          - decision
+          - matched_rule
+      redact_fields: ["credentials", "token", "authorization", "password"]
+
+rate_limits:
+  # Ограничения по субъекту/ресурсу для снижения рисков
+  - id: rl-posting
+    selector:
+      actions: ["ledger:post", "transactions:create"]
+    window: "1m"
+    limits:
+      per_principal: 60
+      per_ip: 120
+  - id: rl-approvals
+    selector:
+      actions: ["transactions:approve", "payments:approve"]
+    window: "1h"
+    limits:
+      per_principal: 50
+
+segmentation:
+  # Разрешения по окружениям
+  - env: dev
+    overrides:
+      relax:
+        - rule_ids: ["allow-create-low", "allow-support-hold-release"]
+      tighten: []
+  - env: staging
+    overrides:
+      relax: []
+      tighten:
+        - rule_ids: ["allow-payout-eu"]
+  - env: prod
+    overrides:
+      relax: []
+      tighten:
+        - rule_ids: ["allow-create-low"]  # В проде проходит только при строгих условиях MFA/сети
+
+testing:
+  # Встроенные пример‑кейсы для quick‑check policy engine
+  cases:
+    - name: writer_low_amount_ok
+      principal:
+        roles: ["role-writer"]
+        mfa: true
+        mfa_level: 2
+      context:
+        env: "prod"
+        client_ip: "10.12.0.5"
+        time: "2025-08-15T10:00:00Z"
+      resource:
+        type: "transactions:tx"
+        attributes: { amount: 5000, risk_score: 20, kyc_status: "passed", region: "EU" }
+      action: "transactions:create"
+      expect: "ALLOW"
+    - name: payout_eu_mid_ok
+      principal:
+        roles: ["role-finops"]
+        mfa: true
+        mfa_level: 2
+      context:
+        env: "prod"
+        client_ip: "10.20.0.10"
+        time: "2025-08-15T11:00:00Z"
+      resource:
+        type: "payments:job"
+        attributes: { amount: 20000, currency: "EUR", route: "sepa", region: "EU" }
+      action: "payments:payout"
+      expect: "ALLOW"
+    - name: deny_no_mfa_critical
+      principal:
+        roles: ["role-writer"]
+        mfa: false
+      context:
+        env: "prod"
+        client_ip: "10.20.0.10"
+        time: "2025-08-15T11:00:00Z"
+      resource:
+        type: "ledger:entry"
+        attributes: { amount: 1000, currency: "EUR", account_tier: "retail", region: "EU" }
+      action: "ledger:post"
+      expect: "DENY"
+    - name: deny_untrusted_net_prod
+      principal:
+        roles: ["role-admin"]
+        mfa: true
+        mfa_level: 2
+      context:
+        env: "prod"
+        client_ip: "203.0.113.10"
+        time: "2025-08-15T12:00:00Z"
+      resource:
+        type: "acl:policy"
+      action: "acl:write"
+      expect: "DENY"
+    - name: break_glass_within_window
+      principal:
+        id: "user-break-glass"
+        mfa: true
+        mfa_level: 2
+      context:
+        env: "prod"
+        client_ip: "10.0.0.1"
+        time: "2025-08-15T12:30:00Z"
+      resource:
+        type: "ledger:entry"
+        attributes: { amount: 1000, currency: "EUR", region: "EU" }
+      action: "ledger:revert"
+      expect: "ALLOW"
+
+change_control:
+  # Процесс изменений политики
+  approvals_required: 2
+  allowed_editors: ["role-admin"]
+  require_signed_commits: true
+  rollout:
+    staged: true
+    shadow_mode_minutes: 30
+    metrics:
+      - "acl.decisions.allow"
+      - "acl.decisions.deny"
+      - "acl.shadow.divergence"
+  rollback:
+    on_error_threshold_percent: 5
+    to_version: "previous-stable"

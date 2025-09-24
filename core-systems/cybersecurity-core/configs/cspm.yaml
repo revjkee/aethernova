@@ -1,0 +1,512 @@
+apiVersion: cspm.neurocity/v1
+kind: CSPMConfig
+metadata:
+  name: cybersecurity-core
+  env: prod
+  version: 1.0.0
+  owner: secops@neurocity.local
+  labels:
+    project: neurocity
+    component: cybersecurity-core
+    managed-by: terraform-k8s
+    confidentiality: high
+
+spec:
+  global:
+    risk:
+      # Якоря для единообразной классификации
+      severities: &severities [critical, high, medium, low, info]
+      scoreWeights: &weights
+        critical: 100
+        high: 70
+        medium: 40
+        low: 15
+        info: 0
+      failThreshold:
+        # Минимальный балл инцидента для эскалации в oncall
+        pagerduty: 70
+        # Минимальный балл для блокирующего статуса в CI/merge
+        ci_block: 60
+      dedupWindow: 4h       # окно дедупликации инцидентов
+      snoozeMax: 7d         # макс. гашение алерта
+      evidenceRequired: true
+
+    scanning:
+      mode: continuous       # continuous | scheduled
+      scheduleCron: "*/10 * * * *"   # каждые 10 минут для провайдеров, где нет стрима
+      concurrency: 8
+      rateLimitPerAccountPerSecond: 10
+      retry:
+        maxAttempts: 5
+        backoff: 5s
+        jitter: true
+
+    storage:
+      findings:
+        type: s3
+        bucket: nc-prod-cybersecurity-findings
+        prefix: cspm/
+        encryption:
+          kmsKeyAlias: alias/cybersecurity-core-kms
+        compression: zstd
+        retentionDays: 365
+      evidence:
+        type: s3
+        bucket: nc-prod-cybersecurity-evidence
+        prefix: cspm/
+        encryption:
+          kmsKeyAlias: alias/cybersecurity-core-kms
+        compression: zstd
+        retentionDays: 730
+      piiScrub:
+        enabled: true
+        patterns:
+          - "(?i)password"
+          - "(?i)secret"
+          - "(?i)apikey"
+          - "(?i)token"
+
+    telemetry:
+      prometheus:
+        enabled: true
+        listen: 0.0.0.0:9108
+        path: /metrics
+      opentelemetry:
+        enabled: true
+        endpoint: otel-collector.observability:4317
+        protocol: grpc
+        resourceAttributes:
+          service.name: cspm-engine
+          service.version: 1.0.0
+          deployment.environment: prod
+
+    governance:
+      changeManagement:
+        requireSignedConfig: true
+        allowedSigners:
+          - CN=NeuroCity SecOps CA
+        requirePRApproval: true
+        minApprovals: 2
+        breakGlass:
+          enabled: true
+          ttl: 2h
+          auditOnly: false
+      slo:
+        detectionTimeP95: 5m
+        triageStartP95: 15m
+        remediationAckP95: 60m
+
+    rbac:
+      teams:
+        - name: secops
+          permissions: [read, triage, approve, remediate, configure]
+        - name: platform
+          permissions: [read, triage]
+        - name: audit
+          permissions: [read, export]
+
+  providers:
+    aws:
+      enabled: true
+      accounts:
+        - id: "111111111111"
+          alias: prod-core
+          roleArn: arn:aws:iam::111111111111:role/NeuroCityCSPMReadOnly
+          regionsAllow: [eu-north-1, eu-west-1, us-east-1]
+          regionsDeny: []
+        - id: "222222222222"
+          alias: prod-security
+          roleArn: arn:aws:iam::222222222222:role/NeuroCityCSPMReadOnly
+          regionsAllow: [eu-north-1]
+          regionsDeny: []
+      services:
+        s3: {enabled: true}
+        iam: {enabled: true}
+        ec2: {enabled: true}
+        rds: {enabled: true}
+        kms: {enabled: true}
+        ecr: {enabled: true}
+        elbv2: {enabled: true}
+        cloudtrail: {enabled: true}
+        logs: {enabled: true}
+
+    azure:
+      enabled: true
+      subscriptions:
+        - id: "00000000-0000-0000-0000-000000000001"
+          alias: prod-core
+          tenantId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+          authRef: aad-sp-cspm
+          locationsAllow: [northeurope, westeurope]
+      services:
+        storage: {enabled: true}
+        keyvault: {enabled: true}
+        network: {enabled: true}
+        compute: {enabled: true}
+        sql: {enabled: true}
+
+    gcp:
+      enabled: true
+      projects:
+        - id: nc-prod-core
+          number: "123456789000"
+          organizationId: "555555555555"
+          authRef: gcp-sa-cspm
+          locationsAllow: [europe-north1, europe-west1]
+      services:
+        storage: {enabled: true}
+        iam: {enabled: true}
+        compute: {enabled: true}
+        sql: {enabled: true}
+        kms: {enabled: true}
+
+    kubernetes:
+      enabled: true
+      clusters:
+        - name: prod-eks-eu-north-1
+          provider: aws
+          contextRef: kubectx-eks-prod
+          namespaces:
+            include: ["*"]
+            exclude: ["kube-system","kube-public"]
+          admissionChecks:
+            enforce: true
+            failurePolicy: Fail
+          benchmarks:
+            cisKubernetes: v1.25
+            cisEKS: v1.3
+          opa:
+            policiesPath: rego://policies/k8s
+        - name: prod-aks-ne
+          provider: azure
+          contextRef: kubectx-aks-prod
+          namespaces:
+            include: ["*"]
+            exclude: ["gatekeeper-system"]
+          benchmarks:
+            cisKubernetes: v1.25
+            cisAKS: v1.5
+          opa:
+            policiesPath: rego://policies/k8s
+
+  compliance:
+    frameworks:
+      - id: CIS_AWS_1_5
+        title: "CIS Amazon Web Services Foundations Benchmark v1.5"
+        enabled: true
+      - id: CIS_AZURE_1_4
+        title: "CIS Microsoft Azure Foundations Benchmark v1.4"
+        enabled: true
+      - id: CIS_GCP_1_3
+        title: "CIS Google Cloud Platform Foundation Benchmark v1.3"
+        enabled: true
+      - id: NIST_800_53_R5
+        title: "NIST SP 800-53 Rev.5"
+        enabled: true
+      - id: ISO_27001_2022
+        title: "ISO/IEC 27001:2022"
+        enabled: true
+
+  policies:
+    defaults:
+      severity: high
+      autoRemediationDefault: false
+      requireApprovalForRemediation: true
+      labels:
+        owner: secops
+        environment: prod
+    groups:
+
+      - id: aws-foundations
+        title: "AWS Foundations"
+        rules:
+          - id: CSPM-AWS-001
+            title: S3 buckets must block public access
+            severity: critical
+            rationale: Prevent unintended public exposure of data.
+            query:
+              engine: graph
+              language: rego
+              source: rego://policies/aws/s3/public_access.rego
+            mappings:
+              frameworks: [CIS_AWS_1_5, NIST_800_53_R5, ISO_27001_2022]
+              controls: ["CIS 3.1","AC-3","A.8.2"]
+            remediation:
+              type: automated
+              runbookRef: rb-aws-s3-block-public
+              changeWindow:
+                cron: "0 2 * * *"
+                timezone: Europe/Stockholm
+              approvals:
+                requiredFromTeams: [secops]
+                minApprovals: 2
+            evidence:
+              collect:
+                - aws:s3:get-bucket-policy
+                - aws:s3:get-public-access-block
+              redactSensitive: true
+
+          - id: CSPM-AWS-002
+            title: Root account must have MFA enabled
+            severity: critical
+            rationale: Root credentials are high-value; MFA reduces risk of compromise.
+            query:
+              engine: api
+              language: builtin
+              source: aws:iam:get-account-summary
+              expression: summary.AccountMFAEnabled == 1
+            mappings:
+              frameworks: [CIS_AWS_1_5, NIST_800_53_R5, ISO_27001_2022]
+              controls: ["CIS 1.14","IA-2(1)","A.5.17"]
+            remediation:
+              type: manual
+              runbookRef: rb-aws-root-mfa
+              approvals:
+                requiredFromTeams: [secops, audit]
+                minApprovals: 1
+            evidence:
+              collect: [aws:iam:get-account-summary]
+
+          - id: CSPM-AWS-003
+            title: CloudTrail must be enabled and integrated with CloudWatch Logs
+            severity: high
+            rationale: Centralized audit logging is required for forensics and compliance.
+            query:
+              engine: graph
+              language: rego
+              source: rego://policies/aws/cloudtrail/enabled_and_cwl.rego
+            mappings:
+              frameworks: [CIS_AWS_1_5, NIST_800_53_R5, ISO_27001_2022]
+              controls: ["CIS 2.x","AU-2","A.8.16"]
+            remediation:
+              type: automated
+              runbookRef: rb-aws-cloudtrail-enable
+              approvals:
+                requiredFromTeams: [secops]
+                minApprovals: 1
+            evidence:
+              collect:
+                - aws:cloudtrail:describe-trails
+                - aws:logs:describe-log-groups
+
+      - id: azure-foundations
+        title: "Azure Foundations"
+        rules:
+          - id: CSPM-AZ-001
+            title: Storage Accounts must require secure transfer (HTTPS)
+            severity: high
+            query:
+              engine: api
+              language: builtin
+              source: azure:storage:get-properties
+              expression: properties.supportsHttpsTrafficOnly == true
+            mappings:
+              frameworks: [CIS_AZURE_1_4, ISO_27001_2022]
+              controls: ["A.8.21"]
+            remediation:
+              type: automated
+              runbookRef: rb-az-storage-https
+              approvals:
+                requiredFromTeams: [secops]
+                minApprovals: 1
+
+      - id: gcp-foundations
+        title: "GCP Foundations"
+        rules:
+          - id: CSPM-GCP-001
+            title: GCS buckets must not be publicly accessible
+            severity: critical
+            query:
+              engine: graph
+              language: rego
+              source: rego://policies/gcp/gcs/public_access.rego
+            mappings:
+              frameworks: [CIS_GCP_1_3, ISO_27001_2022]
+              controls: ["A.8.2"]
+            remediation:
+              type: automated
+              runbookRef: rb-gcp-gcs-block-public
+              approvals:
+                requiredFromTeams: [secops]
+                minApprovals: 2
+
+      - id: kubernetes
+        title: "Kubernetes Baseline"
+        rules:
+          - id: CSPM-K8S-001
+            title: Anonymous auth must be disabled on API Server
+            severity: critical
+            query:
+              engine: k8s
+              language: rego
+              source: rego://policies/k8s/apiserver/no_anonymous.rego
+            mappings:
+              frameworks: [NIST_800_53_R5, ISO_27001_2022]
+              controls: ["AC-3","A.5.17"]
+            remediation:
+              type: manual
+              runbookRef: rb-k8s-apiserver-flags
+              approvals:
+                requiredFromTeams: [platform, secops]
+                minApprovals: 2
+
+          - id: CSPM-K8S-002
+            title: All namespaces must enforce NetworkPolicies
+            severity: high
+            query:
+              engine: k8s
+              language: rego
+              source: rego://policies/k8s/network/namespace_policies.rego
+            remediation:
+              type: automated
+              runbookRef: rb-k8s-default-deny
+              approvals:
+                requiredFromTeams: [secops]
+                minApprovals: 1
+
+  exceptions:
+    # Исключения с обязательным обоснованием, датой истечения и связью с тикетом
+    rules:
+      - ruleId: CSPM-AWS-001
+        scope:
+          provider: aws
+          accounts: ["111111111111"]
+          resources:
+            - arn:aws:s3:::public-data-catalog
+        justification: "Публичный датасет, санкционированная экспозиция (маркетинговый каталог)."
+        owner: data-platform@neurocity.local
+        ticket: SEC-1234
+        expiresAt: "2025-12-31T23:59:59Z"
+        compensatingControls:
+          - "Object ownership enforced"
+          - "S3 Access Logs to central bucket"
+          - "CloudFront OAC + signed URLs"
+
+      - ruleId: CSPM-K8S-002
+        scope:
+          provider: kubernetes
+          clusters: ["prod-eks-eu-north-1"]
+          namespaces: ["ingress-nginx"]
+        justification: "Временное окно миграции сетевых политик, конфликт с legacy Ingress."
+        owner: platform@neurocity.local
+        ticket: SEC-1456
+        expiresAt: "2025-10-15T23:59:59Z"
+        compensatingControls:
+          - "Dedicated node group"
+          - "Restricted SecurityGroups at ENI"
+
+  alerting:
+    routes:
+      - id: critical-route
+        match:
+          severity: [critical]
+        actions:
+          - pagerduty: pd-primary
+          - siem: siem-splunk
+          - slack: slack-secops
+      - id: high-route
+        match:
+          severity: [high]
+        actions:
+          - siem: siem-splunk
+          - jira: jira-secops
+      - id: medium-low-digest
+        match:
+          severity: [medium, low]
+        actions:
+          - digest:
+              id: weekly-digest
+              scheduleCron: "0 8 * * MON"
+              timezone: Europe/Stockholm
+              sink: jira-secops
+      - id: info-route
+        match:
+          severity: [info]
+        actions:
+          - archive: s3-archive
+
+    destinations:
+      pagerduty:
+        pd-primary:
+          routingKeyRef: secret://pagerduty/routing_key
+          severityMap: *severities
+      siem:
+        siem-splunk:
+          type: http
+          urlRef: secret://siem/splunk-hec-url
+          tokenRef: secret://siem/splunk-hec-token
+          format: cef
+          batch:
+            maxItems: 200
+            flushInterval: 5s
+      slack:
+        slack-secops:
+          webhookRef: secret://slack/secops-webhook
+          mentionOn: [critical, high]
+      jira:
+        jira-secops:
+          baseUrlRef: secret://jira/base_url
+          authRef: secret://jira/basic_auth
+          projectKey: SEC
+          issueType: Incident
+          fields:
+            priorityBySeverity:
+              critical: P0
+              high: P1
+              medium: P2
+              low: P3
+              info: P4
+      archive:
+        s3-archive:
+          bucket: nc-prod-cybersecurity-archive
+          prefix: alerts/
+          encryption:
+            kmsKeyAlias: alias/cybersecurity-core-kms
+
+  remediation:
+    approvals:
+      requireTicket: true
+      minApprovals: 2
+      approverTeams: [secops, audit]
+    runbooks:
+      rb-aws-s3-block-public:
+        type: lambda
+        identifier: arn:aws:lambda:eu-north-1:111111111111:function:cspm-s3-block-public
+        rollback:
+          type: none
+        prechecks:
+          - "Bucket is not exempted"
+          - "No conflicting SCP"
+      rb-aws-cloudtrail-enable:
+        type: terraform
+        identifier: git@repo.local:sec/cloudtrail-enable//modules/trail
+        changePlan: true
+        rollback:
+          type: terraform
+          identifier: git@repo.local:sec/cloudtrail-enable//modules/trail
+      rb-aws-root-mfa:
+        type: manual
+        docRef: confluence://runbooks/aws/root-mfa
+      rb-az-storage-https:
+        type: arm
+        identifier: /subscriptions/00000000-0000-0000-0000-000000000001/providers/Microsoft.Resources/deployments/enable-https
+      rb-gcp-gcs-block-public:
+        type: gcloud
+        identifier: "gsutil iam ch -d allUsers -d allAuthenticatedUsers gs://$BUCKET"
+      rb-k8s-apiserver-flags:
+        type: manual
+        docRef: confluence://runbooks/k8s/apiserver-secflags
+      rb-k8s-default-deny:
+        type: kubernetes
+        identifier: kustomize://policies/network/default-deny
+
+  quality:
+    gates:
+      # Блокируем релиз конфигурации, если покрытие критичных контролей ниже 95%
+      coverageCriticalMinPct: 95
+      # Общее покрытие не ниже 85%
+      coverageOverallMinPct: 85
+    canaries:
+      enabled: true
+      rulesSamplePct: 5
+      dryRun: true

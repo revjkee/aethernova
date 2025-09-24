@@ -1,0 +1,204 @@
+{{- /*
+Industrial-grade Ingress template for security-core.
+Works without _helpers.tpl, but compatible with it.
+Values contract (excerpt):
+
+ingress:
+  enabled: true
+  provider: nginx            # nginx|traefik|alb
+  className: nginx
+  annotations: {}            # extra annotations
+  securityHeaders:
+    enabled: true
+    hstsPreload: true
+    csp: "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self';"
+    referrerPolicy: "no-referrer"
+    xfo: "DENY"
+    xcto: "nosniff"
+    xXss: "1; mode=block"
+  mtls:
+    enabled: false
+    secretName: ""           # namespace/secret for NGINX auth-tls if needed
+    verifyDepth: 2
+    optional: false
+  oauth2Proxy:
+    enabled: false
+    authURL: ""              # e.g. https://oauth2-proxy.svc.cluster.local/oauth2/auth
+    signInURL: ""            # e.g. https://auth.example.com/oauth2/start
+  jwt:
+    enabled: false
+    secret: ""               # for nginx jwt
+    realm: "secure"
+  rateLimit:
+    enabled: false
+    connections: "100"
+    rps: "50"
+    burst: "100"
+  backendProtocol: ""        # "HTTP"|"HTTPS"|"GRPC" for nginx
+  proxy:
+    bodySize: "8m"
+    readTimeout: "30"
+    sendTimeout: "30"
+    bufferSize: "16k"
+  ipAllowList: []            # ["10.0.0.0/8","192.168.0.0/16"]
+  canary:
+    enabled: false
+    byHeader: ""
+    byCookie: ""
+    weight: ""
+  hosts:
+    - host: example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: ""         # default: <release>-security-core
+            port:
+              number: 8080   # or {name: http}
+  tls:
+    - secretName: example-tls
+      hosts: [example.com]
+
+service:
+  name: ""                   # default: <release>-security-core
+*/ -}}
+{{- if .Values.ingress.enabled }}
+
+{{- $name := default (printf "%s-%s" .Release.Name "security-core") .Values.service.name -}}
+{{- $class := .Values.ingress.className | default "" -}}
+{{- $provider := .Values.ingress.provider | default "nginx" -}}
+{{- $ann := dict -}}
+
+{{- /* Merge user annotations first (user overrides built-ins) */ -}}
+{{- if .Values.ingress.annotations }}
+  {{- $ann = merge $ann .Values.ingress.annotations -}}
+{{- end }}
+
+{{- /* Provider-specific sane defaults */ -}}
+{{- if eq $provider "nginx" }}
+  {{- $ann = merge $ann (dict
+        "nginx.ingress.kubernetes.io/proxy-body-size" (.Values.ingress.proxy.bodySize | default "8m")
+        "nginx.ingress.kubernetes.io/proxy-read-timeout" (.Values.ingress.proxy.readTimeout | default "30")
+        "nginx.ingress.kubernetes.io/proxy-send-timeout" (.Values.ingress.proxy.sendTimeout | default "30")
+        "nginx.ingress.kubernetes.io/proxy-buffer-size" (.Values.ingress.proxy.bufferSize | default "16k")
+    ) -}}
+  {{- if .Values.ingress.backendProtocol }}
+    {{- $ann = merge $ann (dict "nginx.ingress.kubernetes.io/backend-protocol" .Values.ingress.backendProtocol) -}}
+  {{- end }}
+  {{- if .Values.ingress.rateLimit.enabled }}
+    {{- $ann = merge $ann (dict
+          "nginx.ingress.kubernetes.io/limit-connections" (.Values.ingress.rateLimit.connections | default "100")
+          "nginx.ingress.kubernetes.io/limit-rps"         (.Values.ingress.rateLimit.rps | default "50")
+          "nginx.ingress.kubernetes.io/limit-burst-multiplier" (.Values.ingress.rateLimit.burst | default "100")
+        ) -}}
+  {{- end }}
+  {{- if .Values.ingress.ipAllowList }}
+    {{- $ann = merge $ann (dict "nginx.ingress.kubernetes.io/whitelist-source-range" (join "," .Values.ingress.ipAllowList)) -}}
+  {{- end }}
+  {{- if .Values.ingress.mtls.enabled }}
+    {{- $ann = merge $ann (dict
+          "nginx.ingress.kubernetes.io/auth-tls-secret" .Values.ingress.mtls.secretName
+          "nginx.ingress.kubernetes.io/auth-tls-verify-depth" (toString (.Values.ingress.mtls.verifyDepth | default 2))
+          "nginx.ingress.kubernetes.io/auth-tls-verify-client" (ternary "optional" "on" .Values.ingress.mtls.optional | default "on")
+        ) -}}
+  {{- end }}
+  {{- if .Values.ingress.jwt.enabled }}
+    {{- $ann = merge $ann (dict
+          "nginx.ingress.kubernetes.io/auth-jwt-key" .Values.ingress.jwt.secret
+          "nginx.ingress.kubernetes.io/auth-jwt-realm" (.Values.ingress.jwt.realm | default "secure")
+        ) -}}
+  {{- end }}
+  {{- if .Values.ingress.oauth2Proxy.enabled }}
+    {{- $ann = merge $ann (dict
+          "nginx.ingress.kubernetes.io/auth-url" .Values.ingress.oauth2Proxy.authURL
+          "nginx.ingress.kubernetes.io/auth-signin" .Values.ingress.oauth2Proxy.signInURL
+        ) -}}
+  {{- end }}
+  {{- if .Values.ingress.canary.enabled }}
+    {{- $ann = merge $ann (dict "nginx.ingress.kubernetes.io/canary" "true") -}}
+    {{- if .Values.ingress.canary.byHeader }}
+      {{- $ann = merge $ann (dict "nginx.ingress.kubernetes.io/canary-by-header" .Values.ingress.canary.byHeader) -}}
+    {{- end }}
+    {{- if .Values.ingress.canary.byCookie }}
+      {{- $ann = merge $ann (dict "nginx.ingress.kubernetes.io/canary-by-cookie" .Values.ingress.canary.byCookie) -}}
+    {{- end }}
+    {{- if .Values.ingress.canary.weight }}
+      {{- $ann = merge $ann (dict "nginx.ingress.kubernetes.io/canary-weight" (toString .Values.ingress.canary.weight)) -}}
+    {{- end }}
+  {{- end }}
+
+  {{- /* Security headers via configuration-snippet */ -}}
+  {{- if .Values.ingress.securityHeaders.enabled }}
+    {{- $hsts := (printf "max-age=31536000; includeSubDomains%s" (ternary "; preload" "" .Values.ingress.securityHeaders.hstsPreload)) -}}
+    {{- $csp := .Values.ingress.securityHeaders.csp | default "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self';" -}}
+    {{- $ref := .Values.ingress.securityHeaders.referrerPolicy | default "no-referrer" -}}
+    {{- $xfo := .Values.ingress.securityHeaders.xfo | default "DENY" -}}
+    {{- $xcto := .Values.ingress.securityHeaders.xcto | default "nosniff" -}}
+    {{- $xxss := .Values.ingress.securityHeaders.xXss | default "1; mode=block" -}}
+    {{- $snippet := printf "add_header Strict-Transport-Security \"%s\" always;\nadd_header Content-Security-Policy \"%s\" always;\nadd_header Referrer-Policy \"%s\" always;\nadd_header X-Frame-Options \"%s\" always;\nadd_header X-Content-Type-Options \"%s\" always;\nadd_header X-XSS-Protection \"%s\" always;" $hsts $csp $ref $xfo $xcto $xxss -}}
+    {{- $ann = merge $ann (dict "nginx.ingress.kubernetes.io/configuration-snippet" $snippet) -}}
+  {{- end }}
+{{- else if eq $provider "traefik" }}
+  {{- /* Traefik basic annotations */ -}}
+  {{- $ann = merge $ann (dict
+        "traefik.ingress.kubernetes.io/router.entrypoints" "web,websecure"
+    ) -}}
+{{- else if eq $provider "alb" }}
+  {{- /* AWS ALB annotations */ -}}
+  {{- $ann = merge $ann (dict
+        "kubernetes.io/ingress.class" "alb"
+        "alb.ingress.kubernetes.io/scheme" "internet-facing"
+        "alb.ingress.kubernetes.io/target-type" "ip"
+    ) -}}
+{{- end }}
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $name }}-ingress
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/part-of: core-systems
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/component: api
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+  {{- if $ann }}
+  annotations:
+{{ toYaml $ann | indent 4 }}
+  {{- end }}
+spec:
+  {{- if $class }}
+  ingressClassName: {{ $class }}
+  {{- end }}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- range .Values.ingress.tls }}
+    - secretName: {{ .secretName }}
+      hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+    {{- end }}
+  {{- end }}
+  rules:
+    {{- $svcDefault := $name -}}
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path | default "/" }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ default $svcDefault .service.name }}
+                port:
+                  {{- if .service.port.name }}
+                  name: {{ .service.port.name }}
+                  {{- else }}
+                  number: {{ .service.port.number | default 80 }}
+                  {{- end }}
+          {{- end }}
+    {{- end }}
+{{- end }}

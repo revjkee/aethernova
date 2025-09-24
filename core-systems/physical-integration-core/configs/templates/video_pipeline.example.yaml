@@ -1,0 +1,476 @@
+schema:
+  version: 1
+  description: >
+    Industrial video pipeline template for live and VOD processing in hybrid edge/cloud.
+    This file is a declarative contract to render service configs, k8s manifests and IaC.
+
+globals:
+  environment: "prod"                  # dev|stage|prod
+  region: "eu-north-1"
+  site: "dc-eu-1"
+  timezone: "UTC"
+  organization: "neurocity"
+  project: "physical-integration-core"
+
+  # Стандарты задержек и доступности
+  reliability:
+    slo:
+      live:
+        glass_to_glass_latency_ms: 2500
+        availability_percent: 99.9
+        start_fail_rate_percent: 0.1
+      vod:
+        time_to_first_frame_ms: 1500
+        availability_percent: 99.95
+    sla:
+      escalation_minutes: 15
+
+  # Наблюдаемость / аудит
+  observability:
+    logging:
+      level: "INFO"                    # DEBUG|INFO|WARN|ERROR
+      format: "json"
+      retention_days: 30
+    metrics:
+      prometheus:
+        enabled: true
+        scrape_interval: "15s"
+        labels:
+          component: "video-pipeline"
+    tracing:
+      opentelemetry:
+        enabled: true
+        endpoint: "otel-collector.observability:4317"
+        sample_ratio: 0.1
+    audit:
+      enabled: true
+      sink: "s3://{{ .Values.audit.bucket }}/video-pipeline/"
+      redact_pii: true
+
+  # Глобальные политики безопасности
+  security:
+    kms_key_arn: "arn:aws:kms:eu-north-1:111122223333:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    sse: "aws:kms"
+    verify_manifests_signature: true
+    network:
+      zero_trust: true
+      mTLS:
+        enabled: true
+        min_tls: "1.2"
+    allowed_ingress_cidrs: ["10.0.0.0/8","192.168.0.0/16"]
+    content_integrity:
+      segment_signing: true
+      manifests_signing: true
+
+  # Политики QoS / деградации
+  qos:
+    overload:
+      cpu_threshold_percent: 85
+      gpu_threshold_percent: 90
+      degrade_policy:
+        - condition: "cpu>85% for 3m"
+          action: "raise_gop, reduce_bitrate_tier"
+        - condition: "network_egress_sustained>90% for 5m"
+          action: "switch_to_cmaf_ll, widen_segment_duration"
+    backpressure:
+      max_queue_depth: 10000
+      drop_policy: "keyframe_only"
+
+resources:
+  # Базовые лимиты и предпочтения ускорителей
+  profiles:
+    - name: "cpu-standard"
+      cpu: "4"
+      memory: "8Gi"
+      gpu: null
+      encoder: "x264"
+      node_selector: { "accelerator": "none" }
+    - name: "gpu-nvidia-a10"
+      cpu: "8"
+      memory: "32Gi"
+      gpu:
+        vendor: "nvidia"
+        count: 1
+        product: "A10"
+      encoder: "nvenc"
+      node_selector: { "accelerator": "nvidia-a10" }
+    - name: "gpu-intel-flex"
+      cpu: "8"
+      memory: "32Gi"
+      gpu:
+        vendor: "intel"
+        count: 1
+        product: "Flex140"
+      encoder: "qsv"
+      node_selector: { "accelerator": "intel-flex" }
+
+secretsRef:
+  # ссылки на внешние секреты (External Secrets / Vault / AWS Secrets Manager)
+  drm:
+    store: "external-secrets"
+    path: "kv/media/drm/{{globals.environment}}/"
+    keys:
+      widevine: "widevine_key"
+      fairplay: "fairplay_key"
+      playready: "playready_key"
+  storage:
+    store: "external-secrets"
+    path: "kv/storage/{{globals.environment}}/"
+    keys:
+      s3_access_key: "s3_access_key"
+      s3_secret_key: "s3_secret_key"
+  cdn:
+    store: "external-secrets"
+    path: "kv/cdn/{{globals.environment}}/"
+    keys:
+      api_key: "api_key"
+
+pipelines:
+
+  # ---------------------------------------------------------------------------
+  # LIVE: низкая задержка, многоуровневый ABR, HLS/DASH + опциональный CMAF LL
+  # ---------------------------------------------------------------------------
+  - name: "live_lowlatency"
+    enabled: true
+    description: "Ultra-low-latency live pipeline with ABR ladder and event detection."
+    profile: "gpu-nvidia-a10"
+    mode: "live"
+    idempotency:
+      enabled: true
+      key_template: "{{ stream.session_id }}:{{ input.signal_hash }}"
+      dedup_window_sec: 30
+
+    ingest:
+      protocol: "SRT"                          # RTSP|SRT|RTP|RIST|HLS|WebRTC|Kinesis
+      endpoints:
+        - "srt://0.0.0.0:10080?mode=listener&latency=50"
+      fallback:
+        enable_pull: true
+        pull_urls:
+          - "rtsp://camera-gw.site/stream/primary"
+      healthcheck:
+        grace_period_sec: 10
+        max_stream_gap_sec: 3
+      time_sync:
+        require_ptp_lock: false
+        max_pts_jitter_ms: 80
+
+    decode:
+      engine: "ffmpeg"                         # ffmpeg|gstreamer
+      hardware_accel: "cuda"                   # cuda|qsv|vaapi|null
+      threads: 8
+      drop_non_keyframes_on_overrun: true
+
+    transcode:
+      engine: "ffmpeg"
+      encoder: "nvenc"                         # nvenc|x264|qsv|svt-av1
+      gop:
+        mode: "fixed"
+        size_frames: 60
+        scene_change_detect: true
+      rate_control:
+        mode: "cbr"
+        vbv_buffer_ratio: 1.0
+      ladder:
+        # от верхнего профиля к нижнему; ключевые параметры для сервиса генерации
+        - name: "1080p"
+          width: 1920
+          height: 1080
+          fps: 30
+          bitrate_kbps: 6000
+          audio:
+            codec: "aac"
+            bitrate_kbps: 128
+        - name: "720p"
+          width: 1280
+          height: 720
+          fps: 30
+          bitrate_kbps: 3500
+          audio: { codec: "aac", bitrate_kbps: 128 }
+        - name: "480p"
+          width: 854
+          height: 480
+          fps: 30
+          bitrate_kbps: 1200
+          audio: { codec: "aac", bitrate_kbps: 96 }
+        - name: "240p"
+          width: 426
+          height: 240
+          fps: 15
+          bitrate_kbps: 350
+          audio: { codec: "aac", bitrate_kbps: 64 }
+
+    analytics:
+      enabled: true
+      inference:
+        engine: "onnxruntime"                  # onnxruntime|tensorrt|openvino
+        model_uri: "s3://ml-models/prod/events/yolo11n.onnx"
+        batch: 1
+        interval_frames: 5
+        region_of_interest: []                 # опционально
+      events:
+        bus: "kafka"                           # kafka|sqs|sns|redis
+        destination: "kafka://broker.kafka:9092/topic:video.events"
+        format: "cloudevents"
+        include_frames: false
+        sampling_ratio: 0.1
+      privacy:
+        blur_faces: false
+        pii_redact_text: false
+
+    packaging:
+      muxer: "cmaf"                            # cmaf|hls|dash
+      segment:
+        target_duration_sec: 2
+        partials: true
+        low_latency: true
+        playlist_window: 6
+        dvr_window_sec: 900
+        redundant_manifests: true
+      captions:
+        burn_in: false
+        extract_from_source: true
+        languages: ["en","sv","ru"]
+
+    drm:
+      enabled: true
+      providers: ["widevine","fairplay","playready"]
+      key_rotation:
+        interval_segments: 60
+      license_servers:
+        widevine: "https://license.wv.example.com"
+        fairplay: "https://license.fp.example.com"
+        playready: "https://license.pr.example.com"
+
+    storage:
+      origin:
+        type: "s3"
+        bucket: "live-origin-{{globals.environment}}"
+        prefix: "live/{stream.name}/"
+        sse: "{{globals.security.sse}}"
+        kms_key_arn: "{{globals.security.kms_key_arn}}"
+        cache_control: "public,max-age=2"
+      archive:
+        enabled: true
+        type: "s3"
+        bucket: "live-archive-{{globals.environment}}"
+        prefix: "archive/{stream.name}/"
+        lifecycle:
+          - rule: "transition_glacier_after_7d"
+            transition_after_days: 7
+            storage_class: "GLACIER"
+
+    cdn:
+      push: false
+      pull:
+        provider: "cloudfront"
+        distribution_id: "E1234567890"
+        path_map:
+          "/live/*": "s3://live-origin-{{globals.environment}}/"
+
+    resilience:
+      retry:
+        max_attempts: 8
+        backoff: { type: "exponential", base_ms: 200, max_ms: 10000, jitter: true }
+      dlq:
+        enabled: true
+        target: "sqs://live-pipeline-dlq"
+      limits:
+        max_startup_seconds: 20
+        max_recoveries_per_hour: 6
+
+    autoscaling:
+      horizontal:
+        min_replicas: 2
+        max_replicas: 20
+        metrics:
+          - type: "Resource"
+            cpu_target_percent: 70
+          - type: "Custom"
+            name: "encoder_queue_depth"
+            target: 500
+      vertical:
+        enabled: false
+
+    compliance:
+      content_rights_check: true
+      recording_consent_required: false
+
+  # ---------------------------------------------------------------------------
+  # VOD: прием файлов, транскод в лестницу, упаковка HLS/DASH, QC, публикация
+  # ---------------------------------------------------------------------------
+  - name: "vod_transcode_packaging"
+    enabled: true
+    description: "VOD pipeline for file ingest, multi-ABR transcode and packaging with QC."
+    profile: "cpu-standard"
+    mode: "vod"
+    idempotency:
+      enabled: true
+      key_template: "{{ asset.asset_id }}:{{ asset.sha256 }}"
+
+    ingest:
+      protocol: "S3"
+      endpoints:
+        - "s3://vod-ingest-{{globals.environment}}/incoming/"
+      watch:
+        enabled: true
+        suffix_allow: [".mp4",".mov",".mxf",".mkv",".webm",".wav"]
+        max_parallel: 4
+      quarantine:
+        enabled: true
+        bucket: "vod-quarantine-{{globals.environment}}"
+        reason_on_fail: true
+
+    precheck:
+      media_probe: "ffprobe"
+      validate_container: true
+      max_duration_hours: 6
+      reject_if_corrupted: true
+      normalize_audio_lufs: -16
+
+    transcode:
+      engine: "ffmpeg"
+      parallelism: 2
+      ladder:
+        h264:
+          enabled: true
+          profiles:
+            - { name: "2160p", w: 3840, h: 2160, fps: 30, bitrate_kbps: 20000, profile: "high", level: "5.2" }
+            - { name: "1080p", w: 1920, h: 1080, fps: 30, bitrate_kbps: 8000, profile: "high", level: "4.2" }
+            - { name: "720p",  w: 1280, h: 720,  fps: 30, bitrate_kbps: 5000, profile: "high", level: "4.1" }
+            - { name: "480p",  w: 854,  h: 480,  fps: 30, bitrate_kbps: 1500, profile: "main", level: "3.1" }
+        hevc:
+          enabled: true
+          profiles:
+            - { name: "2160p", w: 3840, h: 2160, fps: 30, bitrate_kbps: 12000, preset: "medium", tier: "high"}
+            - { name: "1080p", w: 1920, h: 1080, fps: 30, bitrate_kbps: 4500, preset: "medium", tier: "main"}
+        av1:
+          enabled: false
+      audio:
+        codec: "aac"         # aac|opus|ac3
+        channels: 2
+        bitrate_kbps: 160
+        loudnorm: true
+      thumbnails:
+        enabled: true
+        interval_sec: 10
+        strip_metadata: true
+        sprite:
+          enabled: true
+          columns: 10
+          rows: 10
+
+    packaging:
+      outputs:
+        hls:
+          enabled: true
+          segment_duration_sec: 4
+          low_latency: false
+          max_playlist_entries: 5000
+        dash:
+          enabled: true
+          segment_duration_sec: 4
+          low_latency: false
+        cmaf:
+          enabled: true
+      captions:
+        source: "embedded"   # embedded|srt|vtt|none
+        languages: ["en"]
+      drm:
+        enabled: true
+        providers: ["widevine","fairplay","playready"]
+
+    qc:
+      enabled: true
+      checks:
+        - "black_frames"
+        - "silence"
+        - "freeze_frames"
+        - "bitrate_tolerance"
+      tolerance:
+        max_black_frames: 120
+        max_freeze_ms: 500
+        bitrate_tolerance_percent: 15
+      reject_on_fail: true
+
+    storage:
+      master:
+        type: "s3"
+        bucket: "vod-master-{{globals.environment}}"
+        prefix: "masters/{asset.asset_id}/"
+      mezzanine:
+        type: "s3"
+        bucket: "vod-mezzanine-{{globals.environment}}"
+        prefix: "mezz/{asset.asset_id}/"
+      distribution:
+        type: "s3"
+        bucket: "vod-distribution-{{globals.environment}}"
+        prefix: "dist/{asset.asset_id}/"
+        public_read: false
+        sse: "{{globals.security.sse}}"
+        kms_key_arn: "{{globals.security.kms_key_arn}}"
+        cache_control: "public,max-age=3600"
+      lifecycle:
+        - rule: "master_to_glacier"
+          prefix: "masters/"
+          transition_after_days: 30
+          storage_class: "GLACIER"
+
+    catalog:
+      publish:
+        cms_webhook: "https://cms.example.com/api/assets/ingested"
+        retry:
+          max_attempts: 5
+          backoff: { type: "exponential", base_ms: 500, max_ms: 15000, jitter: true }
+
+    events:
+      bus: "sqs"
+      topic: "sqs://vod-events"
+      on:
+        start:   { emit: true }
+        success: { emit: true }
+        fail:    { emit: true, include_error: true }
+
+    resilience:
+      concurrency_limit: 4
+      retry:
+        max_attempts: 6
+        backoff: { type: "exponential", base_ms: 300, max_ms: 12000, jitter: true }
+      dlq:
+        enabled: true
+        target: "sqs://vod-pipeline-dlq"
+
+    autoscaling:
+      horizontal:
+        min_replicas: 1
+        max_replicas: 10
+        metrics:
+          - type: "Custom"
+            name: "jobs_in_queue"
+            target: 100
+
+kubernetes:
+  # Подсказки для рендерера Helm/Argo
+  workloads:
+    serviceAccount: "video-pipeline"
+    podSecurity:
+      runAsNonRoot: true
+      seccompProfile: "RuntimeDefault"
+      readOnlyRootFilesystem: true
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution: []
+    tolerations: []
+  networking:
+    networkPolicy:
+      enabled: true
+      egress:
+        allow:
+          - "kafka:9092"
+          - "otel-collector.observability:4317"
+          - "*.amazonaws.com:443"
+      deny_all_else: true
+  configRender:
+    # Куда класть сгенерированные конфиги внутри контейнеров
+    paths:
+      live: "/etc/video/live/"
+      vod:  "/etc/video/vod/"

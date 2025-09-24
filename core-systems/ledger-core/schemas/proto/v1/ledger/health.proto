@@ -1,0 +1,220 @@
+// ledger-core/schemas/proto/v1/ledger/health.proto
+syntax = "proto3";
+
+package ledger.v1;
+
+// --------------------------------------------------------------------------------------
+// Industrial Health API for ledger-core
+// - Rich probes: LIVENESS / READINESS / STARTUP / SELFTEST
+// - Detailed component checks and dependency diagnostics
+// - Build/instance metadata and lightweight metric snapshot
+// - Streaming Watch for active monitoring
+// - Evolution-ready: reserved fields, explicit enums
+// --------------------------------------------------------------------------------------
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// --------------------------------------------------------------------------------------
+// Options for popular languages (adjust module paths to your org standards)
+// --------------------------------------------------------------------------------------
+option go_package = "github.com/your-org/ledger-core/pkg/genproto/ledger/v1;ledgerv1";
+option java_multiple_files = true;
+option java_package = "com.yourorg.ledger.v1";
+option csharp_namespace = "YourOrg.Ledger.V1";
+option php_namespace = "YourOrg\\Ledger\\V1";
+option ruby_package = "YourOrg::Ledger::V1";
+option objc_class_prefix = "YOLG";
+
+// --------------------------------------------------------------------------------------
+// Enums
+// --------------------------------------------------------------------------------------
+
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTH_STATUS_OK          = 1;  // Healthy
+  HEALTH_STATUS_DEGRADED    = 2;  // Functional but impaired (e.g., partial dependency failures)
+  HEALTH_STATUS_WARN        = 3;  // Early warnings (thresholds, nearing limits)
+  HEALTH_STATUS_FAIL        = 4;  // Not healthy (readiness/liveness failed)
+}
+
+enum ProbeKind {
+  PROBE_KIND_UNSPECIFIED = 0;
+  PROBE_KIND_LIVENESS    = 1;  // Is the process alive? No external deps required.
+  PROBE_KIND_READINESS   = 2;  // Ready to serve traffic? Includes critical deps.
+  PROBE_KIND_STARTUP     = 3;  // Startup finished (init, migrations, warmups).
+  PROBE_KIND_SELFTEST    = 4;  // Optional self-tests (fast & side-effect free).
+}
+
+enum ComponentType {
+  COMPONENT_TYPE_UNSPECIFIED = 0;
+  COMPONENT_TYPE_API         = 1;
+  COMPONENT_TYPE_WORKER      = 2;
+  COMPONENT_TYPE_SCHEDULER   = 3;
+  COMPONENT_TYPE_DB          = 4;  // Embedded or local stores
+  COMPONENT_TYPE_CACHE       = 5;
+  COMPONENT_TYPE_MESSAGE_BUS = 6;
+  COMPONENT_TYPE_FILESYSTEM  = 7;
+  COMPONENT_TYPE_EXTERNAL    = 8;  // External integration
+}
+
+// --------------------------------------------------------------------------------------
+// Requests / Responses
+// --------------------------------------------------------------------------------------
+
+message CheckRequest {
+  // Which probe we evaluate
+  ProbeKind kind = 1;
+
+  // If true, include dependency checks even for non-readiness probes.
+  bool include_dependencies = 2;
+
+  // If true, include metric snapshot (gauges/counters) in response.
+  bool include_metrics = 3;
+
+  // Filter by component ids (e.g., "api", "db:primary", "redis:cache").
+  // Empty => all relevant to the probe kind.
+  repeated string component_filter = 4;
+
+  // Client may pass opaque context for logging/tracing correlation.
+  // e.g., {"trace_id":"...", "caller":"prober-xyz"}
+  google.protobuf.Struct context = 5;
+
+  // Reserved for future fields
+  reserved 6, 7, 8, 9, 10;
+}
+
+message CheckResponse {
+  // Overall service health for the requested probe.
+  HealthStatus status = 1;
+
+  // Human-readable summary (single line).
+  string summary = 2;
+
+  // Optional detailed message (multi-line).
+  string details = 3;
+
+  // Service and build information.
+  BuildInfo build = 4;
+
+  // Current process/instance info.
+  InstanceInfo instance = 5;
+
+  // Subsystem/component checks that contributed to the result.
+  repeated ComponentCheck components = 6;
+
+  // Top-level dependency diagnostics (network reachability, latency, etc.).
+  repeated DependencyCheck dependencies = 7;
+
+  // Lightweight metric snapshot (opt-in for size).
+  MetricsSnapshot metrics = 8;
+
+  // Probe kind actually executed (may differ if server remaps UNSPECIFIED).
+  ProbeKind kind = 9;
+
+  // Server-side evaluation timestamp.
+  google.protobuf.Timestamp evaluated_at = 10;
+
+  // Reserved for evolution
+  reserved 11, 12, 13, 14, 15;
+}
+
+message BuildInfo {
+  string service_name   = 1;  // e.g., "ledger-core"
+  string version        = 2;  // SemVer (appVersion)
+  string commit         = 3;  // VCS commit sha
+  string branch         = 4;  // optional
+  google.protobuf.Timestamp build_time = 5;
+  string build_number    = 6;  // CI build/run id
+  string vcs_url         = 7;  // repository URL (optional)
+}
+
+message InstanceInfo {
+  string instance_id = 1;     // pod name / hostname / unique id
+  string zone        = 2;     // AZ/zone
+  string region      = 3;
+  google.protobuf.Timestamp start_time = 4;
+  google.protobuf.Duration  uptime     = 5;
+  string environment = 6;     // dev|staging|prod
+  string container_image = 7; // image ref
+  map<string,string> labels = 8;   // arbitrary instance labels
+  map<string,string> annotations = 9;
+}
+
+message ComponentCheck {
+  string id              = 1; // unique within service, e.g., "api", "db:primary"
+  ComponentType type     = 2;
+  HealthStatus status    = 3;
+  string message         = 4; // human-readable reason
+  google.protobuf.Duration latency = 5; // time spent checking
+  google.protobuf.Timestamp last_transition_time = 6; // last status change
+  // Optional: per-component metrics (narrow scope)
+  MetricsSnapshot metrics = 7;
+  // Arbitrary structured data (e.g., pool stats)
+  google.protobuf.Struct extra = 8;
+
+  // Evolution safety
+  reserved 9, 10, 11;
+}
+
+message DependencyCheck {
+  string target          = 1; // e.g., "postgres://db-primary", "redis://cache"
+  HealthStatus status    = 2;
+  bool reachable         = 3;
+  google.protobuf.Duration latency = 4; // p50 of dial/query
+  string message         = 5;
+  // Optional sampled error code/category (e.g., "ECONNREFUSED", "TIMEOUT")
+  string error_category  = 6;
+  // If dependency exposes its own health endpoint, last reported status.
+  HealthStatus reported_status = 7;
+  // Structured fields like {"replication_lag_ms": 42}
+  google.protobuf.Struct extra = 8;
+
+  reserved 9, 10;
+}
+
+message MetricsSnapshot {
+  // For wire efficiency, use maps; keep counts low (top-N only).
+  map<string, double> gauges   = 1; // e.g., {"cpu.throttle_ratio":0.12, "mem.usage_bytes":1.2e9}
+  map<string, double> counters = 2; // deltas since start or monotonic samples (document semantics)
+  map<string, double> rates    = 3; // computed rates, e.g., "http.req_rate_rps"
+  reserved 4, 5;
+}
+
+// Optional ping for synthetic probes / connectivity.
+message PingRequest {
+  // Optional payload to verify echo behavior / MTU.
+  bytes payload = 1;
+}
+
+message PingResponse {
+  bytes payload = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+// Streaming watch: server pushes health snapshots when status changes or heartbeat interval elapses.
+message WatchRequest {
+  ProbeKind kind = 1;
+  // Minimum interval between updates regardless of changes (heartbeat).
+  google.protobuf.Duration min_interval = 2;
+  // If true, send immediate snapshot upon subscription.
+  bool send_initial = 3;
+
+  reserved 4, 5, 6;
+}
+
+// --------------------------------------------------------------------------------------
+// Service
+// --------------------------------------------------------------------------------------
+
+service HealthService {
+  // Evaluate a specific probe and return a rich health snapshot.
+  rpc Check(CheckRequest) returns (CheckResponse);
+
+  // Lightweight connectivity check.
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // Stream health updates (edge-triggered on changes + heartbeats).
+  rpc Watch(WatchRequest) returns (stream CheckResponse);
+}

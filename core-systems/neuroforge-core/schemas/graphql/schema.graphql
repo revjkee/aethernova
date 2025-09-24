@@ -1,0 +1,503 @@
+"""NeuroForge GraphQL API v1 — промышленная схема"""
+schema @contact(name: "team-ml-platform", url: "https://example.com") {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+# ---------------------------
+# Директивы (инфраструктура)
+# ---------------------------
+
+"""Требует аутентификации и/или определённых ролей"""
+directive @auth(
+  requires: [Role!]
+  any: Boolean = false
+) on OBJECT | FIELD_DEFINITION | INTERFACE
+
+"""Подсказки кэширования для CDN/шлюза"""
+directive @cacheControl(
+  scope: CacheScope = PRIVATE
+  maxAge: Int = 0
+  staleWhileRevalidate: Int = 0
+) on OBJECT | FIELD_DEFINITION | INTERFACE
+
+"""Ограничение частоты запросов на ключ субъекта"""
+directive @rateLimit(
+  window: Int!           # сек
+  max: Int!              # запросов за окно
+  identityArg: String    # имя аргумента, формирующего ключ
+) on FIELD_DEFINITION
+
+"""Аудит доступа и изменений"""
+directive @audit(
+  event: String!
+  attributes: [String!]
+  pii: Boolean = false
+) on FIELD_DEFINITION
+
+# ---------------------------
+# Скаляры
+# ---------------------------
+
+scalar DateTime   # ISO-8601, UTC рекомендован
+scalar UUID       # RFC 4122
+scalar Decimal    # Строковое представление десятичных чисел высокой точности
+scalar BigInt     # Строковое представление 64+ бит целого
+scalar JSON       # Произвольный JSON (map/array/scalar)
+scalar URL
+
+# ---------------------------
+# Общие модели/интерфейсы
+# ---------------------------
+
+"""Глобально адресуемый объект"""
+interface Node @cacheControl(scope: PRIVATE, maxAge: 30) {
+  """Глобальный ID (Relay)"""
+  id: ID!
+}
+
+enum Role {
+  ADMIN
+  MAINTAINER
+  USER
+  SERVICE
+}
+
+enum CacheScope { PUBLIC PRIVATE }
+
+"""Единый формат ошибки, близок к RFC 7807"""
+type ProblemDetails {
+  code: String!           # Короткий машинный код (например, VALIDATION_ERROR)
+  title: String!          # Человекочитаемый заголовок
+  detail: String          # Подробности
+  httpStatus: Int         # Соответствующий HTTP-статус (индикативно)
+  retryAfterSec: Int
+  fields: [InvalidField!] # Детали по полям (валидация)
+}
+
+"""Описание ошибки конкретного поля"""
+type InvalidField {
+  path: String!     # путь (например, input.name)
+  message: String!  # почему недопустимо
+}
+
+"""Стандартный ответ мутаций"""
+type MutationResult {
+  ok: Boolean!
+  problem: ProblemDetails
+}
+
+# ---------------------------
+# Пагинация (Relay + keyset)
+# ---------------------------
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+"""Ключевые параметры keyset-пагинации"""
+input KeysetInput {
+  after: String
+  before: String
+  limit: Int = 50
+}
+
+# ---------------------------
+# Здоровье сервиса
+# ---------------------------
+
+enum HealthStatus { UNKNOWN SERVING NOT_SERVING DEGRADED }
+
+type Probe {
+  name: String!
+  type: String!
+  state: String!     # PASS|WARN|FAIL
+  detail: String
+  latencyMs: Int
+  checkedAt: DateTime!
+}
+
+type Health implements Node {
+  id: ID!
+  status: HealthStatus!
+  version: String
+  revision: String
+  releaseChannel: String
+  node: String
+  zone: String
+  region: String
+  checkedAt: DateTime!
+  metadata: JSON
+  probes: [Probe!]!
+}
+
+# ---------------------------
+# Модели/версии/датасеты/оценки
+# ---------------------------
+
+enum ModelStage { DRAFT STAGING PRODUCTION ARCHIVED }
+
+type Model implements Node @auth(requires: [USER]) {
+  id: ID!
+  name: String!
+  description: String
+  owner: String!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  tags: [String!]!
+  latestVersion: ModelVersion
+  versions(
+    first: Int
+    after: String
+    keyset: KeysetInput
+  ): ModelVersionConnection! @cacheControl(maxAge: 60)
+}
+
+type ModelVersion implements Node {
+  id: ID!
+  model: Model!
+  version: String!          # SemVer или иное
+  stage: ModelStage!
+  createdAt: DateTime!
+  artifactUri: URL!
+  metrics: JSON
+  params: JSON
+  checksumSha256: String
+  deployed: Boolean!
+}
+
+type ModelVersionEdge {
+  cursor: String!
+  node: ModelVersion!
+}
+
+type ModelVersionConnection {
+  pageInfo: PageInfo!
+  totalCount: Int
+  edges: [ModelVersionEdge!]!
+}
+
+enum DatasetKind { TRAIN VAL TEST REF LIVE }
+
+type Dataset implements Node @auth(requires: [USER]) {
+  id: ID!
+  name: String!
+  kind: DatasetKind!
+  uri: URL!
+  format: String!
+  rows: BigInt
+  features: [String!]!
+  createdAt: DateTime!
+  checksumSha256: String
+  description: String
+}
+
+enum JobStatus { PENDING RUNNING SUCCEEDED FAILED CANCELED }
+
+type InferenceJob implements Node @auth(requires: [USER]) {
+  id: ID!
+  modelVersion: ModelVersion!
+  status: JobStatus!
+  createdAt: DateTime!
+  startedAt: DateTime
+  finishedAt: DateTime
+  inputUri: URL
+  outputUri: URL
+  params: JSON
+  metrics: JSON
+  error: ProblemDetails
+}
+
+type Evaluation implements Node @auth(requires: [USER]) {
+  id: ID!
+  modelVersion: ModelVersion!
+  dataset: Dataset!
+  createdAt: DateTime!
+  metrics: JSON!
+  slices: JSON
+  passedGates: Boolean!
+  reportUri: URL
+  baselineId: ID
+}
+
+# ---------------------------
+# Пользователи/ключи/аудит
+# ---------------------------
+
+type User implements Node @auth(requires: [USER]) {
+  id: ID!
+  email: String!
+  name: String
+  roles: [Role!]!
+  createdAt: DateTime!
+  apiKeys: [ApiKey!]!
+}
+
+type ApiKey implements Node @auth(requires: [USER]) {
+  id: ID!
+  name: String!
+  createdAt: DateTime!
+  lastUsedAt: DateTime
+  scopes: [String!]!
+  revoked: Boolean!
+}
+
+type AuditEvent implements Node @auth(requires: [ADMIN, SERVICE], any: true) {
+  id: ID!
+  at: DateTime!
+  actor: String!
+  action: String!
+  objectType: String!
+  objectId: ID
+  attributes: JSON
+}
+
+# ---------------------------
+# Query
+# ---------------------------
+
+type Query {
+  """Текущий пользователь"""
+  me: User @auth(requires: [USER])
+
+  """Универсальный доступ к любому Node по ID"""
+  node(id: ID!): Node
+
+  """Состояние здоровья сервиса"""
+  health(service: String, component: String, scope: String): Health
+    @cacheControl(maxAge: 5)
+
+  # Модели
+  model(id: ID!): Model @auth(requires: [USER])
+  models(
+    search: String
+    tag: String
+    first: Int
+    after: String
+    keyset: KeysetInput
+  ): ModelConnection! @auth(requires: [USER])
+
+  dataset(id: ID!): Dataset @auth(requires: [USER])
+  datasets(
+    kind: DatasetKind
+    first: Int
+    after: String
+    keyset: KeysetInput
+  ): DatasetConnection! @auth(requires: [USER])
+
+  evaluation(id: ID!): Evaluation @auth(requires: [USER])
+  evaluations(
+    modelId: ID
+    modelVersionId: ID
+    first: Int
+    after: String
+    keyset: KeysetInput
+  ): EvaluationConnection! @auth(requires: [USER])
+
+  job(id: ID!): InferenceJob @auth(requires: [USER])
+  jobs(
+    status: JobStatus
+    first: Int
+    after: String
+    keyset: KeysetInput
+  ): InferenceJobConnection! @auth(requires: [USER])
+
+  """Полнотекстовый поиск по сущностям"""
+  search(q: String!, first: Int = 20, after: String): SearchResultConnection!
+    @auth(requires: [USER])
+    @rateLimit(window: 60, max: 120, identityArg: "q")
+}
+
+type ModelEdge { cursor: String!, node: Model! }
+type ModelConnection { pageInfo: PageInfo!, totalCount: Int, edges: [ModelEdge!]! }
+
+type DatasetEdge { cursor: String!, node: Dataset! }
+type DatasetConnection { pageInfo: PageInfo!, totalCount: Int, edges: [DatasetEdge!]! }
+
+type EvaluationEdge { cursor: String!, node: Evaluation! }
+type EvaluationConnection { pageInfo: PageInfo!, totalCount: Int, edges: [EvaluationEdge!]! }
+
+type InferenceJobEdge { cursor: String!, node: InferenceJob! }
+type InferenceJobConnection { pageInfo: PageInfo!, totalCount: Int, edges: [InferenceJobEdge!]! }
+
+union SearchResult = Model | Dataset | ModelVersion | Evaluation | InferenceJob
+type SearchResultEdge { cursor: String!, node: SearchResult! }
+type SearchResultConnection { pageInfo: PageInfo!, totalCount: Int, edges: [SearchResultEdge!]! }
+
+# ---------------------------
+# Mutation
+# ---------------------------
+
+input UpsertModelInput {
+  id: ID
+  name: String!
+  description: String
+  tags: [String!]
+  owner: String
+}
+
+type UpsertModelPayload {
+  result: MutationResult!
+  model: Model
+}
+
+input RegisterModelVersionInput {
+  modelId: ID!
+  version: String!
+  artifactUri: URL!
+  checksumSha256: String!
+  params: JSON
+  metrics: JSON
+}
+
+type RegisterModelVersionPayload {
+  result: MutationResult!
+  modelVersion: ModelVersion
+}
+
+input PromoteModelVersionInput {
+  modelVersionId: ID!
+  stage: ModelStage!
+}
+
+type PromoteModelVersionPayload {
+  result: MutationResult!
+  modelVersion: ModelVersion
+}
+
+input CreateDatasetInput {
+  name: String!
+  kind: DatasetKind!
+  uri: URL!
+  format: String!
+  description: String
+  features: [String!]
+  checksumSha256: String
+}
+
+type CreateDatasetPayload {
+  result: MutationResult!
+  dataset: Dataset
+}
+
+input StartInferenceJobInput {
+  modelVersionId: ID!
+  inputUri: URL
+  params: JSON
+}
+
+type StartInferenceJobPayload {
+  result: MutationResult!
+  job: InferenceJob
+}
+
+input CancelJobInput { id: ID! }
+type CancelJobPayload { result: MutationResult!, job: InferenceJob }
+
+input CreateApiKeyInput {
+  name: String!
+  scopes: [String!] = ["read", "write"]
+}
+
+type CreateApiKeyPayload {
+  result: MutationResult!
+  apiKey: ApiKey
+  """Секрет ключа возвращается один раз"""
+  secret: String
+}
+
+input RevokeApiKeyInput { id: ID! }
+type RevokeApiKeyPayload { result: MutationResult!, apiKey: ApiKey }
+
+input CreateEvaluationInput {
+  modelVersionId: ID!
+  datasetId: ID!
+  metrics: JSON!
+  reportUri: URL
+  baselineId: ID
+}
+
+type CreateEvaluationPayload {
+  result: MutationResult!
+  evaluation: Evaluation
+}
+
+input SetTagInput { modelId: ID!, tag: String! }
+input UnsetTagInput { modelId: ID!, tag: String! }
+type SetTagPayload { result: MutationResult!, model: Model }
+type UnsetTagPayload { result: MutationResult!, model: Model }
+
+type Mutation {
+  upsertModel(input: UpsertModelInput!): UpsertModelPayload
+    @auth(requires: [MAINTAINER, ADMIN], any: true)
+    @audit(event: "model.upsert", attributes: ["input.name","input.id"])
+
+  deleteModel(id: ID!): MutationResult
+    @auth(requires: [ADMIN])
+    @audit(event: "model.delete", attributes: ["id"])
+
+  registerModelVersion(input: RegisterModelVersionInput!): RegisterModelVersionPayload
+    @auth(requires: [MAINTAINER, ADMIN], any: true)
+    @audit(event: "model.version.register", attributes: ["input.modelId","input.version"])
+
+  promoteModelVersion(input: PromoteModelVersionInput!): PromoteModelVersionPayload
+    @auth(requires: [MAINTAINER, ADMIN], any: true)
+    @audit(event: "model.version.promote", attributes: ["input.modelVersionId","input.stage"])
+
+  createDataset(input: CreateDatasetInput!): CreateDatasetPayload
+    @auth(requires: [MAINTAINER, ADMIN], any: true)
+    @audit(event: "dataset.create", attributes: ["input.name","input.kind"])
+
+  startInferenceJob(input: StartInferenceJobInput!): StartInferenceJobPayload
+    @auth(requires: [USER])
+    @audit(event: "job.start", attributes: ["input.modelVersionId"])
+
+  cancelJob(input: CancelJobInput!): CancelJobPayload
+    @auth(requires: [USER])
+    @audit(event: "job.cancel", attributes: ["input.id"])
+
+  createApiKey(input: CreateApiKeyInput!): CreateApiKeyPayload
+    @auth(requires: [USER])
+    @audit(event: "apikey.create", attributes: ["input.name"], pii: true)
+
+  revokeApiKey(input: RevokeApiKeyInput!): RevokeApiKeyPayload
+    @auth(requires: [USER, ADMIN], any: true)
+    @audit(event: "apikey.revoke", attributes: ["input.id"])
+
+  createEvaluation(input: CreateEvaluationInput!): CreateEvaluationPayload
+    @auth(requires: [USER])
+    @audit(event: "evaluation.create", attributes: ["input.modelVersionId","input.datasetId"])
+
+  setTag(input: SetTagInput!): SetTagPayload
+    @auth(requires: [USER])
+    @audit(event: "model.tag.set", attributes: ["input.modelId","input.tag"])
+
+  unsetTag(input: UnsetTagInput!): UnsetTagPayload
+    @auth(requires: [USER])
+    @audit(event: "model.tag.unset", attributes: ["input.modelId","input.tag"])
+}
+
+# ---------------------------
+# Subscription
+# ---------------------------
+
+type Subscription {
+  jobUpdated(id: ID!): InferenceJob
+    @auth(requires: [USER])
+  evaluationUpdated(id: ID!): Evaluation
+    @auth(requires: [USER])
+  healthWatch(service: String, component: String, scope: String): Health
+    @auth(requires: [SERVICE, USER], any: true)
+}
+
+# ---------------------------
+# Привязки Node union
+# ---------------------------
+
+union NodeUnion = Model | ModelVersion | Dataset | InferenceJob | Evaluation | Health | User | ApiKey | AuditEvent
+
+# Опциональная реализация node(id) через NodeUnion может потребовать резолверов.

@@ -1,0 +1,307 @@
+// path: policy-core/schemas/proto/v1/policy/validate.proto
+syntax = "proto3";
+
+package policy.core.v1;
+
+option optimize_for = SPEED;
+option cc_enable_arenas = true;
+option java_multiple_files = true;
+option java_package = "org.aethernova.policy.core.v1";
+option java_outer_classname = "PolicyCoreValidateProto";
+option csharp_namespace = "Aethernova.Policy.Core.V1";
+option go_package = "github.com/aethernova/policy-core/gen/policy/core/v1;policyv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// ============================================================================
+// Общие типы
+// ============================================================================
+
+// Класс данных для применения правил доступа/редакции.
+enum DataClass {
+  DATA_CLASS_UNSPECIFIED = 0;
+  DATA_CLASS_PUBLIC = 1;
+  DATA_CLASS_INTERNAL = 2;
+  DATA_CLASS_CONFIDENTIAL = 3;
+  DATA_CLASS_SECRET = 4;
+}
+
+// Окружение исполнения (влияет на строгие правила).
+enum Environment {
+  ENVIRONMENT_UNSPECIFIED = 0;
+  ENVIRONMENT_DEV = 1;
+  ENVIRONMENT_STAGING = 2;
+  ENVIRONMENT_PROD = 3;
+}
+
+// Поддерживаемые форматы представления политики.
+enum PolicyFormat {
+  POLICY_FORMAT_UNSPECIFIED = 0;
+  POLICY_FORMAT_YAML = 1;
+  POLICY_FORMAT_JSON = 2;
+  POLICY_FORMAT_REGO = 3;
+  POLICY_FORMAT_CEL = 4;
+}
+
+// Статус суммарной проверки.
+enum ValidationStatus {
+  VALIDATION_STATUS_UNSPECIFIED = 0;
+  VALIDATION_STATUS_PASSED = 1;
+  VALIDATION_STATUS_PARTIALLY_PASSED = 2; // есть предупреждения
+  VALIDATION_STATUS_FAILED = 3;            // есть ошибки/криты
+}
+
+// Серьезность отдельной проблемы.
+enum ValidationSeverity {
+  VALIDATION_SEVERITY_UNSPECIFIED = 0;
+  VALIDATION_SEVERITY_INFO = 1;
+  VALIDATION_SEVERITY_WARNING = 2;
+  VALIDATION_SEVERITY_ERROR = 3;
+  VALIDATION_SEVERITY_CRITICAL = 4;
+}
+
+// Дайджест содержимого (для schema-lock/кеширования артефактов).
+message Digest {
+  // Алгоритм: "sha256", "sha512" и т.п.
+  string algo = 1;
+  // Сырые байты дайджеста.
+  bytes value = 2;
+  // Гекс-представление (удобно для логов/человекочитаемо).
+  string hex = 3;
+
+  reserved 4 to 9;
+}
+
+// Универсальная ссылка на правило/проверку.
+message ValidationRuleRef {
+  // Короткий код или идентификатор проверки (например, SEC-001).
+  string code = 1;
+  // Человекочитаемое название (локализация на уровне клиента).
+  string title = 2;
+  // URL на документацию/руководство по исправлению.
+  string url = 3;
+
+  reserved 4 to 9;
+}
+
+// Координаты проблемы в документе.
+message Location {
+  // JSON Pointer или аналогичный путь к полю (например, "/spec/rules/0/action").
+  string pointer = 1;
+  // Строка/колонка (если исходник текстовый).
+  int32 line = 2;
+  int32 column = 3;
+  // Путь файла/ресурса (если document.uri или include).
+  string source = 4;
+
+  reserved 5 to 9;
+}
+
+// Единичная проблема валидации/линтинга.
+message ValidationIssue {
+  string id = 1;                         // стабильный идентификатор (опционально)
+  ValidationSeverity severity = 2;
+  string message = 3;                     // лаконичное описание
+  ValidationRuleRef rule = 4;             // отсылка к правилу/стандарту
+  Location location = 5;                  // где обнаружено
+  string suggestion = 6;                  // короткий хинт по исправлению
+  repeated string related_paths = 7;      // доп. указатели (например, конфликтующие ссылки)
+  map<string, string> metadata = 8;       // произвольные детали
+
+  reserved 9 to 15;
+}
+
+// Сводка проверки.
+message ValidationSummary {
+  ValidationStatus status = 1;
+  uint32 total = 2;
+  uint32 infos = 3;
+  uint32 warnings = 4;
+  uint32 errors = 5;
+  uint32 criticals = 6;
+  google.protobuf.Duration elapsed = 7;
+  string engine_version = 8;   // версия валидатора/движка
+  string schema_version = 9;   // заявленная версия схемы документов
+
+  reserved 10 to 19;
+}
+
+// Артефакт сборки/компиляции (например, скомпилированная политика).
+message BuildArtifact {
+  string kind = 1;             // "compiled_rego", "bundle", "plan", "report"
+  string media_type = 2;       // "application/vnd.rego+binary", "application/zip", ...
+  bytes content = 3;           // сам артефакт (необязательно; можно хранить вне)
+  string uri = 4;              // ссылка/хранилище, если не инлайн
+  Digest checksum = 5;
+
+  reserved 6 to 15;
+}
+
+// Ограничения выполнения (safeguards для DoS/ressource-usage).
+message Limits {
+  uint64 max_bytes = 1;        // максимальный размер входного документа
+  uint32 max_rules = 2;        // лимит правил после парсинга
+  uint32 max_issues = 3;       // обрезать вывод проблем
+  uint32 timeout_ms = 4;       // общий таймаут операции
+  bool fail_on_unknown_fields = 5; // строгий режим схемы
+
+  reserved 6 to 15;
+}
+
+// Представление документа политики.
+message PolicyDocument {
+  // Уникальный идентификатор в рамках аренды/организации.
+  string id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  PolicyFormat format = 4;
+
+  // Источник документа: один из inline/uri/content.
+  oneof source {
+    // Текстовая форма (YAML/JSON/REGO/CEL).
+    string inline = 10;
+    // Ссылка на внешний ресурс: file://, https://, s3:// и т.д.
+    string uri = 11;
+    // Бинарное содержимое (если требуется).
+    bytes content = 12;
+  }
+
+  Digest checksum = 13;                  // контрольное значение исходника
+  map<string, string> labels = 14;       // произвольные метки
+  google.protobuf.Timestamp created_at = 15;
+  google.protobuf.Timestamp modified_at = 16;
+  DataClass data_class = 17;
+
+  reserved 18 to 29;
+}
+
+// ============================================================================
+// Validate
+// ============================================================================
+
+message ValidatePolicyRequest {
+  string request_id = 1;                  // идемпотентность/трассировка
+  PolicyDocument document = 2;            // основной документ
+  repeated PolicyDocument includes = 3;   // зависимости/включения (импорты)
+  Environment environment = 4;            // dev/staging/prod
+  bool strict = 5;                        // строгий режим: предупреждения => fail
+  bool security_checks = 6;               // включить проверки безопасности
+  Limits limits = 7;                      // лимиты по ресурсам
+  map<string, string> context = 8;        // внешние параметры (напр., tenant context)
+  google.protobuf.Timestamp now = 9;      // контрольное "текущее время"
+  string schema_version = 10;             // ожидаемая версия схемы
+
+  reserved 11 to 19;
+}
+
+message ValidatePolicyResponse {
+  ValidationSummary summary = 1;
+  repeated ValidationIssue issues = 2;
+  repeated BuildArtifact artifacts = 3;   // например, план исполнения/пакет
+  Digest compiled_checksum = 4;           // дайджест компилированного результата (если применимо)
+
+  reserved 5 to 15;
+}
+
+// ============================================================================
+// Test (unit-like проверки политик на фикстурах)
+// ============================================================================
+
+message TestCase {
+  string name = 1;
+  // Входные данные для движка политики.
+  google.protobuf.Struct input = 2;
+  // Ожидаемый результат (гибко: allow/deny, поля ответа и т.д.).
+  google.protobuf.Struct expect = 3;
+  google.protobuf.Duration timeout = 4;
+  bool negative = 5; // true => ожидается отрицание/ошибка/deny
+
+  reserved 6 to 9;
+}
+
+message TestPolicyRequest {
+  string request_id = 1;
+  PolicyDocument document = 2;
+  repeated PolicyDocument includes = 3;
+  repeated TestCase cases = 4;
+  Limits limits = 5;
+  Environment environment = 6;
+  bool security_checks = 7;
+  string schema_version = 8;
+
+  reserved 9 to 15;
+}
+
+message TestCaseResult {
+  string name = 1;
+  bool passed = 2;
+  string message = 3;                      // пояснение результата
+  google.protobuf.Struct output = 4;       // фактический результат/трасс
+  google.protobuf.Duration elapsed = 5;
+  repeated ValidationIssue issues = 6;     // найденные проблемы при выполнении конкретного кейса
+
+  reserved 7 to 15;
+}
+
+message TestPolicyResponse {
+  ValidationSummary summary = 1;
+  repeated TestCaseResult results = 2;
+
+  reserved 3 to 9;
+}
+
+// ============================================================================
+// Explain (объяснимость решения политики)
+// ============================================================================
+
+message ExplainRequest {
+  string request_id = 1;
+  PolicyDocument document = 2;
+  repeated PolicyDocument includes = 3;
+  google.protobuf.Struct input = 4;       // контекст запроса
+  Limits limits = 5;
+  Environment environment = 6;
+
+  reserved 7 to 15;
+}
+
+message ExplainStep {
+  // Идентификатор/название сработавшего правила.
+  string rule = 1;
+  // Выражение/условие (фрагмент DSL).
+  string expr = 2;
+  // Результат шага: "matched", "skipped", "failed", "allow", "deny".
+  string outcome = 3;
+  // Привязки (key=value) для отладки.
+  repeated string bindings = 4;
+  // Глубина шага/вложенность.
+  int32 depth = 5;
+
+  reserved 6 to 15;
+}
+
+message ExplainResponse {
+  repeated ExplainStep steps = 1;
+  map<string, google.protobuf.Value> final_bindings = 2; // итоговые значения
+  bool allowed = 3;                                      // итоговое решение (если применимо)
+  repeated string reasons = 4;                           // человекочитаемые причины allow/deny
+
+  reserved 5 to 9;
+}
+
+// ============================================================================
+// Сервис
+// ============================================================================
+
+service PolicyValidationService {
+  // Валидация/линт/безопасность с опциональной компиляцией до артефактов.
+  rpc Validate(ValidatePolicyRequest) returns (ValidatePolicyResponse);
+
+  // Юнит-тестирование политики на наборе кейсов.
+  rpc Test(TestPolicyRequest) returns (TestPolicyResponse);
+
+  // Объяснимость решения/трассировка правил.
+  rpc Explain(ExplainRequest) returns (ExplainResponse);
+}

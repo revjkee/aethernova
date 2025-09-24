@@ -1,0 +1,269 @@
+{{- /*
+  Helpers (локальные, чтобы не требовать _helpers.tpl)
+*/ -}}
+{{- define "nf.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "nf.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name (include "nf.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "nf.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" -}}
+{{- end -}}
+
+{{- define "nf.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "nf.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "nf.labels" -}}
+helm.sh/chart: {{ include "nf.chart" . }}
+app.kubernetes.io/name: {{ include "nf.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: {{ default "neuroforge-core" .Values.partOf }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+{{- end -}}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nf.fullname" . }}
+  {{- if .Values.namespace }}
+  namespace: {{ .Values.namespace }}
+  {{- end }}
+  labels:
+    {{- include "nf.labels" . | nindent 4 }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if .Values.revisionHistoryLimit }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  {{- else }} 
+  revisionHistoryLimit: 5
+  {{- end }}
+  {{- if .Values.strategy }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  {{- else }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  {{- end }}
+  {{- if .Values.minReadySeconds }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "nf.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nf.labels" . | nindent 8 }}
+        {{- include "nf.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.checksumAnnotations }}
+        {{- /* Позволяет прокинуть заранее рассчитанные checksum для конфигов/секретов */}}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ default (include "nf.fullname" .) .Values.serviceAccount.name }}
+      {{- else if .Values.serviceAccount.name }}
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- end }}
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range .Values.imagePullSecrets }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      {{- if .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml .Values.hostAliases | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- /* podSecurityContext */}}
+        runAsNonRoot: {{ default true .Values.podSecurityContext.runAsNonRoot }}
+        {{- with .Values.podSecurityContext.runAsUser }}runAsUser: {{ . }}{{- end }}
+        {{- with .Values.podSecurityContext.runAsGroup }}runAsGroup: {{ . }}{{- end }}
+        {{- with .Values.podSecurityContext.fsGroup }}fsGroup: {{ . }}{{- end }}
+        {{- with .Values.podSecurityContext.seccompProfile }}
+        seccompProfile:
+          type: {{ .type | default "RuntimeDefault" }}
+        {{- else }}
+        seccompProfile:
+          type: RuntimeDefault
+        {{- end }}
+      terminationGracePeriodSeconds: {{ default 20 .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.enableDefaultAntiAffinity }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "nf.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.initContainers }}
+      initContainers:
+        {{- toYaml .Values.initContainers | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: {{ include "nf.name" . }}
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ default "IfNotPresent" .Values.image.pullPolicy }}
+          {{- if .Values.command }}
+          command: {{- toYaml .Values.command | nindent 12 }}
+          {{- end }}
+          {{- if .Values.args }}
+          args: {{- toYaml .Values.args | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ default 8080 .Values.containerPort }}
+              protocol: TCP
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: TZ
+              value: {{ default "UTC" .Values.timezone | quote }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.lifecycle }}
+          lifecycle:
+            {{- toYaml .Values.lifecycle | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: {{ default true .Values.containerSecurity.readOnlyRootFilesystem }}
+            capabilities:
+              drop: ["ALL"]
+            {{- with .Values.containerSecurity.runAsUser }}runAsUser: {{ . }}{{- end }}
+            {{- with .Values.containerSecurity.runAsGroup }}runAsGroup: {{ . }}{{- end }}
+          resources:
+            {{- if .Values.resources }}
+            {{- toYaml .Values.resources | nindent 12 }}
+            {{- else }}
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            {{- end }}
+          volumeMounts:
+            {{- if .Values.volumeMounts }}
+            {{- toYaml .Values.volumeMounts | nindent 12 }}
+            {{- end }}
+
+          {{- $probePort := (default 8080 .Values.containerPort) -}}
+          {{- if .Values.startupProbe.enabled }}
+          startupProbe:
+            {{- if eq (default "http" .Values.startupProbe.type) "http" }}
+            httpGet:
+              path: {{ default "/healthz" .Values.startupProbe.path }}
+              port: {{ default "http" .Values.startupProbe.port | default $probePort }}
+            {{- else if eq .Values.startupProbe.type "tcp" }}
+            tcpSocket:
+              port: {{ default $probePort .Values.startupProbe.port }}
+            {{- end }}
+            failureThreshold: {{ default 30 .Values.startupProbe.failureThreshold }}
+            periodSeconds: {{ default 5 .Values.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ default 2 .Values.startupProbe.timeoutSeconds }}
+          {{- end }}
+
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            {{- if eq (default "http" .Values.livenessProbe.type) "http" }}
+            httpGet:
+              path: {{ default "/healthz" .Values.livenessProbe.path }}
+              port: {{ default "http" .Values.livenessProbe.port | default $probePort }}
+            {{- else if eq .Values.livenessProbe.type "tcp" }}
+            tcpSocket:
+              port: {{ default $probePort .Values.livenessProbe.port }}
+            {{- end }}
+            initialDelaySeconds: {{ default 10 .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ default 10 .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ default 2 .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ default 3 .Values.livenessProbe.failureThreshold }}
+          {{- end }}
+
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            {{- if eq (default "http" .Values.readinessProbe.type) "http" }}
+            httpGet:
+              path: {{ default "/readyz" .Values.readinessProbe.path }}
+              port: {{ default "http" .Values.readinessProbe.port | default $probePort }}
+            {{- else if eq .Values.readinessProbe.type "tcp" }}
+            tcpSocket:
+              port: {{ default $probePort .Values.readinessProbe.port }}
+            {{- end }}
+            initialDelaySeconds: {{ default 5 .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ default 5 .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ default 2 .Values.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ default 3 .Values.readinessProbe.failureThreshold }}
+          {{- end }}
+
+        {{- if .Values.sidecars }}
+        {{- toYaml .Values.sidecars | nindent 8 }}
+        {{- end }}
+
+      volumes:
+        {{- if .Values.volumes }}
+        {{- toYaml .Values.volumes | nindent 8 }}
+        {{- end }}

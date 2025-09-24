@@ -1,0 +1,81 @@
+name: Provenance and SLSA Attestation
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  generate-provenance:
+    name: Generate Provenance and SLSA Attestation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Build package
+        run: poetry build
+
+      - name: Generate SBOM
+        run: |
+          pip install cyclonedx-bom
+          poetry export -f requirements.txt --without-hashes | cyclonedx-py -i - -o sbom.json
+
+      - name: Create artifact digest
+        run: |
+          sha256sum dist/* > artifact-digests.txt
+
+      - name: Generate provenance attestation (SLSA v1.0)
+        uses: slsa-framework/slsa-github-generator@v1.7.0
+        with:
+          builder-id: https://github.com/${{ github.repository }}
+          artifact-path: dist/*
+          provenance-name: slsa-provenance.intoto.jsonl
+          output-path: ./slsa
+          compile-generator: false
+
+      - name: Sign provenance with Sigstore
+        uses: sigstore/gh-action-sigstore-python@v2
+        with:
+          inputs: ./slsa/slsa-provenance.intoto.jsonl
+
+      - name: Upload provenance + SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: slsa-attestation
+          path: |
+            slsa/slsa-provenance.intoto.jsonl
+            sbom.json
+            artifact-digests.txt
+
+      - name: Attach attestation to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            slsa/slsa-provenance.intoto.jsonl
+            sbom.json
+            artifact-digests.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

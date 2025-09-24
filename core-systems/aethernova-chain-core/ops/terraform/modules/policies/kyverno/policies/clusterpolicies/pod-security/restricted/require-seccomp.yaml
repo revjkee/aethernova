@@ -1,0 +1,146 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-seccomp-restricted
+  annotations:
+    policies.kyverno.io/title: "Require seccomp (Restricted)"
+    policies.kyverno.io/category: "Pod Security Standards"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >
+      Enforce seccomp profile on Pods and all container types to align with Pod Security Standards (Restricted):
+      only 'RuntimeDefault' or 'Localhost' allowed; 'Unconfined' and unset are denied.
+      Applies to Pod, initContainers, containers, and ephemeralContainers.
+      References:
+      - Kubernetes Pod Security Standards (Restricted)
+      - Kubernetes seccomp fields
+      - Kyverno seccomp sample policies
+spec:
+  # Включаем фоновую проверку существующих ресурсов
+  background: true
+  # Строгое принудительное действие при нарушении
+  validationFailureAction: Enforce
+  # Дополнительно можно делать Audit в non-prod через overrides
+  # validationFailureActionOverrides:
+  #   - actions: ["Audit"]
+  #     namespaces: ["dev", "staging"]
+
+  # Оцениваем только входящие Pod-объекты (Создание/Обновление) и фоновые сканы
+  rules:
+    - name: require-seccomp-on-pod-and-all-containers
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: >-
+          Seccomp profile must be set to 'RuntimeDefault' or 'Localhost' and must not be 'Unconfined' or empty
+          for Pod.spec and for every container (including initContainers and ephemeralContainers),
+          per Kubernetes Pod Security Standards (Restricted).
+        # Глобальный шаблон для уровня Pod.spec.securityContext
+        # Запрещаем отсутствие seccompProfile или Unconfined на уровне Pod
+        anyPattern:
+          # Вариант 1: Pod-level seccomp = RuntimeDefault
+          - spec:
+              securityContext:
+                seccompProfile:
+                  type: "RuntimeDefault"
+          # Вариант 2: Pod-level seccomp = Localhost (с произвольным профилем по пути)
+          - spec:
+              securityContext:
+                seccompProfile:
+                  type: "Localhost"
+                  localhostProfile: "?*"
+
+        # Дополнительные комплексные проверки по всем типам контейнеров
+        # Если pod-level seccomp не задан, каждый контейнер обязан иметь допустимый seccomp.
+        # Если pod-level задан, контейнеры не должны его ослаблять (Unconfined).
+        # Используем foreach для containers/initContainers/ephemeralContainers.
+        foreach:
+          - list: "request.object.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  # Запрет пустого/отсутствующего seccomp, когда pod-level не задан
+                  - key: "{{ request.object.spec.securityContext.seccompProfile.type || '' }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.securityContext.seccompProfile.type || '' }}"
+                    operator: NotIn
+                    value:
+                      - "RuntimeDefault"
+                      - "Localhost"
+                  - key: "{{ element.securityContext.seccompProfile.type || '' }}"
+                    operator: In
+                    value:
+                      - "Unconfined"
+            message: >-
+              Container '{{ element.name }}' must set seccomp to 'RuntimeDefault' or 'Localhost' and must not be 'Unconfined' or empty.
+
+          - list: "request.object.spec.initContainers[]"
+            preconditions:
+              all:
+                - key: "{{ request.object.spec.initContainers || `[]` }}"
+                  operator: NotEquals
+                  value: "[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ request.object.spec.securityContext.seccompProfile.type || '' }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.securityContext.seccompProfile.type || '' }}"
+                    operator: NotIn
+                    value:
+                      - "RuntimeDefault"
+                      - "Localhost"
+                  - key: "{{ element.securityContext.seccompProfile.type || '' }}"
+                    operator: In
+                    value:
+                      - "Unconfined"
+            message: >-
+              initContainer '{{ element.name }}' must set seccomp to 'RuntimeDefault' or 'Localhost' and must not be 'Unconfined' or empty.
+
+          - list: "request.object.spec.ephemeralContainers[]"
+            preconditions:
+              all:
+                - key: "{{ request.object.spec.ephemeralContainers || `[]` }}"
+                  operator: NotEquals
+                  value: "[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ request.object.spec.securityContext.seccompProfile.type || '' }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.securityContext.seccompProfile.type || '' }}"
+                    operator: NotIn
+                    value:
+                      - "RuntimeDefault"
+                      - "Localhost"
+                  - key: "{{ element.securityContext.seccompProfile.type || '' }}"
+                    operator: In
+                    value:
+                      - "Unconfined"
+            message: >-
+              ephemeralContainer '{{ element.name }}' must set seccomp to 'RuntimeDefault' or 'Localhost' and must not be 'Unconfined' or empty.
+
+    # (Опционально) Страхующая проверка: если pod-level seccomp отсутствует, требуем его явно
+    - name: require-pod-level-seccomp-when-missing
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.securityContext.seccompProfile.type || '' }}"
+            operator: Equals
+            value: ""
+      validate:
+        message: >-
+          Pod.spec.securityContext.seccompProfile must be set to 'RuntimeDefault' or 'Localhost' to meet Restricted PSS.
+        pattern:
+          spec:
+            securityContext:
+              seccompProfile:
+                type: "RuntimeDefault" | "Localhost"

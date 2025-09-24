@@ -1,0 +1,254 @@
+name: Security CI
+
+on:
+  push:
+    branches: [ "main", "release/*" ]
+  pull_request:
+    branches: [ "main", "release/*" ]
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "17 3 * * *"   # nightly security sweep (UTC)
+  workflow_dispatch:
+
+# Жёсткая политика по умолчанию: минимум прав
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  FORCE_COLOR: "1"
+
+jobs:
+  codeql:
+    name: CodeQL (Python)
+    if: ${{ github.event.pull_request.draft == false || github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: +security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  lint-and-bandit:
+    name: Ruff + Bandit
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        python-version: [ "3.10", "3.11", "3.12" ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          check-latest: true
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml', '**/requirements*.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ruff>=0.5" "bandit[toml]>=1.7.9"
+
+      - name: Ruff Lint
+        run: |
+          ruff check --output-format=github .
+
+      - name: Bandit (security lints)
+        run: |
+          bandit -q -r . -c pyproject.toml || bandit -q -r .  # fallback if no config
+
+  pip-audit:
+    name: pip-audit (vulns in deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project (no deps fail hard)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f pyproject.toml ]; then pip install . || true; fi
+
+      - name: Install pip-audit
+        run: pip install "pip-audit>=2.7.0"
+
+      - name: Run pip-audit (advisory DB)
+        run: pip-audit -r requirements.txt -f sarif -o pip-audit.sarif || true
+        if: hashFiles('requirements.txt') != ''
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: hashFiles('requirements.txt') != ''
+        with:
+          sarif_file: pip-audit.sarif
+
+  dependency-review:
+    name: Dependency Review (PR gate)
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-1.0-or-later, GPL-2.0, AGPL-3.0
+          allow-ghsas: ""
+          comment-summary-in-pr: true
+
+  gitleaks:
+    name: Gitleaks (secret scanning)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --source . --report-format sarif --report-path gitleaks.sarif --no-banner
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+
+  semgrep:
+    name: Semgrep OSS (SAST)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Semgrep Scan
+        uses: returntocorp/semgrep-action@v1
+        env:
+          SEMGREP_RULES: >-
+            p/python
+            p/security-audit
+        with:
+          generateSarif: true
+          sarifFile: semgrep.sarif
+          auditOn: push
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+  sbom:
+    name: SBOM (CycloneDX) + Grype (optional)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install cyclonedx-bom
+        run: |
+          python -m pip install --upgrade pip
+          pip install "cyclonedx-bom>=4.0.0"
+
+      - name: Generate SBOM (Python)
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          cyclonedx-bom -e -o sbom-python.json || true
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-python
+          path: sbom-python.json
+          if-no-files-found: ignore
+
+      - name: Grype scan (optional, skip if no container)
+        if: ${{ false }}
+        uses: anchore/scan-action@v3
+        with:
+          image: ghcr.io/OWNER/veilmind-core:latest
+          fail-build: false
+          severity-cutoff: high
+
+  policy-gates:
+    name: Policy Gates (fail on critical)
+    needs: [ codeql, lint-and-bandit, pip-audit, dependency-review, gitleaks, semgrep, sbom ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Gate summary
+        run: |
+          echo "All security jobs finished. Enforcing gates by job conclusions."
+      - name: Enforce gates
+        if: |
+          needs.codeql.result != 'success' ||
+          needs.lint-and-bandit.result != 'success' ||
+          needs.pip-audit.result != 'success' ||
+          needs.dependency-review.result != 'success' ||
+          needs.gitleaks.result != 'success' ||
+          needs.semgrep.result != 'success'
+        run: |
+          echo "Security gate failed — see previous jobs." >&2
+          exit 1

@@ -1,0 +1,280 @@
+# chronowatch-core/configs/heartbeats.yaml
+apiVersion: chronowatch/v1
+kind: HeartbeatConfig
+metadata:
+  service: chronowatch-core
+  environment: ${ENV:production}
+  owner: platform-sre
+  labels:
+    app.kubernetes.io/name: chronowatch
+    app.kubernetes.io/part-of: chronowatch-core
+
+spec:
+  # Единые дефолты для всех проб
+  defaults: &defaults
+    interval: 30s
+    timeout: 5s
+    failure_threshold: 3         # N подряд неудач = отказ
+    success_threshold: 2         # N подряд успехов = восстановление
+    jitter: 20%                  # случайный джиттер, чтобы не бить системой пачкой
+    grace_period: 1m             # «теплый старт» после деплоя/рестарта
+    alert_on_degraded: true
+    verify_tls: true
+    follow_redirects: false
+    labels:
+      team: platform
+      component: chronowatch-core
+      env: ${ENV:production}
+      region: ${REGION:eu-central}
+
+  # Каналы уведомлений и маршруты
+  notificationPolicies:
+    routes:
+      - name: crit-pager
+        match:
+          severity: [critical]
+        receivers: [pagerduty]
+      - name: warn-slack
+        match:
+          severity: [warning]
+        receivers: [slack]
+      - name: info-email
+        match:
+          severity: [info]
+        receivers: [email]
+    receivers:
+      pagerduty:
+        type: pagerduty
+        routing_key: ${PD_ROUTING_KEY}
+      slack:
+        type: slack
+        webhook_url: ${SLACK_WEBHOOK}
+      email:
+        type: email
+        to: ops@chronowatch.example.com
+
+  # Экспорт телеметрии этих heartbeat в систему наблюдаемости
+  export:
+    prometheus:
+      enabled: true
+      listen: ":9464"
+      namespace: chronowatch_heartbeat
+    otlp:
+      enabled: true
+      endpoint: ${OTLP_ENDPOINT:otel-aggregator:4317}
+      insecure: ${OTLP_INSECURE:false}
+      headers:
+        x-otlp-tenant: ${OTLP_TENANT_ID:chronowatch}
+
+  # Набор проб (checks)
+  probes:
+    # HTTP API: /healthz
+    - id: api-http
+      type: http
+      target: https://chronowatch.example.com/healthz
+      method: GET
+      headers:
+        X-Request-ID: ${REQUEST_ID:heartbeat}
+      expect:
+        status: [200, 204]
+        body_contains: "ok"
+      sla:
+        latency_p95_ms: 500
+        availability_objective: "99.90"
+        window: 30d
+      notify:
+        severity: critical
+      <<: *defaults
+
+    # OpenAPI доступность и версия 3.x
+    - id: api-openapi
+      type: http
+      target: https://chronowatch.example.com/openapi.json
+      method: GET
+      timeout: 10s
+      interval: 2m
+      expect:
+        status: [200]
+        jsonpath:
+          - path: "$.openapi"
+            matches: "^3\\."
+      notify:
+        severity: warning
+      <<: *defaults
+
+    # WebSocket «эхо»-пинг
+    - id: api-websocket
+      type: websocket
+      target: wss://chronowatch.example.com/api/ws
+      send_payload: '{"ping":"chronowatch"}'
+      expect:
+        message_contains: "pong"
+      timeout: 10s
+      interval: 1m
+      notify:
+        severity: warning
+      <<: *defaults
+
+    # TCP доступность Postgres (быстрая)
+    - id: postgres-tcp
+      type: tcp
+      target: ${PG_HOST:postgres}:${PG_PORT:5432}
+      timeout: 3s
+      interval: 30s
+      notify:
+        severity: warning
+      <<: *defaults
+
+    # Postgres запрос SELECT 1 (глубокая)
+    - id: postgres-sql
+      type: postgres
+      dsn: "postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST:postgres}:${PG_PORT:5432}/${PG_DB:chronowatch}"
+      expect:
+        query: "SELECT 1;"
+        rows_min: 1
+      timeout: 5s
+      notify:
+        severity: critical
+      <<: *defaults
+
+    # Redis PING
+    - id: redis-ping
+      type: redis
+      address: "${REDIS_HOST:redis}:${REDIS_PORT:6379}"
+      password: "${REDIS_PASSWORD:}"
+      db: 0
+      expect:
+        pong: true
+      interval: 20s
+      notify:
+        severity: warning
+      <<: *defaults
+
+    # RabbitMQ AMQP round-trip (declare+publish)
+    - id: amqp-rabbitmq
+      type: amqp
+      url: "amqp://${RABBIT_USER}:${RABBIT_PASSWORD}@${RABBIT_HOST:rabbitmq}:5672/"
+      expect:
+        declare_queue: heartbeat-probe
+        publish_roundtrip: true
+        max_roundtrip_ms: 300
+      interval: 45s
+      timeout: 5s
+      notify:
+        severity: critical
+      <<: *defaults
+
+    # OTLP-gRPC шлюз (готовность)
+    - id: otel-gateway
+      type: otlp_grpc
+      target: "${OTEL_GATEWAY_HOST:otel-aggregator}:${OTEL_GATEWAY_PORT:4317}"
+      expect:
+        ready: true
+      interval: 1m
+      notify:
+        severity: warning
+      <<: *defaults
+
+    # TLS — срок годности сертификата
+    - id: ingress-tls
+      type: tls
+      target: chronowatch.example.com:443
+      expect:
+        not_after_min_days: 14
+        sni: chronowatch.example.com
+      interval: 6h
+      notify:
+        severity: warning
+      <<: *defaults
+
+    # DNS — наличие A-записей и TTL
+    - id: dns-resolve
+      type: dns
+      name: chronowatch.example.com
+      server: ${DNS_SERVER:1.1.1.1:53}
+      expect:
+        a_records_min: 1
+        max_ttl_seconds: 600
+      interval: 5m
+      notify:
+        severity: warning
+      <<: *defaults
+
+    # Синтетический сценарий логина (мультишаговый)
+    - id: synthetic-login
+      type: scenario
+      steps:
+        - http:
+            name: Get CSRF
+            target: https://chronowatch.example.com/api/v1/auth/csrf
+            method: GET
+            expect:
+              status: [200]
+              jsonpath:
+                - path: "$.csrf_token"
+                  save_as: csrf
+        - http:
+            name: Login
+            target: https://chronowatch.example.com/api/v1/auth/login
+            method: POST
+            headers:
+              Content-Type: application/json
+            body: |
+              {"username":"${SYN_USER}","password":"${SYN_PASS}","csrf_token":"${{csrf}}"}
+            expect:
+              status: [200, 204]
+              header_contains:
+                Set-Cookie: "session="
+        - http:
+            name: Ping protected
+            target: https://chronowatch.example.com/api/v1/me
+            method: GET
+            expect:
+              status: [200]
+              jsonpath:
+                - path: "$.user.id"
+                  exists: true
+      timeout: 20s
+      interval: 2m
+      notify:
+        severity: critical
+      <<: *defaults
+
+  # Окна обслуживания (maintenance)
+  maintenance:
+    windows:
+      - name: nightly-maintenance
+        match:
+          probes: ["postgres-*", "amqp-*"]
+        schedule: "0 2 * * *"    # ежедневно в 02:00
+        duration: 1h
+        suppress_alerts: true
+
+  # Интеллектуальные подавления (корневая причина)
+  suppression:
+    rules:
+      - name: silence-api-when-ingress-down
+        ifAnyFailed: ["ingress-tls", "dns-resolve"]
+        suppress: ["api-http", "api-openapi", "api-websocket", "synthetic-login"]
+        duration: 30m
+
+  # Правила SLO-алертинга поверх heartbeat-метрик
+  alert_rules:
+    - name: api_availability_slo_breach
+      when:
+        probe: "api-http"
+        rolling_window: 7d
+        availability_below: "99.5"
+      severity: critical
+      dedup: 1h
+
+    - name: db_latency
+      when:
+        probe: "postgres-sql"
+        p95_latency_ms_above: 300
+        rolling_window: 30m
+      severity: warning
+      dedup: 30m
+
+schema:
+  version: 1

@@ -1,0 +1,69 @@
+#!/bin/bash
+# path: platform-security/code-protection/immutable_storage/git-hooks/pre-push
+
+# TeslaAI Genesis — Immutable Push Protection Hook (pre-push)
+# Проверка push-операции на соответствие политике безопасности, структуре, авторизации, подписи и цифровому отпечатку
+
+set -e
+
+BRANCH_BLOCK_LIST=("main" "master" "production")
+ALLOWED_SIGNERS_FILE=".trusted-signers"
+CRITICAL_FILES=("genesis.py" "run.sh" "rbac_matrix.yaml")
+FORBIDDEN_FILETYPES=("*.pem" "*.key" "*.crt" "*.env" "*.zip" "*.p12" "*.raw")
+WATERMARK_PATTERN="TeslaAI-FP: [a-f0-9]{24} - DO NOT DELETE"
+
+# Получаем текущую ветку
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+
+echo "[✓] Running pre-push hook for branch: $current_branch"
+
+# 1. Блокировка пушей в защищённые ветки без мёржа
+for protected in "${BRANCH_BLOCK_LIST[@]}"; do
+    if [[ "$current_branch" == "$protected" ]]; then
+        echo "[BLOCKED] Прямой push в защищённую ветку '$protected' запрещён. Используйте merge request через CI/CD."
+        exit 1
+    fi
+done
+
+# 2. Проверка подписей (gpg)
+if [ -f "$ALLOWED_SIGNERS_FILE" ]; then
+    echo "[i] Проверка GPG-подписи..."
+    commits=$(git rev-list --not --remotes)
+    for commit in $commits; do
+        if ! git verify-commit "$commit" &>/dev/null; then
+            echo "[ERROR] Коммит $commit не имеет действительной подписи."
+            exit 1
+        fi
+    done
+fi
+
+# 3. Проверка на запрещённые расширения
+echo "[i] Проверка расширений..."
+FILES=$(git diff --cached --name-only)
+for file in $FILES; do
+    for pattern in "${FORBIDDEN_FILETYPES[@]}"; do
+        if [[ "$file" == $pattern ]]; then
+            echo "[ERROR] Обнаружен запрещённый тип файла для пуша: $file"
+            exit 1
+        fi
+    done
+done
+
+# 4. Проверка отпечатка в ключевых исходниках
+for file in $(git diff --cached --name-only | grep -E '\.py$|\.js$|\.ts$'); do
+    if ! grep -qE "$WATERMARK_PATTERN" "$file"; then
+        echo "[ERROR] Файл $file не содержит отпечатка безопасности TeslaAI."
+        exit 1
+    fi
+done
+
+# 5. Предупреждение об изменении критичных файлов
+for file in "${CRITICAL_FILES[@]}"; do
+    if git diff --cached --name-only | grep -q "^$file$"; then
+        echo "[BLOCKED] Нельзя пушить изменения в критичный файл: $file без RBAC-одобрения."
+        exit 1
+    fi
+done
+
+echo "[OK] Все проверки пройдены. Push разрешён."
+exit 0

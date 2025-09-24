@@ -1,0 +1,352 @@
+// chronowatch-core/schemas/proto/v1/chronowatch/timer.proto
+// SPDX-License-Identifier: Apache-2.0
+//
+// Промышленный контракт управления таймерами для Chronowatch Core.
+//
+// Зависимости (рекомендовано):
+//   - google.golang.org/protobuf
+//   - protoc-gen-go / protoc-gen-go-grpc
+//   - protoc-gen-validate (github.com/bufbuild/protoc-gen-validate)
+//   - grpc-gateway (google/api/annotations.proto) при использовании HTTP
+//
+// ВАЖНО: Пути go/java/csharp пакетов ниже — примеры. Подмените на фактические.
+
+syntax = "proto3";
+
+package chronowatch.v1;
+
+option csharp_namespace = "Chronowatch.V1";
+option go_package       = "github.com/your-org/chronowatch-core/gen/go/chronowatch/v1;chronowatchv1";
+option java_multiple_files = true;
+option java_package        = "com.yourorg.chronowatch.v1";
+option java_outer_classname = "TimerProto";
+option objc_class_prefix   = "CWX";
+option optimize_for        = SPEED;
+option cc_enable_arenas    = true;
+
+// Imports
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/empty.proto";
+import "google/api/annotations.proto";
+import "validate/validate.proto";
+
+// ---------------------------------
+// Базовые типы
+// ---------------------------------
+
+// Состояние таймера.
+enum TimerState {
+  TIMER_STATE_UNSPECIFIED = 0;
+  TIMER_STATE_NEW         = 1;
+  TIMER_STATE_SCHEDULED   = 2;  // ожидает следующего запуска
+  TIMER_STATE_RUNNING     = 3;  // выполняет действие
+  TIMER_STATE_PAUSED      = 4;  // принудительно приостановлен
+  TIMER_STATE_COMPLETED   = 5;  // отработал по условиям (например, max_runs)
+  TIMER_STATE_CANCELLED   = 6;  // отменён
+  TIMER_STATE_FAILED      = 7;  // остановлен из-за необратимой ошибки
+}
+
+// Ретрай-политика для действий.
+message RetryPolicy {
+  int32   max_attempts       = 1 [(validate.rules).int32.gte = 0];             // 0 — без повторов
+  google.protobuf.Duration initial_backoff = 2;                                 // напр. 1s
+  double  backoff_multiplier = 3 [(validate.rules).double.gte = 1];            // напр. 2.0
+  google.protobuf.Duration max_backoff     = 4;                                 // напр. 30s
+  bool    retry_on_http_5xx  = 5;
+  bool    retry_on_http_429  = 6;
+  // Резерв под расширение
+  reserved 7 to 9;
+}
+
+// Dead Letter политика для неуспешных доставок.
+message DeadLetterPolicy {
+  string sink = 1 [(validate.rules).string.min_len = 1]; // напр. "projects/x/topics/deadletter" или URL хранилища
+  int32  max_attempts = 2 [(validate.rules).int32.gte = 0];
+}
+
+// Действие при срабатывании таймера.
+message Action {
+  oneof target {
+    HttpAction   http   = 1;
+    PubSubAction pubsub = 2;
+  }
+  RetryPolicy       retry       = 10;
+  DeadLetterPolicy  dead_letter = 11;
+  bytes             payload     = 12; // необязательный полезный груз; может переопределяться на уровне HTTP/PubSub
+  map<string, string> attributes = 13; // общие атрибуты/метаданные
+}
+
+// HTTP-действие.
+message HttpAction {
+  string url    = 1 [(validate.rules).string.uri = true];
+  string method = 2 [(validate.rules).string.in = {values: ["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"]}];
+  map<string, string> headers = 3;
+  bytes  body   = 4;
+  bool   insecure_skip_verify = 5; // использовать осторожно
+  // mTLS/Basic/OAuth можно расширить далее
+}
+
+// Pub/Sub-действие (пример: Cloud PubSub, Kafka topic и т.п.).
+message PubSubAction {
+  string topic = 1 [(validate.rules).string.min_len = 1];
+  bytes  payload = 2;
+  map<string, string> attributes = 3;
+}
+
+// ---------------------------------
+// Расписания
+// ---------------------------------
+
+// Одноразовый запуск в конкретный момент времени.
+message OneShot {
+  google.protobuf.Timestamp fire_at = 1; // абсолютное время
+}
+
+// Периодический интервал.
+message FixedInterval {
+  google.protobuf.Duration initial_delay = 1; // задержка до первого запуска
+  google.protobuf.Duration interval      = 2 [(validate.rules).duration.required = true];
+  int64 max_runs = 3 [(validate.rules).int64.gte = -1]; // -1 = бесконечно
+}
+
+// Cron-расписание.
+message Cron {
+  string expression = 1 [(validate.rules).string.min_len = 1]; // поддерживаемый синтаксис cron (секунды опционально)
+  bool   include_seconds = 2;                                  // cron с полем секунд
+}
+
+// Спецификация расписания.
+message Schedule {
+  oneof schedule {
+    OneShot       one_shot = 1;
+    FixedInterval interval = 2;
+    Cron          cron     = 3;
+  }
+  string timezone = 10; // IANA TZ, напр. "Europe/Stockholm"
+}
+
+// ---------------------------------
+// Модель таймера
+// ---------------------------------
+
+// Текущий статус таймера.
+message TimerStatus {
+  TimerState state       = 1;
+  int64      run_count   = 2; // сколько раз сработал
+  google.protobuf.Timestamp last_fired_at = 3;
+  google.protobuf.Timestamp next_fire_at  = 4;
+  string     failure_reason = 5;
+}
+
+// Таймер.
+message Timer {
+  string id = 1;                                  // серверный идентификатор (UUID/KSUID)
+  string name = 2 [(validate.rules).string.max_len = 128]; // удобное имя
+  Schedule schedule = 3;
+  Action   action   = 4;
+  bool     enabled  = 5;                          // включён ли таймер
+  map<string, string> labels = 6;                 // пользовательские метки
+  TimerStatus status = 7;
+  string   etag = 8;                               // для конкурентных изменений
+  google.protobuf.Timestamp create_time = 9;
+  google.protobuf.Timestamp update_time = 10;
+  string parent = 11; // ресурс-владелец, напр. "projects/{project}/locations/{location}"
+  reserved 12 to 19;
+}
+
+// Спецификация для создания (без серверных полей).
+message TimerSpec {
+  string name = 1 [(validate.rules).string.max_len = 128];
+  Schedule schedule = 2;
+  Action   action   = 3;
+  bool     enabled  = 4;
+  map<string, string> labels = 5;
+  string   parent   = 6; // "projects/{project}/locations/{location}"
+}
+
+// ---------------------------------
+// Запросы/ответы
+// ---------------------------------
+
+message CreateTimerRequest {
+  string idempotency_key = 1 [(validate.rules).string.max_len = 64]; // для идемпотентности
+  TimerSpec spec = 2 [(validate.rules).message.required = true];
+}
+message CreateTimerResponse {
+  Timer timer = 1;
+}
+
+message GetTimerRequest {
+  string id = 1 [(validate.rules).string.min_len = 1];
+}
+message GetTimerResponse {
+  Timer timer = 1;
+}
+
+message UpdateTimerRequest {
+  Timer timer = 1 [(validate.rules).message.required = true]; // должен содержать id и обновляемые поля
+  google.protobuf.FieldMask update_mask = 2;                  // какие поля менять (name, schedule, action, enabled, labels)
+  string if_match = 3;                                        // ETag для защиты от гонок
+}
+message UpdateTimerResponse {
+  Timer timer = 1;
+}
+
+message DeleteTimerRequest {
+  string id = 1 [(validate.rules).string.min_len = 1];
+  bool   force = 2; // принудительно (если RUNNING/PAUSED)
+}
+message DeleteTimerResponse {}
+
+message ListTimersRequest {
+  string parent     = 1;  // фильтрация по владельцу/пространству
+  int32  page_size  = 2 [(validate.rules).int32.gte = 0, (validate.rules).int32.lte = 1000];
+  string page_token = 3;
+  string filter     = 4;  // примеры: 'labels.env = "prod" AND state = "SCHEDULED"'
+  string order_by   = 5;  // примеры: "create_time desc, name asc"
+}
+message ListTimersResponse {
+  repeated Timer timers = 1;
+  string next_page_token = 2;
+  int64  total_size = 3;
+}
+
+message PauseTimerRequest  { string id = 1; string reason = 2; }
+message ResumeTimerRequest { string id = 1; }
+message CancelTimerRequest { string id = 1; string reason = 2; }
+message ResetTimerRequest  { string id = 1; bool to_initial = 2; } // true — сбросить run_count и next_fire_at по исходной схеме
+
+message ControlTimerResponse {
+  Timer timer = 1;
+}
+
+// События таймера для стриминга/аудита.
+enum TimerEventType {
+  TIMER_EVENT_TYPE_UNSPECIFIED = 0;
+  TIMER_EVENT_SCHEDULED        = 1;
+  TIMER_EVENT_FIRED            = 2;
+  TIMER_EVENT_ACTION_OK        = 3;
+  TIMER_EVENT_ACTION_FAILED    = 4;
+  TIMER_EVENT_PAUSED           = 5;
+  TIMER_EVENT_RESUMED          = 6;
+  TIMER_EVENT_CANCELLED        = 7;
+  TIMER_EVENT_COMPLETED        = 8;
+}
+
+message TimerEvent {
+  string id = 1; // event id
+  string timer_id = 2;
+  TimerEventType type = 3;
+  google.protobuf.Timestamp time = 4;
+  string message = 5;
+  map<string, string> attributes = 6; // доп. контекст (HTTP код, тема и т.п.)
+}
+
+message SubscribeTimerEventsRequest {
+  // фильтры
+  repeated string timer_ids = 1;
+  string filter = 2; // по labels/state/type
+  google.protobuf.Timestamp since = 3; // начать с момента
+}
+
+// Метрики по таймерам (агрегаты для UI/observability).
+message GetTimerMetricsRequest {
+  string parent = 1;
+}
+message GetTimerMetricsResponse {
+  int64 total = 1;
+  int64 scheduled = 2;
+  int64 running = 3;
+  int64 paused = 4;
+  int64 completed = 5;
+  int64 cancelled = 6;
+  int64 failed = 7;
+}
+
+// ---------------------------------
+// Сервис
+// ---------------------------------
+
+service TimerService {
+  // Создать таймер.
+  rpc CreateTimer(CreateTimerRequest) returns (CreateTimerResponse) {
+    option (google.api.http) = {
+      post: "/v1/{spec.parent=projects/*/locations/*}/timers"
+      body: "spec"
+      additional_bindings { post: "/v1/timers" body: "spec" }
+    };
+  }
+
+  // Получить таймер.
+  rpc GetTimer(GetTimerRequest) returns (GetTimerResponse) {
+    option (google.api.http) = {
+      get: "/v1/timers/{id}"
+    };
+  }
+
+  // Обновить таймер (FieldMask + ETag).
+  rpc UpdateTimer(UpdateTimerRequest) returns (UpdateTimerResponse) {
+    option (google.api.http) = {
+      patch: "/v1/timers/{timer.id}"
+      body: "timer"
+    };
+  }
+
+  // Удалить таймер.
+  rpc DeleteTimer(DeleteTimerRequest) returns (DeleteTimerResponse) {
+    option (google.api.http) = {
+      delete: "/v1/timers/{id}"
+    };
+  }
+
+  // Список таймеров.
+  rpc ListTimers(ListTimersRequest) returns (ListTimersResponse) {
+    option (google.api.http) = {
+      get: "/v1/{parent=projects/*/locations/*}/timers"
+      additional_bindings { get: "/v1/timers" }
+    };
+  }
+
+  // Управление состоянием.
+  rpc PauseTimer (PauseTimerRequest)  returns (ControlTimerResponse) {
+    option (google.api.http) = {
+      post: "/v1/timers/{id}:pause"
+      body: "*"
+    };
+  }
+  rpc ResumeTimer(ResumeTimerRequest) returns (ControlTimerResponse) {
+    option (google.api.http) = {
+      post: "/v1/timers/{id}:resume"
+      body: "*"
+    };
+  }
+  rpc CancelTimer(CancelTimerRequest) returns (ControlTimerResponse) {
+    option (google.api.http) = {
+      post: "/v1/timers/{id}:cancel"
+      body: "*"
+    };
+  }
+  rpc ResetTimer (ResetTimerRequest)  returns (ControlTimerResponse) {
+    option (google.api.http) = {
+      post: "/v1/timers/{id}:reset"
+      body: "*"
+    };
+  }
+
+  // Серверный поток событий (live-подписка).
+  rpc SubscribeTimerEvents(SubscribeTimerEventsRequest) returns (stream TimerEvent) {
+    option (google.api.http) = {
+      get: "/v1/timers:events"
+    };
+  }
+
+  // Агрегированные метрики.
+  rpc GetTimerMetrics(GetTimerMetricsRequest) returns (GetTimerMetricsResponse) {
+    option (google.api.http) = {
+      get: "/v1/{parent=projects/*/locations/*}/timers:metrics"
+      additional_bindings { get: "/v1/timers:metrics" }
+    };
+  }
+}

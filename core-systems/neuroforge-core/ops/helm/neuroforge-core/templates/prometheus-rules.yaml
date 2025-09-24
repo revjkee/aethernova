@@ -1,0 +1,66 @@
+{{- /*
+PrometheusRule (monitoring.coreos.com/v1) — шаблон без внешних helpers.
+Рендерится, только если:
+  - .Values.metrics.enabled == true
+  - .Values.metrics.prometheusRule.enabled == true
+  - CRD доступен в .Capabilities.APIVersions
+*/ -}}
+{{- if and .Values.metrics.enabled .Values.metrics.prometheusRule.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ printf "%s-%s" .Release.Name "prometheus-rules" | trunc 63 | trimSuffix "-" }}
+  namespace: {{ default .Release.Namespace .Values.metrics.prometheusRule.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ default "neuroforge-core" .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/version: {{ default .Chart.AppVersion .Chart.Version }}
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: {{ default "neuroforge-core" .Chart.Name }}
+{{- with .Values.metrics.prometheusRule.additionalLabels }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+{{- with .Values.metrics.prometheusRule.annotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+{{- end }}
+spec:
+  groups:
+{{- if .Values.metrics.prometheusRule.groups }}
+{{ toYaml .Values.metrics.prometheusRule.groups | nindent 4 }}
+{{- else }}
+    - name: neuroforge.defaults
+      rules:
+        - alert: NeuroforgePodRestartingTooOften
+          expr: increase(kube_pod_container_status_restarts_total{namespace="{{ default .Release.Namespace .Values.metrics.prometheusRule.namespace }}"}[10m]) > 3
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Поды перезапускаются слишком часто"
+            description: "Контейнеры перезапускались >3 раз за 10m в ns {{ default .Release.Namespace .Values.metrics.prometheusRule.namespace }}."
+        - alert: NeuroforgeHighErrorRate
+          expr: |
+            sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+              / sum(rate(http_server_requests_seconds_count[5m])) > 0.05
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Высокая доля 5xx"
+            description: "Больше 5% запросов завершаются 5xx за 10m."
+        - alert: NeuroforgeHighLatency
+          expr: histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket[5m]))) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "P95 latency > 500ms"
+            description: "95-й перцентиль выше 0.5s в течение 10m."
+{{- end }}
+
+{{- else }}
+{{- /* CRD отсутствует или отключено — ничего не рендерим */ -}}
+{{- end }}

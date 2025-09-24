@@ -1,0 +1,85 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [main, release/**]
+  pull_request:
+    branches: [main, release/**]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Lint, Test, and Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'poetry'
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Lint with Ruff
+        run: poetry run ruff check .
+
+      - name: Type check with mypy
+        run: poetry run mypy src/ tests/
+
+      - name: Run tests
+        run: poetry run pytest --cov=src --cov-report=xml --cov-report=term
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+        if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Generate SBOM
+        run: poetry export -f requirements.txt --without-hashes | cyclonedx-py -i -
+
+      - name: Sign artifacts (sigstore)
+        if: github.ref == 'refs/heads/main'
+        uses: sigstore/gh-action-sigstore-python@v2
+        with:
+          inputs: dist/*
+
+      - name: Upload test reports and artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-${{ matrix.python-version }}
+          path: |
+            .coverage
+            coverage.xml
+            reports/
+
+  branch-protection-check:
+    name: Verify branch protections
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Fail if not targeting protected branches
+        run: |
+          if [[ "${{ github.base_ref }}" != "main" && "${{ github.base_ref }}" != release/* ]]; then
+            echo "PR must target main or release branch."
+            exit 1
+          fi

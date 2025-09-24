@@ -1,0 +1,320 @@
+# aethernova-chain-core/.github/workflows/release.yaml
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer версии (например, v1.2.3). Если не задано — берётся из тега."
+        required: false
+      prerelease:
+        description: "Отметить релиз как pre-release"
+        required: false
+        default: "false"
+      dry_run:
+        description: "Сборка без публикации (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write           # создание GitHub Release и загрузка артефактов
+  packages: write           # публикация в GHCR
+  id-token: write           # OIDC для cosign и attestations
+  security-events: write    # загрузка SARIF отчётов (code scanning)
+  attestations: write       # GitHub Attestations API
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # В процессе ниже приведём имя к lowercase, как требует GHCR
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  preflight:
+    name: Preflight / SemVer / Meta
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      image: ${{ steps.meta.outputs.image }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute meta (version, prerelease, image)
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Приводим имя репозитория к lowercase как требует GHCR
+          image_name="${IMAGE_NAME,,}"
+          echo "image=${REGISTRY}/${image_name}" >> "$GITHUB_OUTPUT"
+
+          # Источник версии: тег push или ручной ввод
+          ref_name="${GITHUB_REF_NAME:-}"
+          input_version="${{ github.event.inputs.version || '' }}"
+          if [[ -n "$input_version" ]]; then
+            ver="$input_version"
+          else
+            ver="$ref_name"
+          fi
+
+          if [[ -z "$ver" ]]; then
+            echo "Не обнаружена версия (ни тега, ни inputs.version)."
+            exit 1
+          fi
+
+          # Допускаем SemVer с пререлизом/metadata: v1.2.3, v1.2.3-rc.1, v1.2.3+build
+          if [[ ! "$ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([\-+].+)?$ ]]; then
+            echo "Неверный формат версии: $ver (ожидается SemVer с префиксом v)"
+            exit 1
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+          # prerelease: если присутствует '-', считаем prerelease
+          if [[ "$ver" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            # можно переопределить вручную через input
+            if [[ "${{ github.event.inputs.prerelease || 'false' }}" == "true" ]]; then
+              echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          # dry-run флаг
+          if [[ "${{ github.event.inputs.dry_run || 'false' }}" == "true" ]]; then
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  test-and-secure:
+    name: Build/Test/SBOM/Security
+    runs-on: ubuntu-latest
+    needs: preflight
+    env:
+      IMAGE: ${{ needs.preflight.outputs.image }}
+      VERSION: ${{ needs.preflight.outputs.version }}
+      DRY_RUN: ${{ needs.preflight.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Язык-агностичные тесты: условно запускаем для разных стеков
+      - name: Setup Go
+        if: hashFiles('go.mod') != ''
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Go test
+        if: hashFiles('go.mod') != ''
+        run: go test ./... -count=1
+
+      - name: Setup Rust
+        if: hashFiles('Cargo.toml') != ''
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cargo test
+        if: hashFiles('Cargo.toml') != ''
+        run: cargo test --locked --all-targets
+
+      - name: Setup Node
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+      - name: Node test
+        if: hashFiles('package.json') != ''
+        run: |
+          npm ci
+          npm run -s test --if-present
+
+      - name: Setup Python
+        if: hashFiles('pyproject.toml') != '' || hashFiles('requirements.txt') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          cache: 'pip'
+      - name: Python test
+        if: hashFiles('pyproject.toml') != '' || hashFiles('requirements.txt') != ''
+        run: |
+          set -e
+          if [[ -f requirements.txt ]]; then pip install -r requirements.txt; fi
+          if [[ -f pyproject.toml ]]; then pip install . || true; fi
+          if compgen -G "tests/test_*.*" > /dev/null; then pytest -q; else echo "No pytest tests found"; fi
+
+      # SBOM (исходники) — как артефакт и для GitHub Release
+      - name: Generate SBOM (source, SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: "sbom-source-${{ github.event.repository.name }}.spdx.json"
+
+      - name: Upload source SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-source
+          path: sbom-source-${{ github.event.repository.name }}.spdx.json
+          retention-days: 21
+
+      # Статический анализ уязвимостей исходников
+      - name: Trivy FS scan (fail on HIGH,CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+      - name: Upload FS scan SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+  build-and-push:
+    name: Docker buildx (multi-arch) / push / SBOM+Provenance
+    runs-on: ubuntu-latest
+    needs: [preflight, test-and-secure]
+    if: ${{ needs.preflight.outputs.dry_run != 'true' }}
+    env:
+      IMAGE: ${{ needs.preflight.outputs.image }}
+      VERSION: ${{ needs.preflight.outputs.version }}
+      IS_PRERELEASE: ${{ needs.preflight.outputs.is_prerelease }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ env.IS_PRERELEASE == 'false' }}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+
+      - name: Build & push (linux/amd64, linux/arm64) with SBOM+Provenance
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Аттестации build-time: SBOM и SLSA provenance (mode=max)
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Отдельно прогоняем Trivy по собранному манифесту изображения
+      - name: Trivy image scan (fail on HIGH,CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-image.sarif
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+      - name: Upload image scan SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+      # Установка cosign для подписи манифеста (keyless OIDC)
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.5.0
+
+      - name: Cosign sign (keyless, sign image manifest)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign $IMAGE@${{ steps.build.outputs.digest }}
+
+      # GitHub Attestations: дополнительная закреплённая SLSA-провенанс-аттестация
+      - name: Upload GitHub build provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [preflight, build-and-push]
+    if: ${{ needs.preflight.outputs.dry_run != 'true' }}
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      IS_PRERELEASE: ${{ needs.preflight.outputs.is_prerelease }}
+    steps:
+      - name: Download SBOM (source)
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-source
+          path: ./dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
+          draft: false
+          prerelease: ${{ env.IS_PRERELEASE }}
+          generate_release_notes: true
+          files: |
+            dist/sbom-source-${{ github.event.repository.name }}.spdx.json
+
+  dry-run-note:
+    name: Dry-run note
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: ${{ needs.preflight.outputs.dry_run == 'true' }}
+    steps:
+      - run: echo "DRY-RUN режим: сборка и публикация образа/релиза пропущены."

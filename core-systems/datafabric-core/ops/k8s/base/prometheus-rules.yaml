@@ -1,0 +1,303 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: datafabric-core
+  labels:
+    app.kubernetes.io/name: datafabric-core
+    app.kubernetes.io/instance: datafabric-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: datafabric-core
+    app.kubernetes.io/version: "0.0.0"   # переопределяйте в overlay
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  groups:
+
+  # ----------------------------------------------------------------------------
+  # Группа: Общие SLI/SLO и сервисные ошибки
+  # ----------------------------------------------------------------------------
+  - name: datafabric-core.slo
+    interval: 30s
+    rules:
+      # Запись: rps и 5xx‑ошибки для сервиса (на уровне ingress либо приложения)
+      # Предпочтительный источник — app‑метрики: http_requests_total{status=~"5.."}
+      # Фолбэк — NGINX ingress metrics, если включены.
+      - record: job:datafabric:http_requests:rate1m
+        expr: |
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace=~".*", service="datafabric-core"}[1m])
+          )
+          OR
+          sum by (namespace, service) (
+            rate(nginx_ingress_controller_requests{exported_service="datafabric-core"}[1m])
+          )
+      - record: job:datafabric:http_requests_5xx:rate1m
+        expr: |
+          sum by (namespace, service) (
+            rate(http_requests_total{namespace=~".*", service="datafabric-core", status=~"5.."}[1m])
+          )
+          OR
+          sum by (namespace, service) (
+            rate(nginx_ingress_controller_requests{exported_service="datafabric-core", status=~"5.."}[1m])
+          )
+
+      # Запись: доля 5xx за 1м/5м/30м
+      - record: job:datafabric:http_5xx_ratio:rate1m
+        expr: |
+          clamp_min(
+            job:datafabric:http_requests_5xx:rate1m
+            /
+            ignoring() group_left()
+            job:datafabric:http_requests:rate1m, 0)
+      - record: job:datafabric:http_5xx_ratio:rate5m
+        expr: |
+          avg_over_time(job:datafabric:http_5xx_ratio:rate1m[5m])
+      - record: job:datafabric:http_5xx_ratio:rate30m
+        expr: |
+          avg_over_time(job:datafabric:http_5xx_ratio:rate1m[30m])
+
+      # Алерт: Высокая доля 5xx (мгновенная)
+      - alert: DatafabricHttp5xxSpike
+        expr: job:datafabric:http_5xx_ratio:rate5m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: рост 5xx ({{ $labels.service }})"
+          description: |
+            Доля 5xx за 5 минут > 5%.
+            Текущее значение: {{ printf "%.2f" (100 * $value) }}%.
+            Проверьте логи приложения/ingress.
+          runbook_url: https://runbooks.example.com/datafabric-core/http-5xx
+
+      # Алерт: Критическая доля 5xx (устойчивая)
+      - alert: DatafabricHttp5xxHigh
+        expr: job:datafabric:http_5xx_ratio:rate30m > 0.02
+        for: 30m
+        labels:
+          severity: critical
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: устойчивая доля 5xx выше SLO"
+          description: |
+            Доля 5xx за 30 минут > 2% (SLO нарушается).
+            Рекомендуется включить аварийный план отката/канареек.
+          runbook_url: https://runbooks.example.com/datafabric-core/http-5xx
+
+      # Латентность p95/p99 (предпочтительно по histogram_quantile из *_bucket)
+      - record: job:datafabric:http_request_duration_seconds:p95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket{service="datafabric-core"}[5m]))
+          )
+      - record: job:datafabric:http_request_duration_seconds:p99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_request_duration_seconds_bucket{service="datafabric-core"}[5m]))
+          )
+
+      - alert: DatafabricLatencyP95High
+        expr: job:datafabric:http_request_duration_seconds:p95 > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: p95 латентности > 500ms"
+          description: |
+            p95 латентности по HTTP превышает 500ms более 10 минут.
+            Проверьте регрессии производительности, БД и внешние зависимости.
+          runbook_url: https://runbooks.example.com/datafabric-core/latency
+
+      - alert: DatafabricLatencyP99High
+        expr: job:datafabric:http_request_duration_seconds:p99 > 1
+        for: 10m
+        labels:
+          severity: critical
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: p99 латентности > 1s"
+          description: |
+            p99 > 1s устойчиво более 10 минут.
+            Возможна деградация. Рассмотрите масштабирование/ускорение кэша.
+          runbook_url: https://runbooks.example.com/datafabric-core/latency
+
+      # SLO burn rate (пример: SLO 99.5% → error budget 0.5%)
+      # Быстрое окно 5m и медленное 1h
+      - record: job:datafabric:slo_error_rate:5m
+        expr: job:datafabric:http_5xx_ratio:rate5m
+      - record: job:datafabric:slo_error_rate:1h
+        expr: job:datafabric:http_5xx_ratio:rate30m
+      - alert: DatafabricSLOBurnFast
+        expr: job:datafabric:slo_error_rate:5m > 0.02 and job:datafabric:slo_error_rate:1h > 0.01
+        for: 15m
+        labels:
+          severity: critical
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: быстрый burn‑rate бюджета ошибок"
+          description: |
+            Ошибки превышают пороги SLO на нескольких окнах (5m и 1h).
+            Немедленно исследуйте причины. Возможен откат.
+          runbook_url: https://runbooks.example.com/datafabric-core/slo
+
+  # ----------------------------------------------------------------------------
+  # Группа: Здоровье приложения и pod‑уровень
+  # ----------------------------------------------------------------------------
+  - name: datafabric-core.app
+    interval: 30s
+    rules:
+      # Readiness/Health: если есть собственная метрика up=1 — используйте её первично
+      - alert: DatafabricHealthDown
+        expr: |
+          avg_over_time(datafabric_core_health{status="ok"}[2m]) < 1
+          OR
+          (
+            # Фолбэк: Service endpoints недоступны (эндпоинтов 0)
+            (max(kube_endpoint_address_available{service="datafabric-core"}) == 0)
+          )
+        for: 2m
+        labels:
+          severity: critical
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: сервис нездоров или без эндпоинтов"
+          description: |
+            Health‑метрика сообщает о сбое или Service не имеет доступных эндпоинтов более 2 минут.
+            Проверьте rollout, readinessProbes и логи контейнера.
+          runbook_url: https://runbooks.example.com/datafabric-core/health
+
+      # Падение реплик Deployment
+      - alert: DatafabricReplicaShortage
+        expr: |
+          kube_deployment_spec_replicas{deployment="datafabric-core"}
+          -
+          kube_deployment_status_replicas_available{deployment="datafabric-core"} > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: не все реплики доступны"
+          description: |
+            Доступных Pod меньше, чем задано в Deployment, более 10 минут.
+            Возможны проблемы с нодами/сетью или контейнер падает при старте.
+          runbook_url: https://runbooks.example.com/datafabric-core/replicas
+
+      # Частые рестарты контейнеров
+      - alert: DatafabricContainerRestarts
+        expr: |
+          increase(kube_pod_container_status_restarts_total{
+            namespace=~".*",
+            pod=~"datafabric-core-.*"
+          }[10m]) > 3
+        for: 10m
+        labels:
+          severity: warning
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: частые рестарты"
+          description: |
+            Количество рестартов контейнера превышает 3 за 10 минут.
+            Проверьте liveness/readiness, лимиты ресурсов, OOM и конфиг.
+          runbook_url: https://runbooks.example.com/datafabric-core/restarts
+
+      # OOM Kill
+      - alert: DatafabricOOMKilled
+        expr: |
+          increase(kube_pod_container_status_last_terminated_reason{
+            reason="OOMKilled", pod=~"datafabric-core-.*"
+          }[30m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: контейнер завершен по OOM"
+          description: |
+            Обнаружены OOM‑события за последние 30 минут.
+            Увеличьте memory requests/limits или оптимизируйте память.
+          runbook_url: https://runbooks.example.com/datafabric-core/oom
+
+      # CPU saturation (над лимитом/заявкой)
+      - alert: DatafabricCpuSaturation
+        expr: |
+          rate(container_cpu_usage_seconds_total{image!="" , pod=~"datafabric-core-.*"}[5m])
+          >
+          (kube_pod_container_resource_limits{resource="cpu", pod=~"datafabric-core-.*"} / 1000)
+        for: 15m
+        labels:
+          severity: warning
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: CPU usage превышает limit"
+          description: |
+            Среднее использование CPU превышает лимит в течение 15 минут.
+            Рассмотрите увеличение лимитов/реплик или профилирование.
+          runbook_url: https://runbooks.example.com/datafabric-core/cpu
+
+      # Memory close to limit
+      - alert: DatafabricMemorySaturation
+        expr: |
+          (container_memory_working_set_bytes{image!="" , pod=~"datafabric-core-.*"}
+           /
+           kube_pod_container_resource_limits{resource="memory", pod=~"datafabric-core-.*"})
+          > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: память близка к лимиту"
+          description: |
+            Использование памяти превышает 90% лимита более 10 минут.
+            Возможны OOM‑риски и деградация.
+          runbook_url: https://runbooks.example.com/datafabric-core/memory
+
+  # ----------------------------------------------------------------------------
+  # Группа: Инфраструктура/кластерные зависимости (фолбэк‑алерты)
+  # ----------------------------------------------------------------------------
+  - name: datafabric-core.infra
+    interval: 1m
+    rules:
+      # Отсутствуют метрики сервиса (защитный алерт)
+      - alert: DatafabricMetricsAbsent
+        expr: |
+          absent(job:datafabric:http_requests:rate1m)
+        for: 15m
+        labels:
+          severity: warning
+          team: core
+          service: datafabric-core
+        annotations:
+          summary: "DataFabric: метрики HTTP отсутствуют"
+          description: |
+            Прометеус не видит метрики HTTP сервиса datafabric-core в течение 15 минут.
+            Проверьте scrape‑конфигурацию, serviceMonitor/ingress аннотации и экспортер.
+          runbook_url: https://runbooks.example.com/datafabric-core/metrics
+
+      # Дисковое пространство на нодах (важно для хранения логов/кэшей)
+      - alert: NodeFilesystemLow
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) < 0.1
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "K8s: мало свободного места на файловой системе ноды"
+          description: |
+            На одной из нод осталось < 10% свободного места более 10 минут.
+            Это может повлиять на поды datafabric-core и другие рабочие нагрузки.
+          runbook_url: https://runbooks.example.com/platform/disk

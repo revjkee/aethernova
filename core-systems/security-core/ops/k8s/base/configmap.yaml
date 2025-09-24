@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-core-config
+  namespace: security-core
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/instance: security-core
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: security
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/managed-by: kustomize
+    security.neurocity.io/zero-trust: "true"
+  annotations:
+    security.neurocity.io/config-format: "v1"
+immutable: true
+data:
+  # Переменные окружения для SecuritySettings (без секретов)
+  security-core.env: |-
+    SECURITY_CORE_AUDIT_LOG_PATH=/var/log/security-core/audit.jsonl
+    SECURITY_CORE_KEY_VAULT_PATH=/var/lib/security-core/keys/local_vault.json
+    SECURITY_CORE_TOTP_WINDOW=1
+    SECURITY_CORE_AEAD_KEY_BYTES=32
+    # ВАЖНО: SECURITY_CORE_MASTER_KEY задаётся только через Secret
+
+  # Параметры аудита и проверки целостности цепочки
+  audit.yaml: |-
+    version: v1
+    path: /var/log/security-core/audit.jsonl
+    integrity:
+      verify_on_startup: true
+      verify_on_shutdown: true
+    retention:
+      rotate_bytes: 104857600   # 100 MiB
+      max_files: 30
+
+  # Роли и биндинги для RBAC (ресурс/действие — двоичный кортеж)
+  rbac.yaml: |-
+    version: v1
+    roles:
+      - name: admin
+        permissions:
+          - { resource: "*", action: "*" }
+      - name: security.auditor
+        permissions:
+          - { resource: "audit_log", action: "read" }
+          - { resource: "policy", action: "read" }
+      - name: pipeline.runner
+        permissions:
+          - { resource: "dataset", action: "read" }
+          - { resource: "pipeline", action: "execute" }
+      - name: service.readonly
+        permissions:
+          - { resource: "dataset", action: "read" }
+          - { resource: "policy", action: "read" }
+    bindings:
+      # Привязки примеров (subject.id). Рекомендуется задавать через Helm/Kustomize vars.
+      - principal: "svc:security-api"
+        roles: ["admin"]
+      - principal: "svc:pipeline"
+        roles: ["pipeline.runner"]
+
+  # ABAC-правила (совместимы с безопасным интерпретатором SafeABAC)
+  abac.yaml: |-
+    version: v1
+    # Политика по умолчанию (применяется при наличии RBAC-допуска)
+    default: "subject.org == resource.org and context.ip in resource.allowed_ips"
+    policies:
+      - name: restrict_offhours_writes
+        when: "resource.type == 'dataset' and action == 'write'"
+        allow_if: "context.time_hour >= 8 and context.time_hour <= 20"
+      - name: gdpr_region_guard
+        when: "resource.region == 'eu' and action in ['read','write']"
+        allow_if: "subject.region == 'eu' and context.geo in ['SE','DE','NL','FR']"
+
+  # Минимальные требования к устройству (Zero-Trust posture)
+  device-posture.yaml: |-
+    version: v1
+    minimal:
+      disk_encryption: true
+      patched: true
+      edr: true
+
+  # Фича-флаги (включение/отключение подсистем)
+  feature-flags.yaml: |-
+    version: v1
+    zero_trust:
+      intent_validation: true
+      device_posture: true
+    crypto:
+      ed25519: true
+      aead_aes_gcm: true

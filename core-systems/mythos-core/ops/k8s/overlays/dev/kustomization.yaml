@@ -1,0 +1,168 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mythos-dev
+nameSuffix: -dev
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/environment: dev
+  app.kubernetes.io/owner: platform
+  app.kubernetes.io/managed-by: kustomize
+
+commonAnnotations:
+  environment: dev
+  # Авто-перезапуск при обновлении конфигов/секретов (если используете reloader — оставьте; иначе удалите)
+  reloader.stakater.com/auto: "true"
+
+# Замена образов (пример: свой dev-реестр и тег)
+images:
+  - name: registry.example.com/mythos-core/app
+    newName: registry.dev.example.com/mythos-core/app
+    newTag: dev-REPLACE_WITH_CI_SHA
+
+# Уменьшаем реплики в dev
+replicas:
+  - name: mythos-core
+    count: 1
+
+# Генерация конфигов/секретов с мердж-поведением и hash-суффиксами
+configMapGenerator:
+  - name: mythos-core
+    behavior: merge
+    literals:
+      - LOG_LEVEL=debug
+      - FEATURES__EXPERIMENTAL=true
+      - DB_HOST=postgres.dev.svc.cluster.local
+      - DB_PORT=5432
+      - REDIS_HOST=redis.dev.svc.cluster.local
+      - REDIS_PORT=6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+    options:
+      disableNameSuffixHash: false
+
+secretGenerator:
+  - name: mythos-core-secret
+    behavior: merge
+    literals:
+      - DB_USER=dev_user
+      - DB_PASSWORD=dev_password_placeholder
+      - API_KEY=dev_key_placeholder
+    type: Opaque
+    options:
+      disableNameSuffixHash: false
+
+# Патчи для Deployment: dev-специфика (imagePullPolicy, env, ресурсы, при необходимости)
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: mythos-core
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mythos-core
+      spec:
+        template:
+          metadata:
+            annotations:
+              # Эти значения будут переопределены через replacements ниже
+              checksum/config: "WILL_BE_SET_BY_REPLACEMENTS"
+              checksum/secret: "WILL_BE_SET_BY_REPLACEMENTS"
+          spec:
+            containers:
+              - name: app
+                imagePullPolicy: Always
+                env:
+                  - name: LOG_LEVEL
+                    valueFrom:
+                      configMapKeyRef:
+                        name: mythos-core
+                        key: LOG_LEVEL
+                  - name: DEBUG
+                    value: "true"
+                  - name: FEATURES__EXPERIMENTAL
+                    valueFrom:
+                      configMapKeyRef:
+                        name: mythos-core
+                        key: FEATURES__EXPERIMENTAL
+                  - name: DB_HOST
+                    valueFrom:
+                      configMapKeyRef:
+                        name: mythos-core
+                        key: DB_HOST
+                  - name: DB_PORT
+                    valueFrom:
+                      configMapKeyRef:
+                        name: mythos-core
+                        key: DB_PORT
+                  - name: REDIS_HOST
+                    valueFrom:
+                      configMapKeyRef:
+                        name: mythos-core
+                        key: REDIS_HOST
+                  - name: REDIS_PORT
+                    valueFrom:
+                      configMapKeyRef:
+                        name: mythos-core
+                        key: REDIS_PORT
+                  - name: DB_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: mythos-core-secret
+                        key: DB_USER
+                  - name: DB_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: mythos-core-secret
+                        key: DB_PASSWORD
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "512Mi"
+
+# Replacements: переносим хэшированные имена сгенерированных ConfigMap/Secret в checksum-аннотации
+# Это гарантирует корректный RollingUpdate при любом изменении содержимого.
+replacements:
+  - source:
+      kind: ConfigMap
+      name: mythos-core
+      fieldPath: metadata.name
+    targets:
+      - select:
+          group: apps
+          version: v1
+          kind: Deployment
+          name: mythos-core
+        fieldPaths:
+          - metadata.annotations.[checksum/config]
+          - spec.template.metadata.annotations.[checksum/config]
+  - source:
+      kind: Secret
+      name: mythos-core-secret
+      fieldPath: metadata.name
+    targets:
+      - select:
+          group: apps
+          version: v1
+          kind: Deployment
+          name: mythos-core
+        fieldPaths:
+          - metadata.annotations.[checksum/secret]
+          - spec.template.metadata.annotations.[checksum/secret]
+
+# Опции генераторов (доп. метки/аннотации на сгенерированные объекты)
+generatorOptions:
+  labels:
+    app.kubernetes.io/part-of: mythos
+    app.kubernetes.io/component: api
+    app.kubernetes.io/environment: dev
+  annotations:
+    managed-by: kustomize

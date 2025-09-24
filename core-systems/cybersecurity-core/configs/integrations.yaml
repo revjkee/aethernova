@@ -1,0 +1,461 @@
+# cybersecurity-core/configs/integrations.yaml
+apiVersion: aethernova.security/v1
+kind: IntegrationsConfig
+
+metadata:
+  name: cybersecurity-core-integrations
+  environment: ${ENVIRONMENT:-prod}       # dev|staging|prod
+  region: ${REGION:-eu-central-1}
+  revision: "1"
+  updatedAt: "2025-09-02T00:00:00Z"       # обновляется CI
+
+schema:
+  version: 1
+  strict: true
+
+defaults:
+  http:
+    timeoutSeconds: 15
+    connectTimeoutSeconds: 5
+    maxIdleConns: 100
+    maxIdleConnsPerHost: 20
+    retry:
+      attempts: 5
+      backoff:
+        type: exponential
+        baseMillis: 200
+        maxMillis: 5000
+      retryOnStatuses: [429, 500, 502, 503, 504]
+      jitter: true
+    circuitBreaker:
+      enabled: true
+      failureRateThreshold: 50       # %
+      slowCallRateThreshold: 50      # %
+      slowCallDurationThresholdMs: 2000
+      slidingWindowSize: 50
+      permittedNumberOfCallsInHalfOpenState: 10
+      waitDurationInOpenStateMs: 60000
+    tls:
+      enforce: true
+      verifyPeer: true
+      minVersion: TLS12
+      ciphers:
+        - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_AES_128_GCM_SHA256
+      caFile: ${TLS_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}
+      clientCertFile: ${TLS_CERT_FILE:-}
+      clientKeyFile: ${TLS_KEY_FILE:-}
+  auth:
+    oidc:
+      enabled: false
+      issuer: ${OIDC_ISSUER:-}
+      audience: ${OIDC_AUDIENCE:-}
+      jwksUri: ${OIDC_JWKS_URI:-}
+    hmac:
+      enabled: false
+      keyEnv: HMAC_SIGNING_KEY
+      algo: sha256
+  batching:
+    enabled: true
+    maxItems: 500
+    flushIntervalSeconds: 5
+  rateLimit:
+    enabled: true
+    rpm: 600
+    burst: 100
+  piiRedaction:
+    enabled: true
+    rules:
+      - name: email
+        pattern: '(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}'
+        replacement: '[REDACTED:EMAIL]'
+      - name: ipv4
+        pattern: '(?:\d{1,3}\.){3}\d{1,3}'
+        replacement: '[REDACTED:IP]'
+      - name: phone
+        pattern: '(?i)\+?\d[\d\-\s]{7,}\d'
+        replacement: '[REDACTED:PHONE]'
+  retention:
+    days:
+      default: 30
+      threatIntel: 14
+      rawEvents: 7
+      audit: 365
+  time:
+    tz: UTC
+
+observability:
+  logging:
+    level: ${LOG_LEVEL:-info}     # trace|debug|info|warn|error
+    format: json
+    includeCaller: true
+    redact:
+      enabled: true
+      fields: ["password","token","authorization","set-cookie","x-api-key"]
+  tracing:
+    opentelemetry:
+      enabled: true
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      protocol: grpc
+      serviceName: cybersecurity-core
+      samplingRatio: 1.0
+      resourceAttributes:
+        deployment.environment: ${ENVIRONMENT:-prod}
+  metrics:
+    prometheus:
+      enabled: true
+      path: /metrics
+      port: 9090
+      histogramBuckets: [0.005,0.01,0.025,0.05,0.1,0.25,0.5,1,2,5]
+  logs:
+    sinks:
+      - type: loki
+        enabled: true
+        url: ${LOKI_URL:-http://loki:3100}
+        labels:
+          app: cybersecurity-core
+          env: ${ENVIRONMENT:-prod}
+
+security:
+  vault:
+    enabled: true
+    address: ${VAULT_ADDR:-http://vault:8200}
+    role: ${VAULT_ROLE:-cybersecurity-core}
+    mount: ${VAULT_MOUNT:-kv}
+    pathPrefix: ${VAULT_PATH_PREFIX:-apps/cybersecurity-core}
+    authMethod: jwt
+  kms:
+    provider: aws
+    keyId: ${KMS_KEY_ID:-}
+    region: ${AWS_REGION:-eu-central-1}
+  mtls:
+    enabled: false
+    caFile: ${MTLS_CA_FILE:-}
+    certFile: ${MTLS_CERT_FILE:-}
+    keyFile: ${MTLS_KEY_FILE:-}
+  signing:
+    jwt:
+      enabled: false
+      privateKeyRef: vault:jwt/privateKey
+      alg: RS256
+      kid: ${JWT_KID:-}
+
+storage:
+  postgres:
+    url: ${DATABASE_URL:-}
+    maxOpenConns: 50
+    maxIdleConns: 10
+    connMaxLifetimeSeconds: 300
+    sslMode: require
+  redis:
+    url: ${REDIS_URL:-redis://redis:6379/0}
+    tls: false
+    prefix: cs:
+  opensearch:
+    url: ${OPENSEARCH_URL:-https://opensearch:9200}
+    username: ${OPENSEARCH_USER:-}
+    passwordEnv: OPENSEARCH_PASSWORD
+    indexPrefix: cs
+    ilmPolicy: cs-hot-warm-30d
+    tls:
+      verifyPeer: true
+  s3:
+    endpoint: ${S3_ENDPOINT:-}
+    bucket: ${S3_BUCKET:-cs-artifacts}
+    region: ${S3_REGION:-eu-central-1}
+    accessKeyEnv: S3_ACCESS_KEY
+    secretKeyEnv: S3_SECRET_KEY
+    sse:
+      type: aws:kms
+      kmsKeyId: ${S3_KMS_KEY_ID:-}
+
+queues:
+  kafka:
+    enabled: true
+    brokers: ${KAFKA_BROKERS:-kafka-1:9093,kafka-2:9093}
+    tls:
+      enabled: true
+      caFile: ${KAFKA_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}
+    sasl:
+      enabled: ${KAFKA_SASL_ENABLED:-false}
+      mechanism: SCRAM-SHA-512
+      username: ${KAFKA_USER:-}
+      passwordEnv: KAFKA_PASSWORD
+    topics:
+      events: cs.events.v1
+      alerts: cs.alerts.v1
+      dlq: cs.dlq.v1
+    acks: all
+    compression: zstd
+    lingerMs: 10
+    batchBytes: 1048576
+  rabbitmq:
+    enabled: false
+    url: ${RABBITMQ_URL:-amqps://user:pass@rabbitmq:5671/vhost}
+    exchanges:
+      events: cs.events
+      alerts: cs.alerts
+    queues:
+      events: cs.events.q
+      alerts: cs.alerts.q
+      dlq: cs.dlq.q
+    dlx: cs.dlx
+
+identity:
+  oidc:
+    enabled: true
+    issuer: ${OIDC_ISSUER:-https://keycloak/auth/realms/aethernova}
+    clientId: ${OIDC_CLIENT_ID:-cybersecurity-core}
+    audience: ${OIDC_AUDIENCE:-cybersecurity-core}
+    requiredClaims:
+      - claim: acr
+        anyOf: ["urn:mfa:required","high"]
+  ldap:
+    enabled: false
+    url: ${LDAP_URL:-}
+    bindDn: ${LDAP_BIND_DN:-}
+    bindPasswordEnv: LDAP_BIND_PASSWORD
+    baseDn: ${LDAP_BASE_DN:-}
+
+notifications:
+  slack:
+    enabled: true
+    webhookEnv: SLACK_WEBHOOK_URL
+    channel: ${SLACK_CHANNEL:-#sec-ops}
+    severityMap:
+      info: notice
+      warning: warn
+      critical: alert
+  telegram:
+    enabled: false
+    botTokenEnv: TG_BOT_TOKEN
+    chatId: ${TG_CHAT_ID:-}
+  pagerduty:
+    enabled: false
+    routingKeyEnv: PAGERDUTY_ROUTING_KEY
+  email:
+    enabled: false
+    smtp:
+      host: ${SMTP_HOST:-}
+      port: 587
+      username: ${SMTP_USER:-}
+      passwordEnv: SMTP_PASSWORD
+      starttls: true
+    from: ${SMTP_FROM:-"secops@aethernova.local"}
+
+siem:
+  splunk:
+    enabled: false
+    hecUrl: ${SPLUNK_HEC_URL:-}
+    tokenEnv: SPLUNK_HEC_TOKEN
+    index: "main"
+    sourcetype: "aethernova:cs"
+    verifyTLS: true
+  sentinel:
+    enabled: false
+    workspaceId: ${AZ_SENTINEL_WORKSPACE_ID:-}
+    sharedKeyEnv: AZ_SENTINEL_SHARED_KEY
+    logType: AethernovaCS
+  qradar:
+    enabled: false
+    apiUrl: ${QRADAR_API_URL:-}
+    tokenEnv: QRADAR_TOKEN
+
+soar:
+  thehive:
+    enabled: false
+    url: ${THEHIVE_URL:-}
+    apiKeyEnv: THEHIVE_API_KEY
+    caseDefaults:
+      tlp: 2
+      pap: 2
+      severity: 2
+  cortex:
+    enabled: false
+    url: ${CORTEX_URL:-}
+    apiKeyEnv: CORTEX_API_KEY
+
+threatIntel:
+  misp:
+    enabled: true
+    url: ${MISP_URL:-}
+    apiKeyEnv: MISP_API_KEY
+    org: ${MISP_ORG:-Aethernova}
+    filter:
+      tags: ["apt","ransomware"]
+      lastHours: 168
+    schedule: "CRON_TZ=UTC */30 * * * *"
+  otx:
+    enabled: true
+    apiKeyEnv: OTX_API_KEY
+    pulsesTags: ["ransomware","exploits"]
+    schedule: "CRON_TZ=UTC 0 * * * *"
+  virustotal:
+    enabled: true
+    apiKeyEnv: VT_API_KEY
+    rateLimitRpm: 240
+  greynoise:
+    enabled: false
+    apiKeyEnv: GREYNOISE_API_KEY
+  abuseipdb:
+    enabled: false
+    apiKeyEnv: ABUSEIPDB_API_KEY
+  shodan:
+    enabled: false
+    apiKeyEnv: SHODAN_API_KEY
+
+endpointSecurity:
+  edr:
+    crowdstrike:
+      enabled: false
+      clientIdEnv: CS_CLIENT_ID
+      clientSecretEnv: CS_CLIENT_SECRET
+      baseUrl: ${CS_BASE_URL:-https://api.crowdstrike.com}
+    sentinelone:
+      enabled: false
+      apiTokenEnv: S1_API_TOKEN
+      baseUrl: ${S1_BASE_URL:-}
+  osquery:
+    enabled: false
+    fleetUrl: ${OSQUERY_FLEET_URL:-}
+    apiKeyEnv: OSQUERY_FLEET_API_KEY
+
+containerSecurity:
+  falco:
+    enabled: true
+    grpc:
+      endpoint: ${FALCO_GRPC_ENDPOINT:-unix:///var/run/falco/falco.sock}
+  trivy:
+    enabled: true
+    serverUrl: ${TRIVY_SERVER_URL:-http://trivy:4954}
+    ignoreUnfixed: true
+    severity: ["HIGH","CRITICAL"]
+    schedule: "CRON_TZ=UTC 0 */6 * * *"
+  snyk:
+    enabled: false
+    tokenEnv: SNYK_TOKEN
+  kubeBench:
+    enabled: true
+  kubeHunter:
+    enabled: false
+  gatekeeper:
+    enabled: true
+  kyverno:
+    enabled: false
+
+vulnerabilityManagement:
+  openvas:
+    enabled: false
+    host: ${OPENVAS_HOST:-}
+    username: ${OPENVAS_USER:-}
+    passwordEnv: OPENVAS_PASSWORD
+  nessus:
+    enabled: false
+    url: ${NESSUS_URL:-}
+    accessKeyEnv: NESSUS_ACCESS_KEY
+    secretKeyEnv: NESSUS_SECRET_KEY
+  dependencyTrack:
+    enabled: false
+    url: ${DT_URL:-}
+    apiKeyEnv: DT_API_KEY
+    project:
+      name: cybersecurity-core
+      uuid: ${DT_PROJECT_UUID:-}
+
+codeSecurity:
+  ghAdvancedSecurity:
+    enabled: false
+    githubTokenEnv: GITHUB_TOKEN
+    org: ${GH_ORG:-aethernova}
+    repo: ${GH_REPO:-cybersecurity-core}
+  semgrep:
+    enabled: true
+    config: p/owasp-top-ten
+    tokenEnv: SEMGREP_APP_TOKEN
+  bandit:
+    enabled: true
+    severityLevel: "LOW"
+  secretScan:
+    enabled: true
+    allowListPatterns: []
+
+pipelines:
+  enrichment:
+    order:
+      - geoip
+      - whois
+      - ti_match
+      - correlation
+      - dedup
+    geoip:
+      provider: maxmind
+      dbPath: ${GEOIP_DB_PATH:-/data/geoip/GeoLite2-City.mmdb}
+    whois:
+      enabled: true
+      timeoutSeconds: 5
+    ti_match:
+      minConfidence: 0.6
+    dedup:
+      windowSeconds: 300
+      keyFields: ["indicator","type","source"]
+  routing:
+    rules:
+      - name: critical-alerts
+        when:
+          any:
+            - field: severity
+              op: ">="
+              value: 8
+        to:
+          - kafka: alerts
+          - notifications: pagerduty
+      - name: default-events
+        when:
+          any:
+            - field: type
+              op: "in"
+              value: ["event","log"]
+        to:
+          - kafka: events
+          - siem: splunk
+
+compliance:
+  frameworks:
+    - name: CIS_K8S_v1_24
+      enabled: true
+    - name: ISO_27001_2022
+      enabled: true
+    - name: SOC2_TSC_2017
+      enabled: true
+
+featureFlags:
+  enableAdaptiveRateLimit: true
+  enableAnomalyDetector: false
+  enableAutoBlockMaliciousIP: false
+
+testing:
+  synthetic:
+    enabled: true
+    schedule: "CRON_TZ=UTC */15 * * * *"
+    generators:
+      - type: ti_event
+        severity: 5
+      - type: alert
+        severity: 9
+
+secrets:
+  # Все чувствительные данные через env или секреты секрет-хранилища.
+  # Поддерживаются ссылки вида "vault:<path>" или "s3:<bucket/key>".
+  references:
+    - name: mispApiKey
+      ref: vault:${VAULT_PATH_PREFIX:-apps/cybersecurity-core}/misp#api_key
+    - name: vtApiKey
+      ref: env:VT_API_KEY
+    - name: splunkToken
+      ref: env:SPLUNK_HEC_TOKEN
+
+validation:
+  failOnUnknownFields: true
+  requireTLSForExternal: true
+  allowPlainHttpInternal: false

@@ -1,0 +1,190 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neuroforge
+  labels:
+    app.kubernetes.io/name: neuroforge
+    app.kubernetes.io/instance: neuroforge
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: neuroforge-core
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "0.0.0" # будет переопределено оверлеем
+spec:
+  replicas: 3 # оверлей может изменить
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: neuroforge
+      app.kubernetes.io/instance: neuroforge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: neuroforge
+        app.kubernetes.io/instance: neuroforge
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: neuroforge-core
+      annotations:
+        # Prometheus text exposition (если сервис скрейпит поды)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+        # Если используются kustomize generators (configMapGenerator/secretGenerator),
+        # kustomize автоматически проставит хэши имен и обновит ссылки.
+    spec:
+      # Безопасность и предсказуемость
+      serviceAccountName: neuroforge
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      priorityClassName: "" # оверлей: neuroforge-priority (опционально)
+      terminationGracePeriodSeconds: 60
+      imagePullSecrets: []   # оверлей: - name: regcred
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Раскладка по топологиям и антиплотность
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: neuroforge
+              app.kubernetes.io/instance: neuroforge
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: neuroforge
+              app.kubernetes.io/instance: neuroforge
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: neuroforge
+                    app.kubernetes.io/instance: neuroforge
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: ["linux"]
+      tolerations: []       # оверлей при необходимости
+      nodeSelector: {}      # оверлей при необходимости
+
+      # Миграции БД/скрипты до старта приложения (при наличии)
+      initContainers:
+        - name: migrate
+          image: ghcr.io/ORG/neuroforge-core:latest # оверлей заменит тег/репозиторий
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "/app/migrate up || { echo 'migrations failed'; exit 1; }"]
+          envFrom:
+            - configMapRef:
+                name: neuroforge-config
+            - secretRef:
+                name: neuroforge-secrets
+                optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: app
+          image: ghcr.io/ORG/neuroforge-core:latest # оверлей заменит тег/репозиторий
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: APP_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/version']
+          envFrom:
+            - configMapRef:
+                name: neuroforge-config
+            - secretRef:
+                name: neuroforge-secrets
+                optional: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/neuroforge
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Пробы: быстрый startup, строгая liveness, частая readiness
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    # дать ingress/servicemesh снять трафик
+                    sleep 5
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: FallbackToLogsOnError
+
+      volumes:
+        - name: config
+          configMap:
+            name: neuroforge-config
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

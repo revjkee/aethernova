@@ -1,0 +1,272 @@
+syntax = "proto3";
+
+package veilmind.v1;
+
+option csharp_namespace = "VeilMind.V1";
+option go_package       = "github.com/veilmind/veilmind-core/gen/proto/veilmind/v1;veilmindv1";
+option java_multiple_files = true;
+option java_package        = "com.veilmind.v1";
+option java_outer_classname = "HealthProto";
+option objc_class_prefix  = "VMH";
+option php_namespace      = "VeilMind\\V1";
+option ruby_package       = "VeilMind::V1";
+option swift_prefix       = "VMH";
+option optimize_for       = SPEED;
+
+// External well-knowns
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/wrappers.proto";
+
+// Optional HTTP annotations (remove if not using grpc-gateway / transcoding)
+import "google/api/annotations.proto";
+
+// -----------------------------------------------------------------------------
+// Health service
+// -----------------------------------------------------------------------------
+//
+// Дизайн:
+// - Совместим с gRPC Health Checking Protocol (Check/Watch), но расширяет
+//   модель статусов и включает объяснимость причин деградации.
+// - Поля помечены комментариями по эволюции; числовые теги фиксированы.
+// - Для HTTP поддержаны /v1/health (GET) и /v1/health/watch (GET stream).
+//
+// Эволюция:
+// - Добавляйте новые поля ТОЛЬКО с новыми номерами тегов.
+// - Не меняйте существующие номера и семантику.
+// - Не переиспользуйте удаленные номера тегов.
+//
+service Health {
+  // Unary проверка статуса сервиса/субсистемы.
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse) {
+    option (google.api.http) = {
+      get: "/v1/health"
+      additional_bindings {
+        get: "/v1/health/{service}"
+      }
+    };
+  }
+
+  // Наблюдение за изменениями статуса (server streaming).
+  rpc Watch(HealthWatchRequest) returns (stream HealthCheckResponse) {
+    option (google.api.http) = {
+      get: "/v1/health/watch"
+      additional_bindings {
+        get: "/v1/health/{service}/watch"
+      }
+    };
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Messages
+// -----------------------------------------------------------------------------
+
+// Возможные статусы сервиса.
+enum ServingStatus {
+  // Неопределено. Используйте UNKNOWN только как дефолт.
+  SERVING_STATUS_UNSPECIFIED = 0;
+
+  // Полностью работоспособен и соответствует SLO.
+  SERVING = 1;
+
+  // Работает, но имеются отклонения (частичные сбои, деградация SLO).
+  DEGRADED = 2;
+
+  // На техобслуживании: намеренно ограничен или недоступен.
+  MAINTENANCE = 3;
+
+  // Не обслуживает запросы.
+  NOT_SERVING = 4;
+}
+
+// Причины деградации/недоступности (машиночитаемые коды).
+enum CauseCode {
+  CAUSE_CODE_UNSPECIFIED = 0;
+
+  // Зависимости: БД/кеш/брокер/внешний API.
+  DEPENDENCY_DOWN = 1;
+  DEPENDENCY_DEGRADED = 2;
+
+  // Ресурсы: CPU/Memory/FD/диск/лимиты.
+  RESOURCE_EXHAUSTED = 3;
+
+  // Развертывание/миграция/maintenance window.
+  MAINTENANCE_WINDOW = 4;
+
+  // Конфигурация/секреты/фичефлаги.
+  MISCONFIGURATION = 5;
+
+  // Ошибки инициализации/старта.
+  STARTUP_FAILURE = 6;
+
+  // Ошибки аутентификации/авторизации к зависимостям.
+  AUTHZ_FAILURE = 7;
+
+  // Достигнут rate limit/троттлинг.
+  RATE_LIMITED = 8;
+}
+
+// Запрос на проверку здоровья.
+// Если service пуст — проверяется корневой сервис (агрегированный статус).
+message HealthCheckRequest {
+  // Сервис/сабсистема (например: "api", "worker", "ingest", "ops.telemetry").
+  string service = 1;
+
+  // Запрашиваемый уровень проверки:
+  // - "liveness" — жив ли процесс.
+  // - "readiness" — готов ли обслуживать трафик (зависимости).
+  // - "startup" — завершена ли инициализация.
+  // Если пусто, трактуется как "readiness".
+  string probe = 2;
+
+  // Запрос конкретных метрик (ключи из HealthIndicator.metrics).
+  repeated string include_metrics = 3;
+
+  // Клиент может передавать кореляционный идентификатор для трассировки.
+  google.protobuf.StringValue correlation_id = 4;
+}
+
+// Ответ со статусом.
+// Совместим с grpc-health, но богаче полями объяснимости.
+message HealthCheckResponse {
+  // Временная метка формирования ответа.
+  google.protobuf.Timestamp timestamp = 1;
+
+  // Идентификатор сервиса/субсистемы.
+  string service = 2;
+
+  // Итоговый статус.
+  ServingStatus status = 3;
+
+  // Детализация по типам проб.
+  Probes probes = 4;
+
+  // Пояснения: коды причин и человекочитаемые сообщения.
+  repeated HealthIssue issues = 5;
+
+  // Метаданные билда/версии для диагностики.
+  BuildInfo build = 6;
+
+  // Продолжительность аптайма текущего процесса.
+  google.protobuf.Duration uptime = 7;
+
+  // Показатели и индикаторы (cpu, mem, зависимостные статусы и т.п.).
+  repeated HealthIndicator indicators = 8;
+
+  // Опциональный расширенный payload (не использовать для критической логики).
+  google.protobuf.Any details = 9;
+
+  // Совместимость: минимальный контракт gRPC Health (true если SERVING).
+  bool serving = 10;
+
+  // Рекомендации по трафику (напр., снизить нагрузку, вывести из ротации).
+  TrafficAdvice traffic_advice = 11;
+
+  // Зарезервировано для будущих полей.
+  reserved 12 to 19;
+}
+
+// Детализация по пробам.
+message Probes {
+  // Жив ли процесс (минимальный ливнесс).
+  ProbeStatus liveness = 1;
+
+  // Готов ли принимать трафик (проверены зависимости).
+  ProbeStatus readiness = 2;
+
+  // Завершена ли инициализация.
+  ProbeStatus startup = 3;
+}
+
+// Состояние конкретной пробы.
+message ProbeStatus {
+  ServingStatus status = 1;
+  // Минимальная информация о причине.
+  repeated HealthIssue issues = 2;
+  // Время последнего успешного прохождения.
+  google.protobuf.Timestamp last_ok = 3;
+}
+
+// Одна причина/проблема.
+message HealthIssue {
+  CauseCode code = 1;
+  // Краткое сообщение для оператора.
+  string message = 2;
+  // Идентификатор зависимости (например, "postgres", "redis", "kafka").
+  string dependency = 3;
+  // Технические детали (stack, errno, http_status и т.п.) — не PII.
+  map<string, string> attributes = 4;
+}
+
+// Метаданные билда/версии.
+message BuildInfo {
+  string version = 1;         // SemVer/дата-тег (например, "1.0.3+abcd123")
+  string commit  = 2;         // git SHA
+  string branch  = 3;         // git ветка (если доступно)
+  string build_date = 4;      // ISO-8601 дата сборки
+  string go_version = 5;      // если релевантно для go-сервисов
+  string runtime     = 6;     // "python3.12", "node18", "go1.22"
+  string platform    = 7;     // "linux/amd64", "linux/arm64"
+}
+
+// Универсальный индикатор здоровья.
+// Используется для доставки метрик/статусов зависимостей и узких мест.
+message HealthIndicator {
+  // Имя индикатора (например, "cpu", "memory", "postgres").
+  string name = 1;
+
+  // Интегральный статус индикатора (например, для зависимостей).
+  ServingStatus status = 2;
+
+  // Набор метрик (ключ-значение) в человекочитаемом виде.
+  map<string, string> metrics = 3;
+
+  // Ключевые пороги/лимиты.
+  map<string, string> thresholds = 4;
+
+  // Дополнительные данные (типизировано при необходимости).
+  google.protobuf.Any details = 5;
+
+  // Временная метка сбора.
+  google.protobuf.Timestamp ts = 6;
+}
+
+// Рекомендации балансировщику/орchestrator'у.
+message TrafficAdvice {
+  // Признак, что экземпляр можно временно исключить из ротации.
+  bool drain = 1;
+
+  // Желаемый уровень приемлемой одновременной нагрузки (hint).
+  google.protobuf.UInt32Value max_concurrency = 2;
+
+  // Рекомендация по delay для новых соединений.
+  google.protobuf.Duration backoff = 3;
+}
+
+// Запрос на наблюдение (stream).
+message HealthWatchRequest {
+  // Сервис/субсистема. Пусто — агрегированный.
+  string service = 1;
+
+  // Максимальная частота обновлений (дебаунс), по умолчанию 1s.
+  google.protobuf.Duration min_interval = 2;
+
+  // Отправлять обновление только при изменении статуса (edge-triggered).
+  bool only_on_change = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Совместимость с стандартным gRPC health checking
+// -----------------------------------------------------------------------------
+//
+// Если нужен строгий контракт grpc.health.v1, создайте отдельный адаптер,
+// который мапит наши Check/Watch на стандартные типы.
+//
+// Пример отображения:
+//   status == SERVING      -> grpc.health.v1.ServingStatus.SERVING
+//   status == NOT_SERVING  -> grpc.health.v1.ServingStatus.NOT_SERVING
+//   иначе                  -> grpc.health.v1.ServingStatus.SERVICE_UNKNOWN
+//
+// -----------------------------------------------------------------------------

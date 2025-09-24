@@ -1,0 +1,231 @@
+syntax = "proto3";
+
+package neuroforge.v1;
+
+option csharp_namespace = "Neuroforge.V1";
+option go_package        = "github.com/neuroforge/neuroforge-core/gen/proto/neuroforge/v1;neuroforgev1";
+option java_multiple_files = true;
+option java_package      = "com.neuroforge.v1";
+option java_outer_classname = "BatchProto";
+option objc_class_prefix = "NFG";
+option php_namespace     = "Neuroforge\\V1";
+option ruby_package      = "Neuroforge::V1";
+
+// Внешние прототипы Google: только стандартные
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/rpc/status.proto";
+
+// =========================
+// Общие соглашения
+// - Все временные метки в UTC.
+// - Поля oneof для разнотипных входов/выходов.
+// - Частичные ошибки: google.rpc.Status на уровне элементов.
+// - Агрегированный статус в BatchResponse.status.
+// - Максимальная совместимость и расширяемость: зарезервированы диапазоны полей.
+// =========================
+
+// Класс SLA/приоритет обработки.
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW         = 1;
+  PRIORITY_NORMAL      = 2;
+  PRIORITY_HIGH        = 3;
+  PRIORITY_CRITICAL    = 4;
+}
+
+// Алгоритм сжатия полезной нагрузки.
+// NONE по умолчанию, GZIP — полезная компрессия для больших входов.
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_NONE        = 1;
+  COMPRESSION_GZIP        = 2;
+}
+
+// Ожидаемый тип данных входа/выхода.
+enum ContentType {
+  CONTENT_TYPE_UNSPECIFIED = 0;
+  CONTENT_TYPE_TEXT        = 1;  // UTF-8
+  CONTENT_TYPE_JSON        = 2;  // application/json
+  CONTENT_TYPE_BYTES       = 3;  // arbitrary bytes
+  CONTENT_TYPE_IMAGE       = 4;  // encoded image (e.g., PNG/JPEG)
+  CONTENT_TYPE_AUDIO       = 5;  // encoded audio (e.g., WAV/FLAC)
+}
+
+// Ключ-значение метаданных клиента/запроса.
+message Metadata {
+  map<string, string> entries = 1;
+}
+
+// Контекст трассировки (встраивается из прокси/шлюза).
+message TraceContext {
+  string trace_id  = 1;  // W3C traceparent (uuid без дефисов или 16/32 hex)
+  string span_id   = 2;  // 8/16 байт hex
+  string parent_id = 3;  // опционально
+  map<string, string> baggage = 10; // произвольные key=value
+}
+
+// Идентификатор модели/версии.
+message ModelSelector {
+  string name    = 1; // пример: "resnet50" или "ner-large"
+  string version = 2; // пример: "1.0.3" или digest/sha
+  map<string, string> tags = 10; // дополнительные теги маршрутизации
+}
+
+// Описание одного элемента батча для инференса.
+message InferenceItem {
+  // Уникальный идентификатор элемента внутри батча (идемпотентность/сопоставление).
+  string item_id = 1;
+
+  // Тип содержимого и сам контент.
+  ContentType content_type = 2;
+
+  // Один из вариантов входа.
+  oneof input {
+    string text      = 3; // UTF-8, если content_type = TEXT/JSON (JSON как строка).
+    bytes  bytes     = 4; // Произвольные байты (image/audio/другое).
+    google.protobuf.Struct json = 5; // Нативный JSON объект.
+  }
+
+  // Признаки/подсказки для модели (необязательно).
+  google.protobuf.Struct features = 10;
+
+  // Опциональные параметры для конкретного инстанса (переопределяют общие).
+  google.protobuf.Struct overrides = 11;
+
+  // Клиентские метаданные уровня элемента.
+  Metadata metadata = 12;
+
+  // Резерв на расширение.
+  reserved 100 to 199;
+}
+
+// Параметры исполнения для всего батча.
+message ExecutionHints {
+  Priority priority = 1;
+  google.protobuf.Duration deadline    = 2; // относительный дедлайн на обработку всего батча.
+  uint32 max_concurrency               = 3; // лимит параллелизма внутри сервера.
+  Compression request_compression      = 4; // как упакован вход (если out-of-band).
+  Compression response_compression     = 5; // предпочтительный ответ.
+  bool strict_ordering                 = 6; // если true — сохранить порядок выдачи как во входе.
+  bool allow_partial_results           = 7; // по умолчанию true: отдавать частичные результаты.
+  reserved 100 to 199;
+}
+
+// Запрос батч-инференса.
+message BatchRequest {
+  // Идемпотентный ключ запроса, задается клиентом. На уровне сервера — дедупликация.
+  string idempotency_key = 1;
+
+  // Модель для батча (можно также переопределять per-item через InferenceItem.overrides).
+  ModelSelector model = 2;
+
+  // Список элементов для обработки.
+  repeated InferenceItem items = 3;
+
+  // Глобальные параметры исполнения.
+  ExecutionHints hints = 4;
+
+  // Клиентские метаданные уровня запроса.
+  Metadata metadata = 5;
+
+  // Контекст трассировки.
+  TraceContext trace = 6;
+
+  // Клиентское время отправки.
+  google.protobuf.Timestamp submit_time = 7;
+
+  // Пользователь/тенант для мультитенант-сценариев.
+  string tenant_id = 8;
+
+  // Резерв.
+  reserved 100 to 199;
+}
+
+// Токенайзер/подсчет токенов (актуально для LLM).
+message TokenUsage {
+  uint32 prompt_tokens     = 1;
+  uint32 completion_tokens = 2;
+  uint32 total_tokens      = 3;
+}
+
+// Статистика исполнения элемента или всего батча.
+message ExecutionStats {
+  uint64 latency_ms       = 1;  // wall-clock время
+  uint64 queue_time_ms    = 2;  // ожидание в очереди
+  uint64 compute_time_ms  = 3;  // чистое время инференса
+  double cpu_seconds      = 4;
+  double gpu_seconds      = 5;
+  uint64 memory_bytes     = 6;
+  TokenUsage token_usage  = 10;
+  map<string, double> custom_metrics = 20; // любые числовые метрики
+}
+
+// Результат для одного элемента батча.
+message InferenceResult {
+  string item_id = 1;   // соответствует InferenceItem.item_id
+  uint32 index   = 2;   // позиция во входном массиве
+
+  // Содержимое результата (ровно одно поле).
+  ContentType content_type = 3;
+  oneof output {
+    string text      = 4; // текстовый ответ
+    bytes  bytes     = 5; // бинарный ответ (логиты/тензор/изображение и т.п.)
+    google.protobuf.Struct json = 6; // структурированный ответ
+  }
+
+  // Оценки/скоринг/метаданные.
+  google.protobuf.Struct annotations = 10;
+  ExecutionStats stats               = 11;
+
+  // Ошибка уровня элемента (если была). При ошибке output может быть пустым.
+  google.rpc.Status error = 20;
+
+  reserved 100 to 199;
+}
+
+// Агрегированный ответ по батчу.
+message BatchResponse {
+  // Повтор idempotency_key для корреляции и кэширования.
+  string idempotency_key = 1;
+
+  // Отдельные результаты в порядке либо входа (если strict_ordering=true),
+  // либо в порядке готовности.
+  repeated InferenceResult results = 2;
+
+  // Агрегированный статус по батчу:
+  // - code=OK если хотя бы один элемент успешен и allow_partial_results=true,
+  // - code=FAILED_PRECONDITION/INVALID_ARGUMENT/etc. при фатальных ошибках,
+  // - details может содержать per-item ошибки.
+  google.rpc.Status status = 3;
+
+  // Сводная статистика.
+  ExecutionStats aggregate_stats = 4;
+
+  // Время начала/окончания обработки.
+  google.protobuf.Timestamp started_at  = 5;
+  google.protobuf.Timestamp finished_at = 6;
+
+  // Серверные метаданные (версия модели, узел, регион и т.п.).
+  Metadata server_metadata = 7;
+
+  reserved 100 to 199;
+}
+
+// Стриминговый элемент ответа (для streaming RPC).
+message BatchStreamChunk {
+  oneof kind {
+    InferenceResult result = 1;   // очередной готовый элемент
+    ExecutionStats  progress = 2; // периодические сводки
+    google.rpc.Status terminal_status = 3; // финальный статус (последний кадр)
+  }
+}
+
+// gRPC-сервис батч-инференса.
+// BatchInfer — обычный запрос/ответ, результаты формируются целиком.
+// BatchInferStream — серверный стрим: элементы приходят по мере готовности.
+service InferenceBatchService {
+  rpc BatchInfer (BatchRequest) returns (BatchResponse);
+  rpc BatchInferStream (BatchRequest) returns (stream BatchStreamChunk);
+}

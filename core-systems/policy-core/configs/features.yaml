@@ -1,0 +1,433 @@
+# policy-core/configs/features.yaml
+apiVersion: features.aethernova.io/v1
+kind: FeatureSet
+
+$schema: https://schemas.aethernova.io/policy-core/featureset-1.0.json  # I cannot verify this
+
+metadata:
+  id: "policy-core.featureset.default"
+  title: "Набор фич Policy Core"
+  version: "1.0.0"
+  revision: 1
+  contentHash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"  # заполняется CI
+  signature:
+    type: "pgp"
+    signer: "config-signing@aethernova.io"
+    value: "PGP-SIGNATURE-PLACEHOLDER"  # заполняется в release-пайплайне
+  owners:
+    - team: "platform-ops"
+    - team: "security-core"
+  createdAt: "2025-08-28T07:45:00Z"
+  updatedAt: "2025-08-28T07:45:00Z"
+  labels:
+    product: "NeuroCity"
+    component: "policy-core"
+
+# Описание доступных атрибутов для таргетинга
+attributes:
+  user:
+    id: { type: "string", required: true }
+    segment: { type: "string", enum: ["staff","early","beta","general"], required: false }
+    country: { type: "string" }
+    region: { type: "string" }
+    is_staff: { type: "boolean" }
+    wallet: { type: "string" }
+    age: { type: "integer" }
+  session:
+    app_version: { type: "semver" }
+    crypto_pfs: { type: "boolean" }
+    locale: { type: "string" }
+    platform: { type: "string", enum: ["web","ios","android","miniapp"] }
+  env:
+    name: { type: "string", enum: ["dev","staging","prod"], required: true }
+    shard: { type: "string" }
+
+# Предустановки условий и раскаток (якоря для переиспользования)
+presets:
+  bucketing:
+    salt: "policy-core-global-salt-v1"
+    unit: "user.id"  # детерминированный ключ сегментации
+
+  conditions:
+    staffOnly: &cond_staff
+      equals: { left: "${user.is_staff}", right: true }
+    euRegion: &cond_eu
+      in:
+        left: "${user.region}"
+        right: ["SE","FI","NO","DK","DE","FR","NL","BE","PL","ES","IT","PT","IE","AT","CZ","SK","HU","EE","LV","LT","RO","BG","HR","SI","LU","GR","CY","MT"]
+    hasWallet: &cond_wallet
+      exists: "${user.wallet}"
+    pfsEnabled: &cond_pfs
+      equals: { left: "${session.crypto_pfs}", right: true }
+    minApp120: &cond_minapp120
+      semverGte: { left: "${session.app_version}", right: "1.2.0" }
+    envIsStaging: &cond_env_stg
+      equals: { left: "${env.name}", right: "staging" }
+    envIsProd: &cond_env_prod
+      equals: { left: "${env.name}", right: "prod" }
+
+  rollouts:
+    canary5: &ro_canary5
+      percentage: 5
+      seed: "${presets.bucketing.salt}"
+      unit: "${presets.bucketing.unit}"
+    stage25_50_100: &ro_25_50_100
+      steps:
+        - at: "now"      # применимо сразу после публикации
+          percentage: 25
+        - after: "24h"
+          percentage: 50
+        - after: "72h"
+          percentage: 100
+      seed: "${presets.bucketing.salt}"
+      unit: "${presets.bucketing.unit}"
+
+evaluation:
+  order:
+    - kill_switches
+    - prerequisites
+    - dependencies
+    - rules
+    - fallbacks
+  fallbacks:
+    bool: false
+    variant: "control"
+    number: 0
+    string: ""
+    json: {}
+  telemetry:
+    otel:
+      service_name: "policy-core"
+      events:
+        decision: "policy.features.decision"
+        exposure: "policy.features.exposure"
+        override: "policy.features.override"
+      attributes:
+        featureset_id: "${metadata.id}"
+        env: "${env.name}"
+
+environments:
+  dev:
+    defaultState: "enabled"
+  staging:
+    defaultState: "enabled"
+  prod:
+    defaultState: "conditional"
+
+kill_switches:
+  - id: "ks.global.policy-core"
+    description: "Глобальный аварийный выключатель Policy Core"
+    state: "disabled"  # если enabled — принудительно отключает все фичи ниже
+    precedence: 100
+
+features:
+  # 1) Обязательный PFS для сессии
+  - id: "security.pfs.mandatory"
+    type: "boolean"
+    description: "Требование Perfect Forward Secrecy для защищённых операций"
+    owners: ["security-core"]
+    prerequisites: []
+    depends_on: []
+    state:
+      env:
+        dev: { value: false }
+        staging: { value: true }
+        prod:
+          rules:
+            - when: *cond_staff
+              value: true
+            - when: *cond_eu
+              rollout: *ro_25_50_100
+              value: true
+            - when: *cond_env_prod
+              value: true
+    safeguards:
+      on_violation: "deny"
+      audit_required: true
+    telemetry:
+      exposure: true
+
+  # 2) Стелс-платежи (ограниченная раскатка)
+  - id: "payments.stealth.v1"
+    type: "boolean"
+    description: "Stealth Payments для приватных переводов"
+    owners: ["onchain-core","security-core"]
+    prerequisites:
+      - "security.pfs.mandatory"
+    depends_on:
+      - "rewards.reva.jetton"
+    state:
+      env:
+        dev: { value: true }
+        staging:
+          rules:
+            - when: *cond_wallet
+              rollout: *ro_canary5
+              value: true
+        prod:
+          rules:
+            - when: *cond_staff
+              value: true
+            - when:
+                allOf:
+                  - *cond_wallet
+                  - *cond_minapp120
+              rollout: *ro_25_50_100
+              value: true
+    safeguards:
+      rate_limit: "30/m"
+      kyc_required: false
+      signed_requests: true
+    telemetry:
+      exposure: true
+
+  # 3) Анонимный мессенджер как соцсеть
+  - id: "messenger.anon.social"
+    type: "variant"
+    description: "Мессенджер-как-соцсеть: истории, профиль-канал, эмодзи, подарки 3D"
+    owners: ["ai-comms-core","platform-security"]
+    variants:
+      - name: "control"   # функционал по умолчанию
+      - name: "stories"
+      - name: "stories_gifts3d"
+    prerequisites:
+      - "security.pfs.mandatory"
+    depends_on:
+      - "security.antiabuse.v2"
+    state:
+      env:
+        dev: { value: "stories_gifts3d" }
+        staging:
+          rules:
+            - when: *cond_staff
+              value: "stories_gifts3d"
+            - when: *cond_env_stg
+              rollout: *ro_canary5
+              value: "stories"
+        prod:
+          rules:
+            - when: *cond_staff
+              value: "stories_gifts3d"
+            - when: *cond_eu
+              rollout:
+                steps:
+                  - at: "now"
+                    percentage: 10
+                  - after: "48h"
+                    percentage: 30
+                  - after: "7d"
+                    percentage: 60
+              value: "stories"
+    telemetry:
+      exposure: true
+
+  # 4) Включение OTEL-трейсинга
+  - id: "observability.otel.traces"
+    type: "boolean"
+    description: "Экспорт трасс в OTLP"
+    owners: ["observability-core"]
+    state:
+      env:
+        dev: { value: true }
+        staging: { value: true }
+        prod: { value: true }
+    remote_config:
+      exporter_otlp_endpoint:
+        type: "string"
+        default: "http://jaeger-collector.observability:4318"
+      sample_ratio:
+        type: "number"
+        default: 0.2
+
+  # 5) Строгие лимиты политики
+  - id: "policy.ratelimit.strict"
+    type: "json"
+    description: "Шаблоны строгих лимитов для критичных маршрутов"
+    owners: ["security-core"]
+    state:
+      env:
+        dev: { value: { "burst": 20, "per_minute": 60 } }
+        staging: { value: { "burst": 10, "per_minute": 40 } }
+        prod: { value: { "burst": 6, "per_minute": 30 } }
+
+  # 6) API v2 флаг включения маршрутов
+  - id: "api.v2.enable"
+    type: "boolean"
+    description: "Активация маршрутов API v2"
+    owners: ["platform-ops"]
+    prerequisites: []
+    depends_on: []
+    state:
+      env:
+        dev: { value: true }
+        staging:
+          rules:
+            - when: *cond_staff
+              value: true
+        prod:
+          rules:
+            - when: *cond_staff
+              value: true
+            - when: *cond_eu
+              rollout: *ro_canary5
+              value: true
+    schedules:
+      - at: "2025-09-15T10:00:00Z"
+        set:
+          prod:
+            rules:
+              - when: *cond_eu
+                rollout: *ro_25_50_100
+                value: true
+
+  # 7) Анти-абьюз v2
+  - id: "security.antiabuse.v2"
+    type: "json"
+    description: "Правила анти-абьюза: невозможные перемещения, макросы, поведенческие евристики"
+    owners: ["security-core"]
+    state:
+      env:
+        dev: { value: { "impossible_travel_km": 400, "macro_detection": true, "input_error_rate": 0.08 } }
+        staging: { value: { "impossible_travel_km": 500, "macro_detection": true, "input_error_rate": 0.05 } }
+        prod: { value: { "impossible_travel_km": 500, "macro_detection": true, "input_error_rate": 0.05 } }
+
+  # 8) On-chain вознаграждения REVA
+  - id: "rewards.reva.jetton"
+    type: "boolean"
+    description: "Включение on-chain наград REVA20"
+    owners: ["onchain-core"]
+    prerequisites:
+      - "security.pfs.mandatory"
+    state:
+      env:
+        dev: { value: true }
+        staging:
+          rules:
+            - when: *cond_wallet
+              value: true
+        prod:
+          rules:
+            - when:
+                allOf: [ *cond_wallet, *cond_minapp120 ]
+              rollout: *ro_canary5
+              value: true
+    remote_config:
+      network:
+        type: "string"
+        default: "ton"
+      token:
+        type: "string"
+        default: "REVA20"
+      decimals:
+        type: "number"
+        default: 9
+
+  # 9) Движок квестлайнов
+  - id: "mythos.questline.v1"
+    type: "boolean"
+    description: "Включение движка квестлайнов Mythos v1"
+    owners: ["mythos-core"]
+    depends_on:
+      - "observability.otel.traces"
+    state:
+      env:
+        dev: { value: true }
+        staging: { value: true }
+        prod:
+          rules:
+            - when: *cond_staff
+              value: true
+            - when: *cond_eu
+              rollout: *ro_canary5
+              value: true
+
+  # 10) Политический DSL v2
+  - id: "policy.dsl.v2"
+    type: "variant"
+    description: "Версия интерпретатора DSL политик"
+    owners: ["policy-engine"]
+    variants:
+      - name: "control"   # v1
+      - name: "v2"
+    state:
+      env:
+        dev: { value: "v2" }
+        staging:
+          rules:
+            - when: *cond_staff
+              value: "v2"
+        prod:
+          rules:
+            - when: *cond_staff
+              value: "v2"
+
+  # 11) Кеш Redis включение
+  - id: "cache.redis.enable"
+    type: "boolean"
+    description: "Включение Redis-кеша"
+    owners: ["platform-ops"]
+    state:
+      env:
+        dev: { value: true }
+        staging: { value: true }
+        prod: { value: true }
+    remote_config:
+      ttl_seconds:
+        type: "number"
+        default: 300
+
+  # 12) Мульти-тенант
+  - id: "platform.multitenant"
+    type: "boolean"
+    description: "Разделение ресурсов по арендаторам"
+    owners: ["platform-ops"]
+    state:
+      env:
+        dev: { value: true }
+        staging: { value: true }
+        prod:
+          rules:
+            - when: *cond_staff
+              value: true
+
+  # 13) Политика хранения данных
+  - id: "compliance.data_retention"
+    type: "number"
+    description: "Срок хранения данных (дней)"
+    owners: ["compliance"]
+    state:
+      env:
+        dev: { value: 7 }
+        staging: { value: 14 }
+        prod: { value: 30 }
+
+overrides:
+  # Высокоприоритетные точечные выключения по инцидентам
+  - id: "override.hotfix.disable.api.v2"
+    when:
+      allOf:
+        - equals: { left: "${env.name}", right: "prod" }
+        - equals: { left: "${session.platform}", right: "miniapp" }
+    set:
+      feature: "api.v2.enable"
+      value: false
+    ttl: "24h"
+    precedence: 1000
+
+validation:
+  rules:
+    - id: "unique-feature-ids"
+      kind: builtin.uniqueIds
+      level: error
+    - id: "deps-exist"
+      kind: builtin.dependenciesExist
+      level: error
+    - id: "variants-covered"
+      kind: builtin.variantCoverage
+      level: warn
+    - id: "types-match"
+      kind: builtin.typeCheck
+      level: error
+    - id: "no-cycles"
+      kind: builtin.noCyclicDependencies
+      level: error

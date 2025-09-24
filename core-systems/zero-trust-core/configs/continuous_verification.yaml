@@ -1,0 +1,430 @@
+# zero-trust-core/configs/continuous_verification.yaml
+apiVersion: zerotrust.ae/v1
+kind: ContinuousVerification
+metadata:
+  name: org-wide-cv
+  tenant: production
+  labels:
+    environment: prod
+    owner: security
+  annotations:
+    description: "Непрерывная верификация Zero Trust политик и контролей"
+spec:
+  version: 1
+  defaults:
+    decision: deny
+    failClosed: true
+    maxConcurrentChecks: 50
+    evidenceRetention: "30d"
+    piiRedaction:
+      enabled: true
+      fields: ["authorization","cookie","set-cookie","password","ssn","pan"]
+    runtimes:
+      # где исполняются активные проверки (probes)
+      executors:
+        - id: kubernetes
+          type: k8s
+          namespace: security-cv
+          serviceAccount: cv-runner
+        - id: lambda
+          type: aws-lambda
+          roleArn: "arn:aws:iam::123456789012:role/cv-runner"
+
+  # 1) Источники сигналов/доказательств
+  evidence:
+    sources:
+      identity:
+        - id: oidc-introspection
+          type: http
+          method: POST
+          url: "https://idp.example.com/oauth2/introspect"
+          headers:
+            Authorization: "@secrets:idp/introspect_bearer"
+          cacheTTL: "2m"
+        - id: audit-authn
+          type: opensearch
+          endpoints: ["https://opensearch.internal:9200"]
+          index: "security-audit*"
+          queryTemplate: |
+            {"query":{"bool":{"filter":[{"term":{"category":"AUTHN"}},{"range":{"@timestamp":{"gte":"now-5m"}}}]}}}
+          auth:
+            basic:
+              username: "@secrets:opensearch/user"
+              password: "@secrets:opensearch/pass"
+      device:
+        - id: mdm-posture
+          type: http
+          method: GET
+          url: "https://mdm.example.com/api/v1/devices/${device_id}"
+          headers:
+            Authorization: "@secrets:mdm/token"
+          cacheTTL: "5m"
+        - id: edr-signals
+          type: http
+          method: GET
+          url: "https://edr.example.com/api/v2/telemetry?device=${device_id}&window=5m"
+          headers:
+            Authorization: "@secrets:edr/token"
+          cacheTTL: "2m"
+      network:
+        - id: flow-logs
+          type: s3
+          uri: "s3://net-logs/flow/partition=${date}"
+          parser: vpc-flow
+          cacheTTL: "10m"
+      policy:
+        - id: opa-decisions
+          type: http
+          method: GET
+          url: "http://opa.security-core.svc.cluster.local:8181/metrics"
+          cacheTTL: "1m"
+        - id: policy-bundle-signature
+          type: fs
+          path: "/etc/zt/policies/bundle.sig"
+      tokens:
+        - id: jwks-current
+          type: http
+          method: GET
+          url: "https://zt.example.com/.well-known/jwks.json"
+          cacheTTL: "10m"
+        - id: jwks-backup
+          type: fs
+          path: "secrets/jwks.json"
+      availability:
+        - id: admin-api-health
+          type: http
+          method: GET
+          url: "https://zt-admin.internal/health"
+          timeout: "2s"
+          cacheTTL: "30s"
+
+  # 2) Каталог проверок (probes) — пассивные (оценка) и активные (симуляции)
+  checks:
+    # 2.1 Пассивные проверки консистентности сигналов
+    passive:
+      - id: idp-token-clockskew
+        description: "Проверка допустимого рассинхрона времени токенов IdP"
+        severity: medium
+        frequency: "1m"
+        using:
+          - identity.oidc-introspection
+        rules:
+          - type: threshold
+            path: "token.iat_to_now_seconds"
+            op: "<="
+            value: 120
+          - type: threshold
+            path: "token.now_to_exp_seconds"
+            op: ">="
+            value: 60
+      - id: device-posture-completeness
+        description: "Покрытие устройств актуальными аттестациями MDM/EDR"
+        severity: high
+        frequency: "5m"
+        using: ["device.mdm-posture","device.edr-signals"]
+        rules:
+          - type: coverage
+            population: "assets.devices.active_24h"
+            sample: "device.mdm-posture.device_id"
+            minPercent: 98
+          - type: threshold
+            path: "device.edr-signals.threat_level"
+            op: "<="
+            value: 1
+      - id: policy-bundle-verified
+        description: "Подпись OPA bundle подтверждена и соответствует ключу"
+        severity: critical
+        frequency: "2m"
+        using: ["policy.policy-bundle-signature","tokens.jwks-backup"]
+        rules:
+          - type: signature_verify
+            artifact: "policy.policy-bundle-signature"
+            jwksRef: "tokens.jwks-backup"
+      - id: audit-ingest-latency
+        description: "Задержка приема аудита ниже порогов SLO"
+        severity: medium
+        frequency: "1m"
+        using: ["identity.audit-authn"]
+        rules:
+          - type: threshold
+            path: "stats.max_ingest_lag_ms"
+            op: "<="
+            value: 2000
+
+    # 2.2 Активные проверки (benign attack simulations / chaos)
+    active:
+      - id: sso-mfa-stepup
+        description: "Симуляция входа с повышенным риском -> требование MFA"
+        severity: high
+        executorRef: kubernetes
+        frequency: "10m"
+        safeGuard:
+          maxParallel: 1
+          dryRun: false
+          blastRadius: "scoped"
+        scenario:
+          steps:
+            - type: oidc_login
+              user: "cv.bot@example.com"
+              ipSpoof: "198.51.100.10"
+              deviceTrust: "low"
+              expect:
+                policyDecision: "mfa_required"
+                latencyMsMax: 800
+            - type: mfa_webauthn_assert
+              expect:
+                policyDecision: "allow"
+        evidenceCollect:
+          - identity.audit-authn
+      - id: mtls-reject-unknown-device
+        description: "mTLS отклоняет клиент без доверенного устройства"
+        severity: critical
+        executorRef: kubernetes
+        frequency: "15m"
+        scenario:
+          steps:
+            - type: mtls_connect
+              service: "https://billing.internal.svc:8443"
+              clientCertRef: "untrusted-device.crt"
+              expect:
+                tls:
+                  verified: false
+                  alert: "unknown_ca|bad_certificate"
+                httpStatus: [400,403,495,496]
+        evidenceCollect:
+          - policy.opa-decisions
+      - id: rbac-boundary-auditor
+        description: "Роль auditor не имеет write‑прав на audit индексы"
+        severity: high
+        executorRef: lambda
+        frequency: "30m"
+        scenario:
+          steps:
+            - type: http_call
+              url: "https://opensearch.internal:9200/security-audit/_doc"
+              method: POST
+              auth:
+                role: "auditor"
+              body: '{"unauthorized":true}'
+              expect:
+                httpStatus: [401,403]
+                notChangedIndex: true
+
+  # 3) Оркестрация: расписание, события, триггеры, приоритеты
+  orchestration:
+    scheduler:
+      jitter: "15s"
+      maxSkips: 3
+    eventTriggers:
+      - id: new-policy-bundle
+        source: "s3://policies/events"
+        match: "bundle_published"
+        run:
+          checks: ["policy-bundle-verified","sso-mfa-stepup"]
+      - id: key-rotation
+        source: "jwks.rotate"
+        run:
+          checks: ["policy-bundle-verified"]
+    priority:
+      critical: 100
+      high: 80
+      medium: 50
+      low: 20
+
+  # 4) Оценка и принятие решений
+  evaluation:
+    aggregate:
+      # весовая модель для сводной оценки риска
+      weights:
+        critical: 5
+        high: 3
+        medium: 2
+        low: 1
+      window: "1h"
+      thresholds:
+        green: 0
+        yellow: 5
+        red: 10
+    actions:
+      - when: "score >= red"
+        do: ["fail_closed","notify","open_incident","freeze_rollout"]
+      - when: "score >= yellow"
+        do: ["notify","step_up_mfa"]
+    stepUpMFA:
+      enabled: true
+      reason: "CV flagged elevated risk"
+      ttl: "1h"
+
+  # 5) Исключения и break-glass
+  exceptions:
+    approvalsRequired: 2
+    entries:
+      - id: "ex-legacy-ci"
+        scope:
+          resources: ["service:ci/*"]
+          actions: ["read"]
+          subjects: ["spiffe://org/ci/legacy-agent"]
+        expiresAt: "2025-12-31T23:59:59Z"
+        justification: "Миграция legacy CI"
+        owners: ["team-devops","sec-platform"]
+      - id: "ex-bypass-mfa-oncall"
+        scope:
+          subjects: ["group:oncall"]
+          actions: ["admin:restart"]
+        expiresIn: "2h"
+        justification: "Аварийное окно OnCall"
+        approvals:
+          - "director-security"
+          - "duty-manager"
+  breakGlass:
+    accounts:
+      - subject: "user:break-glass"
+        methods: ["webauthn"]
+        expiry: "7d"
+    guardrails:
+      requireTicket: true
+      requireTwoPerson: true
+      notify:
+        - "slack://sec-incident"
+        - "email://sec-ops@example.com"
+
+  # 6) Прогрессивный rollout и выборка
+  rollout:
+    strategy: canary
+    stages:
+      - id: canary-5
+        scopePercent: 5
+        successCriteria:
+          maxFailedChecksPercent: 1
+          duration: "30m"
+      - id: prod-25
+        scopePercent: 25
+        successCriteria:
+          maxFailedChecksPercent: 1
+          duration: "1h"
+      - id: prod-100
+        scopePercent: 100
+        successCriteria:
+          maxFailedChecksPercent: 0.5
+          duration: "2h"
+    sampling:
+      users:
+        includeTags: ["human","workforce"]
+        samplePercent: 10
+      services:
+        includeTags: ["critical","payments","auth"]
+        samplePercent: 20
+
+  # 7) Метрики, SLO и алерты
+  observability:
+    slo:
+      - id: audit-ingest-lag
+        objective: "p99_ingest_lag_ms <= 2000"
+        window: "30d"
+        alert:
+          whenBreached: ["pagerduty://sec-oncall","slack://security"]
+      - id: policy-decision-latency
+        objective: "p95_decision_ms <= 150"
+        window: "30d"
+    metrics:
+      prometheus:
+        enabled: true
+        labels:
+          service: cv
+        rules:
+          - record: "cv_checks_failed_total"
+            help: "Сумма проваленных проверок"
+          - record: "cv_risk_score"
+            help: "Сводный риск по окну оценки"
+    tracing:
+      otlp:
+        endpoint: "http://otel-collector:4317"
+        sampling: 0.2
+    dashboards:
+      grafana:
+        folder: "ZeroTrust/CV"
+        provision:
+          - id: "cv-overview"
+            path: "dashboards/cv_overview.json"
+
+  # 8) Отчетность и хранение результатов
+  reporting:
+    sink:
+      - type: opensearch
+        endpoints: ["https://opensearch.internal:9200"]
+        index: "cv-results"
+        auth:
+          basic:
+            username: "@secrets:opensearch/user"
+            password: "@secrets:opensearch/pass"
+      - type: s3
+        uri: "s3://security-cv/reports/"
+    format:
+      type: ndjson
+      schemaVersion: 1
+    include:
+      evidenceHashes: true
+      attachments:
+        - when: "check.severity in ['high','critical']"
+          source: "executor.logs"
+
+  # 9) Интеграции
+  integrations:
+    siem:
+      type: splunk
+      hecUrl: "@secrets:splunk/hec_url"
+      hecToken: "@secrets:splunk/hec_token"
+      index: "security-cv"
+    soar:
+      type: xsoar
+      url: "@secrets:xsoar/url"
+      token: "@secrets:xsoar/token"
+    ticketing:
+      type: jira
+      url: "https://jira.example.com"
+      project: SEC
+      token: "@secrets:jira/token"
+
+  # 10) Политика безопасности запуска проверок
+  safety:
+    networkIsolation:
+      egress:
+        policy: deny
+        exceptions:
+          - "idp.example.com:443"
+          - "opensearch.internal:9200"
+          - "opa.security-core.svc.cluster.local:8181"
+    dataMinimization:
+      storePayloads: false
+      storeHashesOnlyAbove: "1MB"
+    rateLimits:
+      perExecutorQPS: 5
+      perTargetQPS: 1
+    timeouts:
+      default: "15s"
+      hard: "30s"
+
+  # 11) Управление изменениями (GitOps)
+  governance:
+    approvals:
+      requiredFor:
+        - path: "checks.active[*]"
+        - path: "evaluation.actions"
+        - path: "exceptions.entries[*]"
+      minApprovers: 2
+    changeWindows:
+      freeze:
+        - from: "2025-12-24T00:00:00Z"
+          to:   "2026-01-02T00:00:00Z"
+
+  # 12) Переменные/ссылки, которые должен подставить рантайм
+  runtimeBindings:
+    variables:
+      - key: date
+        source: "now:YYYY-MM-DD"
+      - key: device_id
+        source: "context.device.id"
+    references:
+      - "@secrets:*"
+      - "s3://*"
+      - "k8s://*"

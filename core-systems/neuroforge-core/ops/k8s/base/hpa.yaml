@@ -1,0 +1,102 @@
+# file: neuroforge-core/ops/k8s/base/hpa.yaml
+# Промышленный HPA (Kubernetes autoscaling/v2).
+# Требования:
+# 1) В целевом Deployment должны быть заданы resources.requests для CPU и памяти.
+# 2) Для секций Pods/External необходим установленный metrics-adapter (например, Prometheus Adapter).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: neuroforge-api-hpa
+  namespace: neuroforge
+  labels:
+    app.kubernetes.io/name: neuroforge-api
+    app.kubernetes.io/part-of: neuroforge
+    app.kubernetes.io/component: api
+  annotations:
+    kubernetes.io/change-cause: "Tune HPA: cpu/memory/container+pods/external metrics with stabilization"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: neuroforge-api
+  # Безопасные дефолты: в проде минимум 2 реплики для отказоустойчивости.
+  minReplicas: 2
+  maxReplicas: 20
+
+  # Поведение масштабирования: агрессивный scaleUp, консервативный scaleDown.
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100         # не более чем удвоение за окно
+          periodSeconds: 60
+        - type: Pods
+          value: 4           # или +4 пода за окно
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300  # сглаживаем флюктуации 5 минут
+      selectPolicy: Min
+      policies:
+        - type: Percent
+          value: 10          # уменьшаем не более 10% за минуту
+          periodSeconds: 60
+        - type: Pods
+          value: 1           # или минус один под за минуту
+          periodSeconds: 60
+
+  # Мульти-метрики: HPA масштабируется по наихудшей (требующей большего числа реплик).
+  metrics:
+    # 1) CPU: средняя утилизация в процентах от requests по всем подам.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70   # держим ~30% headroom
+
+    # 2) Память: средняя утилизация в процентах от requests по всем подам.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+
+    # 3) Per-container CPU: если критична именно контейнер "app" (в поде есть сайдкары).
+    - type: ContainerResource
+      containerResource:
+        name: cpu
+        container: app           # имя контейнера в PodSpec
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+    # 4) Пользовательская Pods-метрика: среднее значение на под.
+    # Требует метрики вида: pod metric "http_requests_per_second".
+    # Адаптер (например, Prometheus Adapter) должен экспортировать её как pods metric.
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+          # selector опционален; используйте его, если адаптер маркирует серии лейблами.
+          # selector:
+          #   matchLabels:
+          #     app_kubernetes_io_name: neuroforge-api
+        target:
+          type: AverageValue
+          averageValue: "50"     # целевая RPS на под
+
+    # 5) Внешняя метрика (пример): длина очереди заданий.
+    # Требуется External Metrics API через адаптер.
+    - type: External
+      external:
+        metric:
+          name: queue_messages_visible
+          # selector:
+          #   matchLabels:
+          #     queue: neuroforge-jobs
+        target:
+          type: AverageValue
+          averageValue: "100"    # целевой потолок сообщений на реплику

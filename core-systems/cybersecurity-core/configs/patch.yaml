@@ -1,0 +1,199 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cybersecurity-core
+spec:
+  # Опционально: настраиваем стратегию обновления для безопасного релиза
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 25%
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cybersecurity-core
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: cybersecurity-core
+      annotations:
+        # Автоматический рестарт при изменении конфигураций (kustomize добавит checksum аннотации)
+        configchecksum/config: "true"
+        configchecksum/secret: "true"
+        # AppArmor (должно поддерживаться нодами/CRI)
+        container.apparmor.security.beta.kubernetes.io/app: "runtime/default"
+    spec:
+      # Жестко запрещаем автоподстановку сервис-аккаунт токена
+      automountServiceAccountToken: false
+      serviceAccountName: cybersecurity-core-sa
+
+      # Закрытый реестр
+      imagePullSecrets:
+        - name: registry-credentials
+
+      # Предсказуемое DNS-поведение
+      enableServiceLinks: false
+      dnsPolicy: ClusterFirst
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
+
+      # Грациозное завершение
+      terminationGracePeriodSeconds: 30
+
+      # Размещение и отказоустойчивость
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: cybersecurity-core
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values: ["cybersecurity-core"]
+              topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 70
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: ["linux"]
+            - weight: 30
+              preference:
+                matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: NotIn
+                    values: ["t2.nano","t2.micro","t3.nano","t3.micro"]
+
+      # Базовая устойчивость к эвиктам (дополнительно к дефолтным tolerations)
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 120
+        - key: "node.kubernetes.io/unreachable"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 120
+
+      # Общая безопасность Pod
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+        supplementalGroups: [100]
+
+      # Контейнер(ы)
+      containers:
+        - name: app
+          # Рекомендуется фиксировать образ по digest
+          image: registry.example.com/cybersecurity-core@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # Жесткий контейнерный SecurityContext
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          # Ресурсы (под HPA из base)
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+              ephemeral-storage: "2Gi"
+
+          # Пробы здоровья
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: http
+            failureThreshold: 60
+            periodSeconds: 2
+            timeoutSeconds: 1
+
+          # Корректное завершение
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","sleep 5"]
+
+          # Конфигурации только для чтения
+          envFrom:
+            - configMapRef:
+                name: cybersecurity-core
+            - secretRef:
+                name: cybersecurity-core-secrets
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: var-run
+              mountPath: /var/run
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+
+      # Тома: только tmpfs и конфиг/секрет
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: "256Mi"
+        - name: var-run
+          emptyDir:
+            medium: Memory
+            sizeLimit: "64Mi"
+        - name: config
+          projected:
+            sources:
+              - configMap:
+                  name: cybersecurity-core
+                  items:
+                    - key: application.yaml
+                      path: application.yaml
+              - secret:
+                  name: cybersecurity-core-secrets
+                  items:
+                    - key: credentials.yaml
+                      path: credentials.yaml

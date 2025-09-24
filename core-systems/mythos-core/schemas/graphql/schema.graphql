@@ -1,0 +1,672 @@
+# mythos-core/schemas/graphql/schema.graphql
+# Промышленная GraphQL-схема для Mythos Core
+
+"""RFC3339/ISO8601 дата-время в UTC."""
+scalar DateTime
+
+"""UUID v4/v5 строка."""
+scalar UUID
+
+"""Произвольный JSON-объект (сервер валидирует сериализацию)."""
+scalar JSON
+
+"""Файл для загрузки (GraphQL multipart request)."""
+scalar Upload
+
+# ---------------- Directives ----------------
+
+"""Контроль доступа на уровне схемы."""
+directive @auth(
+  requires: [Role!] = [USER]
+) on OBJECT | FIELD_DEFINITION
+
+"""Лимитирование запросов по окну времени."""
+directive @rateLimit(
+  limit: Int!,
+  """ISO8601 duration, например '60s', '1m'."""
+  window: String!,
+  """Аргументы, формирующие идентичность (например, userId, sessionId)."""
+  identityArgs: [String!] = []
+) on FIELD_DEFINITION
+
+"""Управление кэшированием для gateway/клиентов."""
+directive @cacheControl(
+  maxAge: Int,
+  scope: CacheControlScope = PUBLIC,
+  inheritMaxAge: Boolean = false
+) on OBJECT | FIELD_DEFINITION | INTERFACE | UNION
+
+enum CacheControlScope {
+  PUBLIC
+  PRIVATE
+}
+
+enum Role {
+  ANON
+  USER
+  ADMIN
+}
+
+# ---------------- Relay Core ----------------
+
+"""Глобальный интерфейс для всех сущностей."""
+interface Node {
+  """Глобальный ID объекта (обычно base64(typename:id))."""
+  id: ID!
+}
+
+"""Информация о страницах для Relay-пагинации."""
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+# ---------------- Common Value Objects ----------------
+
+"""Диапазон времени (UTC)."""
+input TimeRange {
+  from: DateTime
+  to: DateTime
+}
+
+"""Стандартная фильтрация по тексту/меткам."""
+input TagFilter {
+  include: [String!]
+  exclude: [String!]
+}
+
+# ---------------- Users / Sessions ----------------
+
+type User implements Node @cacheControl(scope: PRIVATE) {
+  id: ID!
+  userId: UUID!
+  username: String!
+  displayName: String
+  roles: [Role!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type Session implements Node @cacheControl(scope: PRIVATE) {
+  id: ID!
+  sessionId: UUID!
+  user: User
+  startedAt: DateTime!
+  lastSeenAt: DateTime
+  expiresAt: DateTime
+  ipHash: String
+}
+
+# ---------------- Narrative Domain ----------------
+
+enum Environment {
+  dev
+  staging
+  prod
+}
+
+enum NarrativeStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+type Narrative implements Node @auth(requires: [USER]) {
+  id: ID!
+  key: String!
+  version: Int!
+  title: String
+  locale: String # BCP-47
+  status: NarrativeStatus!
+  environment: Environment!
+  rootNode: GraphNode
+  tags: [String!]!
+  createdBy: User
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  attributes: JSON
+}
+
+enum NodeType {
+  dialogue
+  choice
+  action
+  ending
+  system
+}
+
+type GraphNode implements Node {
+  id: ID!
+  narrative: Narrative!
+  nodeId: String!
+  type: NodeType!
+  text: String
+  mediaUri: String
+  choices: [Choice!]!
+  position: Int
+  attributes: JSON
+}
+
+type Choice {
+  choiceId: String!
+  label: String!
+  disabled: Boolean!
+  disabledReason: String
+  weight: Float
+}
+
+enum OutcomeType {
+  TEXT
+  IMAGE
+  AUDIO
+  VIDEO
+  STATE_CHANGE
+  REWARD
+  PENALTY
+  END
+}
+
+type Outcome implements Node {
+  id: ID!
+  outcomeId: UUID!
+  narrative: Narrative!
+  node: GraphNode!
+  type: OutcomeType!
+  text: String
+  mediaUri: String
+  end: Boolean!
+  stateDelta: JSON
+  createdAt: DateTime!
+}
+
+# ---------------- Events (aligned with Avro payloads) ----------------
+
+enum EventType {
+  NARRATIVE_STARTED
+  NARRATIVE_UPDATED
+  NODE_ENTERED
+  NODE_EXITED
+  CHOICE_PRESENTED
+  CHOICE_MADE
+  OUTCOME_EMITTED
+  ERROR
+}
+
+interface Event implements Node {
+  id: ID!
+  eventId: UUID!
+  type: EventType!
+  eventTs: DateTime!
+  ingestTs: DateTime
+  environment: Environment!
+  producer: String!
+  traceId: String
+  sessionId: String
+  userId: String
+  narrativeId: ID!
+  tags: [String!]!
+  attributes: JSON
+}
+
+type NarrativeStartedEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  type: EventType!
+  eventTs: DateTime!
+  ingestTs: DateTime
+  environment: Environment!
+  producer: String!
+  traceId: String
+  sessionId: String
+  userId: String
+  narrativeId: ID!
+  tags: [String!]!
+  attributes: JSON
+
+  narrativeVersion: Int!
+  rootNodeId: String!
+  title: String
+  seed: Int
+  metadata: JSON
+}
+
+type NarrativeUpdatedEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  type: EventType!
+  eventTs: DateTime!
+  ingestTs: DateTime
+  environment: Environment!
+  producer: String!
+  traceId: String
+  sessionId: String
+  userId: String
+  narrativeId: ID!
+  tags: [String!]!
+  attributes: JSON
+
+  fromVersion: Int!
+  toVersion: Int!
+  changeNote: String
+  patchJson: String
+}
+
+type NodeEnteredEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  type: EventType!
+  eventTs: DateTime!
+  ingestTs: DateTime
+  environment: Environment!
+  producer: String!
+  traceId: String
+  sessionId: String
+  userId: String
+  narrativeId: ID!
+  tags: [String!]!
+  attributes: JSON
+
+  nodeId: String!
+  nodeType: NodeType!
+  stateDigest: String
+  position: Int
+}
+
+type NodeExitedEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  type: EventType!
+  eventTs: DateTime!
+  ingestTs: DateTime
+  environment: Environment!
+  producer: String!
+  traceId: String
+  sessionId: String
+  userId: String
+  narrativeId: ID!
+  tags: [String!]!
+  attributes: JSON
+
+  nodeId: String!
+  nodeType: NodeType!
+  durationMs: Int!
+  exitReason: String
+}
+
+type ChoicePresentedEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  type: EventType!
+  eventTs: DateTime!
+  ingestTs: DateTime
+  environment: Environment!
+  producer: String!
+  traceId: String
+  sessionId: String
+  userId: String
+  narrativeId: ID!
+  tags: [String!]!
+  attributes: JSON
+
+  choiceSetId: String!
+  nodeId: String!
+  choices: [Choice!]!
+}
+
+type ChoiceMadeEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  type: EventType!
+  eventTs: DateTime!
+  ingestTs: DateTime
+  environment: Environment!
+  producer: String!
+  traceId: String
+  sessionId: String
+  userId: String
+  narrativeId: ID!
+  tags: [String!]!
+  attributes: JSON
+
+  choiceSetId: String!
+  nodeId: String!
+  choiceId: String!
+}
+
+type OutcomeEmittedEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  type: EventType!
+  eventTs: DateTime!
+  ingestTs: DateTime
+  environment: Environment!
+  producer: String!
+  traceId: String
+  sessionId: String
+  userId: String
+  narrativeId: ID!
+  tags: [String!]!
+  attributes: JSON
+
+  outcome: Outcome!
+}
+
+type ErrorEvent implements Event & Node {
+  id: ID!
+  eventId: UUID!
+  type: EventType!
+  eventTs: DateTime!
+  ingestTs: DateTime
+  environment: Environment!
+  producer: String!
+  traceId: String
+  sessionId: String
+  userId: String
+  narrativeId: ID!
+  tags: [String!]!
+  attributes: JSON
+
+  code: String!
+  message: String!
+  fatal: Boolean!
+  retryable: Boolean!
+  stacktrace: String
+}
+
+union AnyEvent =
+    NarrativeStartedEvent
+  | NarrativeUpdatedEvent
+  | NodeEnteredEvent
+  | NodeExitedEvent
+  | ChoicePresentedEvent
+  | ChoiceMadeEvent
+  | OutcomeEmittedEvent
+  | ErrorEvent
+
+# ---------------- Connections ----------------
+
+type NarrativeEdge { cursor: String!, node: Narrative! }
+type NarrativeConnection {
+  edges: [NarrativeEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type GraphNodeEdge { cursor: String!, node: GraphNode! }
+type GraphNodeConnection {
+  edges: [GraphNodeEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type OutcomeEdge { cursor: String!, node: Outcome! }
+type OutcomeConnection {
+  edges: [OutcomeEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type EventEdge { cursor: String!, node: AnyEvent! }
+type EventConnection {
+  edges: [EventEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+# ---------------- Filters ----------------
+
+input NarrativeFilter {
+  status: [NarrativeStatus!]
+  locale: [String!]
+  tags: TagFilter
+  query: String
+}
+
+input NodeFilter {
+  narrativeId: ID!
+  type: [NodeType!]
+  query: String
+}
+
+input EventFilter {
+  narrativeId: ID
+  types: [EventType!]
+  range: TimeRange
+  sessionId: String
+  userId: String
+  tags: TagFilter
+}
+
+# ---------------- Query ----------------
+
+type Query {
+  """Проверка состояния сервиса."""
+  health: Health!
+
+  """Текущий пользователь (или null для ANON)."""
+  me: User @auth(requires: [USER])
+
+  """Глобальный поиск объекта по Node.id."""
+  node(id: ID!): Node
+
+  narratives(
+    filter: NarrativeFilter,
+    first: Int = 20,
+    after: String
+  ): NarrativeConnection! @auth(requires: [USER]) @cacheControl(maxAge: 30)
+
+  narrativeById(id: ID!): Narrative @auth(requires: [USER])
+
+  nodes(
+    filter: NodeFilter!,
+    first: Int = 50,
+    after: String
+  ): GraphNodeConnection! @auth(requires: [USER])
+
+  events(
+    filter: EventFilter!,
+    first: Int = 100,
+    after: String
+  ): EventConnection! @auth(requires: [USER]) @rateLimit(limit: 600, window: "60s", identityArgs: ["filter.sessionId"])
+}
+
+type Health {
+  ok: Boolean!
+  service: String!
+  version: String!
+  time: DateTime!
+}
+
+# ---------------- Mutations (safe result unions) ----------------
+
+# Общие ошибки как типы
+interface MutationError {
+  code: String!
+  message: String!
+}
+
+type ValidationError implements MutationError {
+  code: String!
+  message: String!
+  field: String
+  details: JSON
+}
+
+type AuthError implements MutationError {
+  code: String!
+  message: String!
+}
+
+type NotFoundError implements MutationError {
+  code: String!
+  message: String!
+  resource: String
+}
+
+type ConflictError implements MutationError {
+  code: String!
+  message: String!
+}
+
+type RateLimitError implements MutationError {
+  code: String!
+  message: String!
+  retryAfterSeconds: Int!
+}
+
+type InternalError implements MutationError {
+  code: String!
+  message: String!
+}
+
+# Narrative mutations
+input NarrativeCreateInput {
+  key: String!
+  title: String
+  locale: String
+  tags: [String!]
+  attributes: JSON
+}
+
+type NarrativeCreateSuccess {
+  narrative: Narrative!
+}
+
+union NarrativeCreateResult =
+    NarrativeCreateSuccess
+  | ValidationError
+  | AuthError
+  | ConflictError
+  | InternalError
+
+input NarrativePublishInput {
+  narrativeId: ID!
+  version: Int!
+}
+
+type NarrativePublishSuccess {
+  narrative: Narrative!
+}
+
+union NarrativePublishResult =
+    NarrativePublishSuccess
+  | NotFoundError
+  | ConflictError
+  | AuthError
+  | InternalError
+
+# Node upsert
+input NodeUpsertInput {
+  narrativeId: ID!
+  nodeId: String!
+  type: NodeType!
+  text: String
+  mediaUri: String
+  position: Int
+  choices: [ChoiceInput!]
+  attributes: JSON
+}
+
+input ChoiceInput {
+  choiceId: String!
+  label: String!
+  disabled: Boolean = false
+  disabledReason: String
+  weight: Float
+}
+
+type NodeUpsertSuccess {
+  node: GraphNode!
+}
+
+union NodeUpsertResult =
+    NodeUpsertSuccess
+  | NotFoundError
+  | ValidationError
+  | AuthError
+  | ConflictError
+  | InternalError
+
+# Choice make
+input ChoiceMakeInput {
+  narrativeId: ID!
+  nodeId: String!
+  choiceSetId: String!
+  choiceId: String!
+  sessionId: String
+}
+
+type ChoiceMadeSuccess {
+  event: ChoiceMadeEvent!
+}
+
+union ChoiceMakeResult =
+    ChoiceMadeSuccess
+  | NotFoundError
+  | ValidationError
+  | AuthError
+  | ConflictError
+  | RateLimitError
+  | InternalError
+
+# Session control
+input SessionStartInput {
+  userId: UUID
+  metadata: JSON
+}
+
+type SessionStartSuccess {
+  session: Session!
+}
+
+union SessionStartResult =
+    SessionStartSuccess
+  | AuthError
+  | RateLimitError
+  | InternalError
+
+input SessionEndInput {
+  sessionId: String!
+}
+
+type SessionEndSuccess {
+  ok: Boolean!
+}
+
+union SessionEndResult =
+    SessionEndSuccess
+  | NotFoundError
+  | AuthError
+  | InternalError
+
+type Mutation {
+  narrativeCreate(input: NarrativeCreateInput!): NarrativeCreateResult! @auth(requires: [ADMIN])
+  narrativePublish(input: NarrativePublishInput!): NarrativePublishResult! @auth(requires: [ADMIN])
+
+  nodeUpsert(input: NodeUpsertInput!): NodeUpsertResult! @auth(requires: [ADMIN])
+
+  choiceMake(input: ChoiceMakeInput!): ChoiceMakeResult! @auth(requires: [USER]) @rateLimit(limit: 120, window: "60s", identityArgs: ["input.sessionId"])
+
+  sessionStart(input: SessionStartInput): SessionStartResult!
+  sessionEnd(input: SessionEndInput!): SessionEndResult! @auth(requires: [USER])
+}
+
+# ---------------- Subscriptions ----------------
+
+type Subscription {
+  """Онлайн-стрим событий AnyEvent для конкретного нарратива/сессии."""
+  eventStream(
+    narrativeId: ID!,
+    sessionId: String
+  ): AnyEvent! @auth(requires: [USER])
+}
+
+# ---------------- Schema Entry ----------------
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}

@@ -1,0 +1,427 @@
+# DataFabric Core — PII masking policies
+# Цель: единая индустриальная политика обнаружения и маскирования PII/PHI/секретов
+# Переопределение через переменные окружения поддерживается синтаксисом ${VAR:-default}
+
+apiVersion: v1
+kind: DataProtectionPolicy
+metadata:
+  name: pii-masking
+  version: "1.0.0"
+  description: "Политика обнаружения и маскирования PII/PHI/секретов для журналов, событий, API и хранилища данных"
+  owner: "security-privacy-office"
+  labels:
+    system: datafabric-core
+    component: pii
+    compliance: "gdpr,ccpa,hipaa"
+    environment: ${APP_ENV:-production}
+
+engine:
+  # Управляет поведением движка детекции/маскирования
+  fail_on_internal_error: false
+  default_action: "mask"   # mask|hash|tokenize|drop|allow
+  strict_mode: ${PII_STRICT_MODE:-true}
+  # Производительность
+  max_record_size_bytes: ${PII_MAX_RECORD_BYTES:-1048576}
+  max_matches_per_record: ${PII_MAX_MATCHES:-200}
+  concurrency: ${PII_CONCURRENCY:-4}
+  timeout_ms_per_record: ${PII_TIMEOUT_MS:-50}
+  # Языковые настройки
+  locales: ${PII_LOCALES:-en,ru,de,sv}
+  # Контекст поиска: окно слов вокруг кандидата
+  context_window:
+    left_chars: 32
+    right_chars: 32
+
+transforms:
+  # Определения трансформаций (переиспользуемые по правилам)
+  mask_fixed:
+    type: "mask"
+    params:
+      visible_prefix: 0
+      visible_suffix: 0
+      mask_char: "*"
+  mask_email:
+    type: "mask-email"
+    params:
+      keep_domain: true
+      visible_local_prefix: 1
+      mask_char: "*"
+  mask_phone:
+    type: "mask-phone"
+    params:
+      keep_plus: true
+      visible_suffix: 2
+      mask_char: "*"
+  mask_name:
+    type: "mask"
+    params:
+      visible_prefix: 1
+      visible_suffix: 0
+      mask_char: "*"
+  fpe_card:
+    type: "fpe"   # формат‑сохраняющее шифрование (при наличии HSM/KMS)
+    params:
+      algorithm: "ff1"
+      radix: 10
+      tweak_env: "FPE_TWEAK_HEX"
+      kms_key_env: "FPE_KMS_KEY_ARN"
+      preserve_luhn: true
+  hash_det:
+    type: "hash"
+    params:
+      algorithm: "sha256"
+      secret_salt_env: "PII_SALT"
+      deterministic: true
+      output_encoding: "hex"
+  tokenize:
+    type: "tokenize"
+    params:
+      scheme: "uuid-v4"   # либо "random-32"
+      vault_endpoint: ${PII_VAULT_ENDPOINT:-}
+      vault_token_env: "PII_VAULT_TOKEN"
+  redact:
+    type: "redact"
+    params:
+      replacement: "[REDACTED]"
+  drop:
+    type: "drop"  # удалить поле/значение целиком
+
+detectors:
+  # Комбинированные детекторы: regex, словари, контрольные суммы, опционально NER
+  use_ner: ${PII_USE_NER:-false}
+  ner:
+    provider: ${PII_NER_PROVIDER:-spacy} # spacy|stanza|transformers
+    min_confidence: ${PII_NER_MIN_CONF:-0.85}
+    entities:
+      - PERSON
+      - GPE
+      - ORG
+  regex:
+    # Номера карт (Luhn) — формат‑ориентированная детекция
+    credit_card:
+      pattern: "(?i)(?:^|\\b)(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|(2131|1800)[0-9]{11}|35\\d{14})(?:\\b)"
+      validators:
+        - type: "luhn"
+    iban:
+      pattern: "(?i)\\b[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}\\b"
+      validators:
+        - type: "iban"
+    swift_bic:
+      pattern: "(?i)\\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?\\b"
+    email:
+      pattern: "\\b[a-zA-Z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,24}\\b"
+    phone_e164:
+      pattern: "\\+\\d{7,15}"
+    ipv4:
+      pattern: "\\b(?:(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\.){3}(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\b"
+    ipv6:
+      pattern: "\\b(?:[A-F0-9]{1,4}:){7}[A-F0-9]{1,4}\\b"
+    passport_ru:
+      pattern: "\\b\\d{4}\\s?\\d{6}\\b"
+    snils_ru:
+      pattern: "\\b\\d{3}-\\d{3}-\\d{3}\\s?\\d{2}\\b"
+    nat_id_generic:
+      pattern: "(?i)\\b(?:national\\s?id|ssn|personnummer|id-?number)[:\\s]*([A-Z0-9\\-]{6,20})\\b"
+    birth_date:
+      pattern: "\\b\\d{4}-\\d{2}-\\d{2}\\b|\\b\\d{2}[./-]\\d{2}[./-]\\d{4}\\b"
+    address_hint:
+      pattern: "(?i)\\b(street|str\\.|avenue|ave\\.|road|rd\\.|ул\\.|просп\\.|дом|кв\\.)\\b.*"
+    secret_keys:
+      aws_access_key: "\\bAKIA[0-9A-Z]{16}\\b"
+      aws_secret_key: "(?i)\\baws(.{0,20})?(secret|sk|access).{0,4}key\\b"
+      bearer_token: "(?i)\\bBearer\\s+[A-Za-z0-9._\\-]+\\b"
+      jwt: "(?i)\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9._-]+\\.[A-Za-z0-9._-]+\\b"
+  dictionaries:
+    # Словари для имён/фамилий и «чувствительных» слов
+    first_names:
+      path: ${PII_DICT_FIRST_NAMES_PATH:-}
+      min_len: 3
+    last_names:
+      path: ${PII_DICT_LAST_NAMES_PATH:-}
+      min_len: 3
+
+scopes:
+  # Где применять: structured (json), unstructured (text), logs
+  structured: true
+  unstructured: true
+  logs: true
+  # Список полей, для которых действует белый список (не маскируем, если явно разрешено)
+  allowlist_fields:
+    - "telemetry.session_id"
+    - "request.id"
+  # Поля, которые всегда маскируем как секреты
+  force_secret_fields:
+    - "authorization"
+    - "headers.authorization"
+    - "cookies"
+    - "password"
+    - "secret"
+    - "token"
+    - "api_key"
+
+priorities:
+  # Приоритеты правил: выше — важнее
+  order:
+    - "secrets"
+    - "strict-pii"
+    - "personal-contact"
+    - "ids-and-cards"
+    - "addresses-and-dates"
+    - "low-risk"
+    - "allowlist"
+
+policies:
+  # Группа: секреты и токены
+  - id: "secrets"
+    description: "Моментальное сокрытие ключей и токенов"
+    match:
+      any:
+        - regex: "secret_keys.aws_access_key"
+        - regex: "secret_keys.aws_secret_key"
+        - regex: "secret_keys.bearer_token"
+        - regex: "secret_keys.jwt"
+        - field: "headers.authorization"
+        - field: "authorization"
+    action:
+      transform: "redact"
+    audit:
+      severity: "critical"
+      reason: "Secret detected"
+      tag: "secret"
+
+  # Группа: строгая PII (наиболее чувствительные категории)
+  - id: "strict-pii"
+    description: "Финансовые идентификаторы и документы"
+    match:
+      any:
+        - regex: "credit_card"
+        - regex: "iban"
+        - regex: "swift_bic"
+        - regex: "passport_ru"
+        - regex: "snils_ru"
+        - regex: "nat_id_generic"
+    action:
+      transform: ${PII_STRICT_ACTION:-"fpe_card"}
+    audit:
+      severity: "high"
+      reason: "Sensitive PII"
+      tag: "pii_strict"
+
+  # Группа: персональные контакты
+  - id: "personal-contact"
+    description: "Email/телефоны/адреса/айпи"
+    match:
+      any:
+        - regex: "email"
+        - regex: "phone_e164"
+        - regex: "ipv4"
+        - regex: "ipv6"
+    action:
+      rules:
+        - when:
+            regex: "email"
+          transform: "mask_email"
+        - when:
+            regex: "phone_e164"
+          transform: "mask_phone"
+        - when:
+            regex: "ipv4"
+          transform: "hash_det"
+        - when:
+            regex: "ipv6"
+          transform: "hash_det"
+      default_transform: "hash_det"
+    audit:
+      severity: "medium"
+      reason: "Contact info"
+      tag: "pii_contact"
+
+  # Группа: идентификаторы и карты (нестрогие)
+  - id: "ids-and-cards"
+    description: "Идентификаторы с проверкой формата"
+    match:
+      any:
+        - regex: "credit_card"
+        - regex: "iban"
+        - regex: "swift_bic"
+    action:
+      transform: "fpe_card"
+    audit:
+      severity: "high"
+      reason: "Financial ids"
+      tag: "pii_finance"
+
+  # Группа: адреса и даты
+  - id: "addresses-and-dates"
+    description: "Адресные подсказки и даты рождения"
+    match:
+      any:
+        - regex: "address_hint"
+        - regex: "birth_date"
+    action:
+      rules:
+        - when:
+            regex: "birth_date"
+          transform: "hash_det"
+        - when:
+            regex: "address_hint"
+          transform: "redact"
+      default_transform: "redact"
+    audit:
+      severity: "low"
+      reason: "Address/DoB"
+      tag: "pii_context"
+
+  # Группа: низкий риск (имена, если NER включен)
+  - id: "low-risk"
+    description: "Имена собственные (NER)"
+    enabled: ${PII_LOW_RISK_ENABLED:-true}
+    match:
+      any:
+        - ner: "PERSON"
+    action:
+      transform: "mask_name"
+    audit:
+      severity: "low"
+      reason: "Person name"
+      tag: "pii_name"
+
+  # Группа: allowlist — последний рубеж
+  - id: "allowlist"
+    description: "Белый список дозволенных полей"
+    match:
+      any:
+        - field_in: "scopes.allowlist_fields"
+    action:
+      transform: "allow"
+    audit:
+      severity: "none"
+      reason: "Explicitly allowed"
+      tag: "allow"
+
+field_overrides:
+  # Политики на уровне конкретных полей (structured)
+  - field: "user.email"
+    action:
+      transform: "mask_email"
+  - field: "user.phone"
+    action:
+      transform: "mask_phone"
+  - field: "ip"
+    action:
+      transform: "hash_det"
+  - field: "payment.card_number"
+    action:
+      transform: "fpe_card"
+  - field: "payment.card_cvv"
+    action:
+      transform: "redact"
+  - field: "auth.jwt"
+    action:
+      transform: "redact"
+
+contextual_rules:
+  # Усиление правил при явно заданных контекст‑словах
+  - id: "context-ssn"
+    when:
+      text_contains:
+        - "ssn"
+        - "personnummer"
+        - "national id"
+    then:
+      elevate:
+        to_policy: "strict-pii"
+
+exemptions:
+  # Исключения для техподдержки/отладки (временные, с TTL)
+  enabled: ${PII_EXEMPTIONS_ENABLED:-false}
+  entries:
+    - id: "support-ticket-12345"
+      fields:
+        - "request.debug_payload"
+      ttl_iso8601: "2025-12-31T23:59:59Z"
+      reason: "Поддержка инцидента"
+      action: "allow"
+
+observability:
+  audit_events: ${PII_AUDIT_ENABLED:-true}
+  audit_sink: ${PII_AUDIT_SINK:-kafka}  # kafka|log|http|none
+  audit_topic: ${PII_AUDIT_TOPIC:-df.audit.pii}
+  metrics:
+    namespace: "datafabric_pii"
+    counters:
+      - "matches_total"
+      - "masked_total"
+      - "dropped_total"
+      - "errors_total"
+    histograms:
+      - "latency_ms"
+  logging:
+    redact_log_message: true
+    redact_fields:
+      - "headers.authorization"
+      - "cookies"
+      - "password"
+      - "secret"
+      - "token"
+      - "api_key"
+
+testing:
+  # Набор примеров для unit/integration тестов детектора
+  samples:
+    positive:
+      - "Email: ivan.petrov@example.com"
+      - "Phone: +46701234567"
+      - "Card: 4111 1111 1111 1111"
+      - "IBAN: DE89 3704 0044 0532 0130 00"
+      - "JWT: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjMifQ.sgn"
+      - "AWS Access Key: AKIA1234567890ABCD"
+      - "SNILS: 123-456-789 00"
+      - "Passport RU: 1234 567890"
+    negative:
+      - "Order id: 2025-INV-000123"
+      - "Support ticket: TCK-001-ABC"
+      - "IPv4 like string: 999.999.999.999"
+
+compliance:
+  # Сопоставление категорий с нормативами
+  categories:
+    identifiers:
+      includes: ["email", "phone", "ipv4", "ipv6", "nat_id_generic"]
+      gdpr: "personal_data"
+      ccpa: "personal_information"
+    financial:
+      includes: ["credit_card", "iban", "swift_bic"]
+      gdpr: "special_category_financial"
+      ccpa: "sensitive_personal_information"
+    health:
+      includes: []
+      hipaa: "phi"
+  data_subject_access:
+    export_masked_by_default: true
+    reidentification_requires:
+      - "DPO_APPROVAL"
+      - "SECURITY_TICKET"
+
+defaults_by_environment:
+  production:
+    engine:
+      strict_mode: true
+      max_matches_per_record: 200
+    transforms:
+      mask_email:
+        params:
+          visible_local_prefix: 1
+  staging:
+    engine:
+      strict_mode: true
+    transforms:
+      hash_det:
+        params:
+          algorithm: "sha256"
+  development:
+    engine:
+      strict_mode: false
+      max_matches_per_record: 500
+    observability:
+      audit_events: false

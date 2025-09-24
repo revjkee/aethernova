@@ -1,0 +1,365 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write           # создание релиза, загрузка ассетов
+  packages: write           # пуш в GHCR
+  id-token: write           # keyless подпись Sigstore/OIDC
+  attestations: write       # GitHub Attestations
+  security-events: write    # на будущее: отчёты SAST/CodeQL, если нужно
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  POETRY_VERSION: "1.8.3"
+  PIP_CACHE_DIR: ~/.cache/pip
+
+defaults:
+  run:
+    shell: bash -euo pipefail
+
+jobs:
+  test:
+    name: Test & Lint (Python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install Poetry
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==${POETRY_VERSION}"
+          poetry --version
+          poetry config virtualenvs.in-project true
+
+      - name: Cache Poetry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pypoetry
+            ./.venv
+          key: poetry-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            poetry-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Install deps (app + dev)
+        run: |
+          poetry install --no-interaction --with dev
+
+      - name: Ruff (lint)
+        run: |
+          ./.venv/bin/ruff version || poetry run ruff --version
+          poetry run ruff format --check .
+          poetry run ruff check --output-format=github .
+
+      - name: MyPy (type-check)
+        run: |
+          poetry run mypy --strict
+
+      - name: PyTest (coverage + junit)
+        run: |
+          mkdir -p reports
+          poetry run pytest -q --maxfail=1 --disable-warnings \
+            --junitxml=reports/junit.xml \
+            --cov=cybersecurity_core --cov-report=xml:reports/coverage.xml
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-py${{ matrix.python-version }}
+          path: reports/
+
+  build_pkg:
+    name: Build Python package (Poetry)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Poetry
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==${POETRY_VERSION}"
+          poetry config virtualenvs.in-project true
+
+      - name: Install deps (no dev)
+        run: |
+          poetry install --no-interaction --only main
+
+      - name: Build sdist/wheel
+        run: |
+          poetry build
+          ls -l dist/
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          ls -l
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  build_image:
+    name: Build & Push Docker Image (GHCR, multi-arch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [test]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=cybersecurity-core
+            org.opencontainers.image.description=Cybersecurity Core release image
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Login ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+
+      - name: Export image digest
+        run: echo "IMAGE_DIGEST=${{ steps.build.outputs.digest }}" >> $GITHUB_ENV
+
+      - name: Generate SBOM (image)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ env.IMAGE_DIGEST }}
+          artifact-name: sbom-image.spdx.json
+          format: spdx-json
+
+      - name: Upload image SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-image
+          path: sbom-image.spdx.json
+
+      - name: Attest build provenance (image)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+
+  sbom_source:
+    name: SBOM (source)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build_pkg]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate SBOM (source dir)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          artifact-name: sbom-source.spdx.json
+          format: spdx-json
+
+      - name: Upload source SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-source
+          path: sbom-source.spdx.json
+
+  sign_artifacts:
+    name: Sign artifacts (Cosign keyless)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [build_pkg, build_image, sbom_source]
+    permissions:
+      contents: write
+      id-token: write
+      packages: write
+    env:
+      COSIGN_EXPERIMENTAL: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-source
+          path: attest
+      - name: Download image SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-image
+          path: attest
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Determine image ref
+        run: |
+          echo "IMAGE_REF=${REGISTRY}/${IMAGE_NAME}:$(echo '${{ github.ref_name }}' | sed 's/^v//')" >> $GITHUB_ENV
+
+      - name: Sign container image (keyless OIDC)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cosign sign --yes "${IMAGE_REF}"
+
+      - name: Sign Python artifacts (blobs)
+        run: |
+          for f in dist/*; do
+            cosign sign-blob --yes "$f" --output-signature "$f.sig" --output-certificate "$f.pem"
+          done
+          for f in attest/*; do
+            cosign sign-blob --yes "$f" --output-signature "$f.sig" --output-certificate "$f.pem"
+          done
+
+      - name: Upload signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: signatures
+          path: |
+            dist/*.sig
+            dist/*.pem
+            attest/*.sig
+            attest/*.pem
+
+  release_github:
+    name: GitHub Release (attach assets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build_pkg, sbom_source, build_image, sign_artifacts]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-source
+          path: release
+      - name: Download image SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-image
+          path: release
+      - name: Download signatures
+        uses: actions/download-artifact@v4
+        with:
+          name: signatures
+          path: release
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: cybersecurity-core ${{ github.ref_name }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            dist/*
+            release/*
+
+  publish_pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build_pkg]
+    if: startsWith(github.ref, 'refs/tags/') && secrets.PYPI_TOKEN != ''
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Publish (PyPI)
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          packages-dir: dist
+          skip-existing: true

@@ -1,0 +1,324 @@
+# =============================================================================
+# zero-trust-core — Helm values (industrial baseline)
+# Path: zero-trust-core/ops/helm/zero-trust-core/values.yaml
+# =============================================================================
+
+global:
+  namespace: "zero-trust-core"
+  imagePullSecrets: []        # пример: ["regcred"]
+  priorityClassName: "system-cluster-critical"
+
+  labels:
+    app.kubernetes.io/part-of: zero-trust-core
+    zero-trust.aethernova.io/profile: baseline
+  annotations: {}
+
+  resourcesPreset: "medium"
+  resourcesPresets:
+    tiny:   { requests: { cpu: "25m",  memory: "32Mi"  }, limits: { cpu: "100m", memory: "128Mi" } }
+    small:  { requests: { cpu: "50m",  memory: "64Mi"  }, limits: { cpu: "200m", memory: "256Mi" } }
+    medium: { requests: { cpu: "100m", memory: "128Mi" }, limits: { cpu: "400m", memory: "512Mi" } }
+    large:  { requests: { cpu: "200m", memory: "256Mi" }, limits: { cpu: "1",    memory: "1Gi"   } }
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  podSecurityContext:
+    fsGroup: 65532
+    runAsUser: 65532
+    runAsGroup: 65532
+    runAsNonRoot: true
+    seccompProfile: { type: RuntimeDefault }
+
+  containerSecurityContextDefault:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: { drop: ["ALL"] }
+
+  trust:
+    domain: "aethernova.local"     # логический trust‑домен (используется в аннотациях/метках)
+    spiffe:
+      enabled: false               # при true будет конфигурироваться спиффе‑домена (если поддержано)
+      trustDomain: "aethernova.local"
+
+profile:
+  level: "restricted"              # baseline | restricted
+  mesh: "istio"                    # istio | linkerd | cilium | none
+  gateway: "nginx"                 # nginx | istio | traefik | none
+  egressMode: "deny"               # deny | allowlist | egress-gateway
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+rbac:
+  create: true
+  extraClusterRoles: []
+  extraClusterRoleBindings: []
+
+# -----------------------------------------------------------------------------
+# Pod Security Standards — метки на namespace
+# -----------------------------------------------------------------------------
+podSecurity:
+  addNamespaceLabels: true
+  enforce: true
+  labels:
+    pod-security.kubernetes.io/enforce: "restricted"
+    pod-security.kubernetes.io/enforce-version: "latest"
+    pod-security.kubernetes.io/audit: "restricted"
+    pod-security.kubernetes.io/warn: "restricted"
+
+# -----------------------------------------------------------------------------
+# NetworkPolicy — Zero Trust сеть (deny-all + DNS; egress контролируется)
+# -----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  defaultDeny: true
+  allowDnsEgress:
+    enabled: true
+    namespace: "kube-system"
+    podLabelsAnyOf:
+      - k8s-app: "kube-dns"
+      - k8s-app: "coredns"
+    ports:
+      - { protocol: UDP, port: 53 }
+      - { protocol: TCP, port: 53 }
+
+  # Управляемый egress
+  egress:
+    mode: "deny"   # deny | allowlist | egress-gateway
+    allowCIDRs: [] # при allowlist: список сетей, например ["10.0.0.0/8","192.168.0.0/16"]
+    # Разрешённые внешние FQDN (если CNI поддерживает FQDN‑policy)
+    allowFQDNs: [] # пример: ["api.github.com","ghcr.io"]
+    # При egress-gateway (Istio): трафик идёт только через egress‑шлюз
+    istio:
+      egressGateway:
+        namespace: "istio-system"
+        name: "istio-egressgateway"
+      # ServiceEntry allowlist (хосты/порты/режим TLS)
+      serviceEntries: []
+      # Пример:
+      # serviceEntries:
+      #   - host: "api.github.com"
+      #     ports: [443]
+      #     tlsMode: "SIMPLE"  # SIMPLE | ISTIO_MUTUAL | DISABLE
+
+  additionalPolicies: []  # список произвольных NetworkPolicy yamls (tpl)
+
+# -----------------------------------------------------------------------------
+# Kyverno — минимальный набор Zero Trust политик
+# -----------------------------------------------------------------------------
+kyverno:
+  enabled: true
+  namespace: "kyverno"
+  helmReleaseName: "kyverno"
+  replicaCount: 2
+  resourcesPreset: "small"
+
+  policies:
+    disallowPrivileged:              { enabled: true }
+    disallowHostPID:                 { enabled: true }
+    disallowHostIPC:                 { enabled: true }
+    disallowHostNetwork:             { enabled: true }
+    disallowHostPath:                { enabled: true }
+    restrictVolumeTypes:             { enabled: true, denyTypes: ["hostPath","nfs","cifs","glusterfs"] }
+    blockPrivilegeEscalation:        { enabled: true }
+    dropAllCapabilities:             { enabled: true, allowList: ["NET_BIND_SERVICE"] }
+    requireRunAsNonRoot:             { enabled: true }
+    requireReadOnlyRootFilesystem:   { enabled: true }
+    requireSeccomp:                  { enabled: true, defaultProfile: "RuntimeDefault" }
+    requireProbes:                   { enabled: true }
+    automountSATokenFalse:           { enabled: true }    # запрет автоматического SAToken
+    disallowLatestTag:               { enabled: true }
+    # MFA/RBAC и Ingress‑политики можно включить при необходимости
+    mfaRbacEnforce:                  { enabled: false }
+    ingressMfaRequired:              { enabled: false }
+
+# -----------------------------------------------------------------------------
+# Service Mesh — mTLS и авторизация по умолчанию
+# -----------------------------------------------------------------------------
+mesh:
+  istio:
+    enabled: true
+    namespace: "istio-system"
+    # mTLS STRICT на namespace chart'а
+    mtls:
+      peerAuthentication:
+        enabled: true
+        mode: "STRICT"
+    # AuthorizationPolicy: default DENY, далее allow‑правила
+    authz:
+      defaultAction: "DENY"   # DENY | ALLOW (Zero Trust => DENY)
+      allowRules: []
+      # Пример allowRules:
+      # - name: "allow-ingress-to-apps"
+      #   selector:
+      #     matchLabels:
+      #       app.kubernetes.io/part-of: "my-apps"
+      #   from:
+      #     sources:
+      #       - principals: ["cluster.local/ns/istio-system/sa/istio-ingressgateway"]
+      #   to:
+      #     operations:
+      #       - ports: ["80","443"]
+      #       - methods: ["GET","POST"]
+    # DestinationRule для ISTIO_MUTUAL (при необходимости)
+    destinationRule:
+      enabled: false
+      trafficPolicy:
+        tls:
+          mode: "ISTIO_MUTUAL"
+
+  linkerd:
+    enabled: false
+    # мэппинг значений для LinkerdPolicy/Server/ServerAuthorization
+    defaultDeny: true
+    allowPolicies: []
+
+  cilium:
+    enabled: false
+    ciliumNetworkPolicy:
+      defaultDeny: true
+      rules: []
+
+# -----------------------------------------------------------------------------
+# Ingress security — OIDC/MFA, HSTS, rate‑limit
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: false
+  controller: "nginx"        # nginx | istio | traefik
+  className: "nginx"
+  tls:
+    enabled: true
+    secretName: ""           # если пусто и включено — ожидание cert-manager
+    hsts:
+      enabled: true
+      maxAge: 31536000
+      includeSubDomains: true
+      preload: true
+  auth:
+    oidc:
+      enabled: false
+      # интеграция через oauth2-proxy/ingress‑аннотации
+      issuerURL: ""
+      clientID: ""
+      clientSecretRef: ""      # имя Secret с client_secret
+      scopes: ["openid","email","profile","mfa"]
+      emailDomains: ["*"]
+      # MFA признак (зависит от IdP); политика только проверяет наличие
+      mfaClaim: "amr"
+      mfaAnyOf: ["mfa","otp","hwk"]
+  rateLimit:
+    enabled: true
+    requestsPerMinute: 600
+    burst: 200
+  allowCIDRs: []               # если непусто — только перечисленные сети
+  extraAnnotations: {}
+  hosts: []
+  paths:
+    - path: /
+      pathType: Prefix
+      service:
+        name: ""
+        port: 80
+
+# -----------------------------------------------------------------------------
+# Egress policy (mesh‑aware)
+# -----------------------------------------------------------------------------
+egress:
+  mode: "deny"                # deny | allowlist | egress-gateway
+  allow:
+    cidrs: []
+    fqdn: []
+    ports: []
+  istio:
+    useEgressGateway: false
+    gatewayName: "istio-egressgateway"
+    namespace: "istio-system"
+    serviceEntries: []
+    # Пример:
+    # serviceEntries:
+    #   - host: "ghcr.io"
+    #     ports: [443]
+    #     tlsMode: "SIMPLE"
+
+# -----------------------------------------------------------------------------
+# PDB профили (в связке с меткой pdb.aethernova.io/profile)
+# -----------------------------------------------------------------------------
+pdb:
+  enabled: true
+  stateless:
+    enabled: true
+    maxUnavailable: "25%"
+  stateful:
+    enabled: true
+    minAvailable: "66%"
+  singleton:
+    enabled: true
+    minAvailable: 1
+  ingress:
+    enabled: true
+    minAvailable: 2
+
+# -----------------------------------------------------------------------------
+# Secrets / External Secrets / CSI
+# -----------------------------------------------------------------------------
+secrets:
+  strategy: "external"         # external | sealed | sops | dev
+  external:
+    enabled: true
+    secretStoreRef:
+      kind: "ClusterSecretStore"
+      name: "zero-trust-store"
+    refreshInterval: "1h"
+    keys: []
+    # Пример:
+    # keys:
+    #   - k8sKey: OIDC_CLIENT_SECRET
+    #     remoteRef: { key: "prod/zero-trust/oidc", property: "client_secret" }
+  sealed:
+    enabled: false
+  sops:
+    enabled: false
+
+csiSecretsStore:
+  enabled: false
+  provider: "vault"           # vault | aws | gcp | azure
+  secretObjects: []
+  parameters: {}
+
+# -----------------------------------------------------------------------------
+# Images (закрепляйте digest в проде)
+# -----------------------------------------------------------------------------
+images:
+  pullPolicy: "IfNotPresent"
+  oauth2Proxy: "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0"
+  busybox: "busybox:1.36.1"
+
+# -----------------------------------------------------------------------------
+# Telemetry / Alerts
+# -----------------------------------------------------------------------------
+alerts:
+  enabled: false
+  routes: []
+  # - name: "ingress-4xx-surge"
+  #   webhook: "https://hooks.example"
+  #   match: { type: "nginx", code: "4xx" }
+
+telemetry:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# Tests (smoke)
+# -----------------------------------------------------------------------------
+tests:
+  enabled: true
+  networkPolicy:
+    dnsResolution: true
+  mesh:
+    mtlsStrict: true
+  ingress:
+    authnHeadersPresent: true

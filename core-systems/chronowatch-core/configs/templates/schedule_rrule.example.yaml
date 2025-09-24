@@ -1,0 +1,274 @@
+# chronowatch-core/configs/templates/schedule_rrule.example.yaml
+# Industrial RRULE-based schedules for ChronoWatch Core
+# Schema version for compatibility by config loaders
+version: 1.0.0
+
+# Global defaults via YAML anchors (DRY)
+defaults: &defaults
+  enabled: true
+  timezone: "UTC"                # Overridden per schedule when needed
+  calendar:
+    # RFC-5545 DTSTART in local timezone of the schedule
+    dtstart: "2025-01-01T00:00:00"
+    # Optional upper bound
+    until: null
+    # RFC-5545 RRULE / EXRULE strings (string or list of strings)
+    rrule: []
+    exrule: []
+    # RDATE/EXDATE support (explicit inclusions/exclusions)
+    rdate: []
+    exdate: []
+  windows:
+    # Allowed time windows in local schedule time (HH:MM-HH:MM)
+    allowed_hours: ["00:00-23:59"]
+    # ISO weekday numbers 1..7 (Mon..Sun); empty => no restriction
+    allowed_weekdays: []
+    # Optional business calendar provider (placeholder)
+    business_calendar:
+      provider: "ics"          # ics|builtin|none
+      region: "SE"             # e.g., SE for Sweden; used by builtin providers
+      url: ""                  # ICS URL if provider=ics (fill if applicable)
+      treat_holidays_as_blackout: true
+  execution:
+    # Handler reference inside chronowatch-core (fill your adapter)
+    handler: "chronowatch.handlers.noop:run"
+    payload: {}
+    timeout_ms: 15000
+    # Concurrency control for the same schedule ID
+    concurrency:
+      policy: "forbid"         # forbid|allow|replace_oldest
+      max_parallel: 1
+    # Misfire defines what to do if run time was missed (scheduler down, etc.)
+    misfire:
+      policy: "catchup"        # catchup|skip|fire_now
+      catchup_window_seconds: 86400   # Do not replay older than 1 day
+    # Retry policy for handler failures
+    retry:
+      max_attempts: 3
+      backoff_strategy: "exponential" # fixed|exponential
+      initial_delay_ms: 250
+      max_delay_ms: 10000
+      jitter_ms: 250
+    # Idempotency keys protect downstream from duplicates
+    idempotency:
+      scope: "schedule+ts"     # schedule|schedule+args|schedule+ts
+      ttl_seconds: 86400
+    # Random spread to avoid thundering herd
+    jitter_ms: 0               # e.g., 0..30000 for large fleets
+  safeguards:
+    # Max tolerated skew between time sources (should align with chronowatch.yaml)
+    tolerate_skew_ms: 50
+    # Bound between computed next fire time and actual trigger
+    max_drift_ms: 5
+    # Explicit blackout windows (RRULE/CRON-like strings or HH:MM-HH:MM ranges)
+    blackout:
+      hours: []
+      rrule: []
+  observability:
+    metrics_prefix: "chronowatch"
+    labels: {}
+    tags: []
+    audit:
+      log_level: "INFO"        # DEBUG|INFO|WARN|ERROR
+      redact_fields: ["authorization", "token", "password"]
+  ownership:
+    owner: "team-chronowatch"
+    priority: "normal"         # low|normal|high
+    sla:
+      expected_finish_seconds: 10
+      alert_overdue_seconds: 30
+      notify_channels: []      # e.g., ["pagerduty:chronowatch", "slack:#alerts"]
+
+# ------------------------
+# Schedules definition
+# ------------------------
+schedules:
+
+  # 1) Heartbeat: every minute, UTC
+  - id: "heartbeat-every-minute"
+    name: "System heartbeat"
+    <<: *defaults
+    execution:
+      <<: *defaults.execution
+      handler: "chronowatch.handlers.heartbeat:run"
+      jitter_ms: 500
+    calendar:
+      <<: *defaults.calendar
+      dtstart: "2025-01-01T00:00:00"
+      rrule:
+        - "FREQ=MINUTELY;INTERVAL=1"
+    observability:
+      <<: *defaults.observability
+      labels: { component: "core", kind: "heartbeat" }
+
+  # 2) Business days 09:00 Europe/Stockholm (Mon-Fri), with holidays treated as blackout
+  - id: "daily-open-0900-stockholm"
+    name: "Daily open (Stockholm business days)"
+    <<: *defaults
+    timezone: "Europe/Stockholm"
+    calendar:
+      <<: *defaults.calendar
+      dtstart: "2025-01-01T09:00:00"
+      rrule:
+        - "FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0;BYSECOND=0"
+      # Optionally add EXRULE for weekends (redundant here due to BYDAY)
+      exrule: []
+      # Placeholder for explicit holiday EXDATEs if ICS provider not available
+      exdate: []
+    windows:
+      <<: *defaults.windows
+      business_calendar:
+        provider: "ics"
+        region: "SE"
+        url: ""    # put your ICS holidays feed if used
+        treat_holidays_as_blackout: true
+    execution:
+      <<: *defaults.execution
+      handler: "chronowatch.handlers.opening_tasks:run"
+      retry:
+        <<: *defaults.execution.retry
+        max_attempts: 5
+      misfire:
+        policy: "catchup"
+        catchup_window_seconds: 172800  # 2 days
+    observability:
+      <<: *defaults.observability
+      labels: { region: "SE", window: "morning" }
+
+  # 3) Last business day of month 18:00 local time (Stockholm), skip weekends/holidays
+  - id: "month-end-last-bday-1800"
+    name: "Month-end processing (last business day 18:00)"
+    <<: *defaults
+    timezone: "Europe/Stockholm"
+    calendar:
+      <<: *defaults.calendar
+      dtstart: "2025-01-31T18:00:00"
+      # RRULE picks last weekday of month: BYDAY=MO,TU,WE,TH,FR with BYSETPOS=-1
+      rrule:
+        - "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;BYHOUR=18;BYMINUTE=0;BYSECOND=0"
+      # EXDATE list is optional if business_calendar provided
+      exdate: []
+    windows:
+      <<: *defaults.windows
+      business_calendar:
+        provider: "ics"
+        region: "SE"
+        url: ""
+        treat_holidays_as_blackout: true
+    execution:
+      <<: *defaults.execution
+      handler: "chronowatch.handlers.month_end:run"
+      timeout_ms: 600000                # 10 minutes
+      concurrency:
+        policy: "forbid"
+        max_parallel: 1
+      misfire:
+        policy: "catchup"
+        catchup_window_seconds: 1209600  # 14 days
+      retry:
+        max_attempts: 5
+        backoff_strategy: "exponential"
+        initial_delay_ms: 1000
+        max_delay_ms: 60000
+        jitter_ms: 500
+    safeguards:
+      <<: *defaults.safeguards
+      blackout:
+        hours:
+          - "00:00-06:00"               # disallow night runs outside declared time
+        rrule: []                       # extra blackout RRULEs if needed
+    observability:
+      <<: *defaults.observability
+      labels: { process: "month-end", criticality: "high" }
+    ownership:
+      <<: *defaults.ownership
+      priority: "high"
+      sla:
+        expected_finish_seconds: 1800
+        alert_overdue_seconds: 3600
+        notify_channels: ["pagerduty:finance", "slack:#ops-finance"]
+
+  # 4) Quarterly report: last Friday of each quarter, 16:00 UTC
+  - id: "quarterly-report-last-friday-1600"
+    name: "Quarterly report cutoff"
+    <<: *defaults
+    timezone: "UTC"
+    calendar:
+      <<: *defaults.calendar
+      dtstart: "2025-03-28T16:00:00"
+      # Months of quarters: Jan, Apr, Jul, Oct with BYSETPOS=-1 & BYDAY=FR
+      rrule:
+        - "FREQ=MONTHLY;BYMONTH=3,6,9,12;BYDAY=FR;BYSETPOS=-1;BYHOUR=16;BYMINUTE=0;BYSECOND=0"
+    execution:
+      <<: *defaults.execution
+      handler: "chronowatch.handlers.quarterly_report:run"
+      misfire:
+        policy: "skip"                   # do not replay quarter cutoffs
+      retry:
+        <<: *defaults.execution.retry
+        max_attempts: 2
+    observability:
+      <<: *defaults.observability
+      labels: { report: "quarterly", cutoff: "true" }
+
+  # 5) High-frequency job with bounded catch-up and random spread
+  - id: "hf-5m-jittered"
+    name: "High-frequency 5-min job (jittered)"
+    <<: *defaults
+    timezone: "UTC"
+    calendar:
+      <<: *defaults.calendar
+      dtstart: "2025-01-01T00:00:00"
+      rrule:
+        - "FREQ=MINUTELY;INTERVAL=5"
+    execution:
+      <<: *defaults.execution
+      handler: "chronowatch.handlers.hf_job:run"
+      jitter_ms: 15000                   # spread up to 15s
+      misfire:
+        policy: "catchup"
+        catchup_window_seconds: 7200     # 2 hours max backlog
+      retry:
+        max_attempts: 4
+        backoff_strategy: "fixed"
+        initial_delay_ms: 500
+        max_delay_ms: 500
+        jitter_ms: 200
+    observability:
+      <<: *defaults.observability
+      labels: { frequency: "5m" }
+
+  # 6) One-off inclusions/exclusions using RDATE/EXDATE
+  - id: "ad-hoc-maintenance-window"
+    name: "Ad-hoc maintenance (one-offs)"
+    <<: *defaults
+    timezone: "Europe/Stockholm"
+    calendar:
+      <<: *defaults.calendar
+      # No RRULE; explicit RDATEs define single-run events
+      rrule: []
+      rdate:
+        - "2025-10-10T23:00:00"
+        - "2025-11-14T23:00:00"
+      # EXDATE can cancel previously planned RDATEs if needed
+      exdate:
+        - "2025-11-14T23:00:00"
+    execution:
+      <<: *defaults.execution
+      handler: "chronowatch.handlers.maintenance:run"
+      timeout_ms: 900000                 # 15 minutes
+      misfire:
+        policy: "fire_now"
+    safeguards:
+      <<: *defaults.safeguards
+      blackout:
+        hours: []                        # maintenance explicitly scheduled, no generic blackout
+
+# ------------------------
+# Validation hints (optional)
+# ------------------------
+validation:
+  rrule_required_for_recurring: true
+  # Ensure at least one of rrule/rdate present
+  require_any_event_source: true
+  forbid_past_dtstart: false

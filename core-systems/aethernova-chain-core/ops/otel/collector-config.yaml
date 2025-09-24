@@ -1,0 +1,209 @@
+# ops/otel/collector-config.yaml
+# OpenTelemetry Collector (contrib) — gateway-профиль
+# Режим: три конвейера (traces, metrics, logs). Все чувствительные параметры подаются через env.
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+receivers:
+  # SDK/агенты присылают сюда все три сигнала (gRPC/HTTP)
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # max_recv_msg_size_mib и compression можно добавить при необходимости
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Метрики узла/хоста
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      load: {}
+      network: {}
+      process: {}
+
+  # Метрики kubelet (ресурсы контейнеров/подов/узлов)
+  kubeletstats:
+    collection_interval: 30s
+    auth_type: serviceAccount
+    endpoint: ${KUBELET_ENDPOINT_URL} # например, https://${NODE_NAME}:10250
+    insecure_skip_verify: true
+    metric_groups:
+      - container
+      - pod
+      - node
+
+  # Прямой сбор метрик через Prometheus
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'chain-core-app'
+          scrape_interval: 15s
+          static_configs:
+            - targets: ['${CHAIN_CORE_SVC}:9090']  # сервис с /metrics
+        - job_name: 'otel-self'
+          scrape_interval: 15s
+          static_configs:
+            - targets: ['0.0.0.0:8888']           # метрики самого Коллектора
+
+  # Контейнерные логи (multiline, CRI-имена, JSON/текст)
+  filelog:
+    include:
+      - /var/log/containers/*.log
+    start_at: beginning
+    include_file_path: true
+    include_file_name: false
+    operators:
+      - type: move
+        from: attributes["log.file.path"]
+        to: resource["log.file.path"]
+      - type: add
+        field: resource["service.name"]
+        value: ${SERVICE_NAME}
+      - type: regex_parser
+        # CRI формат имени: <pod>_<namespace>_<container>-<containerID>.log
+        regex: '^(?P<time>[^ ]+) (?P<stream>stdout|stderr) (?P<flag>[^ ]*) (?P<log>.*)$'
+        timestamp:
+          parse_from: attributes["time"]
+          layout_type: gotime
+          layout: 2006-01-02T15:04:05.000000000Z07:00
+      - type: recombine
+        # Поддержка многострочных стэктрейсов
+        combine_field: attributes["log"]
+        is_first_entry: 'body matches "^(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)|^\\d{4}-\\d{2}-\\d{2}"'
+        max_batch_size: 1000
+        max_line_length: 262144
+      - type: severity_parser
+        parse_from: attributes["log"]
+        mapping:
+          debug:
+            - (?i)\bdebug\b
+          info:
+            - (?i)\binfo\b
+          warn:
+            - (?i)\bwarn(ing)?\b
+          error:
+            - (?i)\berr(or)?\b
+          fatal:
+            - (?i)\bfatal\b
+      - type: json_parser
+        parse_from: attributes["log"]
+        # тихий режим на случай текстовых логов
+        on_error: skip
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+  batch:
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+    timeout: 5s
+
+  resourcedetection:
+    detectors: [ env, system ]
+    system:
+      hostname_sources: [ os ]
+    timeout: 5s
+    override: false
+
+  k8sattributes:
+    auth_type: serviceAccount
+    # Автообнаружение по IP/UID/контейнеру
+    passthrough: false
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.node.name
+        - k8s.container.name
+        - k8s.pod.start_time
+      labels:
+        - key: app.kubernetes.io/name
+          from: pod
+          tag_name: k8s.app.name
+        - key: app.kubernetes.io/component
+          from: pod
+          tag_name: k8s.app.component
+        - key: app.kubernetes.io/instance
+          from: pod
+          tag_name: k8s.app.instance
+      annotations:
+        - key: chain.aethernova/role
+          from: pod
+          tag_name: chain.role
+
+  attributes/drop-noisy:
+    actions:
+      - key: container.id
+        action: delete
+      - key: k8s.pod.uid
+        action: delete
+        # при необходимости оставьте, если нужен трекинг UID
+
+  transform/normalization:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(unit, "seconds") where metric.name == "process.runtime.jvm.uptime"
+    log_statements:
+      - context: log
+        statements:
+          - replace_matches(body, "(?s)\\u0000", "")   # убираем NUL
+    trace_statements:
+      - context: span
+        statements:
+          - set(status.code, 2) where attributes["http.status_code"] >= 500
+
+exporters:
+  # Основной вендор-агностичный экспорт
+  otlp:
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}         # напр. https://otel-gateway:4317 (grpc) или :4318 (http)
+    tls:
+      insecure: ${OTEL_EXPORTER_OTLP_INSECURE:false}
+    headers:
+      # Пробрасываем ключ/токен из окружения, если нужен
+      x-api-key: ${OTEL_EXPORTER_OTLP_API_KEY:}
+
+  # Для быстрой диагностики (можно отключить на проде)
+  logging:
+    loglevel: warn
+
+  # Локальная экспозиция метрик Коллектора в Prometheus
+  prometheus:
+    endpoint: 0.0.0.0:8888
+    namespace: otelcol
+
+service:
+  telemetry:
+    logs:
+      level: info
+  extensions: [ health_check, pprof, zpages ]
+
+  pipelines:
+    traces:
+      receivers: [ otlp ]
+      processors: [ memory_limiter, k8sattributes, attributes/drop-noisy, batch, transform/normalization ]
+      exporters: [ otlp, logging ]
+    metrics:
+      receivers: [ otlp, hostmetrics, kubeletstats, prometheus ]
+      processors: [ memory_limiter, k8sattributes, attributes/drop-noisy, batch, transform/normalization ]
+      exporters: [ otlp, prometheus ]
+    logs:
+      receivers: [ otlp, filelog ]
+      processors: [ memory_limiter, k8sattributes, attributes/drop-noisy, batch, transform/normalization ]
+      exporters: [ otlp, logging ]

@@ -1,0 +1,430 @@
+apiVersion: veilmind.io/v1
+kind: ConsentPolicy
+metadata:
+  name: default-consent-policy
+  owner: privacy-office
+  environment: prod
+  version: "2025-08-21"
+  annotations:
+    description: >
+      Шаблон политики согласий (Consent) для veilmind-core. Содержит цели обработки,
+      юридические основания по регионам, правила показа баннера/диалога, хранение и аудит,
+      интеграции с CMP и принудительное исполнение на уровне PEP/SDK/Edge.
+
+spec:
+  schema:
+    checksum: "sha256:CHANGEME"          # подставляется в CI для контроля целостности
+    minEngineVersion: "1.2.0"
+
+  defaults:
+    model: "granular"                    # granular|bundled
+    defaultState: "prompt"               # prompt|deny|allow (для нерегулируемых зон)
+    localeFallback: "en"
+    recordTtlDays: 395                   # ≥ 13 месяцев по ряду регуляций
+    proofMode: "signed"                  # signed|unsigned
+    hashSaltRef: "KMS:projects/CHANGEME/locations/global/keyRings/privacy/cryptoKeys/consent-hash"
+    ipStorage: "truncated"               # none|truncated|hashed (рекомендуется hashed)
+    cookieDomain: ".example.com"
+    cookieSecure: true
+    cookieSameSite: "Lax"
+    revokeAllOnGPC: true                 # глобальный сигнал GPC трактуется как opt-out
+
+  jurisdictions:
+    # Примеры регионов. Дополните по вашим зонам присутствия.
+    - code: "EEA"                        # GDPR/EEA
+      detection:
+        byGeoIP: ["AT","BE","BG","HR","CY","CZ","DE","DK","EE","ES","FI","FR","GR","HU","IE","IT","LT","LU","LV","MT","NL","PL","PT","RO","SE","SI","SK","IS","LI","NO"]
+        byTzHint: ["Europe/","Atlantic/"]
+      legalFramework: "GDPR"
+      defaultState: "deny"
+      ageOfConsent: 16
+    - code: "UK"
+      detection:
+        byGeoIP: ["GB"]
+      legalFramework: "UK-GDPR"
+      defaultState: "deny"
+      ageOfConsent: 13
+    - code: "US-CA"
+      detection:
+        byGeoIP: ["US-CA"]
+      legalFramework: "CPRA"
+      defaultState: "prompt"
+      ageOfConsent: 13
+    - code: "BR"
+      detection:
+        byGeoIP: ["BR"]
+      legalFramework: "LGPD"
+      defaultState: "prompt"
+      ageOfConsent: 13
+    - code: "ROW"                         # остальные страны
+      detection:
+        fallback: true
+      legalFramework: "Other"
+      defaultState: "prompt"
+      ageOfConsent: 13
+
+  ageGating:
+    enabled: true
+    underAgeAction: "deny_non_essential" # deny_non_essential|block_all|route_parental
+    parentalFlow:
+      provider: "CHANGEME-parental-consent"
+      timeoutMinutes: 30
+      evidenceRetentionDays: 395
+
+  # Декларация целей обработки. Каждая цель может иметь разный правовой режим по регионам.
+  purposes:
+    - id: "strictly_necessary"
+      name: "Строго необходимые"
+      description: "Функционирование сайта/сервиса, безопасность, балансировка."
+      categories: ["authentication","security","load_balancing"]
+      legalBasis:
+        default: { basis: "legitimate_interest" }
+        EEA:     { basis: "legitimate_interest" }
+        UK:      { basis: "legitimate_interest" }
+        US-CA:   { basis: "necessary" }
+      required: true
+      defaultState: "allow"
+      retention:
+        days: 365
+      processors:
+        - vendor: "FirstParty"
+          dpaRef: "internal"
+      enforcement:
+        tags: ["essential"]
+        allowOnDeny: true
+
+    - id: "analytics"
+      name: "Аналитика"
+      description: "Измерение аудиторных и технических метрик."
+      categories: ["analytics"]
+      legalBasis:
+        default: { basis: "consent" }
+        US-CA:   { basis: "opt_out" }  # CPRA treat as sale/share opt-out
+      required: false
+      defaultState: "deny"
+      retention:
+        days: 395
+      processors:
+        - vendor: "CHANGEME-AnalyticsVendor"
+          dpaRef: "https://vendor.example/dpa"
+          dataLocation: "EEA"
+      enforcement:
+        tags: ["analytics"]
+        block:
+          endpoints:
+            - pattern: "https://analytics.example.com/*"
+          cookies:
+            - names: ["_ga","_gid","_gat"]
+        sdkFlags:
+          - key: "feature.analytics.enabled"
+            valueWhenAllowed: true
+            valueWhenDenied: false
+
+    - id: "personalization"
+      name: "Персонализация"
+      description: "Запоминание настроек, контент по предпочтениям."
+      categories: ["functional","personalization"]
+      legalBasis:
+        default: { basis: "consent" }
+      required: false
+      defaultState: "deny"
+      dependencies: ["analytics"]
+      retention:
+        days: 180
+      processors:
+        - vendor: "FirstParty"
+          dpaRef: "internal"
+      enforcement:
+        tags: ["personalization"]
+        sdkFlags:
+          - key: "feature.personalization.enabled"
+            valueWhenAllowed: true
+            valueWhenDenied: false
+
+    - id: "ads"
+      name: "Реклама"
+      description: "Таргетированная реклама и измерение эффективности."
+      categories: ["advertising"]
+      legalBasis:
+        default: { basis: "consent" }
+        US-CA:   { basis: "opt_out" }    # «Do Not Sell/Share»
+      required: false
+      defaultState: "deny"
+      retention:
+        days: 180
+      processors:
+        - vendor: "IAB-TCF"
+          dpaRef: "https://iabeurope.eu/tcf-2-2/"
+      enforcement:
+        tags: ["ads"]
+        block:
+          endpoints:
+            - pattern: "*://*.adserver.example/*"
+          cookies:
+            - names: ["uid","ad_prefs"]
+        headerInjections:
+          - header: "X-Consent-Ads"
+            valueWhenAllowed: "1"
+            valueWhenDenied: "0"
+
+    - id: "a_b_testing"
+      name: "A/B тестирование"
+      description: "Эксперименты интерфейса и функций."
+      categories: ["analytics","experimentation"]
+      legalBasis:
+        default: { basis: "consent" }
+      required: false
+      defaultState: "deny"
+      retention:
+        days: 90
+      processors:
+        - vendor: "CHANGEME-ExperimentVendor"
+          dpaRef: "https://vendor.example/dpa"
+      enforcement:
+        tags: ["experiments"]
+        sdkFlags:
+          - key: "feature.experiments.enabled"
+            valueWhenAllowed: true
+            valueWhenDenied: false
+
+    - id: "error_reporting"
+      name: "Отчеты об ошибках"
+      description: "Сбор трассировок и логов с минимизацией PII."
+      categories: ["analytics","security"]
+      legalBasis:
+        default: { basis: "legitimate_interest" }
+        EEA:     { basis: "consent" }    # при расширенных данных
+      required: false
+      defaultState: "prompt"
+      retention:
+        days: 30
+      processors:
+        - vendor: "CHANGEME-SentryLike"
+          dpaRef: "https://vendor.example/dpa"
+      enforcement:
+        tags: ["telemetry"]
+        piiRedaction: "hash"
+
+    - id: "email_marketing"
+      name: "E‑mail маркетинг"
+      description: "Рассылки и рекомендации по e‑mail."
+      categories: ["marketing"]
+      legalBasis:
+        default: { basis: "consent" }
+        BR:      { basis: "consent" }
+      channel: "email"
+      required: false
+      defaultState: "deny"
+      doubleOptIn: true
+      retention:
+        days: 730
+      processors:
+        - vendor: "CHANGEME-ESP"
+          dpaRef: "https://esp.example/dpa"
+      enforcement:
+        tags: ["email_marketing"]
+        requireVerifiedChannel: true
+
+    - id: "biometrics"
+      name: "Биометрия"
+      description: "Биометрические идентификаторы (чувствительные данные)."
+      categories: ["special_category"]
+      legalBasis:
+        default: { basis: "explicit_consent" }
+      required: false
+      defaultState: "deny"
+      retention:
+        days: 30
+      sensitive: true
+      processors: []
+      enforcement:
+        tags: ["biometrics"]
+        blockAllUnlessExplicit: true
+
+  # Маппинг внешних сигналов согласия/оптаутов.
+  externalSignals:
+    tcf:
+      enabled: true
+      version: "2.2"
+      mapPurposes:
+        "1": "ads"                 # Storage and/or access of information on a device
+        "7": "ads"                 # Measure ad performance
+        "10": "analytics"          # Develop and improve products
+      vendorExceptions: []         # список IAB Vendor IDs с особыми условиями
+    usPrivacy:
+      enabled: true
+      map:                         # CCPA/CPRA (usp string)
+        "N": { ads: "allow" }      # user has not opted out
+        "Y": { ads: "deny" }       # do not sell/share
+    gpc:
+      enabled: true
+      effect:
+        US-CA: { ads: "deny" }
+        default: { ads: "deny" }
+    dnt:
+      enabled: true
+      effect:
+        default: { analytics: "deny", ads: "deny" }
+
+  # Правила вычисления итогового состояния по каждой цели.
+  evaluation:
+    order: ["jurisdiction", "ageGating", "externalSignals", "userChoice", "orgDefault"]
+    conflictResolution: "most_protective"  # most_protective|user_priority|signal_priority
+    fallback: "deny"
+
+  # Хранение записей согласий (Consent Records).
+  records:
+    storage: "server"               # server|client (рекомендуется server)
+    encryptionKmsRef: "KMS:projects/CHANGEME/locations/global/keyRings/privacy/cryptoKeys/consent-store"
+    fields:
+      - "subjectId"                 # псевдонимизированный идентификатор субъекта
+      - "jurisdiction"
+      - "purposeId"
+      - "state"                     # allow|deny|prompt
+      - "legalBasis"
+      - "ts"
+      - "evidence"                  # баннер/диалог, версия текста, IP (хеш/усеченный)
+      - "proof"                     # подпись/хэш записи
+    index:
+      - ["subjectId","purposeId","ts"]
+    retentionDays: 395
+    rotation:
+      periodDays: 30
+      deleteExpired: true
+
+  # Параметры CMP/UX: тексты, локали, поведение виджета.
+  ui:
+    cmpProvider: "CHANGEME-CMP"
+    showBannerOnFirstVisit: true
+    showModalForSensitive: true
+    rePrompt:
+      intervalDays: 180
+      onPolicyChange: true
+    i18n:
+      supported: ["en","ru","sv"]
+      texts:
+        en:
+          title: "We value your privacy"
+        ru:
+          title: "Мы заботимся о вашей конфиденциальности"
+        sv:
+          title: "Vi värnar om din integritet"
+
+  # Принудительное исполнение согласий на разных уровнях.
+  enforcement:
+    edge:
+      # Правила для Edge/CDN: блокировка запросов к доменам и куки без согласия.
+      rules:
+        - when: "purpose('analytics') == 'deny'"
+          block:
+            endpoints: ["*://*.analytics.example/*"]
+            cookies: ["_ga","_gid"]
+        - when: "purpose('ads') == 'deny'"
+          block:
+            endpoints: ["*://*.adserver.example/*"]
+    backend:
+      # Инъекция заголовков/контекста в PEP/микросервисы.
+      headers:
+        - name: "X-Consent-Analytics"
+          value: "{{ state('analytics') }}"
+        - name: "X-Consent-Ads"
+          value: "{{ state('ads') }}"
+      denyOn:
+        - when: "sensitiveRequested() && purpose('biometrics') != 'allow'"
+          error: "CONSENT_REQUIRED"
+    sdk:
+      featureFlags:
+        map:
+          "feature.analytics.enabled": "analytics"
+          "feature.personalization.enabled": "personalization"
+          "feature.experiments.enabled": "a_b_testing"
+
+  # Аудит и соответствие.
+  audit:
+    emit:
+      destination: "siem"
+      format: "json"
+      fields: ["subjectId","jurisdiction","purposeId","state","legalBasis","ts","policyVersion"]
+    dpiARefs:
+      - "CHANGEME-DPIA-REF"
+    vendorDPAs:
+      - vendor: "CHANGEME-AnalyticsVendor"
+        url: "https://vendor.example/dpa"
+    dataTransfers:
+      eeaThirdCountry:
+        sccInPlace: true
+        list:
+          - processor: "CHANGEME-AnalyticsVendor"
+            country: "US"
+            sccModule: "Module 2"
+
+  # Исключения с истечением срока и обязательной причиной.
+  exceptions:
+    requireTicket: true
+    items:
+      - id: "EX-CONSENT-001"
+        scope:
+          subjects: ["user:alice@example.com"]
+          purposes: ["analytics"]
+          jurisdictions: ["EEA"]
+        overrideState: "allow"
+        expiresAt: "2025-09-30T23:59:59Z"
+        justification: "Performance investigation"
+
+  # Валидаторы и тест‑векторы для CI.
+  validation:
+    strict: true
+    tests:
+      - name: "EEA first visit — deny non-essential"
+        ctx:
+          region: "EEA"
+          userChoice: {}
+          signals: {}
+          age: 25
+        expect:
+          analytics: "deny"
+          ads: "deny"
+          strictly_necessary: "allow"
+      - name: "US-CA with GPC — deny ads"
+        ctx:
+          region: "US-CA"
+          signals:
+            gpc: true
+        expect:
+          ads: "deny"
+      - name: "Row user accepted analytics"
+        ctx:
+          region: "ROW"
+          userChoice:
+            analytics: "allow"
+        expect:
+          analytics: "allow"
+      - name: "Minor in EEA — non-essential denied"
+        ctx:
+          region: "EEA"
+          age: 12
+        expect:
+          analytics: "deny"
+          ads: "deny"
+
+  # Управление изменениями политики.
+  changeControl:
+    approval:
+      required: true
+      roles: ["privacy-office","secops"]
+    rollout:
+      mode: "staged"
+      stages:
+        - name: "shadow"
+          trafficPercent: 0
+          durationMinutes: 60
+        - name: "canary"
+          trafficPercent: 10
+          durationMinutes: 120
+        - name: "full"
+          trafficPercent: 100
+    rollback:
+      on:
+        - "complaints_rate>threshold"
+        - "consent_drop>20%"
+        - "conversion_drop>10%"

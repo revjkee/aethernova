@@ -1,0 +1,188 @@
+name: mythos-core
+
+x-common: &common
+  image: python:3.12-slim
+  user: "${UID:-1000}:${GID:-1000}"
+  working_dir: /workspace/mythos-core
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777,size=256m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - SETGID
+    - SETUID
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+  environment:
+    PYTHONDONTWRITEBYTECODE: "1"
+    PYTHONUNBUFFERED: "1"
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    PIP_NO_CACHE_DIR: "1"
+    PYTHONPATH: "/workspace"
+  volumes:
+    # Корень репозитория в контейнер (только чтение)
+    - ../../:/workspace:ro
+    # Логи и данные (запись)
+    - mythos_logs:/var/log/mythos
+    - mythos_jobs:/data/jobs
+    - mythos_artifacts:/data/artifacts
+  networks:
+    - mythos-net
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  training_worker:
+    <<: *common
+    container_name: mythos-training-worker
+    command:
+      - python
+      - neuroforge/workers/training_worker.py
+      - --jobs-root
+      - /data/jobs
+      - --log-dir
+      - /var/log/mythos/worker
+      - --http-host
+      - 0.0.0.0
+      - --http-port
+      - "8080"
+      - --concurrency
+      - "${WORKER_CONCURRENCY:-2}"
+      - --poll-interval
+      - "${WORKER_POLL_INTERVAL:-1.0}"
+      - --stale-reclaim-seconds
+      - "${WORKER_STALE_RECLAIM_SEC:-900}"
+      - --log-level
+      - "${WORKER_LOG_LEVEL:-INFO}"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).getcode()==200 else sys.exit(1)\""]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+        reservations:
+          cpus: "0.25"
+          memory: 256m
+
+  serve_local:
+    <<: *common
+    container_name: mythos-serve-local
+    depends_on:
+      training_worker:
+        condition: service_healthy
+    command:
+      - python
+      - cli/tools/serve_local.py
+      - --root
+      - /data/artifacts
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8081"
+      - --log-dir
+      - /var/log/mythos/serve
+      - --log-level
+      - "${SERVE_LOG_LEVEL:-INFO}"
+      - --max-upload-mb
+      - "${SERVE_MAX_UPLOAD_MB:-2048}"
+      # CORS при необходимости
+      # - --cors
+      # - "${SERVE_CORS:-*}"
+    environment:
+      # Аутентификация: Bearer-токен из переменной или секрета
+      LLM_SERVE_TOKEN_FILE: "/run/secrets/serve_local_token"
+      # Бэкенд читает фактический токен внутри через файл; для простоты
+      # передаём также напрямую (если секрет не используется)
+      TOKEN: "${SERVE_LOCAL_TOKEN:-}"
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=3).getcode()==200 else sys.exit(1)\""]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 10s
+    secrets:
+      - source: serve_local_token
+        target: serve_local_token
+        mode: 0440
+        uid: "1000"
+        gid: "1000"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+        reservations:
+          cpus: "0.10"
+          memory: 128m
+
+  llm_chat_demo:
+    <<: *common
+    container_name: mythos-llm-chat-demo
+    depends_on:
+      training_worker:
+        condition: service_started
+      serve_local:
+        condition: service_healthy
+    command:
+      - python
+      - examples/llm_chat_demo/app.py
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8090"
+      LOG_LEVEL: "${CHAT_LOG_LEVEL:-INFO}"
+      PROVIDER: "${CHAT_PROVIDER:-mock}"      # mock | openai
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o-mini}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      LLM_CHAT_TOKEN: "${LLM_CHAT_TOKEN:-}"
+      CORS: "${CHAT_CORS:-*}"
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3).getcode()==200 else sys.exit(1)\""]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+        reservations:
+          cpus: "0.10"
+          memory: 128m
+
+networks:
+  mythos-net:
+    driver: bridge
+
+volumes:
+  mythos_logs:
+  mythos_jobs:
+  mythos_artifacts:
+
+secrets:
+  serve_local_token:
+    file: ./secrets/serve_local_token.txt

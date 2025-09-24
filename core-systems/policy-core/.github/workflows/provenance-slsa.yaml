@@ -1,0 +1,150 @@
+# file: policy-core/.github/workflows/provenance-slsa.yaml
+name: build-sign-attest-provenance
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*", "release-*" ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: slsa-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write           # для keyless подписи cosign (OIDC)
+  attestations: write       # для actions/attest-build-provenance
+  actions: read
+  security-events: write    # на будущее (SBOM SARIF/сканирование)
+
+env:
+  IMAGE_NAME: policy-core
+  REGISTRY: ghcr.io
+  # Итоговый референс образа без тега/дайджеста
+  IMAGE_REF: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+  # Базовые теги (semver/sha/date)
+  DEFAULT_TAG: latest
+
+jobs:
+  build-sign-attest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_REF }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=${{ env.DEFAULT_TAG }},enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=policy-core
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.vendor=Aethernova
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+            context: .
+            push: true
+            platforms: linux/amd64,linux/arm64
+            tags: ${{ steps.meta.outputs.tags }}
+            labels: ${{ steps.meta.outputs.labels }}
+            provenance: false     # аттестации делаем отдельно контролируемо
+            sbom: false           # SBOM генерируем отдельно syft'ом
+
+      - name: Extract image digest
+        id: digest
+        run: |
+          echo "DIGEST=${{ steps.build.outputs.digest }}" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=${{ env.IMAGE_REF }}@${{ steps.build.outputs.digest }}" >> $GITHUB_OUTPUT
+
+      # ---------- Подпись контейнера (Sigstore, keyless OIDC) ----------
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Cosign keyless sign image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign --yes ${{ steps.digest.outputs.IMAGE_URI }}
+
+      # ---------- Генерация SBOM (SPDX JSON) ----------
+      - name: Generate SBOM (SPDX JSON) via Syft
+        id: sbom
+        uses: anchore/sbom-action@v0.17.6
+        with:
+          image: ${{ steps.digest.outputs.IMAGE_URI }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.spdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+      # ---------- Аттестация SBOM (cosign attest) ----------
+      - name: Cosign attest SBOM (spdx-json)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign attest \
+            --yes \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            ${{ steps.digest.outputs.IMAGE_URI }}
+
+      # ---------- SLSA Build Provenance (GitHub attestations) ----------
+      - name: Attest build provenance (SLSA v1)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.IMAGE_REF }}
+          subject-digest: ${{ steps.digest.outputs.DIGEST }}
+          push-to-registry: true
+
+      # ---------- Краткое резюме в Job Summary ----------
+      - name: Write job summary
+        run: |
+          {
+            echo "## Supply Chain Summary"
+            echo ""
+            echo "- Image: \`${{ env.IMAGE_REF }}\`"
+            echo "- Digest: \`${{ steps.digest.outputs.DIGEST }}\`"
+            echo "- Pushed tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo "- Cosign: keyless OIDC signature created"
+            echo "- SBOM: \`sbom.spdx.json\` generated and attached via cosign attest"
+            echo "- Build Provenance: GitHub attestation (SLSA predicate) published"
+          } >> $GITHUB_STEP_SUMMARY

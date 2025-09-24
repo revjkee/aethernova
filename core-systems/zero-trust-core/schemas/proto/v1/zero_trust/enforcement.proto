@@ -1,0 +1,314 @@
+// zero-trust-core/schemas/proto/v1/zero_trust/enforcement.proto
+syntax = "proto3";
+
+package zero_trust.v1;
+
+option go_package = "github.com/yourorg/zero-trust-core/gen/go/zero_trust/v1;zerotrustv1";
+option java_multiple_files = true;
+option java_package = "com.yourorg.zerotrust.v1";
+option csharp_namespace = "YourOrg.ZeroTrust.V1";
+option objc_class_prefix = "ZT";
+option php_namespace = "YourOrg\\ZeroTrust\\V1";
+option ruby_package = "YourOrg::ZeroTrust::V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/any.proto";
+
+// ----------------------------- Базовые enum ----------------------------------
+
+// Итоговый эффект применения политики Zero Trust.
+enum DecisionEffect {
+  DECISION_EFFECT_UNSPECIFIED = 0;
+  ALLOW     = 1;
+  DENY      = 2;
+  STEP_UP   = 3; // Требуется дополнительная аутентификация (MFA/WebAuthn)
+  ISOLATE   = 4; // Карантин: ограниченный доступ по профилю
+  CONDITIONAL = 5; // Условный доступ (ограничение методов/путей и т.п.)
+  ERROR     = 6; // Ошибка оценки (fallback в PEP зависит от стратегии)
+}
+
+// Тип запрашиваемого действия.
+enum ActionType {
+  ACTION_TYPE_UNSPECIFIED = 0;
+  READ    = 1;
+  LIST    = 2;
+  WRITE   = 3;
+  DELETE  = 4;
+  ADMIN   = 5;
+  DEPLOY  = 6;
+  EXECUTE = 7;
+  CONNECT = 8; // Egress/исходящее соединение
+}
+
+// Тип субъекта.
+enum SubjectType {
+  SUBJECT_TYPE_UNSPECIFIED = 0;
+  HUMAN    = 1;
+  SERVICE  = 2;
+  WORKLOAD = 3; // машинная идентичность (SPIFFE/SVID)
+}
+
+// Уровень чувствительности данных (для нормализации риска).
+enum DataSensitivity {
+  DATA_SENSITIVITY_UNSPECIFIED = 0;
+  LOW    = 1;
+  MEDIUM = 2;
+  HIGH   = 3;
+}
+
+// ----------------------------- Запрос на оценку -------------------------------
+
+// Запрос от PEP к PDP.
+message EnforcementRequest {
+  string request_id = 1;                        // Идентификатор запроса (idempotency)
+  google.protobuf.Timestamp timestamp = 2;      // Время формирования запроса (UTC)
+  string tenant = 3;                            // Многоарендность (realm/org)
+  string trace_id = 4;                          // Трассировка (сквозной id)
+  string correlation_id = 5;                    // Корреляция с внешними системами
+  Subject subject = 6;                          // Субъект (пользователь/сервис)
+  Resource resource = 7;                        // Ресурс/приложение/назначение
+  Action action = 8;                            // Запрашиваемое действие
+  Context context = 9;                          // Контекст окружения
+  map<string, string> attributes = 10;          // Свободные атрибуты (ABAC)
+  repeated string purpose_of_use = 11;          // Цель доступа (POU)
+  // Зарезервировано для будущих полей
+  reserved 12, 13, 14, 15;
+}
+
+// Описатель действия.
+message Action {
+  ActionType type = 1;
+  // Поля ниже релевантны HTTP/API сценариям.
+  string method = 2;                             // GET/POST/...
+  string path = 3;                               // Например, /v1/transactions
+  google.protobuf.Struct extra = 4;              // Доп. атрибуты действия
+}
+
+// Субъект и его идентичность.
+message Subject {
+  SubjectType type = 1;
+  oneof principal_id {
+    string user_id = 2;                          // Для HUMAN
+    string service_id = 3;                       // Для SERVICE/WORKLOAD
+  }
+  Identity identity = 4;                         // IdP-контекст (OIDC/SAML)
+  repeated string groups = 5;                    // Нормализованные группы
+  repeated string roles = 6;                     // Нормализованные роли
+  map<string, string> claims = 7;                // Сырые клеймы (малые значения)
+  map<string, google.protobuf.Struct> ext = 8;   // Расширения (например, attrs от сторонних провайдеров)
+}
+
+// Контекст IdP/аутентификации.
+message Identity {
+  string issuer = 1;                             // iss
+  string subject = 2;                            // sub
+  int32 aal = 3;                                 // 1..3
+  repeated string mfa_methods = 4;               // "webauthn","totp","push"
+  google.protobuf.Timestamp auth_time = 5;       // Когда прошла аутентификация
+  string session_id = 6;                         // sid (для back-channel logout)
+}
+
+// Ресурс/назначение (унифицировано для API и egress).
+message Resource {
+  string app = 1;                                // Идентификатор приложения
+  string resource_id = 2;                        // Локальный идентификатор
+  repeated string labels = 3;                    // Метки ресурса (admin,pci,pii,internal)
+  DataSensitivity sensitivity = 4;               // Чувствительность данных
+  // Поля egress/CONNECT:
+  string domain = 5;                             // Назначение (FQDN)
+  int32 port = 6;                                // Порт назначения
+  string category = 7;                           // Категория egress (corporate,payments,...)
+  // Дополнительные атрибуты ресурса.
+  google.protobuf.Struct attributes = 8;
+}
+
+// ----------------------------- Контекст окружения -----------------------------
+
+message Context {
+  TLSContext tls = 1;                            // mTLS/SVID и пр.
+  DevicePosture device = 2;                      // Постура устройства
+  NetworkContext network = 3;                    // Сетевой контекст (IP/ASN/гео/зона)
+  BehaviorContext behavior = 4;                  // Поведенческие метрики/аномалии
+  RiskScores risk = 5;                           // Агрегированный риск и компоненты
+  DataLabels data = 6;                           // Нормализованные метки данных
+  repeated string approvals = 7;                 // Идентификаторы активных approvals
+  BreakGlass break_glass = 8;                    // Break-glass статус
+  map<string, google.protobuf.Struct> ext = 9;   // Расширения (EDR, UEBA, CASB и т.д.)
+}
+
+message TLSContext {
+  bool client_auth = 1;                          // Клиентский сертификат предъявлен
+  string svid = 2;                               // SPIFFE ID, если есть
+  repeated string san = 3;                       // SAN (DNS/IP/URI)
+  string mtls_profile = 4;                       // Профиль mTLS (strict/...)
+  bool revocation_checked = 5;                   // Выполнена проверка OCSP/CRL
+  string cert_fingerprint_sha256 = 6;            // sha256 клиентского сертификата
+}
+
+message DevicePosture {
+  string profile = 1;                            // managed_win11/managed_mac/unmanaged
+  bool managed = 2;
+  bool edr_healthy = 3;
+  bool disk_encryption = 4;
+  bool secure_boot = 5;
+  int32 os_patch_staleness_days = 6;             // 0 = актуально
+  bool jailbreak_root = 7;
+  string os_name = 8;                            // Windows 11, macOS 15, ...
+  string os_version = 9;
+  string hardware_model = 10;
+  map<string, string> inventory = 11;            // Серийники, asset-tag и пр.
+  Attestation attestation = 12;
+}
+
+message Attestation {
+  bool tpm_present = 1;
+  bool tpm_attested = 2;
+  string mdm_vendor = 3;
+  bool mdm_enrolled = 4;
+  google.protobuf.Struct evidence = 5;           // Сырые артефакты
+}
+
+message NetworkContext {
+  string source_ip = 1;
+  string asn = 2;
+  string geo_country = 3;                        // ISO-3166 alpha2
+  string zone = 4;                               
+  bool tor_proxy = 5;
+  bool new_asn = 6;
+  repeated string ip_tags = 7;                   // Метки источника (vpn,dc1,...)
+}
+
+message BehaviorContext {
+  bool impossible_travel = 1;
+  int32 burst_access_score = 2;                  // 0..100
+  google.protobuf.Struct recent_activity = 3;    // Сводная активность
+}
+
+message DataLabels {
+  repeated string labels = 1;                    // pci, pii, code, internal
+  DataSensitivity sensitivity = 2;
+}
+
+message RiskScores {
+  float user_risk = 1;                           // 0..100
+  float device_risk = 2;                         // 0..100
+  float network_risk = 3;                        // 0..100
+  float behavior_risk = 4;                       // 0..100
+  float data_sensitivity_risk = 5;               // 0..100
+  float total = 6;                               // 0..100 агрегат
+}
+
+message BreakGlass {
+  bool active = 1;
+  google.protobuf.Timestamp valid_until = 2;
+  string approved_by = 3;
+  string ticket = 4;                             
+}
+
+// ----------------------------- Ответ PDP -------------------------------------
+
+message EnforcementDecision {
+  string request_id = 1;                         // Эхо из запроса
+  google.protobuf.Timestamp timestamp = 2;       // Время принятия решения
+  DecisionEffect effect = 3;                     // Итоговый эффект
+  string reason = 4;                             // Короткое объяснение
+  float risk_score = 5;                          // Дублирование для удобства
+  RiskScores risk_breakdown = 6;                 // Разложение риска
+  repeated Obligation obligations = 7;           // Обязательства PEP (заголовки, токены, периметры)
+  ConditionalAccess conditional = 8;             // Для CONDITIONAL
+  Isolation isolation = 9;                       // Для ISOLATE
+  StepUp step_up = 10;                           // Для STEP_UP
+  string policy_id = 11;                         // Какое правило сработало
+  int32 policy_priority = 12;                    // Приоритет правила
+  repeated EvaluationTrace trace = 13;           // След срабатываний/оценок
+  google.protobuf.Duration decision_ttl = 14;    // TTL кэширования решения
+  map<string, string> headers = 15;              // Заголовки для инъекции в ответ
+  DlpOutcome dlp = 16;                           // Результат DLP-контролей
+  EgressDecision egress = 17;                    // Решение по egress
+  string tenant = 18;                            
+  string trace_id = 19;                          
+  string correlation_id = 20;                    
+  map<string, string> labels = 21;               // Произвольные метки решения
+  // Зарезервированные номера на будущее
+  reserved 22 to 29;
+}
+
+// Обязательства, которые PEP должен выполнить при ENFORCE/ALLOW/STEP_UP и т.п.
+message Obligation {
+  string id = 1;                                 // Например, "inject_header"
+  string type = 2;                               // Семантика исполнения (договорная)
+  google.protobuf.Struct params = 3;             // Параметры
+  google.protobuf.Duration ttl = 4;              // Срок действия обязательства
+}
+
+// Условный доступ: ограничение методов/путей/скоростей и т.д.
+message ConditionalAccess {
+  repeated string allow_methods = 1;             // Разрешенные методы
+  repeated string deny_methods = 2;              // Явно запрещенные методы
+  google.protobuf.Struct restrictions = 3;       // Прочие ограничения (rate-limit и т.п.)
+}
+
+// Параметры изоляции (карантинного режима).
+message Isolation {
+  repeated string restrict_apps = 1;             // Разрешенные приложения
+  int32 limit_bandwidth_kbps = 2;                
+  bool dlp_force_redact = 3;                     
+  google.protobuf.Struct extra = 4;
+}
+
+// Требование step-up аутентификации.
+message StepUp {
+  repeated string methods = 1;                   // "webauthn","totp",...
+  google.protobuf.Duration max_window = 2;       // Время на прохождение
+  google.protobuf.Struct challenge = 3;          // Детали вызова/каналов
+}
+
+// Результат DLP (для пост-обработки в PEP/прокси).
+message DlpOutcome {
+  string mode = 1;                               // "block","redact","allow"
+  string severity = 2;                           // "low","medium","high"
+  repeated string redacted_patterns = 3;         // Что было скрыто
+  google.protobuf.Struct details = 4;
+}
+
+// Решение по egress (CONNECT).
+message EgressDecision {
+  bool allowed = 1;
+  repeated string allowed_domains = 2;           // Явные разрешения
+  repeated string denied_domains = 3;            // Явные запреты
+  repeated PortRule allowed_ports = 4;           // Разрешенные порты/протоколы
+  google.protobuf.Struct details = 5;
+}
+
+message PortRule {
+  string proto = 1;                              // tcp/udp
+  int32 port = 2;
+}
+
+// Трейс оценки правил для аудита/отладки.
+message EvaluationTrace {
+  string rule_id = 1;
+  string effect = 2;                             // "permit"/"forbid"/"score"
+  string expr = 3;                               // Упрощенное выражение/условие
+  bool matched = 4;
+  float score_delta = 5;                         // Вклад в итоговый риск (если применимо)
+  google.protobuf.Struct extras = 6;             
+}
+
+// Обертка ответа (для расширяемости).
+message EnforcementResponse {
+  EnforcementDecision decision = 1;
+  google.protobuf.Any ext = 2;                   // Вендорные расширения
+}
+
+// ----------------------------- Сервис PDP -------------------------------------
+
+service ZeroTrustEnforcement {
+  // Unary запрос на оценку.
+  rpc Evaluate(EnforcementRequest) returns (EnforcementResponse);
+
+  // Двунаправленный стрим для низкой задержки (edge‑PEP).
+  rpc StreamDecisions(stream EnforcementRequest) returns (stream EnforcementResponse);
+}

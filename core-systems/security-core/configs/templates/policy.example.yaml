@@ -1,0 +1,486 @@
+# security-core/configs/templates/policy.example.yaml
+# Industrial Security Baseline Policy (machine-readable)
+# Apply via security-core loader; validated against embedded JSON Schema
+
+schema_version: 1.3.0
+policy_id: "sec-core-baseline"
+policy_name: "NeuroCity Security Baseline"
+description: >
+  Единая политика безопасности платформы (Zero Trust). Используется для
+  генерации регламентов, гейтов CI/CD, политик Kubernetes/OPA, настроек
+  секретов и мониторинга. Все разделы машиночитаемы и исполнимы.
+
+metadata:
+  owner: "security@neurocity.example"
+  approvers:
+    - name: "CISO"
+      email: "ciso@neurocity.example"
+    - name: "Head of Platform"
+      email: "platform@neurocity.example"
+  reviewers:
+    - sec-arch@neurocity.example
+    - devsecops@neurocity.example
+  classification: "Internal-Restricted"
+  created_at: "2025-08-20T00:00:00Z"
+  updated_at: "2025-08-20T00:00:00Z"
+  validity:
+    not_before: "2025-08-20T00:00:00Z"
+    not_after: "2026-08-20T00:00:00Z"
+  change_control:
+    change_process: "SEC-RFC-0007"
+    required_approvals: 2
+    signed_commits: true
+
+defaults: &defaults
+  enforcement_mode: "enforce"    # monitor|enforce
+  severity_threshold: "high"     # low|medium|high|critical
+  ticket_project_key: "SEC"
+  sla:
+    low: "5d"
+    medium: "3d"
+    high: "24h"
+    critical: "4h"
+
+risk_matrix:
+  levels:
+    low:
+      impact: "minor"
+      likelihood: "unlikely"
+    medium:
+      impact: "moderate"
+      likelihood: "possible"
+    high:
+      impact: "major"
+      likelihood: "likely"
+    critical:
+      impact: "severe"
+      likelihood: "almost_certain"
+  acceptance:
+    require_signoff_for: ["high","critical"]
+    accepted_by_roles: ["CISO","Head of Platform"]
+
+identity_and_access:
+  <<: *defaults
+  zero_trust: true
+  requirements:
+    mfa:
+      user: "required"
+      admin: "required"
+      service_accounts: "phishable_mfa_forbidden"
+    sso:
+      enforced: true
+      provider: "OIDC"
+      claims:
+        - "email_verified=true"
+        - "group:neurocity-engineering"
+    password_policy:
+      min_length: 14
+      rotation_days: 180
+      blocklist_common: true
+      require_entropy_bits: 60
+    session:
+      max_lifetime_minutes: 480
+      idle_timeout_minutes: 30
+      device_binding: true
+    rbac:
+      model: "role_based"
+      roles:
+        - id: "viewer"
+          permissions: ["read:logs","read:metrics"]
+        - id: "developer"
+          permissions: ["deploy:dev","read:secrets:dev","read:artifacts"]
+        - id: "ops"
+          permissions: ["deploy:stage","deploy:prod","read:secrets:*","manage:runtime"]
+        - id: "security"
+          permissions: ["read:all","manage:policy","quarantine:workload","rotate:keys"]
+        - id: "admin"
+          permissions: ["*"]
+      separation_of_duties:
+        forbidden_role_pairs:
+          - ["developer","security"]
+          - ["developer","admin"]
+    service_accounts:
+      key_rotation_days: 90
+      max_token_ttl_minutes: 60
+      audience_restriction_required: true
+      provenance_binding_required: true
+
+cryptography:
+  <<: *defaults
+  kms:
+    provider: "cloudKMS"
+    key_uris:
+      app_secrets: "kms://neurocity/app-secrets"
+      db_encryption: "kms://neurocity/db-at-rest"
+      code_signing: "kms://neurocity/code-sign"
+  key_management:
+    rotation_days:
+      app_secrets: 90
+      db_encryption: 365
+      code_signing: 180
+    dual_control_required: true
+    export_protection: "forbidden"
+  approved_algorithms:
+    asymmetric:
+      - "Ed25519"
+      - "RSA-2048"
+      - "RSA-3072"
+      - "ECDSA-P256"
+    symmetric:
+      - "AES-256-GCM"
+      - "ChaCha20-Poly1305"
+    hashing:
+      - "SHA-256"
+      - "SHA-384"
+    kdf:
+      - "scrypt(N=2^15,r=8,p=1)"
+      - "Argon2id(m=256MB,t=3,p=1)"
+  tls:
+    min_version: "TLS1.2"
+    prefer_version: "TLS1.3"
+    ciphersuites_policy: "modern"
+    hsts: true
+    certificate_pinning: "critical_endpoints_only"
+
+secrets_management:
+  <<: *defaults
+  provider: "hashicorp_vault"
+  forbidden_sources: ["env_files","git","dockerfile_args"]
+  allowed_injection:
+    - "runtime_mount"
+    - "sidecar_injector"
+  audit:
+    log_secret_reads: true
+    anomaly_threshold_daily_reads: 100
+  naming:
+    pattern: "^secret\\/[a-z0-9\\-\\/]{3,64}$"
+  scanning:
+    pre_commit: true
+    ci: true
+    revoke_if_leaked: true
+
+network_and_perimeter:
+  <<: *defaults
+  microsegmentation: true
+  default_deny: true
+  egress_filtering: true
+  allowed_egress_cidrs:
+    - "0.0.0.0/0:443"
+    - "10.0.0.0/8:53"
+  inbound_policies:
+    prod:
+      allow:
+        - name: "public_https"
+          ports: [443]
+          cidrs: ["0.0.0.0/0"]
+          waf_required: true
+        - name: "ssh_bastion"
+          ports: [22]
+          cidrs: ["203.0.113.0/24"]
+          mfa_required: true
+    dev:
+      allow:
+        - name: "vpn_only"
+          ports: [443,22]
+          cidrs: ["10.10.0.0/16"]
+  dns_security:
+    dnssec: true
+    blocklists_enabled: true
+
+runtime_security:
+  <<: *defaults
+  os_baseline:
+    hardening_profile: "cis_level_2"
+    auto_patch:
+      enable: true
+      max_deferral_days: 7
+  container_security:
+    base_images:
+      allowed_registries: ["registry.neurocity.example","ghcr.io/neurocity"]
+      require_signature: true
+      sbom_required: true
+    runtime:
+      rootless: true
+      read_only_fs: true
+      drop_caps: ["ALL"]
+      allow_privileged: false
+      seccomp_profile: "default"
+      apparmor_profile: "default"
+  kubernetes:
+    admission_controls:
+      enforce_policies: true
+      psa_level: "restricted"
+    required_settings:
+      run_as_non_root: true
+      allow_host_network: false
+      disallow_hostpath: true
+      image_pull_policy: "Always"
+      resources:
+        cpu_requests_min: "50m"
+        mem_requests_min: "64Mi"
+    network_policies_required: true
+    secrets_type: "ExternalSecrets"
+  serverless:
+    signing_required: true
+    network_egress_default_deny: true
+
+sdlc_and_cicd:
+  <<: *defaults
+  branch_protection:
+    require_reviews: 2
+    codeowners_required: true
+    signed_commits_required: true
+  pipelines:
+    provenance: "SLSA-L3"
+    stages:
+      - name: "static_analysis"
+        gates:
+          - "sast_no_high"
+          - "iac_no_critical"
+      - name: "dependency_security"
+        gates:
+          - "no_known_vulns_high"
+          - "license_policy_pass"
+      - name: "build_and_sign"
+        gates:
+          - "sbom_generated"
+          - "image_signed"
+      - name: "dynamic_tests"
+        gates:
+          - "dast_no_high"
+          - "api_fuzz_min_coverage"
+      - name: "deploy"
+        environment_promotion: ["dev","stage","prod"]
+        require_change_ticket: true
+  scanners:
+    sast: ["semgrep","codeql"]
+    dast: ["owasp-zap"]
+    iac: ["tfsec","checkov"]
+    container: ["grype","trivy"]
+    secrets: ["gitleaks"]
+  quality_budgets:
+    min_test_coverage_percent: 80
+    flaky_test_failure_rate_max_percent: 2
+
+supply_chain_security:
+  <<: *defaults
+  artifact_signing: "cosign"
+  attestations:
+    sbom_format: "SPDX"
+    build_provenance: true
+  dependencies:
+    allowlist_licenses: ["MIT","Apache-2.0","BSD-3-Clause","ISC"]
+    denylist_licenses: ["GPL-3.0-only"]
+    pinning_required: true
+    update_window_days: 14
+  repo_controls:
+    third_party_sources_require_review: true
+    vendoring_required_for_critical: true
+
+observability_and_logging:
+  <<: *defaults
+  log_levels:
+    app: "info"
+    security: "info"
+    system: "notice"
+  retention_days:
+    security: 365
+    app: 90
+    audit: 730
+  integrity_protection:
+    immutability: true
+    timestamping: true
+  pii_redaction:
+    enabled: true
+    patterns:
+      - "email"
+      - "phone"
+      - "iban"
+  metrics:
+    slos:
+      auth_success_rate_min: 99.95
+      p99_login_latency_ms_max: 400
+  tracing:
+    sample_rate_percent: 10
+    block_sensitive_spans: true
+
+dlp_and_data_governance:
+  <<: *defaults
+  data_classes:
+    - id: "public"
+      examples: ["marketing"]
+    - id: "internal"
+      examples: ["engineering_docs"]
+    - id: "restricted"
+      examples: ["source_code","architecture"]
+    - id: "confidential"
+      examples: ["user_pii","secrets"]
+  storage_controls:
+    at_rest_encryption_required: true
+    access_by_role_only: true
+  egress_controls:
+    restrict_personal_email_domains: true
+    block_public_buckets: true
+  dataset_registry_required: true
+
+backup_and_recovery:
+  <<: *defaults
+  rpo_minutes: 15
+  rto_minutes: 60
+  immutable_backups: true
+  geo_redundant: true
+  test_restore_frequency_days: 30
+
+incident_response:
+  <<: *defaults
+  runbooks:
+    - id: "RB-IR-001"
+      name: "Compromised Credential"
+      url: "runbooks/ir/compromised-credential.md"
+    - id: "RB-IR-002"
+      name: "Prod Breach"
+      url: "runbooks/ir/prod-breach.md"
+  communication_matrix:
+    legal_required_for: ["breach","pii_exposure"]
+    regulators_notify_within_hours: 72
+  containment:
+    auto_quarantine_enabled: true
+    kill_switches:
+      api_egress: true
+      artifact_promotion: true
+  postmortems:
+    required_for_levels: ["high","critical"]
+    max_publish_days: 7
+
+compliance_mapping:
+  frameworks:
+    iso27001:
+      clauses: ["A.5","A.8","A.9","A.12","A.14","A.16","A.18"]
+    soc2:
+      trust_services: ["Security","Availability","Confidentiality"]
+    cis_benchmarks:
+      profiles: ["kubernetes_level2","linux_level2"]
+
+checks:
+  # Machine-executable checks bound to gates. Each check has id, query, severity, remediation.
+  - id: "sast_no_high"
+    type: "sast"
+    tool: "semgrep"
+    severity: "high"
+    fail_on_findings: true
+    remediation: "Fix high severity findings before merge."
+  - id: "iac_no_critical"
+    type: "iac"
+    tool: "checkov"
+    severity: "critical"
+    policy_pack: "baseline"
+    remediation: "Correct critical IaC misconfigurations."
+  - id: "no_known_vulns_high"
+    type: "dependency"
+    tool: "trivy"
+    severity: "high"
+    max_cvss: 7.0
+    remediation: "Upgrade dependencies or apply patches."
+  - id: "sbom_generated"
+    type: "supply_chain"
+    tool: "syft"
+    severity: "medium"
+    required: true
+    remediation: "Generate SPDX SBOM and attach attestation."
+  - id: "image_signed"
+    type: "supply_chain"
+    tool: "cosign"
+    severity: "high"
+    required: true
+    remediation: "Sign images with KMS key and verify in admission."
+  - id: "dast_no_high"
+    type: "dast"
+    tool: "owasp-zap"
+    severity: "high"
+    fail_on_findings: true
+    remediation: "Fix high DAST issues."
+  - id: "api_fuzz_min_coverage"
+    type: "fuzz"
+    tool: "restler"
+    severity: "medium"
+    min_coverage_percent: 60
+    remediation: "Increase API fuzzing coverage."
+
+exceptions:
+  <<: *defaults
+  require:
+    business_justification: true
+    risk_acceptance_level: "documented"
+    expiry_days_max: 90
+    approvers: ["CISO","Head of Platform"]
+  format:
+    fields: ["requester","system","control_id","risk_level","expiry_date","mitigations"]
+  active: []
+
+environments:
+  dev:
+    overrides:
+      enforcement_mode: "monitor"
+      identity_and_access:
+        requirements:
+          mfa:
+            user: "required"
+            admin: "required"
+      sdlc_and_cicd:
+        quality_budgets:
+          min_test_coverage_percent: 60
+  stage:
+    overrides:
+      enforcement_mode: "enforce"
+      sdlc_and_cicd:
+        quality_budgets:
+          min_test_coverage_percent: 70
+  prod:
+    overrides:
+      enforcement_mode: "enforce"
+      identity_and_access:
+        separation_of_duties:
+          forbidden_role_pairs:
+            - ["developer","admin"]
+            - ["developer","security"]
+      runtime_security:
+        kubernetes:
+          required_settings:
+            resources:
+              cpu_requests_min: "100m"
+              mem_requests_min: "128Mi"
+
+integrations:
+  opa:
+    bundles:
+      enabled: true
+      package_prefix: "neurocity.security"
+  admission_controller:
+    verify_image_signatures: true
+    verify_slsa_attestations: true
+  ci_cd:
+    exporters:
+      - type: "gitlab_rules"
+      - type: "github_actions_checks"
+  vault:
+    namespace: "neurocity"
+
+telemetry:
+  policy_hash: "auto"
+  emit_metrics: true
+  events:
+    on_violation: "webhook"
+    webhook_url: "https://sec-core-router.neurocity.example/webhook"
+
+signatures:
+  required: true
+  signers:
+    - role: "security"
+      key_ref: "kms://neurocity/code-sign"
+  last_signed: null
+
+json_schema:
+  $schema: "https://json-schema.org/draft/2020-12/schema"
+  type: object
+  required: ["schema_version","policy_id","identity_and_access","cryptography"]
+  additionalProperties: true

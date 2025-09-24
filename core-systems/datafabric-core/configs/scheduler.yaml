@@ -1,0 +1,388 @@
+# datafabric-core / configs / scheduler.yaml
+# Принципы: предсказуемость, справедливость, безопасность.
+# Никаких секретов в файле. Все чувствительные значения — через env/secret-хранилище.
+
+meta:
+  version: 1
+  owner: platform-scheduling
+  environment: ${APP_ENV:-staging}
+  timezone: ${SCHED_TZ:Europe/Stockholm}
+  nowSource: monotonic-then-utc
+
+cluster:
+  # Топология воркеров/раннеров
+  workers:
+    pools:
+      - name: default
+        replicas: ${SCHED_POOL_DEFAULT:4}
+        queueSelectors: ["q.default", "q.high", "q.bulk"]
+        runtime:
+          kind: process            # process|container|k8s-job
+          maxTasksPerWorker: 50
+          shutdownGraceSeconds: 30
+      - name: io
+        replicas: ${SCHED_POOL_IO:2}
+        queueSelectors: ["q.io", "q.minio", "q.kafka"]
+        runtime:
+          kind: process
+          maxTasksPerWorker: 100
+          shutdownGraceSeconds: 30
+      - name: cpu
+        replicas: ${SCHED_POOL_CPU:2}
+        queueSelectors: ["q.cpu"]
+        runtime:
+          kind: process
+          maxTasksPerWorker: 8
+          shutdownGraceSeconds: 60
+  scaling:
+    # Включите внешнее автоскейлинг-управление в k8s/terraform при необходимости
+    enabled: true
+    backlogTargets:
+      - queue: "q.high"
+        targetLagSeconds: 10
+      - queue: "q.default"
+        targetLagSeconds: 60
+
+storage:
+  # Координация блокировок и очередей
+  redis:
+    host: ${REDIS_HOST:redis}
+    port: ${REDIS_PORT:6379}
+    passwordRef: ${REDIS_PASSWORD_REF:secret://redis/password}
+    tls: ${REDIS_TLS_ENABLED:false}
+    keyPrefix: "df:sched:"
+    connectTimeoutMs: 200
+    socketTimeoutMs: 2000
+  postgres:
+    dsn: ${SCHED_PG_DSN:postgresql://datafabric:***@postgres:5432/datafabric}
+    pool:
+      min: 2
+      max: 16
+    tables:
+      jobs: "scheduler_jobs"
+      runs: "scheduler_runs"
+      leases: "scheduler_leases"
+
+queues:
+  defaults:
+    # Порядок обслуживания: приоритет + справедливый share между таганутыми группами
+    policy: weighted-fair
+    visibilityTimeoutSeconds: 900
+    delivery:
+      ordering: fifo               # fifo|lifo|priority
+      maxInFlight: 10000
+      maxDeliveryAttempts: 25
+    backoff:
+      strategy: exponential-jitter
+      baseSeconds: 2
+      maxSeconds: 600
+      jitterRatio: 0.2
+    deadLetter:
+      kind: stream                 # stream|queue|topic
+      name: "q.dead"
+      maxItems: 200000
+    parking:
+      enabled: true
+      reasonRetentionDays: 14
+    payload:
+      maxBytes: 1048576            # 1 MiB
+      compression: auto            # auto|gzip|zstd|off
+    idempotency:
+      keyHeader: "Idempotency-Key"
+      ttlSeconds: 86400
+  items:
+    - name: q.high
+      priority: 100
+      weight: 5
+      sla:
+        softSeconds: 10
+        hardSeconds: 60
+      concurrency:
+        global: 128
+        perTenant: 32
+        perWorker: 8
+      eviction:
+        preemptLowerQueues: true
+    - name: q.default
+      priority: 50
+      weight: 10
+      sla:
+        softSeconds: 60
+        hardSeconds: 300
+      concurrency:
+        global: 256
+        perTenant: 32
+        perWorker: 8
+    - name: q.io
+      priority: 40
+      weight: 6
+      concurrency:
+        global: 128
+        perTenant: 16
+    - name: q.cpu
+      priority: 60
+      weight: 4
+      concurrency:
+        global: 64
+        perTenant: 8
+        perWorker: 2
+      resources:
+        cpuCoresPerTask: 1
+    - name: q.bulk
+      priority: 10
+      weight: 1
+      throttling:
+        ratePerSecond: 20
+        burst: 40
+      concurrency:
+        global: 64
+        perTenant: 8
+
+calendars:
+  # Бизнес-календари и окна запуска
+  default:
+    timezone: ${SCHED_TZ:Europe/Stockholm}
+    includes:
+      - cron: "0 7 * * 1-5"    # будни с 07:00
+      - cron: "0 9 * * 6"      # суббота 09:00
+    excludes:
+      - holidaySet: "se-public" # публичные праздники SE
+      - date: "2025-12-25"
+  sets:
+    se-public:
+      dates:
+        - "2025-01-01"
+        - "2025-12-25"
+        - "2025-12-26"
+
+limits:
+  # Глобальные лимиты по типам задач и тенантам
+  globalConcurrency: 512
+  perTenant:
+    default: 64
+    overrides:
+      - tenant: "gold"
+        limit: 128
+      - tenant: "bronze"
+        limit: 16
+  perTaskKind:
+    ingest: 128
+    transform: 128
+    export: 64
+  circuitBreaker:
+    errorRateWindowSeconds: 300
+    errorRateThreshold: 0.2
+    openSeconds: 120
+    halfOpenSamples: 10
+  stormProtection:
+    scheduleQpsLimit: 200       # ограничение на создание задач API
+    actorQpsLimit: 50           # на одного актора/ключ идентичности
+
+defaults:
+  # Стандартные значения для JobSpec, если явно не заданы
+  job:
+    queue: "q.default"
+    tenant: "public"
+    kind: "generic"
+    priority: 0
+    calendar: "default"
+    timeoutSeconds: 900
+    hardKillAfterSeconds: 30
+    retries:
+      maxAttempts: 6
+      backoff: inherit           # inherit|fixed|exponential-jitter
+      fixedSeconds: 30
+    retryOn:
+      - retriable_error
+      - io_timeout
+      - rate_limited
+    doNotRetryOn:
+      - invalid_input
+      - unauthorized
+    dedupe:
+      strategy: key-ttl          # none|key-ttl|key-forever
+      rejectOnDuplicate: true
+    lock:
+      kind: lease
+      leaseTtlSeconds: 120
+    artifacts:
+      persistLogs: true
+      logTtlDays: 14
+      metricsTtlDays: 400
+      payloadTtlDays: 7
+    tracing:
+      sample: 0.1
+    audit:
+      enabled: true
+      level: summary
+
+tasks:
+  # Каталог типов задач с их требованиями
+  - kind: "ingest"
+    queue: "q.io"
+    concurrency:
+      perWorker: 10
+    resources:
+      cpuCores: 0.2
+      memoryMiB: 256
+    timeouts:
+      runSeconds: 600
+      heartbeatSeconds: 15
+    retries:
+      maxAttempts: 10
+      backoff:
+        strategy: exponential-jitter
+        baseSeconds: 2
+        maxSeconds: 300
+    inputs:
+      schemaRef: "schema://ingest/v1"
+    outputs:
+      schemaRef: "schema://event/v1"
+  - kind: "transform"
+    queue: "q.cpu"
+    resources:
+      cpuCores: 1
+      memoryMiB: 1024
+    timeouts:
+      runSeconds: 900
+      heartbeatSeconds: 20
+    retries:
+      maxAttempts: 5
+  - kind: "export"
+    queue: "q.bulk"
+    throttling:
+      ratePerSecond: 10
+      burst: 20
+    timeouts:
+      runSeconds: 1800
+
+scheduling:
+  # Политики принятия решений
+  fairness:
+    enabled: true
+    groupBy: ["tenant", "queue"]
+    minSharePerGroup: 1
+    starvationTimeoutSeconds: 60
+  priorities:
+    # Нормализация относительных приоритетов
+    normalize: true
+    cap: 1000
+  placement:
+    # Выбор пула воркеров
+    strategy: "binpack-respect-queue"   # spread|binpack|binpack-respect-queue
+  preemption:
+    enabled: true
+    protectKinds: ["ingest"]            # не вытесняем critical‑IO
+    rules:
+      - whenQueue: "q.high"
+        canPreempt: ["q.default","q.bulk"]
+  windows:
+    respectCalendar: true
+    rejectOutsideWindow: true
+
+deadlines:
+  # Жёсткие дедлайны и SLA-классы
+  classes:
+    - name: interactive
+      maxQueueSeconds: 5
+      maxRuntimeSeconds: 60
+      escalateToQueue: "q.high"
+    - name: batch
+      maxQueueSeconds: 600
+      maxRuntimeSeconds: 3600
+
+leases:
+  # Управление лизингом задач (видимость/воркер heartbeat)
+  heartbeatIntervalSeconds: 10
+  expireAfterMissedHeartbeats: 6
+  extendOnProgressSeconds: 60
+
+api:
+  # Контроль входящего трафика планировщика
+  authn:
+    mode: jwt
+    issuer: ${JWT_ISSUER:https://auth.example.org}
+    audience: ["datafabric-core"]
+  rateLimit:
+    perIpRps: 20
+    perTokenRps: 50
+  quotas:
+    createJobPerTenantPerMinute: 1000
+  audit:
+    redactFields: ["payload", "secrets", "authorization"]
+
+observability:
+  logs:
+    level: ${SCHED_LOG_LEVEL:info}
+    json: true
+  metrics:
+    exporter: otlp
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://otel-collector:4318}
+  tracing:
+    exporter: otlp
+    sample: 0.1
+  alerts:
+    slos:
+      - name: queue_high_sla_violation
+        expr: "sla_violation_ratio{queue='q.high'} > 0.01"
+        for: "5m"
+      - name: scheduler_heartbeat_misses
+        expr: "worker_missed_heartbeats_total > 0"
+        for: "2m"
+
+maintenance:
+  # Очистка и репэйр
+  janitor:
+    runEveryCron: "*/5 * * * *"
+    tasks:
+      - kind: purge-completed
+        completedOlderThanDays: 7
+        limit: 10000
+      - kind: purge-parking
+        parkedOlderThanDays: 30
+        limit: 5000
+      - kind: retry-dead-letter
+        dlq: "q.dead"
+        maxPerRun: 500
+      - kind: release-zombie-leases
+        olderThanMinutes: 15
+
+integration:
+  # Интеграция с внешними системами запуска
+  cron:
+    enabled: true
+    timezone: ${SCHED_TZ:Europe/Stockholm}
+    sources:
+      - kind: file
+        path: ${SCHED_CRON_FILE:/app/configs/cron.yaml}
+      - kind: http
+        url: ${SCHED_CRON_URL:}
+        authHeaderRef: ${SCHED_CRON_TOKEN_REF:secret://scheduler/cron-token}
+  kafka:
+    enabled: true
+    bootstrap: ${KAFKA_BROKER:kafka:9092}
+    topic: ${SCHED_TOPIC:datafabric.schedules}
+    consumerGroup: ${SCHED_CG:datafabric-scheduler}
+    security:
+      protocol: ${KAFKA_SECURITY_PROTOCOL:SASL_SSL}
+      sasl:
+        mechanism: ${KAFKA_SASL_MECHANISM:OAUTHBEARER}
+        username: ${KAFKA_SASL_USERNAME:}
+        passwordRef: ${KAFKA_SASL_PASSWORD_REF:secret://kafka/sasl}
+      tls:
+        insecureSkipVerify: ${KAFKA_TLS_INSECURE:false}
+
+validation:
+  # Включаем строгую валидацию входящих JobSpec
+  schemas:
+    jobSpec: "schema://scheduler/job/v1"
+    taskCatalog: "schema://scheduler/task-catalog/v1"
+  rejectUnknownFields: true
+  maxLabels: 32
+  maxAnnotations: 64
+
+featureFlags:
+  # Переключатели поведения (должны приходить из централизованного FF‑сервиса)
+  respectJobPriorityV2: true
+  fairShareV2: true
+  spanLinking: true

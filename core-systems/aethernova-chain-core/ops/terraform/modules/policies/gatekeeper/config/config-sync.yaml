@@ -1,0 +1,109 @@
+# 文件: aethernova-chain-core/ops/terraform/modules/policies/gatekeeper/config/config-sync.yaml
+# Назначение: центральная конфигурация Gatekeeper для репликации кластерных данных (inventory)
+# и управления исключениями по процессам. Должен называться строго "config". Источник: docs.  # ref: https://open-policy-agent.github.io/gatekeeper/website/docs/sync/
+apiVersion: config.gatekeeper.sh/v1alpha1
+kind: Config
+metadata:
+  name: config                  # ВАЖНО: имя должно быть "config" (иначе Gatekeeper игнорирует ресурс)
+  namespace: gatekeeper-system
+  labels:
+    app.kubernetes.io/name: gatekeeper-config
+    app.kubernetes.io/part-of: gatekeeper
+    app.kubernetes.io/managed-by: terraform
+  annotations:
+    # Документация:
+    # - Репликация данных (Config/SyncSet), форматы inventory: https://open-policy-agent.github.io/gatekeeper/website/docs/sync/
+    # - Исключения пространств имён по процессам: https://open-policy-agent.github.io/gatekeeper/website/docs/exempt-namespaces
+    aethernova.io/owner: platform-security-core
+spec:
+  ###########################################################################
+  # 1) Исключения по процессам (глобально для всех constraints)
+  #    Доступные процессы: audit, webhook, sync, mutation-webhook, "*"        # ref: docs
+  ###########################################################################
+  match:
+    # Полный байпас для системных пространств имён: не аудировать, не вызывать вебхук,
+    # не синхронизировать в OPA, не применять мутации в этих ns.
+    - excludedNamespaces: ["kube-*", "kube-system", "kube-public", "kube-node-lease",
+                           "gatekeeper-system", "cert-manager", "istio-system",
+                           "openshift-*", "local-path-storage"]
+      processes: ["*"]
+
+    # Пример тонкой настройки: исключить prod-observability от синхронизации инвентаря,
+    # но сохранить аудит/вебхук (можно удалить при ненадобности).
+    - excludedNamespaces: ["prod-observability"]
+      processes: ["sync"]
+
+  ###########################################################################
+  # 2) Репликация данных (inventory) для референциальных проверок
+  #    Все перечисленные GVK будут доступны в Rego через data.inventory...
+  #    Примечание: список можно минимизировать для снижения нагрузки.
+  ###########################################################################
+  sync:
+    syncOnly:
+      # --- core/v1 ---
+      - { group: "", version: "v1", kind: "Namespace" }
+      - { group: "", version: "v1", kind: "Pod" }
+      - { group: "", version: "v1", kind: "Service" }
+      - { group: "", version: "v1", kind: "ServiceAccount" }
+      - { group: "", version: "v1", kind: "Node" }
+      - { group: "", version: "v1", kind: "ConfigMap" }
+      # Внимание: синхронизация Secret увеличивает риск экспонирования данных в policy-слое.
+      # Обычно НЕ добавляем Secret. Добавляйте ТОЛЬКО если это обосновано и безопасно.
+
+      # --- apps/v1 ---
+      - { group: "apps", version: "v1", kind: "Deployment" }
+      - { group: "apps", version: "v1", kind: "StatefulSet" }
+      - { group: "apps", version: "v1", kind: "DaemonSet" }
+      - { group: "apps", version: "v1", kind: "ReplicaSet" }
+
+      # --- batch/v1 ---
+      - { group: "batch", version: "v1", kind: "Job" }
+      - { group: "batch", version: "v1", kind: "CronJob" }
+
+      # --- networking.k8s.io/v1 ---
+      - { group: "networking.k8s.io", version: "v1", kind: "Ingress" }
+      - { group: "networking.k8s.io", version: "v1", kind: "NetworkPolicy" }
+
+      # --- rbac.authorization.k8s.io/v1 ---
+      - { group: "rbac.authorization.k8s.io", version: "v1", kind: "Role" }
+      - { group: "rbac.authorization.k8s.io", version: "v1", kind: "RoleBinding" }
+      - { group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole" }
+      - { group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding" }
+
+      # --- policy/v1 ---
+      - { group: "policy", version: "v1", kind: "PodDisruptionBudget" }
+
+      # --- autoscaling/v2 ---
+      - { group: "autoscaling", version: "v2", kind: "HorizontalPodAutoscaler" }
+
+      # --- storage.k8s.io/v1 ---
+      - { group: "storage.k8s.io", version: "v1", kind: "StorageClass" }
+      - { group: "storage.k8s.io", version: "v1", kind: "CSIDriver" }
+
+      # --- admissionregistration.k8s.io/v1 ---
+      - { group: "admissionregistration.k8s.io", version: "v1", kind: "ValidatingWebhookConfiguration" }
+      - { group: "admissionregistration.k8s.io", version: "v1", kind: "MutatingWebhookConfiguration" }
+
+      # --- apiextensions.k8s.io/v1 ---
+      - { group: "apiextensions.k8s.io", version: "v1", kind: "CustomResourceDefinition" }
+
+      # --- gateway-api (опционально, если используется) ---
+      - { group: "gateway.networking.k8s.io", version: "v1", kind: "GatewayClass" }
+      - { group: "gateway.networking.k8s.io", version: "v1", kind: "Gateway" }
+      - { group: "gateway.networking.k8s.io", version: "v1", kind: "HTTPRoute" }
+
+      # --- cert-manager (опционально) ---
+      - { group: "cert-manager.io", version: "v1", kind: "Certificate" }
+      - { group: "cert-manager.io", version: "v1", kind: "Issuer" }
+      - { group: "cert-manager.io", version: "v1", kind: "ClusterIssuer" }
+
+      # --- monitoring (Prometheus Operator, опционально) ---
+      - { group: "monitoring.coreos.com", version: "v1", kind: "ServiceMonitor" }
+      - { group: "monitoring.coreos.com", version: "v1", kind: "PodMonitor" }
+
+  ###########################################################################
+  # 3) Подсказка по доступу к данным в Rego (для разработчиков политик)
+  #    Кластерные ресурсы: data.inventory.cluster["v1"].Namespace["gatekeeper"]
+  #    Namespaced ресурсы: data.inventory.namespace["ns"]["v1"]["Pod"]["pod-name"]
+  #    Источник формата: раздел "Accessing replicated data" в docs.
+  ###########################################################################

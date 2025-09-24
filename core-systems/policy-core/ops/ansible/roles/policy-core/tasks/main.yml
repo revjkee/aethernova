@@ -1,0 +1,244 @@
+# path: policy-core/ops/ansible/roles/policy-core/tasks/main.yml
+---
+- name: "Префлайт: проверка версии Ansible"
+  ansible.builtin.assert:
+    that:
+      - ansible_version.full is version('2.12', '>=')
+    fail_msg: "Требуется Ansible >= 2.12"
+    success_msg: "Ansible версии {{ ansible_version.full }}"
+
+- name: "Определить платформу"
+  ansible.builtin.set_fact:
+    _is_debian: "{{ ansible_facts.os_family == 'Debian' }}"
+    _is_redhat: "{{ ansible_facts.os_family == 'RedHat' }}"
+
+- name: "Установить системные пакеты (Debian)"
+  ansible.builtin.apt:
+    name:
+      - python3
+      - python3-venv
+      - python3-pip
+      - gcc
+      - libffi-dev
+      - libssl-dev
+      - pkg-config
+    update_cache: true
+    state: present
+  when: _is_debian
+
+- name: "Установить системные пакеты (RedHat)"
+  ansible.builtin.yum:
+    name:
+      - python3
+      - python3-pip
+      - python3-virtualenv
+      - gcc
+      - gcc-c++
+      - libffi-devel
+      - openssl-devel
+      - python3-devel
+      - pkgconfig
+    state: present
+  when: _is_redhat
+
+- name: "Создать группу приложения"
+  ansible.builtin.group:
+    name: "{{ policy_core_group | default('app') }}"
+    gid: "{{ policy_core_gid | default(1000) }}"
+    state: present
+  register: _grp
+
+- name: "Создать пользователя приложения"
+  ansible.builtin.user:
+    name: "{{ policy_core_user | default('app') }}"
+    uid: "{{ policy_core_uid | default(1000) }}"
+    group: "{{ policy_core_group | default('app') }}"
+    shell: /bin/bash
+    create_home: true
+    state: present
+  register: _usr
+
+- name: "Создать директории"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ policy_core_user | default('app') }}"
+    group: "{{ policy_core_group | default('app') }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop:
+    - { path: "{{ policy_core_home | default('/opt/policy-core') }}", mode: "0750" }
+    - { path: "{{ policy_core_log_dir | default('/var/log/policy-core') }}", mode: "0750" }
+    - { path: "{{ policy_core_data_dir | default('/var/lib/policy-core') }}", mode: "0750" }
+    - { path: "{{ policy_core_conf_dir | default('/etc/policy-core') }}", mode: "0750" }
+
+- name: "Создать Python venv"
+  ansible.builtin.command:
+    cmd: "python3 -m venv {{ policy_core_venv | default('/opt/policy-core/.venv') }}"
+    creates: "{{ policy_core_venv | default('/opt/policy-core/.venv') }}/bin/activate"
+  register: _venv
+  changed_when: _venv.rc == 0
+
+- name: "Обновить pip/wheel/setuptools в venv"
+  ansible.builtin.pip:
+    name:
+      - pip
+      - wheel
+      - setuptools
+    state: latest
+    virtualenv: "{{ policy_core_venv | default('/opt/policy-core/.venv') }}"
+    virtualenv_python: python3
+
+- name: "Установить policy-core из PyPI или локального исходника"
+  vars:
+    _pkg_spec: >-
+      {{
+        (policy_core_src is defined)
+        | ternary(policy_core_src, "policy-core[web]" ~
+          (policy_core_version is defined | ternary("==" ~ policy_core_version, "")))
+      }}
+  ansible.builtin.pip:
+    name: "{{ _pkg_spec }}"
+    state: present
+    virtualenv: "{{ policy_core_venv | default('/opt/policy-core/.venv') }}"
+    virtualenv_python: python3
+    extra_args: "{{ policy_core_pip_extra_args | default('--no-cache-dir') }}"
+  register: _pip_install
+
+- name: "Сформировать env-файл конфигурации"
+  vars:
+    _env_map: "{{ policy_core_env | default({ 'APP_ENV':'prod', 'LOG_LEVEL':'info', 'HTTP_PORT': (policy_core_port | default(8000) | string) }) }}"
+    _env_content: |-
+      {% for k, v in _env_map | dictsort %}
+      {{ k }}={{ v }}
+      {% endfor %}
+  ansible.builtin.copy:
+    dest: "{{ (policy_core_conf_dir | default('/etc/policy-core')) ~ '/policy-core.env' }}"
+    owner: "{{ policy_core_user | default('app') }}"
+    group: "{{ policy_core_group | default('app') }}"
+    mode: "0640"
+    content: "{{ _env_content }}\n"
+  register: _env_written
+
+- name: "Сформировать env-файл секретов"
+  vars:
+    _sec_map: "{{ policy_core_secret_env | default({}) }}"
+    _sec_content: |-
+      {% for k, v in _sec_map | dictsort %}
+      {{ k }}={{ v }}
+      {% endfor %}
+  ansible.builtin.copy:
+    dest: "{{ (policy_core_conf_dir | default('/etc/policy-core')) ~ '/policy-core.secrets' }}"
+    owner: "{{ policy_core_user | default('app') }}"
+    group: "{{ policy_core_group | default('app') }}"
+    mode: "0640"
+    content: "{{ _sec_content }}\n"
+  no_log: true
+  when: (policy_core_secret_env | default({})) | length > 0
+  register: _sec_written
+
+- name: "Создать systemd unit для policy-core (uvicorn)"
+  vars:
+    _svc_path: "/etc/systemd/system/policy-core.service"
+    _venv_bin: "{{ policy_core_venv | default('/opt/policy-core/.venv') }}/bin"
+    _app_mod: "{{ policy_core_app_module | default('policy_core.api:app') }}"
+    _port: "{{ policy_core_port | default(8000) }}"
+    _loglvl: "{{ policy_core_log_level | default('info') }}"
+    _user: "{{ policy_core_user | default('app') }}"
+    _group: "{{ policy_core_group | default('app') }}"
+    _workdir: "{{ policy_core_home | default('/opt/policy-core') }}"
+    _confdir: "{{ policy_core_conf_dir | default('/etc/policy-core') }}"
+    _logdir: "{{ policy_core_log_dir | default('/var/log/policy-core') }}"
+    _datadir: "{{ policy_core_data_dir | default('/var/lib/policy-core') }}"
+    _workers: >-
+      {{ policy_core_workers | default(ansible_facts.processor_vcpus | default(2)) }}
+  ansible.builtin.copy:
+    dest: "{{ _svc_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=policy-core API (uvicorn)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      WorkingDirectory={{ _workdir }}
+      EnvironmentFile={{ _confdir }}/policy-core.env
+      {% if (policy_core_secret_env | default({}))|length > 0 -%}
+      EnvironmentFile={{ _confdir }}/policy-core.secrets
+      {% endif -%}
+      Environment=PYTHONDONTWRITEBYTECODE=1
+      Environment=PYTHONUNBUFFERED=1
+      User={{ _user }}
+      Group={{ _group }}
+      ExecStart={{ _venv_bin }}/uvicorn {{ _app_mod }} --host 0.0.0.0 --port {{ _port }} --workers {{ _workers }} --log-level {{ _loglvl }} --proxy-headers
+      Restart=on-failure
+      RestartSec=3
+      TimeoutStopSec=30
+      # Security hardening
+      NoNewPrivileges=true
+      PrivateTmp=true
+      ProtectSystem=strict
+      ProtectHome=true
+      ReadWritePaths={{ _logdir }} {{ _datadir }} {{ _workdir }}
+      UMask=0027
+      AmbientCapabilities=
+      CapabilityBoundingSet=
+      RestrictRealtime=true
+      RestrictSUIDSGID=true
+      RestrictNamespaces=true
+      LockPersonality=true
+      MemoryDenyWriteExecute=true
+      RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+      LimitNOFILE=65535
+
+      [Install]
+      WantedBy=multi-user.target
+  register: _unit_written
+
+- name: "systemd daemon-reload при изменении unit"
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _unit_written is changed
+
+- name: "Открыть порт firewalld (если доступен)"
+  ansible.posix.firewalld:
+    port: "{{ (policy_core_port | default(8000) | string) }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  when:
+    - ansible_facts.services is defined or true
+    - "'firewalld' in ansible_facts.packages or 'firewalld' in (ansible_facts.services | default({}))"
+  ignore_errors: true
+
+- name: "SELinux: разрешить сетевые соединения для приложений (если включён)"
+  ansible.posix.seboolean:
+    name: "nis_enabled"
+    state: true
+    persistent: true
+  when:
+    - ansible_facts.selinux is defined
+    - ansible_facts.selinux.status == "enabled"
+  ignore_errors: true
+
+- name: "Запустить/включить policy-core"
+  vars:
+    _need_restart: "{{ (_env_written is changed) or (_sec_written is defined and _sec_written is changed) or (_unit_written is changed) or (_pip_install is changed) }}"
+  ansible.builtin.systemd:
+    name: policy-core.service
+    state: "{{ _need_restart | ternary('restarted','started') }}"
+    enabled: true
+
+- name: "Ожидать доступности HTTP healthz"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ policy_core_port | default(8000) }}/healthz"
+    status_code: 200
+    timeout: 2
+  register: _health
+  retries: 20
+  delay: 2
+  until: _health.status is defined and _health.status == 200
+  failed_when: _health is failed

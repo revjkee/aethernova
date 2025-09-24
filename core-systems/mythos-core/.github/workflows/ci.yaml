@@ -1,0 +1,273 @@
+name: mythos-core CI
+
+on:
+  push:
+    branches: [ "main", "develop", "release/*" ]
+    tags:     [ "v*" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write  # для загрузки SARIF (если включите security-сканы)
+  id-token: none
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  # Покрытие/отчёты (опционально)
+  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+jobs:
+  lint:
+    name: Lint & Style
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            **/requirements*.txt
+            **/pyproject.toml
+            **/setup.cfg
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.6.9
+
+      - name: Ruff lint
+        run: |
+          ruff check --output-format=github .
+
+      - name: Ruff format check
+        run: |
+          ruff format --check .
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ lint ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            **/requirements*.txt
+            **/pyproject.toml
+            **/setup.cfg
+
+      - name: Install dependencies (core + type)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          # mypy и полезные плагины
+          pip install mypy==1.11.2 pydantic sqlalchemy mypy-extensions
+          # опциональные плагины, если используете
+          pip install pydantic-settings || true
+        shell: bash
+
+      - name: Run mypy
+        run: |
+          mypy --config-file mythos-core/mypy.ini mythos-core
+
+  test:
+    name: Tests ${{ matrix.python-version }} • ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    needs: [ lint ]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest ]
+        python-version: [ "3.10", "3.11", "3.12" ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: |
+            **/requirements*.txt
+            **/pyproject.toml
+            **/setup.cfg
+
+      - name: Install project and test deps
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          # PyTest и покрытие
+          pip install pytest pytest-cov
+        shell: bash
+
+      - name: Run pytest with coverage
+        run: |
+          pytest -q \
+            --maxfail=1 \
+            --disable-warnings \
+            --cov=mythos-core \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing
+        shell: bash
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload to Codecov (optional)
+        if: env.CODECOV_TOKEN != '' && (success() || failure())
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: coverage.xml
+          flags: ${{ matrix.python-version }}
+          fail_ci_if_error: false
+
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ lint ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install audit tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit bandit || true
+        shell: bash
+
+      - name: pip-audit (advisories)
+        continue-on-error: true   # не роняем сборку из-за сетевых флейков/мирроров
+        run: |
+          pip-audit -r requirements.txt || pip-audit || true
+
+      - name: Bandit (SAST) if config present
+        continue-on-error: true
+        run: |
+          if [ -f bandit.yaml ] || [ -f bandit.yml ]; then
+            bandit -c bandit.yaml -r mythos-core || bandit -c bandit.yml -r mythos-core || true
+          else
+            bandit -r mythos-core -q || true
+          fi
+
+  sbom:
+    name: SBOM (Syft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [ lint ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SBOM (if syft available)
+        id: sbom
+        shell: bash
+        run: |
+          if command -v syft >/dev/null 2>&1; then
+            syft dir:. -o spdx-json=sbom.spdx.json || true
+          else
+            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true
+            syft dir:. -o spdx-json=sbom.spdx.json || true
+          fi
+          if [ -f sbom.spdx.json ]; then echo "created=true" >> $GITHUB_OUTPUT; fi
+      - name: Upload SBOM
+        if: steps.sbom.outputs.created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: sbom.spdx.json
+          retention-days: 7
+
+  build:
+    name: Build & Validate dist
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [ typecheck, test ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            **/pyproject.toml
+            **/setup.cfg
+            **/requirements*.txt
+
+      - name: Build wheel/sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*
+        shell: bash
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mythos-core-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Пример публикации на PyPI по тегу (отключено по умолчанию)
+  # включите, если добавите секреты PYPI_TOKEN и будете пушить теги v*
+  publish:
+    name: Publish to PyPI (on tag)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [ build ]
+    if: startsWith(github.ref, 'refs/tags/v') && secrets.PYPI_TOKEN != ''
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download dist from artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mythos-core-dist
+          path: dist
+      - name: Publish (twine)
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          python -m pip install --upgrade pip twine
+          twine upload --non-interactive dist/*

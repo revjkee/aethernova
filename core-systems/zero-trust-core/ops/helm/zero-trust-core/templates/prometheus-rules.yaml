@@ -1,0 +1,338 @@
+# path: zero-trust-core/ops/helm/zero-trust-core/templates/prometheus-rules.yaml
+{{- /*
+PrometheusRule for zero-trust-core
+Values (suggested):
+alerts:
+  enabled: true
+  runbookBaseURL: "https://runbooks.internal/zero-trust-core"
+  windows:
+    short: 5m
+    medium: 15m
+    long: 1h
+  thresholds:
+    errorRatio: 0.05
+    latencyP99Ms: 500
+    cpuSaturation: 0.9
+    memSaturation: 0.9
+    restartBurst: 3
+    scrapeFailuresPct: 10
+  severity:
+    critical: critical
+    warning: warning
+    info: info
+metrics:
+  http:
+    enabled: true
+    # choose metric family exposed by app; first match that exists will work
+    # try order: http_server_requests_seconds (Prometheus histo from popular libs), OR http_request_duration_seconds
+    selector: '{app_kubernetes_io_part_of="zero-trust-core"}'
+    # label names for route/status if needed
+    statusLabel: 'code'
+    methodLabel: 'method'
+  vpn:
+    enabled: false
+    selector: '{app_kubernetes_io_component="vpn",app_kubernetes_io_part_of="zero-trust-core"}'
+  otel:
+    enabled: false
+    selector: '{job="otel-collector"}'
+cni:
+  provider: "" # "", "cilium", "calico"
+*/ -}}
+{{- if .Values.alerts.enabled }}
+{{- $ns := .Release.Namespace -}}
+{{- $rel := .Release.Name -}}
+{{- $name := include "zero-trust-core.fullname" . -}}
+{{- $labels := include "zero-trust-core.labels" . -}}
+{{- $rb := default "" .Values.alerts.runbookBaseURL -}}
+{{- $w := .Values.alerts.windows | default (dict "short" "5m" "medium" "15m" "long" "1h") -}}
+{{- $t := .Values.alerts.thresholds | default (dict "errorRatio" 0.05 "latencyP99Ms" 500 "cpuSaturation" 0.9 "memSaturation" 0.9 "restartBurst" 3 "scrapeFailuresPct" 10) -}}
+{{- $sev := .Values.alerts.severity | default (dict "critical" "critical" "warning" "warning" "info" "info") -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $name }}-rules
+  namespace: {{ $ns }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: alerts
+    app.kubernetes.io/part-of: zero-trust-core
+spec:
+  groups:
+    # =======================
+    # Recording rules (SLO/агрегации)
+    # =======================
+    - name: ztc.recording
+      rules:
+        # HTTP request rate (5m)
+        {{- if .Values.metrics.http.enabled }}
+        - record: ztc:http_requests:rate5m
+          expr: |
+            sum by (namespace) (
+              rate(http_requests_total{{ .Values.metrics.http.selector }}[{{ $w.short }}])
+              or rate(http_server_requests_seconds_count{{ .Values.metrics.http.selector }}[{{ $w.short }}])
+            )
+          labels:
+            release: "{{ $rel }}"
+        # Error ratio (5m)
+        - record: ztc:http_error_ratio:5m
+          expr: |
+            (
+              sum by (namespace) (
+                rate(http_requests_total{{ .Values.metrics.http.selector }},{{ .Values.metrics.http.statusLabel | default "code" }}=~"5..|4.."[{{ $w.short }}])
+                or rate(http_server_requests_seconds_count{{ .Values.metrics.http.selector }},{{ .Values.metrics.http.statusLabel | default "status" }}=~"5..|4.."[{{ $w.short }}])
+              )
+            )
+            /
+            clamp_min(
+              sum by (namespace) (
+                rate(http_requests_total{{ .Values.metrics.http.selector }}[{{ $w.short }}])
+                or rate(http_server_requests_seconds_count{{ .Values.metrics.http.selector }}[{{ $w.short }}])
+              ), 1e-6)
+          labels:
+            release: "{{ $rel }}"
+        # Latency p99 (ms)
+        - record: ztc:http_latency_p99_ms:5m
+          expr: |
+            1000 *
+            histogram_quantile(
+              0.99,
+              sum by (le) (
+                rate(http_request_duration_seconds_bucket{{ .Values.metrics.http.selector }}[{{ $w.short }}])
+                or rate(http_server_requests_seconds_bucket{{ .Values.metrics.http.selector }}[{{ $w.short }}])
+              )
+            )
+          labels:
+            release: "{{ $rel }}"
+        {{- end }}
+
+        # CPU saturation per pod (requested cores as baseline)
+        - record: ztc:pod_cpu_saturation:ratio
+          expr: |
+            clamp_max(
+              sum by (namespace,pod) (rate(container_cpu_usage_seconds_total{image!="",container!~"POD|",namespace="{{ $ns }}"}[{{ $w.short }}]))
+              /
+              clamp_min(sum by (namespace,pod) (kube_pod_container_resource_requests{resource="cpu",unit="core",namespace="{{ $ns }}"})
+              , 0.001)
+            , 10)
+          labels:
+            release: "{{ $rel }}"
+        # Memory saturation per pod (rss / request)
+        - record: ztc:pod_mem_saturation:ratio
+          expr: |
+            clamp_max(
+              sum by (namespace,pod) (container_memory_working_set_bytes{image!="",container!~"POD|",namespace="{{ $ns }}"})
+              /
+              clamp_min(sum by (namespace,pod) (kube_pod_container_resource_requests{resource="memory",unit="byte",namespace="{{ $ns }}"})
+              , 1e6)
+            , 10)
+          labels:
+            release: "{{ $rel }}"
+
+    # =======================
+    # Availability / Deployments
+    # =======================
+    - name: ztc.availability
+      rules:
+        # Разница между желаемыми и доступными репликами по деплойментам релиза
+        - alert: ZTCDeploymentUnavailable
+          expr: |
+            (
+              sum by (namespace, deployment) (
+                kube_deployment_spec_replicas{namespace="{{ $ns }}"}
+              )
+              -
+              sum by (namespace, deployment) (
+                kube_deployment_status_replicas_available{namespace="{{ $ns }}"}
+              )
+            )
+            * on (namespace, deployment) group_left(label_app_kubernetes_io_instance)
+            kube_deployment_labels{namespace="{{ $ns }}",label_app_kubernetes_io_instance="{{ $rel }}",label_app_kubernetes_io_part_of="zero-trust-core"} > 0
+          for: {{ $w.medium }}
+          labels:
+            severity: {{ $sev.critical | quote }}
+            team: "platform"
+          annotations:
+            summary: "Недоступные реплики Deployment"
+            description: "У деплойментов релиза {{ $rel }} есть недоступные реплики > {{ $w.medium }}."
+            runbook_url: {{ printf "%s/deployments#unavailable" $rb | quote }}
+
+        # Readiness-провал по подам релиза
+        - alert: ZTCPodNotReady
+          expr: |
+            max by (namespace,pod) (
+              kube_pod_status_ready{condition="true",namespace="{{ $ns }}"} == 0
+            )
+            * on (namespace,pod) group_left(label_app_kubernetes_io_instance)
+            kube_pod_labels{namespace="{{ $ns }}",label_app_kubernetes_io_instance="{{ $rel }}",label_app_kubernetes_io_part_of="zero-trust-core"} == 1
+          for: {{ $w.short }}
+          labels:
+            severity: {{ $sev.warning | quote }}
+          annotations:
+            summary: "Pod не готов (Readiness=false)"
+            description: "Pod {{`{{ $labels.pod }}`}} не проходит Readiness более {{ $w.short }}."
+            runbook_url: {{ printf "%s/pods#not-ready" $rb | quote }}
+
+        # Частые перезапуски контейнеров
+        - alert: ZTCContainerCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}"}[{{ $w.short }}]) >= {{ $t.restartBurst }}
+            * on (namespace,pod) group_left(label_app_kubernetes_io_instance)
+            kube_pod_labels{namespace="{{ $ns }}",label_app_kubernetes_io_instance="{{ $rel }}",label_app_kubernetes_io_part_of="zero-trust-core"} == 1
+          for: {{ $w.short }}
+          labels:
+            severity: {{ $sev.warning | quote }}
+          annotations:
+            summary: "Частые перезапуски контейнера"
+            description: "Pod {{`{{ $labels.pod }}`}} перезапускается ≥ {{ $t.restartBurst }} раз за {{ $w.short }}."
+            runbook_url: {{ printf "%s/pods#crashloop" $rb | quote }}
+
+    # =======================
+    # SLO: HTTP ошибки и латентность (если метрики включены)
+    # =======================
+    {{- if .Values.metrics.http.enabled }}
+    - name: ztc.http.slo
+      rules:
+        - alert: ZTCHttpHighErrorRatio
+          expr: ztc:http_error_ratio:5m{namespace="{{ $ns }}"} > {{ $t.errorRatio }}
+          for: {{ $w.medium }}
+          labels:
+            severity: {{ $sev.critical | quote }}
+          annotations:
+            summary: "Высокая доля HTTP-ошибок"
+            description: "Ошибка/все запросы за {{ $w.short }} > {{ $t.errorRatio }} (namespace {{ $ns }})."
+            runbook_url: {{ printf "%s/http#errors" $rb | quote }}
+
+        - alert: ZTCHttpHighLatencyP99
+          expr: ztc:http_latency_p99_ms:5m{namespace="{{ $ns }}"} > {{ $t.latencyP99Ms }}
+          for: {{ $w.medium }}
+          labels:
+            severity: {{ $sev.warning | quote }}
+          annotations:
+            summary: "Высокая латентность p99"
+            description: "p99 > {{ $t.latencyP99Ms }} ms за {{ $w.short }} (namespace {{ $ns }})."
+            runbook_url: {{ printf "%s/http#latency" $rb | quote }}
+    {{- end }}
+
+    # =======================
+    # Ресурсы: CPU/Memory
+    # =======================
+    - name: ztc.resources
+      rules:
+        - alert: ZTCPodCPUSaturation
+          expr: |
+            max by (namespace,pod) (ztc:pod_cpu_saturation:ratio{namespace="{{ $ns }}"}) > {{ $t.cpuSaturation }}
+          for: {{ $w.medium }}
+          labels:
+            severity: {{ $sev.warning | quote }}
+          annotations:
+            summary: "CPU насыщение"
+            description: "Pod {{`{{ $labels.pod }}`}} использует > {{ mul $t.cpuSaturation 100 | int }}% от CPU-request более {{ $w.medium }}."
+            runbook_url: {{ printf "%s/resources#cpu" $rb | quote }}
+
+        - alert: ZTCPodMemorySaturation
+          expr: |
+            max by (namespace,pod) (ztc:pod_mem_saturation:ratio{namespace="{{ $ns }}"}) > {{ $t.memSaturation }}
+          for: {{ $w.medium }}
+          labels:
+            severity: {{ $sev.warning | quote }}
+          annotations:
+            summary: "Memory насыщение"
+            description: "Pod {{`{{ $labels.pod }}`}} использует > {{ mul $t.memSaturation 100 | int }}% от Memory-request более {{ $w.medium }}."
+            runbook_url: {{ printf "%s/resources#memory" $rb | quote }}
+
+    # =======================
+    # Scrape/Observability
+    # =======================
+    - name: ztc.observability
+      rules:
+        - alert: ZTCScrapeFailuresHigh
+          expr: |
+            100 * (
+              sum by (job,namespace) (increase(prometheus_target_scrapes_exceeded_sample_limit_total{namespace="{{ $ns }}"}[{{ $w.short }}]))
+              +
+              sum by (job,namespace) (increase(prometheus_target_sync_failed_total{namespace="{{ $ns }}"}[{{ $w.short }}]))
+            )
+            /
+            clamp_min(sum by (job,namespace) (increase(prometheus_target_scrapes_total{namespace="{{ $ns }}"}[{{ $w.short }}])), 1) > {{ $t.scrapeFailuresPct }}
+          for: {{ $w.medium }}
+          labels:
+            severity: {{ $sev.info | quote }}
+          annotations:
+            summary: "Проблемы со scrape Prometheus"
+            description: "Доля неуспешных/ограниченных scrape > {{ $t.scrapeFailuresPct }}% за {{ $w.short }}."
+            runbook_url: {{ printf "%s/observability#scrape" $rb | quote }}
+
+        {{- if .Values.metrics.otel.enabled }}
+        - alert: ZTCOtelExportFailures
+          expr: |
+            rate(otelcol_exporter_send_failed_spans_total{{ .Values.metrics.otel.selector }}[{{ $w.short }}]) > 0
+            or rate(otelcol_exporter_send_failed_logs_total{{ .Values.metrics.otel.selector }}[{{ $w.short }}]) > 0
+            or rate(otelcol_exporter_send_failed_metric_points_total{{ .Values.metrics.otel.selector }}[{{ $w.short }}]) > 0
+          for: {{ $w.short }}
+          labels:
+            severity: {{ $sev.warning | quote }}
+          annotations:
+            summary: "OTEL экспортер возвращает ошибки"
+            description: "Обнаружены ошибки экспорта OTEL метрик/логов/трейсов."
+            runbook_url: {{ printf "%s/observability#otel" $rb | quote }}
+        {{- end }}
+
+    # =======================
+    # VPN / Zero-Trust (опционально)
+    # =======================
+    {{- if .Values.metrics.vpn.enabled }}
+    - name: ztc.vpn
+      rules:
+        - alert: ZTCVpnTunnelDown
+          expr: |
+            avg_over_time(avm_vpn_tunnel_healthy{{ .Values.metrics.vpn.selector }}[{{ $w.short }}]) < 0.5
+          for: {{ $w.short }}
+          labels:
+            severity: {{ $sev.critical | quote }}
+          annotations:
+            summary: "VPN туннель не здоров"
+            description: "Здоровье VPN < 50% за {{ $w.short }}. Проверить WireGuard/OpenVPN соединения."
+            runbook_url: {{ printf "%s/vpn#tunnel" $rb | quote }}
+        - alert: ZTCVpnHandshakeStale
+          expr: |
+            max_over_time(avm_vpn_last_handshake_seconds_ago{{ .Values.metrics.vpn.selector }}[{{ $w.short }}]) >  {{ mul 3 60 }}
+          for: {{ $w.short }}
+          labels:
+            severity: {{ $sev.warning | quote }}
+          annotations:
+            summary: "WireGuard handshake устарел"
+            description: "Последний handshake устарел > 3 минут."
+            runbook_url: {{ printf "%s/vpn#handshake" $rb | quote }}
+    {{- end }}
+
+    # =======================
+    # CNI дропы (опционально, провайдер-специфично)
+    # =======================
+    {{- if eq (default "" .Values.cni.provider) "cilium" }}
+    - name: ztc.cni.cilium
+      rules:
+        - alert: ZTCCiliumDrops
+          expr: |
+            increase(cilium_drop_count_total{namespace="{{ $ns }}"}[{{ $w.short }}]) > 0
+          for: {{ $w.short }}
+          labels:
+            severity: {{ $sev.info | quote }}
+          annotations:
+            summary: "Cilium дропает трафик"
+            description: "Обнаружены drop-события на Cilium за {{ $w.short }}. Проверить NetworkPolicy."
+            runbook_url: {{ printf "%s/network#cilium-drops" $rb | quote }}
+    {{- else if eq (default "" .Values.cni.provider) "calico" }}
+    - name: ztc.cni.calico
+      rules:
+        - alert: ZTCCalicoDeniedPackets
+          expr: |
+            increase(calico_denied_packets_total{namespace="{{ $ns }}"}[{{ $w.short }}]) > 0
+          for: {{ $w.short }}
+          labels:
+            severity: {{ $sev.info | quote }}
+          annotations:
+            summary: "Calico отклоняет пакеты"
+            description: "Обнаружены deny-события Calico за {{ $w.short }}. Проверить NetworkPolicy."
+            runbook_url: {{ printf "%s/network#calico-deny" $rb | quote }}
+    {{- end }}
+{{- end }}

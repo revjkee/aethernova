@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// NeuroForge Core — Health API (industrial-grade)
+// Назначение: проверка живости/готовности/здоровья сервисов, подробные пробы и потоковое наблюдение.
+// Совместимость: семантически совместима с gRPC Health Checking (SERVING/NOT_SERVING/...),
+// расширена статусом DEGRADED и подробными пробами.
+//
+// Требования к генерации (примеры плагинов см. scripts/gen_proto.sh):
+//  - protoc >= 3.21
+//  - Для REST-генерации/документации: import google/api/annotations.proto и наличие googleapis в -I.
+
+syntax = "proto3";
+
+package neuroforge.v1;
+
+option go_package        = "github.com/yourorg/neuroforge-core/gen/go/neuroforge/v1;neuroforgev1";
+option java_multiple_files = true;
+option java_package      = "io.neuroforge.v1";
+option csharp_namespace  = "Neuroforge.V1";
+option ruby_package      = "Neuroforge::V1";
+option php_namespace     = "Neuroforge\\V1";
+
+// Well-known types
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// Optional HTTP annotations (safe to remove if REST не требуется)
+import "google/api/annotations.proto";
+
+// -------------------- Messages --------------------
+
+message HealthCheckRequest {
+  // Имя логического сервиса (может быть пустым — проверка всего приложения).
+  string service = 1;
+
+  // Необязательный компонент внутри сервиса (например, "db", "cache", "queue").
+  string component = 2;
+
+  // Необязательная область (например, Kubernetes namespace или логический домен).
+  string scope = 3;
+
+  // Произвольные селекторы для таргетированной проверки.
+  map<string, string> labels = 4;
+
+  // Зарезервировано под будущее расширение (сохранение совместимости).
+  reserved 6, 7, 8;
+  reserved "tenant", "environment";
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    // Значение по умолчанию неизвестно.
+    UNKNOWN = 0;
+    // Сервис работает штатно.
+    SERVING = 1;
+    // Сервис не обслуживает запросы.
+    NOT_SERVING = 2;
+    // Запрошенный service неизвестен.
+    SERVICE_UNKNOWN = 3;
+    // Сервис работает деградированно (частичные сбои/перегрузка).
+    DEGRADED = 4;
+  }
+
+  // Итоговый агрегированный статус.
+  ServingStatus status = 1;
+
+  // Версия приложения (SemVer), ревизия (git SHA) и канал релиза.
+  string version         = 2;
+  string revision        = 3;
+  string release_channel = 4;
+
+  // Узел/зона/регион — полезно для распределённых систем.
+  string node   = 5;
+  string zone   = 6;
+  string region = 7;
+
+  // Временная метка формирования ответа.
+  google.protobuf.Timestamp checked_at = 8;
+
+  // Дополнительные метаданные (не содержат секретов).
+  map<string, string> metadata = 9;
+
+  // Подробные пробы по субкомпонентам.
+  repeated Probe probes = 10;
+
+  // Зарезервировано для будущих критичных изменений схемы.
+  reserved 11, 12;
+  reserved "debug";
+}
+
+// Описание отдельной пробы.
+message Probe {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_INTERNAL    = 1;  // внутренняя логика
+    TYPE_DATABASE    = 2;
+    TYPE_CACHE       = 3;
+    TYPE_MESSAGE_BUS = 4;
+    TYPE_HTTP_UPSTREAM = 5;
+    TYPE_GRPC_UPSTREAM = 6;
+    TYPE_STORAGE     = 7;
+    TYPE_FILESYSTEM  = 8;
+    TYPE_CUSTOM      = 9;
+  }
+
+  enum State {
+    PROBE_UNKNOWN = 0;
+    PASS          = 1;
+    WARN          = 2;
+    FAIL          = 3;
+  }
+
+  string name    = 1;                         // человекочитаемое имя пробы
+  Type   type    = 2;                         // тип пробы
+  State  state   = 3;                         // результат
+  string detail  = 4;                         // краткая причина/описание
+  google.protobuf.Duration latency = 5;       // длительность выполнения пробы
+  google.protobuf.Timestamp checked_at = 6;   // момент проверки
+  map<string, string> attributes = 7;         // дополнительные атрибуты (например, endpoint)
+}
+
+// Запрос для потокового наблюдения.
+// min_interval задаёт минимальную периодичность обновлений, чтобы ограничить частоту событий.
+message WatchHealthRequest {
+  string service  = 1;
+  string component = 2;
+  string scope     = 3;
+  map<string, string> labels = 4;
+
+  // Минимальная периодичность эмиссии обновлений.
+  google.protobuf.Duration min_interval = 5;
+
+  // Необязательная выборка событий (0.0..1.0), например 0.1 = 10% обновлений.
+  float sample_ratio = 6;
+}
+
+// Пустые запросы для удобных эндпоинтов живости/готовности (livez/readyz).
+message LivenessRequest {}
+message ReadinessRequest {}
+
+// -------------------- Service --------------------
+
+service Health {
+  // Синхронная проверка здоровья с агрегированным статусом и подробными пробами.
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse) {
+    option (google.api.http) = {
+      get: "/v1/health"
+      additional_bindings: { get: "/v1/health/{service}" }
+      additional_bindings: { get: "/v1/health/{service}/{component}" }
+    };
+  }
+
+  // Непрерывное наблюдение за состоянием: возвращает поток обновлений.
+  rpc Watch(WatchHealthRequest) returns (stream HealthCheckResponse) {
+    option (google.api.http) = {
+      get: "/v1/health/watch"
+    };
+  }
+
+  // Упрощённая проверка живости процесса.
+  rpc CheckLiveness(LivenessRequest) returns (HealthCheckResponse) {
+    option (google.api.http) = {
+      get: "/v1/livez"
+    };
+  }
+
+  // Проверка готовности к обслуживанию трафика (зависимости и пр.).
+  rpc CheckReadiness(ReadinessRequest) returns (HealthCheckResponse) {
+    option (google.api.http) = {
+      get: "/v1/readyz"
+    };
+  }
+}

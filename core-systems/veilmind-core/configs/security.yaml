@@ -1,0 +1,422 @@
+apiVersion: veilmind.security/v1
+kind: SecurityConfig
+metadata:
+  owner: security-team
+  environment: ${ACTIVE_PROFILE:-prod}
+  revision: 1
+
+zeroTrust:
+  # Политика по умолчанию: все действия/каналы запрещены до явного разрешения.
+  denyByDefault: true
+  # Интеграция с движком риска (совместимо с risk_recalc_worker):
+  riskGates:
+    enabled: true
+    thresholds:
+      medium: ${RISK_THR_MEDIUM:-30.0}
+      high: ${RISK_THR_HIGH:-60.0}
+      critical: ${RISK_THR_CRIT:-80.0}
+    decisions:
+      # При CRITICAL — блок; при HIGH — step-up (MFA); при MEDIUM — наблюдать/маркировать сессию.
+      - when: { minLevel: CRITICAL }  # CRITICAL/HIGH/MEDIUM/LOW
+        actions: [ BLOCK, REQUIRE_IR ]
+      - when: { minLevel: HIGH }
+        actions: [ STEP_UP_AUTH ]
+      - when: { minLevel: MEDIUM }
+        actions: [ OBSERVE ]
+
+transport:
+  # TLS для внешних соединений сервиса
+  tls:
+    minVersion: TLS1_2
+    preferServerCiphers: true
+    ciphers:
+      # Современные наборы, совместимы с TLS 1.2/1.3
+      - TLS_AES_128_GCM_SHA256
+      - TLS_AES_256_GCM_SHA384
+      - TLS_CHACHA20_POLY1305_SHA256
+      - ECDHE-ECDSA-AES256-GCM-SHA384
+      - ECDHE-RSA-AES256-GCM-SHA384
+    hsts:
+      enabled: true
+      maxAgeSeconds: 31536000
+      includeSubdomains: true
+      preload: true
+    clientAuth:
+      # mTLS опционально; для Istio STRICT mTLS — выключите здесь и полагайтесь на mesh.
+      requireClientCert: false
+      caBundlePath: ${TLS_CLIENT_CABUNDLE:-}
+  # Политика исходящих соединений сервиса (дополнительно к NetworkPolicy)
+  egress:
+    allowList:
+      - name: otlp-collector
+        host: ${OTLP_HOST:-otel-collector}
+        ports: [4317]
+        protocols: [tcp]
+      - name: redis
+        host: ${REDIS_HOST:-redis}
+        ports: [6379]
+        protocols: [tcp]
+    defaultAction: DENY
+
+httpSecurity:
+  # Жёсткие заголовки безопасности
+  headers:
+    xContentTypeOptions: "nosniff"
+    xFrameOptions: "DENY"
+    referrerPolicy: "no-referrer"
+    xXSSProtection: "0"      # полагаться на CSP
+    permissionsPolicy:
+      - geolocation=()
+      - camera=()
+      - microphone=()
+      - usb=()
+      - payment=()
+    # Конфигурируемая CSP, безопасная по умолчанию
+    contentSecurityPolicy:
+      enabled: true
+      policy: >
+        default-src 'none';
+        base-uri 'none';
+        frame-ancestors 'none';
+        object-src 'none';
+        img-src 'self' data:;
+        style-src 'self';
+        script-src 'self';
+        connect-src 'self';
+        font-src 'self';
+        form-action 'self';
+        upgrade-insecure-requests;
+  cors:
+    enabled: false
+    allowOrigins: []
+    allowMethods: [GET, POST]
+    allowHeaders: [Content-Type, Authorization, X-Request-ID]
+    exposeHeaders: [X-Request-ID]
+    allowCredentials: false
+    maxAgeSeconds: 600
+  csrf:
+    enabled: true
+    sameSite: "Strict"      # Strict/Lax/None
+    cookieName: "__Host-vm_csrf"
+    headerName: "X-CSRF-Token"
+    rotateEveryRequests: 20
+    tokenBytes: 32
+
+authentication:
+  # JWT валидация для API; совместимо с RequestAuthentication/Issuers из Istio
+  jwt:
+    enabled: true
+    issuers:
+      - issuer: ${JWT_ISSUER:-https://auth.example.com/}
+        jwksUri: ${JWKS_URI:-https://auth.example.com/.well-known/jwks.json}
+        audiences: [ "veilmind-core", "payments-api" ]
+        clockSkewSeconds: 60
+        requiredClaims:
+          - sub
+          - iat
+          - exp
+        optionalClaims: [ email, roles, acr ]
+        algorithms: [ RS256, ES256, EdDSA ]
+        rejectNoneAlg: true
+        rejectWeakKey: true
+    acceptFromHeaders:
+      - name: "Authorization"
+        prefix: "Bearer "
+    acceptFromParams: []
+  # Сессионная аутентификация (для админ‑UI, если применяется)
+  session:
+    enabled: true
+    cookie:
+      name: "__Host-veilmind"
+      httpOnly: true
+      secure: true
+      sameSite: "Strict"
+      maxAgeSeconds: 28800
+    store:
+      backend: "memory"      # memory|redis
+      redisUrl: ${REDIS_URL:-redis://redis:6379/0}
+    rotateEveryLogin: true
+  # Step‑up аутентификация (MFA) при повышенном риске
+  mfa:
+    enabled: true
+    modes: [ totp, webauthn ]
+    totp:
+      issuer: "veilmind-core"
+      period: 30
+      digits: 6
+      algo: SHA1
+    webauthn:
+      rpId: ${WEBAUTHN_RP_ID:-veilmind.local}
+      attestation: "none"
+
+authorization:
+  # RBAC + атрибутная авторизация (ABAC) — правила маршрутов и действий
+  mode: "RBAC_ABAC"
+  rbac:
+    # Роли и привилегии — минимально необходимые
+    roles:
+      - name: viewer
+        permissions: [ "metrics:read", "status:read" ]
+      - name: operator
+        permissions: [ "config:read", "config:write", "jobs:trigger" ]
+      - name: admin
+        permissions: [ "*" ]
+    bindings:
+      - subjectSelector: { claim: "roles", anyOf: ["admin"] }
+        toRoles: [ "admin" ]
+      - subjectSelector: { claim: "roles", anyOf: ["operator"] }
+        toRoles: [ "operator" ]
+      - subjectSelector: { claim: "roles", anyOf: ["viewer"] }
+        toRoles: [ "viewer" ]
+  abac:
+    # Дополнительные атрибутные правила (пример: ограничить действия по чувствительности данных)
+    rules:
+      - name: dlp-high-risk-write
+        match:
+          action: "config:write"
+          context:
+            dataSensitivity: "HIGH"
+        decision: "DENY"
+  # Политика эскалации привилегий
+  privilegeEscalation:
+    requireMFAFor: [ "admin" ]
+    sessionMaxLifetimeSeconds: 14400
+
+cryptography:
+  # Стандартизованные примитивы и параметры
+  keys:
+    keystore: "env"             # env|vault|kms
+    rotation:
+      enabled: true
+      intervalDays: 90
+      overlapDays: 7
+  symmetric:
+    default: "AES-256-GCM"      # AES-256-GCM|ChaCha20-Poly1305
+  hashing:
+    password:
+      alg: "argon2id"
+      # Параметры ориентировочные, подбирайте по железу/DoS‑стойкости
+      params:
+        timeCost: 3
+        memoryCostMiB: 64
+        parallelism: 1
+        saltBytes: 16
+        tagBytes: 32
+    general:
+      alg: "SHA-256"
+  rng:
+    requireCSPRNG: true
+  # Подписи артефактов/событий
+  signing:
+    enabled: true
+    algorithm: "ed25519"
+    verifyInbound: true
+
+secrets:
+  # Управление секретами — дефолт через окружение, опционально Vault/KMS
+  sources:
+    - type: "env"
+      prefix: "VM_"
+    - type: "vault"
+      enabled: ${VAULT_ENABLED:-false}
+      address: ${VAULT_ADDR:-http://vault:8200}
+      role: ${VAULT_ROLE:-veilmind-core}
+      mount: "kv"
+      path: "veilmind/core"
+    - type: "kms"
+      enabled: ${KMS_ENABLED:-false}
+      provider: "gcp-kms"   # gcp-kms|aws-kms|azure-kv
+      keyId: ${KMS_KEY_ID:-}
+  policy:
+    forbidInConfig: true
+    auditAccess: true
+    cacheTtlSeconds: 60
+
+inputValidation:
+  # Глобальные лимиты и фильтры входа
+  sizeLimits:
+    bodyBytes: 1048576          # 1 MiB
+    headerBytes: 16384
+    fieldLength: 4096
+  canonicalization:
+    normalizeUnicode: true
+    trimWhitespace: true
+  json:
+    strict: true
+    maxDepth: 40
+  fileUploads:
+    enabled: false
+    maxBytes: 0
+    mimeAllowList: []
+    scan:
+      enabled: false
+      provider: ""
+  ssrf:
+    blockPrivateCidrs: true
+    allowedHosts: [ ]
+
+rateLimiting:
+  enabled: true
+  buckets:
+    - name: ip-anon
+      key: "ip"
+      limit: 100
+      windowSeconds: 60
+      burst: 50
+    - name: user-auth
+      key: "sub"
+      limit: 300
+      windowSeconds: 60
+      burst: 100
+  penalties:
+    backoffSeconds: 60
+    banSeconds: 900
+
+antiAutomation:
+  enabled: true
+  # Включается на чувствительных маршрутах (логин/регистрация/сброс пароля)
+  captcha:
+    provider: "turnstile"       # turnstile|recaptcha|none
+    siteKey: ${CAPTCHA_SITE_KEY:-}
+    secretKey: ${CAPTCHA_SECRET_KEY:-}
+  # Простая защита от перебора паролей/кодов
+  login:
+    maxFailures: 5
+    coolOffSeconds: 900
+
+privacyDLP:
+  # Маскирование и предотвращение утечек
+  piiMasking:
+    enabled: true
+    strategies:
+      email: "hash-prefix-6"
+      phone: "last4"
+      ip: "truncate-24"
+  dlp:
+    enabled: true
+    rules:
+      - name: block-credit-card
+        pattern: "payment.card"
+        action: "REDACT"
+      - name: block-secret
+        pattern: "secret|token|apikey"
+        action: "REDACT"
+
+observability:
+  # Аудит и неотрицание
+  audit:
+    enabled: true
+    format: "jsonl"
+    destination: "stdout"       # stdout|file|otlp
+    filePath: "/var/log/veilmind/audit.log"
+    include:
+      - auth.success
+      - auth.failure
+      - rbac.decision
+      - abac.decision
+      - risk.decision
+      - config.change
+    redactFields: [ "authorization", "cookie", "password", "token", "secret" ]
+    integritySeal:
+      enabled: true
+      algorithm: "HMAC-SHA256"
+      keyRef: "VM_AUDIT_HMAC_KEY"
+  tracing:
+    enabled: true
+    exporter: "otlp"
+    endpoint: ${OTLP_ENDPOINT:-http://otel-collector:4317}
+    sampling: 0.1
+  metrics:
+    enabled: true
+    prometheus:
+      bindAddress: "0.0.0.0"
+      port: 9109
+      path: "/metrics"
+
+supplyChain:
+  artifacts:
+    verifyChecksums: true
+    verifySignatures: true
+    allowedSigningAlgos: [ "ed25519", "ecdsa-p256" ]
+  dependencies:
+    blocklistLicenses: [ "GPL-3.0-only", "AGPL-3.0-only" ]
+    allowlistLicenses: [ "MIT", "Apache-2.0", "BSD-3-Clause" ]
+    vulnerabilityBudget:
+      severityThreshold: "high"   # none|low|medium|high|critical
+      failOnThreshold: true
+
+operations:
+  # Политики для управления изменениями/конфигами
+  changeManagement:
+    requireReviewFor:
+      - security.yaml
+      - configs/*
+    approvals: 2
+  dataRetention:
+    logsDays: 30
+    auditDays: 365
+    piiDays: 30
+  backups:
+    enabled: true
+    encryptWith: "kms"
+    frequencyCron: "0 3 * * *"
+    retentionDays: 14
+  incidentResponse:
+    sevs:
+      - name: SEV1
+        notify: [ "sec-oncall", "ops-oncall" ]
+        rtoMinutes: 30
+      - name: SEV2
+        notify: [ "sec-oncall" ]
+        rtoMinutes: 240
+
+runtimeHardening:
+  # Дублирует и документирует runtime‑гарантии (совместимо с контейнером/VM)
+  linux:
+    noNewPrivileges: true
+    seccomp: "runtime/default"
+    capabilitiesDropAll: true
+    readOnlyRootFs: true
+  process:
+    maxOpenFiles: 16384
+    maxProc: 1024
+  gcPressure:
+    maxHeapMiB: 1024
+
+routes:
+  # Точечные правила безопасности на маршруты API
+  - path: "/api/v1/admin/*"
+    methods: [GET, POST, PUT, DELETE]
+    authRequired: true
+    rolesAnyOf: [ "admin" ]
+    riskMinLevel: LOW
+    rateLimitBucket: "user-auth"
+    csrfRequired: true
+  - path: "/api/v1/config/*"
+    methods: [GET, PUT]
+    authRequired: true
+    rolesAnyOf: [ "operator", "admin" ]
+    rbacPermissionsAnyOf: [ "config:read", "config:write" ]
+    riskMinLevel: MEDIUM
+    stepUpRequired: true
+  - path: "/metrics"
+    methods: [GET]
+    authRequired: false
+    ipAllowList: [ "10.0.0.0/8", "192.168.0.0/16" ]
+  - path: "/healthz"
+    methods: [GET]
+    authRequired: false
+
+testing:
+  # Встроенные проверки безопасности на старте/в CI
+  startupChecks:
+    jwtIssuersReachable: true
+    jwksCachePreload: true
+    cspSyntaxValid: true
+    headersPolicyValid: true
+  chaosSecurity:
+    simulate:
+      # Включать только в тестовых окружениях
+      jwtKeyRotation: false
+      redisUnreachable: false
+      otlpCollectorUnavailable: false

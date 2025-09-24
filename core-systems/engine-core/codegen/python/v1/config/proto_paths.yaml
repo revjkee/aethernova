@@ -1,0 +1,216 @@
+# Aethernova Engine | Codegen v1
+# Конфигурация путей и профилей генерации для .proto
+# Формат: YAML, стабильный для CI и локальной разработки.
+
+version: 1
+schema: "aethernova.codegen.proto-paths/1.0"
+
+meta:
+  project: "engine-core"
+  owner: "Aethernova Platform Team"
+  contact: "platform@aethernova.example"
+  updated_at: "2025-08-12T12:00:00Z"
+
+# Глобальные переменные с подстановкой через ${VAR}
+env:
+  REPO_ROOT: "${REPO_ROOT:-.}"
+  SCHEMAS_ROOT: "${SCHEMAS_ROOT:-${REPO_ROOT}/engine-core/schemas/proto}"
+  OUT_ROOT: "${OUT_ROOT:-${REPO_ROOT}/engine-core/codegen/python/v1/generated}"
+  AUTOGEN_DIR: "${AUTOGEN_DIR:-_autogen}"
+
+# Корневые каталоги include для protoc (-I)
+include_roots:
+  - "${SCHEMAS_ROOT}"                       # локальные схемы проекта
+  - "${REPO_ROOT}"                          # корень (на случай относительных импортов)
+  # Дополнительно можно подключить внешние зависимости (пример закомментирован)
+  # - "${REPO_ROOT}/third_party/proto"
+
+# Алиасы для удобных импортов import "engine/v1/..."
+aliases:
+  engine.v1: "engine-core/schemas/proto/v1/engine"
+  common.v1: "engine-core/schemas/proto/v1/common"
+  economy.v1: "engine-core/schemas/proto/v1/economy"
+
+# Явно объявленные модули схем
+modules:
+  engine:
+    roots:
+      - "engine-core/schemas/proto/v1/engine"
+    sources:
+      - "engine-core/schemas/proto/v1/engine/**/*.proto"
+    exclude:
+      - "**/*_internal.proto"
+    visibility: public
+  common:
+    roots:
+      - "engine-core/schemas/proto/v1/common"
+    sources:
+      - "engine-core/schemas/proto/v1/common/**/*.proto"
+    visibility: public
+  economy:
+    roots:
+      - "engine-core/schemas/proto/v1/economy"
+    sources:
+      - "engine-core/schemas/proto/v1/economy/**/*.proto"
+    visibility: internal
+
+# Цели генерации и плагины для каждой
+targets:
+  python:
+    description: "Генерация Python protobuf + gRPC stubs"
+    tool: "python -m grpc_tools.protoc"
+    options:
+      optimize_for: "SPEED"
+      python_out: "${OUT_ROOT}/${AUTOGEN_DIR}"
+      grpc_python_out: "${OUT_ROOT}/${AUTOGEN_DIR}"
+      mypy_out: null                         # при наличии mypy-protobuf можно указать путь
+      plugins:
+        - name: "grpc_python_out"
+          required: true
+        # Пример опционального плагина типизации:
+        # - name: "mypy_protobuf"
+        #   param: "--mypy_out=${OUT_ROOT}/${AUTOGEN_DIR}"
+    args:
+      # Порядок важен: сначала include (-I), затем список proto‑файлов
+      includes_from: "include_roots"
+    reproducible: true
+    strip_timestamps: true
+
+# Профили сборки: dev/ci/release
+profiles:
+  dev:
+    includes:
+      - "@include_roots"
+    modules:
+      - "engine"
+      - "common"
+      - "economy"
+    target: "python"
+    flags:
+      fail_on_warn: false
+      experimental_allow_unstable: true
+    lint:
+      enabled: true
+      ruleset: "basic"
+  ci:
+    includes:
+      - "@include_roots"
+    modules:
+      - "engine"
+      - "common"
+      - "economy"
+    target: "python"
+    flags:
+      fail_on_warn: true
+      experimental_allow_unstable: false
+    lint:
+      enabled: true
+      ruleset: "strict"
+  release:
+    includes:
+      - "@include_roots"
+    modules:
+      - "engine"
+      - "common"
+      - "economy"
+    target: "python"
+    flags:
+      fail_on_warn: true
+      experimental_allow_unstable: false
+    lint:
+      enabled: true
+      ruleset: "strict"
+    freeze_imports: true
+
+# Сопоставление конкретных артефактов для ключевых протосхем
+artifacts:
+  - name: "engine.network"
+    from: "engine-core/schemas/proto/v1/engine/network.proto"
+    out:
+      python:
+        files:
+          - "engine/network_pb2.py"
+          - "engine/network_pb2_grpc.py"
+  - name: "common.error"
+    from: "engine-core/schemas/proto/v1/common/error/error.proto"
+    out:
+      python:
+        files:
+          - "common/error/error_pb2.py"
+          - "common/error/error_pb2_grpc.py"
+
+# Политики безопасности и целостности
+security:
+  import_allowlist:
+    - "engine-core/schemas/proto/**"
+    - "third_party/proto/google/**"
+  import_blocklist:
+    - "**/deprecated/**"
+  plugin_allowlist:
+    - "grpc_python_out"
+    - "mypy_protobuf"
+  plugin_blocklist:
+    - "protoc-gen-custom-unsafe"
+  verify_checksums: true
+  # При true — запрещает генерацию, если обнаружены неучтенные внешние include
+  forbid_unknown_includes: true
+
+# Кэширование и детерминизм
+cache:
+  enabled: true
+  dir: "${REPO_ROOT}/.cache/proto"
+  key:
+    inputs:
+      - "@modules.engine.sources"
+      - "@modules.common.sources"
+      - "@modules.economy.sources"
+      - "@include_roots"
+      - "@targets.python.options"
+      - "@profiles.ci.flags"
+    salt: "codegen-api:1.0.0"
+  restore_from_ci: true
+
+# Контроль целостности источников (для быстрых скипов)
+integrity:
+  algorithm: "sha256"
+  manifest: "${OUT_ROOT}/${AUTOGEN_DIR}/__genstamp__.json"
+  track:
+    - "@modules.engine.sources"
+    - "@modules.common.sources"
+    - "@modules.economy.sources"
+
+# Хуки до/после генерации
+hooks:
+  pre:
+    - name: "validate-env"
+      run: "python - <<'PY'\nimport os,sys\nreq=['REPO_ROOT','SCHEMAS_ROOT']\nmissing=[v for v in req if not os.getenv(v)]\n# не фейлим, просто предупреждение\nprint('env ok' if not missing else 'warn: missing ' + ','.join(missing))\nPY"
+    - name: "proto-lint"
+      run: "bash -lc 'command -v buf >/dev/null 2>&1 && buf lint || echo buf not installed, skipping'"
+  post:
+    - name: "stamp-sbom"
+      run: "python - <<'PY'\nimport json,os,sys,hashlib,glob\nout=os.environ.get('OUT_ROOT','engine-core/codegen/python/v1/generated')\nfiles=glob.glob(out+'/**/*.py',recursive=True)\nh=hashlib.sha256()\n[h.update(open(f,'rb').read()) for f in files]\nopen(os.path.join(out,'SBOM.CODEGEN.txt'),'w').write(h.hexdigest())\nprint('SBOM created')\nPY"
+
+# Интеграция с реестром схем (опционально)
+registry:
+  enabled: false
+  endpoints:
+    - name: "internal"
+      url: "https://schemas-registry.internal/api/v1"
+      auth: "env:SCHEMA_REGISTRY_TOKEN"
+      # Пинованные версии внешних пакетов
+      pins:
+        googleapis: "1.0.0"
+        opentelemetry: "0.20.0"
+
+# Отчёт и уровень логирования
+reporting:
+  verbose: true
+  emit_files: true
+  print_cmdline: true
+  timings: true
+
+# Примеры запуска (для документации tooling, не исполняется самим YAML)
+examples:
+  dev: "python -m engine_core.codegen.pytool --profile dev"
+  ci: "python -m engine_core.codegen.pytool --profile ci --verify"
+  release: "python -m engine_core.codegen.pytool --profile release --freeze"

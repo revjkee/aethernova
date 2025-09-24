@@ -1,0 +1,78 @@
+{{- /*
+PodDisruptionBudget (PDB) for cybersecurity-core
+Особенности:
+ - Автовыбор apiVersion (policy/v1 при наличии, иначе policy/v1beta1; в противном случае fail).
+ - Включение/отключение через .Values.pdb.enabled.
+ - Валидация: одновременно minAvailable и maxUnavailable запрещены.
+ - Гибкий selector: matchLabels (дефолт: name/instance/part-of) + matchExpressions.
+ - Доп. метки/аннотации через .Values.pdb.labels / .Values.pdb.annotations.
+ - Имя: <fullname>-pdb, где fullname можно переопределить через .Values.fullnameOverride.
+*/ -}}
+
+{{- if .Values.pdb.enabled }}
+
+{{- /* apiVersion detection */ -}}
+{{- $pdbApi := "policy/v1" -}}
+{{- if not (.Capabilities.APIVersions.Has "policy/v1/PodDisruptionBudget") -}}
+  {{- if .Capabilities.APIVersions.Has "policy/v1beta1/PodDisruptionBudget" -}}
+    {{- $pdbApi = "policy/v1beta1" -}}
+  {{- else -}}
+    {{- fail "Cluster does not support PodDisruptionBudget (neither policy/v1 nor policy/v1beta1)." -}}
+  {{- end -}}
+{{- end -}}
+
+{{- /* name helpers (standalone, без _helpers.tpl) */ -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- $fullname := default (printf "%s-%s" .Release.Name $name) .Values.fullnameOverride -}}
+{{- $pdbName := printf "%s-pdb" $fullname | trunc 63 | trimSuffix "-" -}}
+
+{{- /* validation */ -}}
+{{- if and (.Values.pdb.minAvailable) (.Values.pdb.maxUnavailable) -}}
+  {{- fail "Only one of .Values.pdb.minAvailable or .Values.pdb.maxUnavailable may be set." -}}
+{{- end -}}
+
+apiVersion: {{ $pdbApi }}
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $pdbName }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/part-of: cybersecurity-core
+    {{- with .Values.pdb.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.pdb.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* Spec policy: either minAvailable or maxUnavailable (string or int). Defaults to minAvailable: "50%". */ -}}
+  {{- if .Values.pdb.maxUnavailable }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ default "50%" .Values.pdb.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      # Дефолтный таргетинг на pods этого релиза (совместим с стандартными метками)
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/part-of: cybersecurity-core
+      {{- with .Values.pdb.selector.matchLabels }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+    {{- with .Values.pdb.selector.matchExpressions }}
+    matchExpressions:
+      {{- /*
+        Пример элемента:
+        - key: "app.kubernetes.io/component"
+          operator: In
+          values: ["api","worker"]
+      */ -}}
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+
+{{- end }}

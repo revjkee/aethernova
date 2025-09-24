@@ -1,0 +1,198 @@
+# Base public ingress for mythos-core
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mythos-core
+  namespace: mythos-core
+  labels:
+    app.kubernetes.io/name: mythos-core
+    app.kubernetes.io/part-of: mythos-core
+  annotations:
+    # Ingress class
+    kubernetes.io/ingress.class: nginx
+    # TLS via cert-manager
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    acme.cert-manager.io/http01-edit-in-place: "true"
+    # ExternalDNS (если используется)
+    external-dns.alpha.kubernetes.io/hostname: mythos.example.com
+    # Force HTTPS
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # HSTS
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "63072000"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+    # Timeouts и прокси-настройки
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "8"
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+    # Безопасные заголовки
+    nginx.ingress.kubernetes.io/server-snippet: |
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+      add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+      add_header Cross-Origin-Opener-Policy "same-origin" always;
+      add_header Cross-Origin-Resource-Policy "same-origin" always;
+      add_header Cross-Origin-Embedder-Policy "require-corp" always;
+      # Настройте CSP под ваш фронтенд
+      add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' https: wss:" always;
+    # Включение ModSecurity при наличии поддержки контроллера (опционально)
+    # nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    # nginx.ingress.kubernetes.io/enable-owasp-core-rules: "true"
+    # nginx.ingress.kubernetes.io/modsecurity-snippet: |
+    #   SecRuleEngine On
+    #   SecRequestBodyLimit 10485760
+    # Использование регулярных выражений для /api
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [mythos.example.com]
+      secretName: mythos-core-tls
+  rules:
+    - host: mythos.example.com
+      http:
+        paths:
+          # API: переписываем /api/... на /... для бэкенда, если требуется
+          - path: /api(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: mythos-core-api
+                port:
+                  number: 8080
+          # Веб-клиент
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mythos-core-web
+                port:
+                  number: 80
+---
+# Optional rewrite rule for API if backend expects root path.
+# Включите аннотацию ниже вместо блока выше, если нужно переписывать путь.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mythos-core-api-rewrite
+  namespace: mythos-core
+  labels:
+    app.kubernetes.io/name: mythos-core
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mythos.example.com
+      http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: mythos-core-api
+                port:
+                  number: 8080
+---
+# Admin scope with IP allowlist and stricter limits
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mythos-core-admin
+  namespace: mythos-core
+  labels:
+    app.kubernetes.io/name: mythos-core
+    app.kubernetes.io/component: admin
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    # Ограничение источников для админки
+    nginx.ingress.kubernetes.io/whitelist-source-range: "203.0.113.0/24,198.51.100.0/24,10.0.0.0/8"
+    # Более жесткие лимиты
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "1"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    # Базовая аутентификация при необходимости
+    # nginx.ingress.kubernetes.io/auth-type: basic
+    # nginx.ingress.kubernetes.io/auth-secret: mythos-admin-basic-auth
+    # nginx.ingress.kubernetes.io/auth-realm: "Authentication Required"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [mythos.example.com]
+      secretName: mythos-core-tls
+  rules:
+    - host: mythos.example.com
+      http:
+        paths:
+          - path: /admin
+            pathType: Prefix
+            backend:
+              service:
+                name: mythos-core-admin
+                port:
+                  number: 8081
+---
+# Optional mTLS enforcement for sensitive routes (enable and set correct secret)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mythos-core-mtls
+  namespace: mythos-core
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    # Секрет должен содержать ca.crt с доверенным корневым сертификатом
+    # nginx.ingress.kubernetes.io/auth-tls-secret: mythos-core/mtls-ca
+    # nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    # nginx.ingress.kubernetes.io/auth-tls-verify-depth: "2"
+    # nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mythos.example.com
+      http:
+        paths:
+          - path: /internal
+            pathType: Prefix
+            backend:
+              service:
+                name: mythos-core-internal
+                port:
+                  number: 9090
+---
+# Canary ingress for progressive delivery of API (10 percent traffic)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mythos-core-api-canary
+  namespace: mythos-core
+  labels:
+    app.kubernetes.io/name: mythos-core
+    app.kubernetes.io/component: api
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mythos.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: mythos-core-api-canary
+                port:
+                  number: 8080

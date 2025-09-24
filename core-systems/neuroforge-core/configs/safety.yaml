@@ -1,0 +1,396 @@
+# file: neuroforge-core/configs/safety.yaml
+schema: neuroforge.safety.v1
+version: "1.0.0"
+updated_at: "2025-08-26Z"
+description: "Единая политика эксплуатационной безопасности (safety) для сервисов neuroforge-core."
+
+profiles:
+  # Базовые параметры применяются всегда, затем переопределяются profile_overrides.{prod|staging|dev}
+  default:
+    runtime_limits:
+      # Жёсткие лимиты процесса/рантайма
+      max_heap_mb: 2048
+      max_threads: 512
+      max_fds: 65536
+      # Пул HTTP
+      http_server:
+        max_concurrency: 1024
+        max_keepalive_requests: 1000
+        keepalive_seconds: 30
+        read_header_timeout_seconds: 5
+        request_timeout_seconds: 30
+        write_timeout_seconds: 30
+        max_request_body_bytes: 10485760    # 10 MiB
+        max_request_header_bytes: 65536
+      grpc_server:
+        max_concurrency: 512
+        max_message_bytes: 10485760
+        deadline_seconds: 20
+      # Бэкенд-пулы
+      connection_pools:
+        default:
+          max_open: 200
+          max_idle: 50
+          max_lifetime_seconds: 1800
+          idle_timeout_seconds: 300
+
+    resilience:
+      # Политика дедлайнов и ретраев; idempotency_key обязателен для методов с побочными эффектами
+      retries:
+        enabled: true
+        policy: "exponential_jitter"
+        max_attempts: 4
+        base_delay_ms: 100
+        max_delay_ms: 5000
+        retry_on: ["5xx","connect_error","timeout","429"]
+        respect_idempotency: true
+        per_route_overrides: {}
+      deadlines:
+        client_default_seconds: 10
+        db_default_seconds: 5
+        cache_default_seconds: 1
+      circuit_breakers:
+        enabled: true
+        defaults:
+          failure_rate_threshold: 50       # %
+          slow_call_rate_threshold: 100    # %
+          slow_call_duration_ms: 500
+          sliding_window:
+            type: "count"
+            size: 50
+          minimum_calls: 20
+          wait_duration_in_open_state_ms: 30000
+          permitted_calls_in_half_open_state: 5
+        per_dependency_overrides: {}
+      bulkheads:
+        enabled: true
+        max_concurrent_calls: 100
+        max_queue_size: 200
+      hedging:
+        enabled: false
+        at_risk_latency_ms: 200
+        max_hedges: 1
+      backpressure:
+        enabled: true
+        queue_high_watermark: 1000
+        shed_requests_above: 1200
+        retry_after_seconds: 1
+
+    io_validation:
+      # Вход: структура, размеры, контент; Выход: формат и маскировка полей
+      input:
+        json_schema_validation: "reject_on_error"
+        max_array_length: 10000
+        max_string_length: 1048576
+        forbid_content_types: ["application/xml","text/xml"]
+        sanitize_html: true
+        forbid_unsafe_html: true
+        numeric_bounds:
+          max_int: 9007199254740991
+          min_int: -9007199254740991
+      output:
+        enforce_content_type: true
+        default_content_type: "application/json; charset=utf-8"
+        redact_fields: ["password","token","secret","api_key","authorization","set-cookie"]
+        pretty_print_json: false
+
+    feature_safety:
+      # Опасные/чувствительные возможности выключены по умолчанию
+      flags:
+        enable_untrusted_plugins: false
+        allow_remote_code_execution: false
+        enable_experimental_endpoints: false
+        enable_bulk_delete: false
+        enable_schema_migration_via_api: false
+      kill_switch:
+        # Глобальные быстрые выключатели; читает рантайм без перезапуска
+        read_only_mode: false
+        freeze_writes: false
+        disable_external_calls: false
+        disable_background_jobs: false
+
+    release_safety:
+      rollout:
+        strategy: "canary"                  # canary|bluegreen|recreate
+        canary:
+          steps:
+            - traffic_percent: 10
+              hold_minutes: 10
+            - traffic_percent: 25
+              hold_minutes: 15
+            - traffic_percent: 50
+              hold_minutes: 20
+            - traffic_percent: 100
+              hold_minutes: 0
+        health_gates:
+          min_samples: 200
+          error_rate_percent:
+            threshold: 2.0
+            window_minutes: 5
+          p95_latency_ms:
+            threshold: 300
+            window_minutes: 5
+          saturation_cpu_percent:
+            threshold: 80
+            window_minutes: 5
+          saturation_memory_percent:
+            threshold: 85
+            window_minutes: 5
+        halt_rules:
+          on_sev_at_least: 2               # см. incident.severity
+          on_error_budget_depleted: true
+          on_db_migration_failure: true
+          on_circuit_open_major: true
+        auto_rollback:
+          enabled: true
+          trigger_error_rate_percent: 5.0
+          trigger_p95_latency_ms: 600
+          evaluation_minutes: 5
+
+    fallbacks:
+      # Поведение при сбоях: фолбэки и грациозная деградация
+      default_ttl_seconds: 30
+      cache:
+        enabled: true
+        stale_while_revalidate_seconds: 60
+        allow_serve_stale_on_origin_error: true
+      static_responses:
+        # По конкретным маршрутам можно возвращать статический ответ при недоступности бэкенда
+        enabled: false
+        routes: []
+      read_only_on_primary_down: true
+
+    dependencies:
+      # Белый список зависимостей и режим отказа
+      services:
+        - name: "postgres"
+          endpoint: "${DATABASE_URL}"
+          timeout_seconds: 5
+          fail_mode: "fail_fast"           # fail_fast|fallback|degrade
+          required: true
+        - name: "redis"
+          endpoint: "${REDIS_URL}"
+          timeout_seconds: 1
+          fail_mode: "fallback"
+          required: true
+        - name: "object_store"
+          endpoint: "s3://${S3_BUCKET}"
+          timeout_seconds: 3
+          fail_mode: "degrade"
+          required: false
+      dns_fail_fast_seconds: 2
+      resolve_via_trusted_dns: true
+
+    sandboxing:
+      # Политика процесса/контейнера (должна быть согласована с оркестратором)
+      seccomp_profile: "runtime/default"
+      apparmor_profile: "runtime/default"
+      no_new_privileges: true
+      drop_caps: ["ALL"]
+      read_only_root_fs: true
+      tmpfs_paths: ["/tmp","/var/tmp"]
+      ulimits:
+        nofile_soft: 65536
+        nofile_hard: 65536
+        nproc_soft: 16384
+        nproc_hard: 32768
+
+    queues_jobs:
+      # Настройки очередей, планировщика и бэкенд-воркеров
+      scheduler:
+        min_interval_seconds: 60
+        jitter_percent: 10
+        forbid_overlapping_jobs: true
+        max_runtime_seconds: 1800
+        kill_on_timeout: true
+      queues:
+        default:
+          max_inflight: 200
+          visibility_timeout_seconds: 600
+          dlq:
+            enabled: true
+            max_receive_count: 5
+      jobs:
+        # Предустановленные лимиты для типов задач
+        - name: "report_generation"
+          max_concurrency: 10
+          deadline_seconds: 300
+          retry:
+            max_attempts: 3
+            backoff_ms: 500
+        - name: "file_import"
+          max_concurrency: 5
+          deadline_seconds: 900
+          retry:
+            max_attempts: 5
+            backoff_ms: 1000
+
+    ml_safety:
+      # Применимо к компонентам с ML/LLM
+      enabled: false
+      input_guardrails:
+        max_prompt_chars: 20000
+        allow_tools: false
+        forbidden_patterns: ["api_key","password","secret"]
+      output_guardrails:
+        redact_pii: true
+        max_output_tokens: 2048
+      drift_detection:
+        enabled: true
+        js_divergence_threshold: 0.1
+        window_samples: 1000
+      model_rollback:
+        enabled: true
+        trigger_on_sev: 2
+        trigger_on_qos_drop_percent: 10
+
+    data_and_cache:
+      # Безопасные дефолты для кэша и сториджей
+      cache_eviction_policy: "LFU"
+      max_cache_entry_bytes: 1048576
+      cold_start_preload:
+        enabled: false
+        keys: []
+      snapshot_recovery:
+        enabled: true
+        source: "s3://${S3_SNAPSHOT_BUCKET}/snapshots/${SERVICE_NAME}"
+
+    incident:
+      severity:
+        # SEV-уровни для стоп-правил и алёртов
+        sev1: "Полная недоступность или утечка данных"
+        sev2: "Серьёзная деградация или частичная недоступность"
+        sev3: "Умеренная деградация"
+        sev4: "Минорная проблема"
+      paging:
+        enabled: true
+        provider: "pagerduty"
+        service_key: "${PAGERDUTY_SERVICE_KEY}"
+      chatops:
+        enabled: true
+        webhook_url: "${SLACK_WEBHOOK_URL}"
+      auto_ticket:
+        enabled: true
+        system: "jira"
+        project_key: "${JIRA_PROJECT}"
+      postmortem:
+        required_for_sev_at_least: 2
+        draft_due_hours: 24
+
+    slo:
+      # SLO и ошибкобюджет для стоп-правил релиза
+      availability_target_percent: 99.9
+      latency_budget_ms:
+        p95: 300
+        p99: 800
+      error_budget_window_days: 30
+      burn_alerts:
+        fast_burn_multiple: 14          # x от бюджета
+        slow_burn_multiple: 2
+
+    observability_hooks:
+      # Ключевые метрики и события для safety
+      metrics:
+        required:
+          - "http.server.requests.count"
+          - "http.server.errors.count"
+          - "http.server.duration.p95"
+          - "runtime.cpu.percent"
+          - "runtime.mem.rss.mb"
+          - "queue.backlog"
+          - "circuit.open.count"
+      traces:
+        sample_rate: 0.2
+      events:
+        emit_on:
+          - "release.started"
+          - "release.halted"
+          - "release.rolled_back"
+          - "circuit.opened"
+          - "circuit.closed"
+
+  profile_overrides:
+    prod:
+      runtime_limits:
+        http_server:
+          request_timeout_seconds: 20
+          write_timeout_seconds: 20
+      resilience:
+        retries:
+          max_attempts: 3
+          base_delay_ms: 100
+          max_delay_ms: 3000
+        circuit_breakers:
+          defaults:
+            wait_duration_in_open_state_ms: 60000
+      release_safety:
+        rollout:
+          canary:
+            steps:
+              - traffic_percent: 5
+                hold_minutes: 15
+              - traffic_percent: 25
+                hold_minutes: 20
+              - traffic_percent: 50
+                hold_minutes: 30
+              - traffic_percent: 100
+                hold_minutes: 0
+        health_gates:
+          error_rate_percent: { threshold: 1.0, window_minutes: 10 }
+          p95_latency_ms:     { threshold: 250, window_minutes: 10 }
+      sandboxing:
+        ulimits:
+          nofile_soft: 131072
+          nofile_hard: 131072
+      slo:
+        availability_target_percent: 99.95
+        latency_budget_ms:
+          p95: 250
+          p99: 600
+
+    staging:
+      runtime_limits:
+        http_server:
+          max_concurrency: 512
+      release_safety:
+        rollout:
+          canary:
+            steps:
+              - traffic_percent: 20
+                hold_minutes: 5
+              - traffic_percent: 50
+                hold_minutes: 5
+              - traffic_percent: 100
+                hold_minutes: 0
+
+    dev:
+      runtime_limits:
+        http_server:
+          max_concurrency: 128
+          request_timeout_seconds: 60
+      resilience:
+        retries:
+          max_attempts: 2
+      feature_safety:
+        flags:
+          enable_experimental_endpoints: true
+      incident:
+        paging:
+          enabled: false
+        chatops:
+          enabled: false
+
+# Проверочные правила и обязательные переменные окружения
+validation:
+  require_env:
+    - "SERVICE_NAME"
+    - "DATABASE_URL"
+  forbid_empty:
+    - "profiles.default.dependencies.services[0].endpoint"
+  require_when:
+    - if: "profiles.default.incident.paging.enabled"
+      then:
+        - "profiles.default.incident.paging.service_key"
+    - if: "profiles.default.release_safety.auto_rollback.enabled"
+      then:
+        - "profiles.default.release_safety.health_gates"

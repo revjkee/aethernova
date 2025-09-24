@@ -1,0 +1,228 @@
+# 1) Блокируем всё по умолчанию в текущем namespace (подбирается при применении).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-default-deny-all
+  labels:
+    app.kubernetes.io/part-of: omnimind-core
+spec:
+  podSelector: {}            # все Pod'ы в namespace
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# 2) Разрешаем egress на DNS (CoreDNS) для Pod'ов omnimind-core.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-dns-egress
+  labels:
+    app.kubernetes.io/part-of: omnimind-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: omnimind-core
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        # В большинстве кластеров CoreDNS помечен k8s-app=kube-dns и расположен в kube-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        # Альтернативная метка для некоторых дистрибутивов
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: coredns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# 3) Разрешаем входящий трафик к приложениям только от ingress-контроллера.
+# Уточните метки ingress-контроллера под ваш кластер (например, ingress-nginx).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-from-ingress-controller
+  labels:
+    app.kubernetes.io/part-of: omnimind-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: omnimind-core
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+        # Для внутренних HTTP/gRPC входов через sidecar/серверы — при необходимости:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8443
+---
+# 4) Разрешаем сервис-to-сервис трафик внутри набора omnimind-core (микросервисы).
+# Открываем только необходимые порты приложений (обновите список под ваш стек).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-app-mesh-internal
+  labels:
+    app.kubernetes.io/part-of: omnimind-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: omnimind-core
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: omnimind-core
+      ports:
+        - protocol: TCP
+          port: 8080        # HTTP API
+        - protocol: TCP
+          port: 8443        # HTTPS API
+        - protocol: TCP
+          port: 50051       # gRPC
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: omnimind-core
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8443
+        - protocol: TCP
+          port: 50051
+---
+# 5) Разрешаем egress в Observability-стек (Prometheus, Loki, OTel Collector, Fluent Bit).
+# Пример меток для namespace "observability" и типовых приложений; уточните под ваши развёртывания.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-egress-observability
+  labels:
+    app.kubernetes.io/part-of: omnimind-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: omnimind-core
+  policyTypes: ["Egress"]
+  egress:
+    # Prometheus scrape (TCP/9090 часто используется клиентом для remote-write на gateway)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["prometheus", "prometheus-server", "prometheus-k8s"]
+      ports:
+        - protocol: TCP
+          port: 9090
+    # Loki (TCP/3100)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["loki", "loki-distributed"]
+      ports:
+        - protocol: TCP
+          port: 3100
+    # OpenTelemetry Collector (OTLP gRPC 4317, HTTP 4318)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    # Fluent Bit/Fluentd (пример: TCP/24224)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["fluent-bit", "fluentd"]
+      ports:
+        - protocol: TCP
+          port: 24224
+---
+# 6) Опционально: разрешаем egress на NTP (точное время важно для TLS и журналирования).
+# При наличии корпоративного NTP замените CIDR на адреса ваших серверов.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-egress-ntp
+  labels:
+    app.kubernetes.io/part-of: omnimind-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: omnimind-core
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0    # заменить на корпоративные NTP CIDR
+      ports:
+        - protocol: UDP
+          port: 123
+---
+# 7) Заготовка под egress-whitelist к внешним API через известные CIDR.
+# Добавьте ваши адресные блоки вместо примеров; доменные имена недопустимы в NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-egress-external-whitelist
+  labels:
+    app.kubernetes.io/part-of: omnimind-core
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: omnimind-core
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        # примеры: адресные блоки egress-шлюза/прокси/наружных API
+        - ipBlock:
+            cidr: 10.0.0.0/8
+        - ipBlock:
+            cidr: 172.16.0.0/12
+      ports:
+        - protocol: TCP
+          port: 443

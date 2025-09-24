@@ -1,0 +1,329 @@
+syntax = "proto3";
+
+package datafabric.v1.lineage;
+
+option go_package          = "github.com/company/datafabric-core/pkg/api/v1/lineage;lineage";
+option java_package        = "com.company.datafabric.v1.lineage";
+option java_multiple_files = true;
+option csharp_namespace    = "Company.DataFabric.V1.Lineage";
+option objc_class_prefix   = "DFCL";
+
+// Общие типы (UUID, Timestamp, Status, KeyValue, PageRequest/Response, AnyValue)
+import "datafabric/v1/common.proto";
+
+// ============= Базовые идентификаторы и версии =============
+
+message DatasetId {
+  // Логический источник (например, s3, kafka, postgres)
+  string namespace = 1;
+  // Полный путь/имя, например "curated/datasets/commerce/orders"
+  string name = 2;
+  // Опциональная версия набора данных (снапшот/commit)
+  string version = 3;
+}
+
+message FieldId {
+  DatasetId dataset = 1;
+  // Имена столбцов с поддержкой точечной нотации для вложенных полей
+  string field_path = 2; // напр., "customer.email" или "attributes.order.city"
+}
+
+message JobId {
+  string namespace = 1;   // напр., "spark://prod" или "airflow://stg"
+  string name      = 2;   // уникальное имя пайплайна/задачи
+  string version   = 3;   // хеш/семвер релиза
+}
+
+message RunId {
+  datafabric.v1.common.UUID run_uuid = 1; // уникальная идентичность исполнения
+  string external_id = 2;                 // идемпотентный ID оркестратора (job_run_id)
+}
+
+// ============= Фасеты (расширяемые метаданные) =============
+
+message SchemaFacet {
+  message Field {
+    string name        = 1;
+    string type        = 2;
+    bool   nullable    = 3;
+    string description = 4;
+    repeated datafabric.v1.common.KeyValue tags = 5;
+  }
+  repeated Field fields = 1;
+  string schema_version = 2;
+}
+
+message DataQualityFacet {
+  // Минимальный набор показателей качества
+  double completeness_pct = 1;   // 0..100
+  double accuracy_pct      = 2;   // 0..100
+  double freshness_minutes = 3;   // задержка данных
+  uint64 row_count         = 4;
+  map<string, double> metrics = 5; // доп. метрики (например, null_ratio.email)
+}
+
+message StatisticsFacet {
+  map<string, string> stats = 1; // произвольные статистики в строковом виде
+}
+
+message SourceFacet {
+  string format        = 1;  // delta|parquet|kafka|postgres|iceberg|hudi|csv|jsonl
+  string physical_path = 2;  // URI/URL
+  string location      = 3;  // регион/кластер
+}
+
+message OwnershipFacet {
+  string producer_team  = 1;
+  string owner_team     = 2;
+  string contact_email  = 3;
+  repeated string consumers = 4; // заинтересованные команды
+}
+
+message GovernanceFacet {
+  string classification = 1; // public|internal|confidential|restricted
+  repeated string policies = 2; // ссылки на применённые политики (например, "pii-masking")
+  repeated datafabric.v1.common.KeyValue labels = 3;
+}
+
+message RunArgsFacet {
+  map<string, string> args = 1; // параметры запуска/конфигурация
+}
+
+message Facets {
+  SchemaFacet      schema      = 1;
+  DataQualityFacet quality     = 2;
+  StatisticsFacet  statistics  = 3;
+  SourceFacet      source      = 4;
+  OwnershipFacet   ownership   = 5;
+  GovernanceFacet  governance  = 6;
+  RunArgsFacet     run_args    = 7;
+  // Произвольные расширения; value — сериализованные данные внешних фасетов
+  map<string, datafabric.v1.common.AnyValue> additional = 90;
+}
+
+// ============= Сущности lineage =============
+
+message Dataset {
+  DatasetId id = 1;
+  Facets    facets = 2;
+  datafabric.v1.common.Timestamp created_at = 3;
+  datafabric.v1.common.Timestamp updated_at = 4;
+}
+
+message Job {
+  JobId id = 1;
+  Facets facets = 2;
+  datafabric.v1.common.Timestamp created_at = 3;
+  datafabric.v1.common.Timestamp updated_at = 4;
+}
+
+message Run {
+  RunId  id   = 1;
+  JobId  job  = 2;
+  datafabric.v1.common.Timestamp started_at  = 3;
+  datafabric.v1.common.Timestamp completed_at = 4;
+  Status status = 5;
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    RUNNING  = 1;
+    COMPLETED = 2;
+    FAILED   = 3;
+    ABORTED  = 4;
+  }
+
+  Facets facets = 6;
+}
+
+// Ребро графа lineage (происхождение)
+message LineageEdge {
+  DatasetId upstream = 1;
+  DatasetId downstream = 2;
+  string transformation = 3; // краткое описание операции (join/map/aggregate/…)
+  JobId via_job = 4;
+  RunId via_run = 5;
+  datafabric.v1.common.Timestamp created_at = 6;
+}
+
+// ============= События lineage (ingest) =============
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  START     = 1;
+  COMPLETE  = 2;
+  FAIL      = 3;
+  ABORT     = 4;
+  UPDATE    = 5; // обновление фасетов/метаданных
+}
+
+message DatasetInput {
+  DatasetId dataset = 1;
+  Facets    facets  = 2; // observed facets на входе
+}
+
+message DatasetOutput {
+  DatasetId dataset = 1;
+  Facets    facets  = 2; // observed facets на выходе
+}
+
+message LineageEvent {
+  datafabric.v1.common.UUID event_id = 1;       // для идемпотентности
+  EventType type = 2;
+  JobId job = 3;
+  RunId run = 4;
+
+  // Наблюдаемые входы/выходы и связи
+  repeated DatasetInput inputs = 5;
+  repeated DatasetOutput outputs = 6;
+
+  // Необязательное явное указание рёбер (если вычислено на стороне эмиттера)
+  repeated LineageEdge edges = 7;
+
+  // Таймстемпы события
+  datafabric.v1.common.Timestamp event_time = 8;  // время события на источнике
+  datafabric.v1.common.Timestamp observed_at = 9; // когда коллектор увидел событие
+
+  // Контекст/метки
+  datafabric.v1.common.RequestMetadata request_meta = 10;
+  repeated datafabric.v1.common.KeyValue tags = 11;
+
+  // Расширяемость
+  Facets run_facets = 12; // доп. фасеты для конкретного запуска
+}
+
+// ============= Запросы графа lineage =============
+
+enum GraphDirection {
+  GRAPH_DIRECTION_UNSPECIFIED = 0;
+  UPSTREAM   = 1; // все предки
+  DOWNSTREAM = 2; // все потомки
+  BOTH       = 3;
+}
+
+message GraphFilter {
+  // Ограничение по времени событий
+  datafabric.v1.common.Timestamp from = 1;
+  datafabric.v1.common.Timestamp to   = 2;
+
+  // Фильтры по ярлыкам/тегам/политикам
+  repeated string include_namespaces = 3;
+  repeated string include_tags       = 4;
+  repeated string require_policies   = 5;
+
+  // Ограничение по глубине
+  uint32 max_depth = 6;
+
+  // Ограничение по числу вершин/рёбер (safety guard)
+  uint32 max_nodes = 7;
+  uint32 max_edges = 8;
+}
+
+message GraphNode {
+  oneof node {
+    Dataset dataset = 1;
+    Job     job     = 2;
+  }
+}
+
+message GraphEdge {
+  DatasetId upstream   = 1;
+  DatasetId downstream = 2;
+  JobId     via_job    = 3;
+  RunId     via_run    = 4;
+}
+
+message LineageGraph {
+  repeated GraphNode nodes = 1;
+  repeated GraphEdge edges = 2;
+  datafabric.v1.common.Timestamp generated_at = 3;
+}
+
+// ============= Сервис lineage =============
+
+service LineageService {
+  // Потоковая инжестия событий lineage (идемпотентна по event_id)
+  rpc Ingest (stream LineageEvent) returns (IngestAcks);
+
+  // Униарная инжестия (батч)
+  rpc IngestBatch (IngestBatchRequest) returns (IngestAcks);
+
+  // Получить подграф lineage от заданной точки
+  rpc GetGraph (GetGraphRequest) returns (LineageGraph);
+
+  // Обратная связь о состоянии инжестии/хранилища
+  rpc Health (HealthRequest) returns (HealthResponse);
+
+  // Поиск сущностей (datasets/jobs/runs) с пагинацией/фильтрами
+  rpc Search (SearchRequest) returns (SearchResponse);
+}
+
+// ============= Сообщения сервиса =============
+
+message IngestBatchRequest {
+  repeated LineageEvent events = 1;
+}
+
+message IngestAck {
+  datafabric.v1.common.UUID event_id = 1;
+  datafabric.v1.common.Status status = 2;
+}
+
+message IngestAcks {
+  repeated IngestAck items = 1;
+}
+
+message GetGraphRequest {
+  oneof anchor {
+    DatasetId dataset = 1;
+    JobId     job     = 2;
+  }
+  GraphDirection direction = 3;
+  GraphFilter    filter    = 4;
+}
+
+message HealthRequest {
+  string probe = 1; // "readiness"|"liveness"|"storage"
+}
+
+message HealthResponse {
+  datafabric.v1.common.Status status = 1;
+  map<string, string> details = 2; // latency_ms, backlog, store, version
+}
+
+// Типы сущностей для поиска
+enum EntityKind {
+  ENTITY_KIND_UNSPECIFIED = 0;
+  DATASET = 1;
+  JOB     = 2;
+  RUN     = 3;
+}
+
+message SearchRequest {
+  string query = 1; // полнотекстовый запрос по имени/тегам/ярлыкам
+  repeated EntityKind kinds = 2;
+  repeated string namespaces = 3;
+  datafabric.v1.common.PageRequest page = 4;
+
+  // Фильтры по времени (для RUN)
+  datafabric.v1.common.Timestamp from = 5;
+  datafabric.v1.common.Timestamp to   = 6;
+
+  // Требуемые политики/метки (для DATASET/JOB)
+  repeated string require_policies = 7;
+  repeated string include_tags = 8;
+}
+
+message SearchResponseItem {
+  EntityKind kind = 1;
+  oneof entity {
+    Dataset dataset = 2;
+    Job     job     = 3;
+    Run     run     = 4;
+  }
+  double score = 5; // релевантность
+}
+
+message SearchResponse {
+  repeated SearchResponseItem items = 1;
+  datafabric.v1.common.PageResponse page = 2;
+}

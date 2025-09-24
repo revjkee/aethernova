@@ -1,0 +1,79 @@
+{{-/*
+ConfigMap шаблон для veilmind-core.
+Зависит от helper-ов:
+  - "veilmind-core.fullname"
+  - "veilmind-core.labels"
+Ожидаемые values (примеры):
+  configMap:
+    enabled: true
+    nameOverride: ""
+    immutable: true
+    labels: {}
+    annotations: {}
+  config:                # map[string]any — будет выведено в data
+    application.yaml: |
+      server:
+        port: 8080
+  configFiles:           # map[string]string — имя файла -> содержимое (tpl)
+    logging.yaml: |
+      level: {{ .Values.log.level | default "INFO" }}
+  configEnv:             # map[string]any — соберется в data["app.env"]
+    LOG_LEVEL: DEBUG
+    FEATURE_FLAGS: dev-fast-boot
+  configBinary:          # map[string]string — base64-значения для binaryData
+    cert.pem: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0t...
+*/ -}}
+{{- if .Values.configMap.enabled | default true }}
+{{- $fullName := include "veilmind-core.fullname" . -}}
+{{- $cfg := .Values.config | default dict -}}
+{{- $files := .Values.configFiles | default dict -}}
+{{- $env := .Values.configEnv | default dict -}}
+{{- $bin := .Values.configBinary | default dict -}}
+{{- $hashInput := printf "%s\n%s\n%s\n%s" ($cfg | toYaml) ($files | toYaml) ($env | toYaml) ($bin | toYaml) -}}
+{{- $cfgHash := sha256sum $hashInput -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{- if .Values.configMap.nameOverride }} {{ .Values.configMap.nameOverride | quote }} {{- else }} {{ printf "%s-config" $fullName | quote }} {{- end }}
+  labels:
+    {{- include "veilmind-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: veilmind
+    {{- with .Values.configMap.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    veilmind-core.io/config-hash: {{ $cfgHash | quote }}
+    {{- with .Values.configMap.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+immutable: {{ .Values.configMap.immutable | default true }}
+data:
+  {{-/* Секция config: любая структура -> YAML в файле, строка -> как есть */ -}}
+  {{- range $k, $v := $cfg }}
+  {{ $k }}: |-
+    {{- if kindIs "string" $v -}}
+{{ tpl (toString $v) $ | nindent 4 }}
+    {{- else -}}
+{{ toYaml $v | nindent 4 }}
+    {{- end -}}
+  {{- end }}
+  {{-/* Секция файлов с tpl */ -}}
+  {{- range $name, $content := $files }}
+  {{ $name }}: |-
+{{ tpl (toString $content) $ | nindent 4 }}
+  {{- end }}
+  {{-/* Сборка env-файла app.env */ -}}
+  {{- if $env }}
+  app.env: |-
+{{- range $ek, $ev := $env }}
+{{ printf "%s=%s" $ek (tpl (toString $ev) $) | nindent 4 }}
+{{- end }}
+  {{- end }}
+{{- if $bin }}
+binaryData:
+  {{- range $bk, $bv := $bin }}
+  {{ $bk }}: {{ $bv | toString | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,353 @@
+# File: neuroforge-core/configs/registry.yaml
+# Унифицированная конфигурация доступа к реестрам и хранилищам артефактов для neuroforge-core.
+# Поддерживаются типы: oci (контейнеры), pypi (python-дистрибутивы), model (hf/s3/gcs), dataset (s3/gcs),
+# а также "attest" для политик проверки подписи и происхождения (SLSA).
+
+version: 1
+
+# -----------------------------------------------------------------------------
+# 0. Глобальные настройки и профили окружений
+# -----------------------------------------------------------------------------
+defaults:
+  network:
+    connect_timeout_ms: 2500
+    read_timeout_ms: 15000
+    write_timeout_ms: 15000
+    dns_cache_ttl_sec: 60
+    retries:
+      max_attempts: 5
+      backoff: exponential
+      base_delay_ms: 200
+      max_delay_ms: 5000
+    rate_limit:
+      enabled: true
+      rps: 20
+      burst: 40
+  tls:
+    enforce: true
+    min_version: TLS1_2
+    # При необходимости пропиньте корневой сертификат или публичный ключ реестра
+    ca_bundle_path: /etc/ssl/certs/ca-bundle.crt
+    # pinning_sha256: ["sha256/CHANGEME_BASE64PIN=="]
+  cache:
+    enabled: true
+    dir: /var/lib/neuroforge/registry-cache
+    max_size_mb: 20480   # 20 GiB
+    ttl_sec: 86400       # 1 день
+  # Политики доверия применяются на уровне источников (sources.*) и дополнительно тут как дефолты
+  trust:
+    cosign:
+      verify: true
+      # cosign keyless (Sigstore) + локальные ключи; identities ограничьте под свою орг.
+      identities:
+        - issuer: "https://token.actions.githubusercontent.com"
+          subject_regex: "^https://github.com/your-org/neuroforge-core(.+)"
+      # Доп. публичные ключи (PEM) — путь или ENV:VAR
+      public_keys:
+        - env: COSIGN_PUBKEY_PEM_B64   # base64 кодированный PEM в переменной окружения
+      tlog: { required: false }        # в приватных реестрах можно отключить обязательный Rekor
+    slsa:
+      verify: true
+      predicate_type: "slsaprovenance" # in-toto SLSA
+      min_slsa_level: 3
+      # Проверка субъекта: сопоставление sha256 артефакта из provenance c фактическим
+      subject_match: strict
+    sbom:
+      verify: true
+      formats: ["cyclonedx-json", "spdx-json"]
+      require_for: ["oci", "pypi"]     # типы, для которых SBOM обязателен
+
+profiles:
+  active: ${REGISTRY_PROFILE:-dev}  # dev | stage | prod
+  dev:
+    inherits: defaults
+  stage:
+    inherits: defaults
+    network:
+      rate_limit: { enabled: true, rps: 50, burst: 100 }
+  prod:
+    inherits: defaults
+    network:
+      rate_limit: { enabled: true, rps: 200, burst: 400 }
+    cache:
+      max_size_mb: 51200 # 50 GiB
+    trust:
+      slsa: { verify: true, min_slsa_level: 3 }
+      sbom: { verify: true, require_for: ["oci","pypi","model"] }
+
+# -----------------------------------------------------------------------------
+# 1. Allow/Deny — контроль источников и артефактов
+# -----------------------------------------------------------------------------
+policy:
+  allow:
+    oci:
+      - "ghcr.io/your-org/neuroforge-core/*"
+      - "public.ecr.aws/your-ns/*"
+    pypi:
+      - "neuroforge-*"
+      - "oblivionvault-*"
+    model:
+      - "s3://neuroforge-models/*"
+      - "hf://your-org/*"
+    dataset:
+      - "s3://neuroforge-datasets/*"
+  deny:
+    oci:
+      - "docker.io/*"         # пример: запрет dockerhub для prod
+    pypi:
+      - ".*(beta|alpha).*"    # запрет предрелизов
+  quarantine:
+    enabled: true
+    # Правила карантина — артефакты без подписи/без SBOM/без SLSA
+    rules:
+      - reason: "unsigned"
+        when: { signature: "missing" }
+      - reason: "no-slsa"
+        when: { slsa: "missing" }
+      - reason: "no-sbom"
+        when: { sbom: "missing" }
+    action: "block"            # block | allow-with-warning | mirror-only
+
+# -----------------------------------------------------------------------------
+# 2. Источники (OCI, PyPI, модели/датасеты) с зеркалами и приоритетами
+# -----------------------------------------------------------------------------
+sources:
+  oci:
+    # Основной приватный реестр организации
+    ghcr:
+      type: oci
+      registry: ghcr.io
+      namespace: your-org
+      auth:
+        mode: token
+        username_env: GHCR_USERNAME
+        token_env: GHCR_TOKEN
+      mirrors:
+        - name: ecr-mirror
+          registry: public.ecr.aws
+          namespace: your-ns
+          priority: 20
+        - name: local-cache
+          registry: registry.local       # внутренний pull-through кэш
+          namespace: neuroforge
+          priority: 50
+      trust:
+        cosign:
+          verify: true
+          identities:
+            - issuer: "https://token.actions.githubusercontent.com"
+              subject_regex: "^https://github.com/your-org/neuroforge-core(.+)"
+        slsa:
+          verify: true
+          min_slsa_level: 3
+        sbom:
+          verify: true
+    # Публичные образы сторонних базовых образов — только как mirror
+    quay:
+      type: oci
+      registry: quay.io
+      namespace: ""
+      readonly: true
+      trust:
+        cosign: { verify: true }
+        slsa:   { verify: false }   # для базовых образов может отсутствовать
+        sbom:   { verify: false }
+
+  pypi:
+    internal:
+      type: pypi
+      index_url: "https://pypi.your-org.internal/simple"
+      auth:
+        mode: basic
+        username_env: PYPI_USER
+        password_env: PYPI_PASS
+      mirrors:
+        - name: pypi-official
+          index_url: "https://pypi.org/simple"
+          priority: 100
+      trust:
+        sbom: { verify: false }  # SBOM для wheel/SDist часто публикуется отдельно
+    pypi-official:
+      type: pypi
+      index_url: "https://pypi.org/simple"
+      readonly: true
+
+  model:
+    # Хранилище моделей в S3
+    s3-models:
+      type: s3
+      endpoint: "https://s3.amazonaws.com"
+      region: "us-east-1"
+      bucket: "neuroforge-models"
+      prefix: ""
+      auth:
+        mode: static
+        access_key_env: S3_ACCESS_KEY_ID
+        secret_key_env: S3_SECRET_ACCESS_KEY
+      encryption:
+        sse: "aws:kms"
+        kms_key_arn_env: S3_KMS_KEY_ARN
+      trust:
+        sbom: { verify: true }
+        slsa: { verify: true, min_slsa_level: 3 }
+    # HuggingFace Hub как дополнительный источник
+    huggingface:
+      type: hf
+      namespace: your-org
+      auth:
+        mode: token
+        token_env: HF_TOKEN
+      trust:
+        sbom: { verify: false }
+        slsa: { verify: false }
+
+  dataset:
+    s3-datasets:
+      type: s3
+      endpoint: "https://s3.amazonaws.com"
+      region: "us-east-1"
+      bucket: "neuroforge-datasets"
+      prefix: ""
+      auth:
+        mode: static
+        access_key_env: S3_ACCESS_KEY_ID
+        secret_key_env: S3_SECRET_ACCESS_KEY
+      encryption:
+        sse: "aws:kms"
+        kms_key_arn_env: S3_KMS_KEY_ARN
+
+# -----------------------------------------------------------------------------
+# 3. Политики публикации (push) и ретеншн
+# -----------------------------------------------------------------------------
+publish:
+  oci:
+    target: ghcr        # имя источника из sources.oci
+    immutability: true  # запрет переписывать теги, кроме тех, что в исключениях
+    tag_policies:
+      required:
+        - slsa           # требовать валидную SLSA-происхождение при публикации
+        - cosign         # требовать подпись cosign
+      reserved_tags:
+        - latest
+      deny_patterns:
+        - ".*(alpha|beta|rc).*"   # запрещаем предрелизы для prod
+  pypi:
+    target: internal
+    allow_prerelease: false
+    classifiers_required:
+      - "Programming Language :: Python :: 3"
+      - "License :: OSI Approved :: MIT License"
+  retention:
+    oci:
+      keep_last: 50
+      keep_days: 180
+    pypi:
+      keep_last: 50
+      keep_days: 365
+    model:
+      keep_days: 365
+    dataset:
+      keep_days: 730
+
+# -----------------------------------------------------------------------------
+# 4. Политики проверок и соответствия (attest, provenance, SBOM)
+# -----------------------------------------------------------------------------
+attest:
+  cosign:
+    keyless:
+      enabled: true
+      oidc_issuer_allowlist:
+        - "https://token.actions.githubusercontent.com"
+      subject_regex_allow:
+        - "^https://github.com/your-org/neuroforge-core(.+)"
+    keys:
+      # Дополнительные публичные ключи cosign — через файлы/ENV
+      - file: /etc/neuroforge/keys/cosign_pubkey.pem
+  slsa:
+    predicates:
+      - type: slsaprovenance
+        required: true
+        min_level: 3
+        # Проверка соответствия builder/id
+        builder_id_regex: "^https://github.com/slsa-framework/slsa-github-generator/.+"
+        # Проверка, что материалы (materials) включают исходный коммит текущего артефакта
+        require_materials_git: true
+  sbom:
+    cyclone_dx:
+      required: true
+      min_version: "1.4"
+      allow_external_references: false
+
+# -----------------------------------------------------------------------------
+# 5. Маппинг логических репозиториев компонентов приложения
+# -----------------------------------------------------------------------------
+repositories:
+  app:
+    oci: "ghcr/your-org/neuroforge-core/app"
+    # порядок источников pull (первый — главный)
+    pull_order: ["ghcr", "ecr-mirror", "local-cache"]
+  worker:
+    oci: "ghcr/your-org/neuroforge-core/worker"
+    pull_order: ["ghcr", "ecr-mirror", "local-cache"]
+  scheduler:
+    oci: "ghcr/your-org/neuroforge-core/scheduler"
+    pull_order: ["ghcr", "ecr-mirror", "local-cache"]
+  py:
+    pypi: "internal"
+    allow_extras: true
+  models:
+    preferred: ["s3-models", "huggingface"]
+  datasets:
+    preferred: ["s3-datasets"]
+
+# -----------------------------------------------------------------------------
+# 6. Креды (указываются ссылками на ENV/файлы, самих секретов в yaml нет)
+# -----------------------------------------------------------------------------
+credentials:
+  env_required:
+    - GHCR_USERNAME
+    - GHCR_TOKEN
+    - S3_ACCESS_KEY_ID
+    - S3_SECRET_ACCESS_KEY
+  files_optional:
+    - /etc/neuroforge/keys/cosign_pubkey.pem
+
+# -----------------------------------------------------------------------------
+# 7. Аудит и журналирование
+# -----------------------------------------------------------------------------
+audit:
+  enabled: true
+  sink: file
+  path: /var/log/neuroforge/registry-audit.jsonl
+  redact:
+    patterns:
+      - "(?i)authorization: Bearer [A-Za-z0-9._-]+"
+      - "(?i)password=[^&\\s]+"
+  fields:
+    include:
+      - ts
+      - action        # pull|push|verify|attest
+      - subject       # URL артефакта
+      - digest        # sha256
+      - source        # имя источника из конфигурации
+      - outcome       # success|failure
+      - reasons       # массив причин/политик
+      - duration_ms
+
+# -----------------------------------------------------------------------------
+# 8. Диагностика и self-test
+# -----------------------------------------------------------------------------
+selftest:
+  enabled: true
+  on_startup: true
+  checks:
+    - type: tls
+      target: "https://ghcr.io"
+    - type: auth
+      source: "ghcr"
+    - type: oci-head
+      repository: "ghcr.io/your-org/neuroforge-core/app"
+      reference: "latest"
+    - type: s3-access
+      bucket: "neuroforge-models"
+      region: "us-east-1"

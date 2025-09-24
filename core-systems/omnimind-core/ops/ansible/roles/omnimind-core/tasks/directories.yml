@@ -1,0 +1,164 @@
+---
+# omnimind-core / ops / ansible / roles / omnimind-core / tasks / directories.yml
+# Назначение: подготовка каталогов приложения с безопасными правами, SELinux и ACL.
+
+- name: "directories | Gather minimal facts (used for path ops)"
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - 'min'
+  tags: [baseline, runtime, app, directories]
+
+- name: "directories | Build default directories from role/app vars"
+  ansible.builtin.set_fact:
+    _omc_defaults:
+      - { path: "{{ app_home | default('/opt/omnimind/omnimind-core') }}", owner: "{{ app_run_user | default('omnimind') }}", group: "{{ app_run_group | default('omnimind') }}", mode: "0750" }
+      - { path: "{{ app_data_dir | default('/var/lib/omnimind') }}",         owner: "{{ app_run_user | default('omnimind') }}", group: "{{ app_run_group | default('omnimind') }}", mode: "0750" }
+      - { path: "{{ app_log_dir  | default('/var/log/omnimind') }}",         owner: "{{ app_run_user | default('omnimind') }}", group: "{{ app_run_group | default('omnimind') }}", mode: "0755" }
+      - { path: "{{ app_tmp_dir  | default('/var/tmp/omnimind') }}",         owner: "{{ app_run_user | default('omnimind') }}", group: "{{ app_run_group | default('omnimind') }}", mode: "0770" }
+      - { path: "/etc/omnimind/tls",                                         owner: "root",                                      group: "root",                                   mode: "0750" }
+  tags: [baseline, runtime, app, directories]
+
+- name: "directories | Merge defaults with inventory paths_ensure"
+  ansible.builtin.set_fact:
+    _omc_paths_raw: >-
+      {{
+        (_omc_defaults + (paths_ensure | default([])))
+        | map('combine', {}, recursive=True) | list
+      }}
+  tags: [baseline, runtime, app, directories]
+
+- name: "directories | Validate entries and normalize"
+  vars:
+    _mode_regex: '^(0[0-7]{3}|[0-7]{4})$'
+  ansible.builtin.set_fact:
+    _omc_paths: >-
+      {{
+        _omc_paths_raw
+        | selectattr('path','defined')
+        | selectattr('path','string')
+        | map('combine', {
+            'owner': (item.owner | default(app_run_user | default('omnimind'))),
+            'group': (item.group | default(app_run_group | default('omnimind'))),
+            'mode':  ( (item.mode  | default('0750')) | string ),
+            'secontext': (item.secontext | default(omit)),
+            'acl': (item.acl | default(omit)),
+            'state': (item.state | default('directory')),
+            'recurse': (item.recurse | default(false))
+          })
+        | list
+      }}
+  loop: "{{ _omc_paths_raw }}"
+  loop_control:
+    loop_var: item
+    label: "{{ item.path | default('undefined') }}"
+  failed_when: >
+    (item.path is not string) or
+    ( (item.mode | default('0750') | string) is not match(_mode_regex) )
+  tags: [baseline, runtime, app, directories]
+
+- name: "directories | Ensure parent directories exist (best-effort)"
+  ansible.builtin.file:
+    path: "{{ item.path | dirname }}"
+    state: directory
+    owner: "root"
+    group: "root"
+    mode: "0755"
+  loop: "{{ _omc_paths | unique(attribute='path') }}"
+  loop_control:
+    label: "{{ item.path | dirname }}"
+  when: (item.path | dirname) not in ['/', '/root', '/home']
+  tags: [baseline, runtime, app, directories]
+
+- name: "directories | Create/ensure directories with desired permissions"
+  ansible.builtin.file:
+    path:  "{{ item.path }}"
+    state: "{{ item.state }}"
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode:  "{{ item.mode }}"
+    recurse: "{{ item.recurse | bool }}"
+  loop: "{{ _omc_paths | unique(attribute='path') }}"
+  loop_control:
+    label: "{{ item.path }} → {{ item.owner }}:{{ item.group }} {{ item.mode }}"
+  notify:
+    - omnimind-core :: directories changed
+  tags: [baseline, runtime, app, directories]
+
+- name: "directories | Apply SELinux context (sefcontext + restorecon) when requested"
+  when:
+    - (selinux_enabled | default(ansible_facts.selinux.status == 'enabled')) | bool
+  block:
+    - name: "directories | Declare persistent SELinux context rules"
+      ansible.posix.sefcontext:
+        target: "{{ item.secontext.target }}"
+        setype: "{{ item.secontext.setype }}"
+        ftype:  "{{ item.secontext.ftype | default('a') }}"
+        state:  "{{ item.secontext.state | default('present') }}"
+      loop: "{{ _omc_paths | selectattr('secontext','defined') | list }}"
+      loop_control:
+        label: "{{ item.secontext.target | default(item.path) }}"
+      register: _omc_sef
+
+    - name: "directories | Restore SELinux contexts if rules changed"
+      ansible.builtin.command: "restorecon -irv {{ item.item.secontext.target | default(item.item.path) }}"
+      args:
+        warn: false
+      changed_when: "'relabeled' in item.stdout or 'reset' in item.stdout"
+      loop: "{{ _omc_sef.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.secontext.target | default(item.item.path) }}"
+  tags: [security, runtime, app, directories]
+
+- name: "directories | Apply POSIX ACLs (optional per entry)"
+  when: item.acl is defined
+  ansible.posix.acl:
+    path: "{{ item.path }}"
+    entity: "{{ acl_entry.entity }}"
+    etype:  "{{ acl_entry.etype }}"
+    permissions: "{{ acl_entry.perms }}"
+    state: present
+    recursive: "{{ item.recurse | default(false) }}"
+  loop: "{{ _omc_paths | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+  vars:
+    acl_entry: "{{ item.acl }}"
+  tags: [security, runtime, app, directories]
+
+- name: "directories | Assert resulting permissions (defensive check)"
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+  register: _omc_stat
+  loop: "{{ _omc_paths | unique(attribute='path') }}"
+  loop_control:
+    label: "{{ item.path }}"
+  tags: [baseline, runtime, app, verify, directories]
+
+- name: "directories | Verify stat matches expected owner/group/mode"
+  ansible.builtin.assert:
+    that:
+      - (item.stat.exists | default(false)) | bool
+      - item.stat.pw_name == (lookup('ansible.builtin.vars', '_exp_owner') | default(item.item.owner))
+      - item.stat.gr_name == (lookup('ansible.builtin.vars', '_exp_group') | default(item.item.group))
+      - ("%0.4o" % (item.stat.mode | int)) == (item.item.mode | string)
+    quiet: true
+    fail_msg: >-
+      Directory {{ item.item.path }} does not match expected state:
+      owner/group/mode expected={{ item.item.owner }}:{{ item.item.group }} {{ item.item.mode }},
+      got={{ item.stat.pw_name }}:{{ item.stat.gr_name }} {{ "%0.4o" % (item.stat.mode | int) }}
+  loop: "{{ _omc_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  tags: [verify, runtime, app, directories]
+
+# Optional: вывод сводки при -vv
+- name: "directories | Summary"
+  ansible.builtin.debug:
+    msg:
+      changed_dirs: "{{ (ansible_run_tags is defined) | ternary('n/a', 'see handler or --diff') }}"
+      total: "{{ _omc_paths | length }}"
+      sample: "{{ _omc_paths | map(attribute='path') | list }}"
+  when: ansible_verbosity | int >= 2
+  tags: [runtime, app, directories]

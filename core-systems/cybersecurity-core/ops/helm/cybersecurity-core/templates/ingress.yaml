@@ -1,0 +1,161 @@
+{{- /*
+cybersecurity-core/ops/helm/cybersecurity-core/templates/ingress.yaml
+Production-grade, helper-less Ingress template.
+*/ -}}
+{{- if .Values.ingress.enabled }}
+
+{{- /* Compute canonical names without relying on helpers */ -}}
+{{- $chartName := default .Chart.Name .Values.nameOverride -}}
+{{- $fullName := default (printf "%s-%s" .Release.Name $chartName) .Values.fullnameOverride -}}
+{{- $namespace := .Release.Namespace -}}
+{{- $svcName := default $fullName (default .Values.service.name .Values.ingress.serviceName) -}}
+{{- $svcPort := default 80 .Values.service.port -}}
+{{- $className := default "nginx" .Values.ingress.className -}}
+{{- $hosts := default list .Values.ingress.hosts -}}
+{{- $tlsBlocks := default list .Values.ingress.tls.blocks -}}
+{{- $tlsEnabled := default false .Values.ingress.tls.enabled -}}
+{{- $tlsSecret := .Values.ingress.tls.secretName -}}
+{{- $clusterIssuer := .Values.ingress.tls.clusterIssuer -}}
+{{- $externalDNS := .Values.ingress.externalDNS -}}
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $chartName }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: api
+    env: {{ default "prod" .Values.env }}
+  annotations:
+    {{- /* User-supplied annotations first (highest priority for overrides) */}}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+    {{- /* ExternalDNS integration */}}
+    {{- if and $externalDNS.enabled $hosts }}
+    external-dns.alpha.kubernetes.io/ttl: "{{ default 300 $externalDNS.ttl }}"
+    external-dns.alpha.kubernetes.io/target: "{{ $externalDNS.target | default "" }}"
+    {{- /* Optionally publish all hostnames for wildcard/cert-manager flows */}}
+    external-dns.alpha.kubernetes.io/hostname: "{{ join "," (pluck "host" $hosts | compact) }}"
+    {{- end }}
+
+    {{- /* cert-manager wiring (optional) */}}
+    {{- if $clusterIssuer }}
+    cert-manager.io/cluster-issuer: "{{ $clusterIssuer }}"
+    {{- end }}
+    {{- if .Values.ingress.tls.issuer }}
+    cert-manager.io/issuer: "{{ .Values.ingress.tls.issuer }}"
+    {{- end }}
+
+    {{- /* NGINX controller hardening (applies iff className == nginx) */}}
+    {{- if eq $className "nginx" }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "{{ default true .Values.ingress.sslRedirect }}"
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "{{ default 31536000 .Values.ingress.hstsMaxAge }}"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "{{ default "1m" .Values.ingress.proxyBodySize }}"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "{{ default 30 .Values.ingress.proxyReadTimeout }}"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "{{ default 30 .Values.ingress.proxySendTimeout }}"
+    {{- if .Values.ingress.rewriteTarget }}
+    nginx.ingress.kubernetes.io/rewrite-target: "{{ .Values.ingress.rewriteTarget }}"
+    {{- end }}
+    {{- if .Values.ingress.enableRegex }}
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    {{- end }}
+    {{- with .Values.ingress.whitelistSourceRange }}
+    nginx.ingress.kubernetes.io/whitelist-source-range: "{{ join "," . }}"
+    {{- end }}
+    {{- with .Values.ingress.rateLimit }}
+    nginx.ingress.kubernetes.io/limit-rps: "{{ default 5 .rps }}"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "{{ default 5 .burstMultiplier }}"
+    {{- if .nodelay }}
+    nginx.ingress.kubernetes.io/limit-nodelay: "true"
+    {{- end }}
+    {{- end }}
+    {{- if .Values.ingress.securityHeaders.enabled }}
+    nginx.ingress.kubernetes.io/server-snippet: |
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Referrer-Policy "no-referrer" always;
+      add_header X-XSS-Protection "1; mode=block" always;
+      add_header Permissions-Policy "geolocation=(), microphone=()" always;
+      {{- if .Values.ingress.securityHeaders.contentSecurityPolicy }}
+      add_header Content-Security-Policy "{{ .Values.ingress.securityHeaders.contentSecurityPolicy }}" always;
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
+spec:
+  ingressClassName: {{ $className }}
+  {{- /* TLS handling:
+        1) explicit blocks via .Values.ingress.tls.blocks (array of {secretName, hosts})
+        2) or single secretName + all hosts if tls.enabled
+  */}}
+  {{- if or (and $tlsEnabled (or $tlsSecret (gt (len $hosts) 0))) (gt (len $tlsBlocks) 0) }}
+  tls:
+    {{- if gt (len $tlsBlocks) 0 }}
+    {{- range $tlsBlocks }}
+    - secretName: {{ .secretName | quote }}
+      hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+    {{- end }}
+    {{- else }}
+    - secretName: {{ default (printf "%s-tls" $fullName) $tlsSecret | quote }}
+      hosts:
+        {{- range $hosts }}
+        {{- if .host }}
+        - {{ .host | quote }}
+        {{- end }}
+        {{- end }}
+    {{- end }}
+  {{- end }}
+
+  rules:
+    {{- range $h := $hosts }}
+    - host: {{ $h.host | quote }}
+      http:
+        paths:
+          {{- /* extraPaths (e.g., for ALB/GCE pre-routes) */}}
+          {{- with $.Values.ingress.extraPaths }}
+          {{- range . }}
+          - path: {{ .path | default "/" | quote }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ default $svcName .service.name }}
+                {{- if .service.portNumber }}
+                port:
+                  number: {{ .service.portNumber }}
+                {{- else }}
+                port:
+                  number: {{ default $svcPort .service.port }}
+                {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- /* primary host-specific paths */}}
+          {{- $paths := default (list (dict "path" "/" "pathType" "Prefix" "service" (dict "name" $svcName "port" $svcPort))) $h.paths -}}
+          {{- range $p := $paths }}
+          - path: {{ $p.path | default "/" | quote }}
+            pathType: {{ $p.pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ default $svcName ($p.service.name | default $svcName) }}
+                {{- if $p.service.portNumber }}
+                port:
+                  number: {{ $p.service.portNumber }}
+                {{- else }}
+                port:
+                  number: {{ default $svcPort $p.service.port }}
+                {{- end }}
+          {{- end }}
+    {{- end }}
+
+{{- end }}

@@ -1,0 +1,414 @@
+{{- /*
+  prometheus-rules.yaml — промышленный Helm‑шаблон для oblivionvault-core
+
+  Требования:
+  - Prometheus Operator (CRD: monitoring.coreos.com/v1, PrometheusRule)
+  - kube-state-metrics, node-exporter, cadvisor (обычно входят в kube-prometheus-stack)
+  - App metrics: http_* либо http_server_requests_* (Spring), опционально: grpc_*, go_*, process_*
+
+  Минимальные Values (пример):
+  alerts:
+    enabled: true
+    prometheusInstance: "k8s"
+    selector: 'job=~"oblivionvault-core|.*oblivionvault.*"'
+    podSelector: 'namespace="{{ .Release.Namespace }}", pod=~"oblivionvault-core-.*"'
+    windows:
+      short: "5m"
+      medium: "30m"
+      long: "6h"
+      day: "1d"
+    slo:
+      targetAvailability: 0.999        # 99.9%
+      pageBurnFast: 14.4                # стандартные SRE пороги
+      pageBurnSlow: 6                   # для длинного окна
+      warnBurn: 1
+      minRequestsPerSecond: 0.5
+      latency:
+        p95: 0.300                      # 300ms
+        p99: 1.000                      # 1s
+    thresholds:
+      errorRatePage: 0.05               # 5% в коротком окне
+      errorRateWarn: 0.02               # 2%
+      restartsWarn: 3
+      restartsCrit: 10
+      cpuThrottleRatioWarn: 0.2
+      cpuThrottleRatioCrit: 0.4
+      memUtilWarn: 0.85
+      memUtilCrit: 0.95
+      fsUtilWarn: 0.85
+      fsUtilCrit: 0.95
+    runbookBaseURL: "https://runbooks.example.com/oblivionvault-core"
+    grafana:
+      baseURL: "https://grafana.example.com"
+      dashboardUID: "ov-core-main"
+    labels:
+      team: "platform-observability"
+      service: "oblivionvault-core"
+      tier: "backend"
+    integrations:
+      postgres:
+        enabled: false
+        selector: 'job=~"postgres.*"'
+      redis:
+        enabled: false
+        selector: 'job=~"redis.*"'
+      rabbitmq:
+        enabled: false
+        selector: 'job=~"rabbitmq.*"'
+      kafka:
+        enabled: false
+        selector: 'job=~"kafka.*"'
+*/ -}}
+{{- if .Values.alerts.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "oblivionvault-core.fullname" . }}-rules
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "oblivionvault-core.labels" . | nindent 4 }}
+    prometheus: {{ default "k8s" .Values.alerts.prometheusInstance | quote }}
+    role: "alert-rules"
+    app.kubernetes.io/component: "observability"
+spec:
+  groups:
+
+  # -------- SLI/SLO: Availability & Error Budget Burn --------
+  - name: {{ include "oblivionvault-core.fullname" . }}.slo.availability
+    interval: "30s"
+    rules:
+      - record: :ovc:http_request_rate:{{ .Values.alerts.windows.short | default "5m" }}
+        expr: |
+          sum by (job) (
+            rate(
+              http_requests_total{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}"
+            }[{{ .Values.alerts.windows.short | default "5m" }}])
+          )
+          OR
+          sum by (job) (
+            rate(
+              http_server_requests_seconds_count{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}"
+            }[{{ .Values.alerts.windows.short | default "5m" }}])
+          )
+
+      - record: :ovc:http_error_rate:{{ .Values.alerts.windows.short | default "5m" }}
+        expr: |
+          sum by (job) (
+            rate(
+              http_requests_total{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}", status=~"5.."
+            }[{{ .Values.alerts.windows.short | default "5m" }}])
+          )
+          OR
+          sum by (job) (
+            rate(
+              http_server_requests_seconds_count{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}", status=~"5.."
+            }[{{ .Values.alerts.windows.short | default "5m" }}])
+          )
+
+      - record: :ovc:http_error_ratio:{{ .Values.alerts.windows.short | default "5m" }}
+        expr: |
+          clamp_min(
+            (
+              :ovc:http_error_rate:{{ .Values.alerts.windows.short | default "5m" }}
+              /
+              :ovc:http_request_rate:{{ .Values.alerts.windows.short | default "5m" }}
+            ), 0
+          )
+
+      - record: :ovc:error_budget_burn:short
+        expr: |
+          :ovc:http_error_ratio:{{ .Values.alerts.windows.short | default "5m" }}
+          /
+          (1 - {{ default 0.999 .Values.alerts.slo.targetAvailability }})
+
+      - record: :ovc:http_error_ratio:{{ .Values.alerts.windows.long | default "6h" }}
+        expr: |
+          clamp_min(
+            (
+              (
+                sum by (job) (
+                  rate(
+                    http_requests_total{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}", status=~"5.."
+                  }[{{ .Values.alerts.windows.long | default "6h" }}])
+                )
+                OR
+                sum by (job) (
+                  rate(
+                    http_server_requests_seconds_count{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}", status=~"5.."
+                  }[{{ .Values.alerts.windows.long | default "6h" }}])
+                )
+              )
+              /
+              (
+                sum by (job) (
+                  rate(
+                    http_requests_total{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}"
+                  }[{{ .Values.alerts.windows.long | default "6h" }}])
+                )
+                OR
+                sum by (job) (
+                  rate(
+                    http_server_requests_seconds_count{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}"
+                  }[{{ .Values.alerts.windows.long | default "6h" }}])
+                )
+              )
+            ), 0
+          )
+
+      - record: :ovc:error_budget_burn:long
+        expr: |
+          :ovc:http_error_ratio:{{ .Values.alerts.windows.long | default "6h" }}
+          /
+          (1 - {{ default 0.999 .Values.alerts.slo.targetAvailability }})
+
+      - alert: OVC_SLOErrorBudgetBurn_Fast
+        expr: |
+          (
+            :ovc:error_budget_burn:short
+            > {{ default 14.4 .Values.alerts.slo.pageBurnFast }}
+          )
+          and
+          (
+            :ovc:http_request_rate:{{ .Values.alerts.windows.short | default "5m" }}
+            > {{ default 0.5 .Values.alerts.slo.minRequestsPerSecond }}
+          )
+        for: {{ .Values.alerts.windows.medium | default "30m" }}
+        labels:
+          severity: page
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Быстрый расход error‑бюджета (short window)"
+          description: "Burn‑rate превышает порог на коротком окне; вероятна деградация SLO."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/slo-error-budget"
+          dashboard: "{{ .Values.alerts.grafana.baseURL }}/d/{{ .Values.alerts.grafana.dashboardUID }}"
+
+      - alert: OVC_SLOErrorBudgetBurn_Slow
+        expr: |
+          :ovc:error_budget_burn:long > {{ default 6 .Values.alerts.slo.pageBurnSlow }}
+        for: {{ .Values.alerts.windows.long | default "6h" }}
+        labels:
+          severity: page
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Медленный, устойчивый расход error‑бюджета (long window)"
+          description: "Burn‑rate стабильно высок; требуется анализ трендов и первопричин."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/slo-error-budget"
+          dashboard: "{{ .Values.alerts.grafana.baseURL }}/d/{{ .Values.alerts.grafana.dashboardUID }}"
+
+      - alert: OVC_HighErrorRate
+        expr: |
+          :ovc:http_error_ratio:{{ .Values.alerts.windows.short | default "5m" }}
+          > {{ default 0.05 .Values.alerts.thresholds.errorRatePage }}
+        for: {{ .Values.alerts.windows.medium | default "30m" }}
+        labels:
+          severity: page
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Высокая доля 5xx"
+          description: "Доля HTTP 5xx выше порога на коротком окне."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/error-rate"
+          dashboard: "{{ .Values.alerts.grafana.baseURL }}/d/{{ .Values.alerts.grafana.dashboardUID }}"
+
+      - alert: OVC_WarnErrorRate
+        expr: |
+          :ovc:http_error_ratio:{{ .Values.alerts.windows.short | default "5m" }}
+          > {{ default 0.02 .Values.alerts.thresholds.errorRateWarn }}
+        for: {{ .Values.alerts.windows.medium | default "30m" }}
+        labels:
+          severity: warning
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Предупреждение: рост 5xx"
+          description: "Доля 5xx превышает предупреждающий порог."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/error-rate"
+
+  # -------- Latency (p95/p99), generic OR Spring buckets --------
+  - name: {{ include "oblivionvault-core.fullname" . }}.slo.latency
+    interval: "30s"
+    rules:
+      - record: :ovc:latency:p95
+        expr: |
+          (
+            histogram_quantile(0.95,
+              sum by (le) (rate(
+                http_request_duration_seconds_bucket{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}"
+              }[{{ .Values.alerts.windows.short | default "5m" }}]))
+            )
+            OR
+            histogram_quantile(0.95,
+              sum by (le) (rate(
+                http_server_requests_seconds_bucket{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}"
+              }[{{ .Values.alerts.windows.short | default "5m" }}]))
+            )
+          )
+
+      - record: :ovc:latency:p99
+        expr: |
+          (
+            histogram_quantile(0.99,
+              sum by (le) (rate(
+                http_request_duration_seconds_bucket{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}"
+              }[{{ .Values.alerts.windows.short | default "5m" }}]))
+            )
+            OR
+            histogram_quantile(0.99,
+              sum by (le) (rate(
+                http_server_requests_seconds_bucket{ {{ tpl (default `job=~"oblivionvault-core|.*oblivionvault.*"` .Values.alerts.selector) . }}, namespace="{{ .Release.Namespace }}"
+              }[{{ .Values.alerts.windows.short | default "5m" }}]))
+            )
+          )
+
+      - alert: OVC_LatencyP95High
+        expr: |
+          :ovc:latency:p95 > {{ default 0.300 .Values.alerts.slo.latency.p95 }}
+        for: {{ .Values.alerts.windows.medium | default "30m" }}
+        labels:
+          severity: warning
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Высокая латентность p95"
+          description: "p95 превышает SLO‑порог."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/latency"
+
+      - alert: OVC_LatencyP99High
+        expr: |
+          :ovc:latency:p99 > {{ default 1.000 .Values.alerts.slo.latency.p99 }}
+        for: {{ .Values.alerts.windows.medium | default "30m" }}
+        labels:
+          severity: page
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Критическая латентность p99"
+          description: "p99 превышает SLO‑порог."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/latency"
+
+  # -------- K8s App Health (pods, restarts, OOM, readiness) --------
+  - name: {{ include "oblivionvault-core.fullname" . }}.k8s.health
+    interval: "30s"
+    rules:
+      - alert: OVC_PodCrashLooping
+        expr: |
+          max by (pod) (
+            kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff", {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} }
+          ) > 0
+        for: "5m"
+        labels:
+          severity: page
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Pod в CrashLoopBackOff"
+          description: "Контейнер(ы) перезапускаются в цикле."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/pods#crashloop"
+
+      - alert: OVC_PodNotReady
+        expr: |
+          min by (pod) (
+            kube_pod_status_ready{condition="true", {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} }
+          ) == 0
+        for: "10m"
+        labels:
+          severity: warning
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Pod не готов (Ready=false)"
+          description: "Pod длительно не достигает состояния Ready."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/pods#not-ready"
+
+      - alert: OVC_ContainerOOMKilled
+        expr: |
+          increase(
+            kube_pod_container_status_terminated_reason{reason="OOMKilled", {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} }[{{ .Values.alerts.windows.medium | default "30m" }}]
+          ) > 0
+        for: "1m"
+        labels:
+          severity: page
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Контейнер убит по OOM"
+          description: "Зафиксировано OOMKilled за последнее окно."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/pods#oom"
+
+      - alert: OVC_ContainerFrequentRestarts
+        expr: |
+          increase(
+            kube_pod_container_status_restarts_total{ {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} }[{{ .Values.alerts.windows.short | default "5m" }}]
+          ) > {{ default 3 .Values.alerts.thresholds.restartsWarn }}
+        for: "5m"
+        labels:
+          severity: warning
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Частые перезапуски контейнера"
+          description: "Количество рестартов превышает предупреждающий порог."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/pods#restarts"
+
+      - alert: OVC_ContainerRestartsStorm
+        expr: |
+          increase(
+            kube_pod_container_status_restarts_total{ {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} }[{{ .Values.alerts.windows.short | default "5m" }}]
+          ) > {{ default 10 .Values.alerts.thresholds.restartsCrit }}
+        for: "5m"
+        labels:
+          severity: page
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Шторм перезапусков"
+          description: "Всплеск рестартов контейнеров."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/pods#restarts"
+
+  # -------- Resources: CPU throttling, Memory/CPU utilization vs limits/requests --------
+  - name: {{ include "oblivionvault-core.fullname" . }}.k8s.resources
+    interval: "30s"
+    rules:
+      - alert: OVC_CPUThrottlingHigh
+        expr: |
+          (
+            rate(container_cpu_cfs_throttled_periods_total{ {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} }[{{ .Values.alerts.windows.short | default "5m" }}])
+            /
+            rate(container_cpu_cfs_periods_total{ {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} }[{{ .Values.alerts.windows.short | default "5m" }}])
+          ) > {{ default 0.4 .Values.alerts.thresholds.cpuThrottleRatioCrit }}
+        for: {{ .Values.alerts.windows.medium | default "30m" }}
+        labels:
+          severity: page
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Сильный CPU throttling"
+          description: "Высокая доля throttled periods; проверьте CPU лимиты/узкое место."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/resources#cpu-throttling"
+
+      - alert: OVC_CPUThrottlingWarn
+        expr: |
+          (
+            rate(container_cpu_cfs_throttled_periods_total{ {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} }[{{ .Values.alerts.windows.short | default "5m" }}])
+            /
+            rate(container_cpu_cfs_periods_total{ {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} }[{{ .Values.alerts.windows.short | default "5m" }}])
+          ) > {{ default 0.2 .Values.alerts.thresholds.cpuThrottleRatioWarn }}
+        for: {{ .Values.alerts.windows.medium | default "30m" }}
+        labels:
+          severity: warning
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "CPU throttling (предупреждение)"
+          description: "Замечен throttling; возможно, лимиты/ресурсы надо скорректировать."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/resources#cpu-throttling"
+
+      - alert: OVC_MemoryUtilizationHigh
+        expr: |
+          (
+            sum by (pod) (container_memory_working_set_bytes{image!="", {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} })
+            /
+            sum by (pod) (kube_pod_container_resource_limits{resource="memory", unit="byte", {{ tpl (default `namespace="{{ .Release.Namespace }}"` .Values.alerts.podSelector) . }} })
+          ) > {{ default 0.95 .Values.alerts.thresholds.memUtilCrit }}
+        for: {{ .Values.alerts.windows.short | default "5m" }}
+        labels:
+          severity: page
+          {{- with .Values.alerts.labels }}{{- toYaml . | nindent 10 }}{{- end }}
+        annotations:
+          summary: "Критическая утилизация памяти"
+          description: "Память контейнеров близка к лимиту."
+          runbook_url: "{{ .Values.alerts.runbookBaseURL }}/resources#memory"
+
+      - alert: OVC_MemoryUtilizationWarn
+        expr: |
+          (
+            sum by (pod) (container_memory_working_set_bytes{image!="", {{ tpl (default `namespace="{{ .Re

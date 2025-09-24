@@ -1,0 +1,393 @@
+# Версия схемы и метаданные
+schema_version: "1.1.0"
+metadata:
+  system: "security-core"
+  component: "mfa"
+  owner_team: "Platform Security"
+  contacts:
+    oncall_slack: "sec-oncall"
+    email: "security@example.org"
+  compliance:
+    - "NIST SP 800-63B AAL2-AAL3"
+    - "ISO/IEC 27001"
+    - "SOC 2 Type II"
+  pii_handling: "minimize-and-encrypt"
+  change_control:
+    require_approval: true
+    freeze_windows:
+      - "prod: Fri 16:00-23:59 UTC"
+      - "prod: Sat 00:00-23:59 UTC"
+
+# Источник секретов и ключей
+secrets:
+  provider: "vault"            # vault | aws-kms | gcp-kms | azure-kv
+  path_prefix: "kv/security-core/mfa/"
+  keys:
+    totp_signing_key: "mfa/totp/signing_key"            # HMAC ключ в HSM/KMS
+    backup_code_pepper: "mfa/backup/pepper"             # строка-перец
+    push_provider_token: "mfa/push/provider_token"
+    sms_provider_token: "mfa/sms/provider_token"
+    email_smtp_password: "mfa/email/smtp_password"
+    webauthn_attestation_roots: "mfa/webauthn/attestation_roots"  # PEM цепочки
+    jwt_sign_key: "mfa/jwt/sign"                        # для выдачи JWS событий
+  hsm:
+    enabled: true
+    slot_label: "SEC_MFA"
+    mechanisms: ["RSA-PSS", "ECDSA-P256", "Ed25519"]
+
+# Профили сред с наследованием
+environment:
+  current: "dev"   # dev | stage | prod
+  profiles:
+    dev: &env_dev
+      risk_thresholds: { low: 0, medium: 40, high: 70, critical: 85 }
+      rate_limits: { ip_per_min: 30, user_per_min: 10, user_per_hour: 100 }
+      logging:
+        level: "DEBUG"
+        siem_sink: "stdout"
+    stage: &env_stage
+      risk_thresholds: { low: 0, medium: 45, high: 75, critical: 88 }
+      rate_limits: { ip_per_min: 20, user_per_min: 8, user_per_hour: 60 }
+      logging:
+        level: "INFO"
+        siem_sink: "splunk"
+    prod: &env_prod
+      risk_thresholds: { low: 0, medium: 50, high: 80, critical: 90 }
+      rate_limits: { ip_per_min: 12, user_per_min: 5, user_per_hour: 30 }
+      logging:
+        level: "WARN"
+        siem_sink: "splunk"
+
+# Определение методов MFA (с якорями для переиспользования)
+methods:
+  totp: &totp_defaults
+    enabled: true
+    issuer: "ExampleCorp"
+    algorithm: "SHA1"           # SHA1 по RFC 6238 совместим, SHA256 опционально
+    digits: 6
+    period_seconds: 30
+    skew_windows: 1             # допуск ±1 окно
+    enrollment:
+      require_primary_pwd: true
+      display_qr: true
+      throttle_seconds: 3
+    verification:
+      max_attempts: 6
+      lockout_minutes: 5
+      reuse_window_block: true
+    recovery:
+      allow_time_correction: true
+    storage:
+      secret_at_rest: "encrypt+hsm-wrap"
+      format: "base32"
+  webauthn_passkey: &webauthn_defaults
+    enabled: true
+    rp_id: "example.org"
+    rp_name: "ExampleCorp"
+    attestation: "direct"       # none | indirect | direct | enterprise
+    authenticator_selection:
+      resident_key: "preferred" # required | preferred | discouraged
+      user_verification: "required"
+      attachment: "platform, cross-platform"
+    allow_transports: ["internal", "usb", "ble", "nfc"]
+    acceptable_algorithms: ["ES256", "EdDSA"]
+    enterprise_attestation_policy:
+      allow_list_aaguid: []     # список AAGUID для enterprise ключей
+    verification:
+      challenge_ttl_seconds: 120
+      max_attempts: 5
+      lockout_minutes: 5
+  push: &push_defaults
+    enabled: true
+    provider: "fcf"             # fcf: Firebase/FCM абстракция
+    require_number_matching: true
+    bind_geo: true
+    bind_device: true
+    bind_ip_subnet: true
+    challenge_ttl_seconds: 90
+    max_attempts: 4
+    lockout_minutes: 5
+    device_trust_grace_days: 30
+  sms:
+    enabled: false              # выключено по умолчанию, уязвимо к SIM‑swap
+    provider: "twilio"
+    code_length: 6
+    ttl_seconds: 120
+    max_attempts: 5
+    lockout_minutes: 5
+    sender_id: "ExampleCorp"
+  email_code:
+    enabled: false              # не рекомендуется для высокого риска
+    ttl_seconds: 300
+    code_length: 8
+    max_attempts: 5
+  backup_codes:
+    enabled: true
+    count: 10
+    length: 10
+    charset: "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    hash: "argon2id"
+    rotate_on_view: true
+    expire_days: 365
+  totp_sha256:
+    <<: *totp_defaults
+    algorithm: "SHA256"
+
+# Политики MFA: глобальные и условные
+policies:
+  global:
+    require_mfa: true
+    minimum_assurance_level: "AAL2"   # AAL1 | AAL2 | AAL3
+    allowed_methods: ["webauthn_passkey", "totp", "push", "backup_codes"]
+    disallowed_methods: ["sms", "email_code"]
+    step_up_triggers:
+      - name: "elevated_privilege_action"
+        actions: ["delete_production_data", "rotate_keys", "approve_payment"]
+        required_methods: ["webauthn_passkey"]
+      - name: "sensitive_personal_data_access"
+        resource_tags: ["pii", "phi"]
+        required_methods: ["webauthn_passkey", "totp"]
+    session:
+      max_age_minutes: 720
+      reauth_on_risk_increase: true
+      reauth_on_privilege_escalation: true
+  role_based:
+    - role: "admin"
+      required_methods: ["webauthn_passkey"]
+      disallow_weak_factors: true
+      require_device_trust: true
+      mfa_grace_on_rotation_minutes: 10
+    - role: "finance_approver"
+      required_methods: ["webauthn_passkey", "push"]
+      transaction_binding: "amount+beneficiary+hash"
+    - role: "developer"
+      required_methods: ["webauthn_passkey", "totp"]
+      ci_cd_exemptions: false
+  network_zones:
+    - zone: "trusted_office"
+      cidrs: ["10.10.0.0/16", "10.20.0.0/16"]
+      relaxations:
+        allow_methods: ["totp", "push", "webauthn_passkey"]
+        keep_step_up: true
+    - zone: "untrusted_internet"
+      cidrs: ["0.0.0.0/0"]
+      force_methods: ["webauthn_passkey"]
+  application_rules:
+    - app_id: "prod_console"
+      required_methods: ["webauthn_passkey"]
+    - app_id: "customer_support_tool"
+      required_methods: ["webauthn_passkey", "totp"]
+    - app_id: "hr_system"
+      required_methods: ["webauthn_passkey"]
+
+# Риск‑двигатель: сигналы → оценка → действие
+risk_engine:
+  scoring:
+    thresholds: *env_dev   # будет заменено профилем среды по environment.current
+  signals:
+    ip_reputation:
+      enabled: true
+      providers: ["crowdsec", "abuseipdb"]
+      weight: 25
+    tor_vpn_detector:
+      enabled: true
+      weight: 20
+    geo_velocity:
+      enabled: true
+      km_per_hour_threshold: 900
+      weight: 20
+    new_device:
+      enabled: true
+      weight: 15
+      device_fingerprint:
+        method: "hardware+os+browser"
+        rotation_days: 180
+    impossible_time_window:
+      enabled: true
+      weight: 10
+    anomalous_behavior:
+      enabled: true
+      source: "behavioral_biometrics"
+      weight: 15
+  actions:
+    low:
+      allow_methods: ["webauthn_passkey", "totp", "push"]
+      step_up: false
+    medium:
+      allow_methods: ["webauthn_passkey", "totp", "push"]
+      step_up: true
+      require_methods: ["webauthn_passkey"]
+    high:
+      step_up: true
+      require_methods: ["webauthn_passkey", "totp"]
+      deny_weak_factors: true
+    critical:
+      deny: true
+      notify: ["soc", "user"]
+
+# Лимиты, защитные меры и блокировки
+protections:
+  rate_limits:
+    ip_per_minute:  *env_dev
+    user_verify_attempts:
+      window_seconds: 300
+      max_attempts: 8
+    enroll_per_user_per_day: 3
+  brute_force:
+    progressive_delays:
+      initial_ms: 500
+      factor: 2.0
+      max_ms: 8000
+  lockouts:
+    user_minutes: 15
+    ip_minutes: 10
+  csrf:
+    require_same_site: "Lax"
+  replay:
+    jti_cache_ttl_seconds: 600
+
+# Жизненный цикл: онбординг, реверификация, отзыв
+lifecycle:
+  enrollment:
+    default_methods: ["webauthn_passkey", "totp"]
+    admin_mandatory: ["webauthn_passkey"]
+    proofing_required: "AAL2"
+    allowed_remote_enroll: true
+    remote_enroll_requirements:
+      video_liveness: true
+      id_document_check: true
+  reverification:
+    interval_days:
+      admin: 30
+      standard: 180
+    rotate_backup_codes_on_reverify: true
+  revocation:
+    on_suspicious_activity: true
+    notify_user: true
+    cooldown_minutes: 60
+
+# Восстановление доступа
+account_recovery:
+  enabled: true
+  methods_order: ["webauthn_passkey", "backup_codes", "security_admin_review"]
+  admin_review:
+    require_two_person_rule: true
+    evidence_required: ["id_check", "hr_ticket", "manager_approval"]
+  cooldown_hours: 24
+  session_isolation: true
+
+# Логирование, аудит и мониторинг
+observability:
+  logging:
+    level: "INFO"
+    redact_fields: ["secret", "token", "code", "assertion"]
+    sinks:
+      - type: "siem"
+        name: "splunk"
+        index: "sec_mfa"
+      - type: "json_file"
+        path: "/var/log/security-core/mfa.json"
+  audit:
+    events:
+      - "mfa.enroll.start"
+      - "mfa.enroll.success"
+      - "mfa.verify.success"
+      - "mfa.verify.failed"
+      - "mfa.stepup.required"
+      - "mfa.recovery.requested"
+      - "mfa.method.revoked"
+    retention_days: 3650
+    integrity:
+      sign_with_jws: true
+      key_ref: "secrets.jwt_sign_key"
+  metrics:
+    emit_prometheus: true
+    slo:
+      availability_percent: 99.95
+      p99_challenge_latency_ms: 1500
+    alerts:
+      on_lockout_spike:
+        threshold_per_10min: 50
+        notify: ["soc"]
+
+# Интеграции
+integrations:
+  oidc:
+    enabled: true
+    issuer: "https://id.example.org"
+    claim_for_mfa_level: "acr"
+    acr_values_map:
+      AAL1: "urn:mace:incommon:iap:silver"
+      AAL2: "urn:mace:incommon:iap:gold"
+      AAL3: "urn:mace:incommon:iap:platinum"
+  saml:
+    enabled: true
+    authn_context_map:
+      AAL2: "urn:oasis:names:tc:SAML:2.0:ac:classes:TimeSyncToken"
+      AAL3: "urn:oasis:names:tc:SAML:2.0:ac:classes:SmartcardPKI"
+  scim:
+    enabled: true
+    base_url: "https://scim.example.org"
+  webhooks:
+    verify_event:
+      url: "https://hooks.example.org/mfa/verify"
+      auth: "hmac"
+      timeout_ms: 1500
+  device_trust:
+    mdm:
+      required_for_admin: true
+      providers: ["intune", "jamf"]
+
+# Уведомления
+notifications:
+  locales: ["en", "ru"]
+  templates:
+    mfa_enroll_ru: "Вы зарегистрировали MFA. Если это не вы, обратитесь в службу безопасности."
+    mfa_verify_failed_ru: "Попытка входа заблокирована из‑за неверного кода."
+    mfa_recovery_started_ru: "Запущено восстановление доступа. Если это не вы, немедленно сообщите в SOC."
+  channels:
+    email:
+      enabled: true
+      from: "no-reply@example.org"
+    push:
+      enabled: true
+    sms:
+      enabled: false
+
+# Криптополитика
+crypto:
+  jwk_sets:
+    accept: ["ES256", "EdDSA"]
+  key_rotation:
+    rotation_days: 90
+    overlap_days: 7
+  fips_mode: false
+
+# Данные и приватность
+data_policy:
+  retention:
+    device_fingerprint_days: 365
+    ip_reputation_cache_hours: 24
+  minimization:
+    drop_geo_after_minutes: 30
+  export:
+    subject_access_request_days: 30
+
+# Тесты и проверки безопасности
+assurance:
+  preprod_checks:
+    - "webauthn-attestation-verify"
+    - "rate-limit-smoke"
+    - "backup-codes-entropy-test"
+  chaos_mode:
+    enabled: false
+    fault_injection_percent: 2
+
+# Профиль текущей среды применяется последним
+profile_overrides:
+  dev:
+    <<: *env_dev
+  stage:
+    <<: *env_stage
+  prod:
+    <<: *env_prod

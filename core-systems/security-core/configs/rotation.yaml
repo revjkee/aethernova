@@ -1,0 +1,441 @@
+apiVersion: security.neurocity.io/v1alpha3
+kind: RotationConfig
+metadata:
+  service: security-core
+  owner: platform-security
+  contact: secops@neurocity.example
+  revision: "2025.08.19"
+  lastModified: "2025-08-19T00:00:00Z"
+  annotations:
+    gitops.change-cause: "bootstrap rotation policy"
+    compliance.profiles: "ISO27001,PCI-DSS,SOX"
+    timezone: "UTC"
+
+# -----------------------------
+# ГЛОБАЛЬНАЯ ПОЛИТИКА
+# -----------------------------
+policy:
+  execution:
+    timezone: "UTC"
+    max_parallel_rotations: 2            # ограничение конкуренции
+    rate_limit_per_minute: 4
+    retry_backoff: "15m,30m,60m"         # экспоненциальная последовательность
+    max_retries: 3
+    blackout_windows:                    # периоды запрета (релизы/пик‑часы)
+      - cron: "0 16 * * MON-FRI"         # 16:00 UTC рабочие релизы
+        reason: "release freeze window"
+    maintenance_windows:                  # предпочтительные окна
+      - cron: "0 02 * * *"               # 02:00 UTC ежедневно
+        duration: "90m"
+  notifications:
+    channels:
+      - type: "slack"
+        target: "#sec-rotations"
+      - type: "email"
+        target: "secops@neurocity.example"
+  audit:
+    enabled: true
+    sink: "kafka"
+    topic: "audit.rotation.v1"
+    include_payload_hashes: true          # хэш‑след, без самих секретов
+  slo:
+    success_rate: ">= 99.9%"
+    max_mttR: "30m"                       # Mean Time to Rotate
+    max_mttD: "10m"                       # Mean Time to Detect failed rotation
+
+# -----------------------------
+# ШАБЛОНЫ СТРАТЕГИЙ (ЯКОРЯ)
+# -----------------------------
+strategies:
+  blue_green: &blue_green
+    method: "blue-green"                  # генерируем NEXT, прогоняем трафик, затем переключаем
+    overlap_window: "2h"
+    rollback:
+      enabled: true
+      window: "24h"
+      trigger_on:
+        - healthcheck_failures>=3
+        - error_rate_p95>0.5%
+  rotate_in_place: &rotate_in_place
+    method: "in-place"
+    brief_downtime_allowed: false
+    rollback:
+      enabled: true
+      window: "2h"
+  canary_percent: &canary_25
+    method: "canary"
+    increments:
+      - percentage: 25
+        soak_time: "30m"
+      - percentage: 50
+        soak_time: "30m"
+      - percentage: 100
+        soak_time: "30m"
+    rollback:
+      enabled: true
+      window: "12h"
+
+# -----------------------------
+# ОБЩИЕ ХУКИ
+# -----------------------------
+hooks:
+  prechecks:
+    - id: "vault-reachable"
+      type: "http"
+      target: "${VAULT_HEALTHCHECK_URL}"
+      expect_status: 200
+    - id: "kms-quota"
+      type: "aws-kms-quota"
+      region: "eu-north-1"
+  validators:
+    - id: "jwt-sample-sign-verify"
+      type: "jwt"
+      alg: "EdDSA"
+    - id: "tls-endpoint-probe"
+      type: "tcp"
+      hostFrom: "service_dns"
+      port: 443
+      timeout: "5s"
+  postrotate_checks:
+    - id: "error-rate"
+      type: "metrics"
+      source: "prometheus"
+      query: "rate(http_requests_errors_total[5m])"
+      threshold: "<=0.005"
+    - id: "latency-p95"
+      type: "metrics"
+      source: "prometheus"
+      query: "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))"
+      threshold: "<=0.300"
+
+# -----------------------------
+# РЕСУРСЫ ДЛЯ РОТАЦИИ
+# -----------------------------
+resources:
+
+  # 1) JWT ключи подписи (JWK)
+  - id: "jwt-signing-key"
+    type: "jwk"
+    path: "k8s://secret/security-core/security-core-secrets:JWT_SIGNING_KEY"
+    schedule:
+      cron: "0 02 * * *"                  # ежедневно 02:00 UTC
+      jitter: "10m"
+    strategy: *blue_green
+    generation:
+      provider: "vault"
+      engine: "transit"
+      key_type: "ed25519"
+      length: 256
+    distribution:
+      targets:
+        - kind: "k8s-secret"
+          name: "security-core-secrets"
+          key: "JWT_SIGNING_KEY_NEXT"
+          namespace: "security-core"
+      propagation:
+        reload:
+          deployment: "security-core-api"
+          strategy: "rolling"
+          max_unavailable: "25%"
+          wait_ready_timeout: "10m"
+    validation:
+      hooks:
+        - "jwt-sample-sign-verify"
+    dependencies: []
+    compliance:
+      references: ["PCI-DSS 3.6", "NIST SP 800-57"]
+    break_glass:
+      contact: "ciso@neurocity.example"
+      ttl: "1h"
+
+  # 2) OIDC client secret
+  - id: "oidc-client-secret"
+    type: "opaque"
+    path: "k8s://secret/security-core/security-core-secrets:OIDC_CLIENT_SECRET"
+    schedule:
+      cron: "0 03 * * SUN"                # еженедельно по воскресеньям
+    strategy: *blue_green
+    generation:
+      provider: "vault"
+      engine: "kv"
+      length: 64
+      charset: "base64url"
+    distribution:
+      targets:
+        - kind: "k8s-secret"
+          name: "security-core-secrets"
+          key: "OIDC_CLIENT_SECRET_NEXT"
+          namespace: "security-core"
+    validation:
+      hooks: []
+    dependencies: []
+
+  # 3) Токен корневой интеграции API
+  - id: "api-root-token"
+    type: "opaque"
+    path: "k8s://secret/security-core/security-core-secrets:API_TOKEN_ROOT"
+    schedule:
+      cron: "0 04 1 * *"                  # 1‑го числа месяца
+    strategy: *canary_25
+    generation:
+      provider: "vault"
+      engine: "kv"
+      length: 48
+      charset: "hex"
+    distribution:
+      targets:
+        - kind: "http-webhook"
+          name: "internal-consumers"
+          url: "${INTERNAL_WEBHOOK_ROTATE}"
+          method: "POST"
+          authHeaderFrom: "ROTATOR_WEBHOOK_TOKEN"
+    validation:
+      hooks:
+        - id: "post-webhook-ack"
+          type: "http"
+          target: "${INTERNAL_WEBHOOK_ROTATE}/status"
+          expect_status: 200
+    dependencies: []
+
+  # 4) Пароль Postgres
+  - id: "db-password"
+    type: "db-password"
+    path: "secret://db/security-core:password"
+    schedule:
+      cron: "0 01 * * SUN"                # еженедельно
+    strategy: *rotate_in_place
+    generation:
+      provider: "vault"
+      engine: "database"
+      role: "sec_core_rw"
+      rotation_statement: "ALTER USER sec_core WITH PASSWORD '{{password}}';"
+      length: 32
+      charset: "alnum+symbols"
+    distribution:
+      targets:
+        - kind: "k8s-secret"
+          name: "security-core-secrets"
+          key: "DATABASE_URL"
+          template: "postgresql://sec_core:{{password}}@db:5432/security_core"
+          namespace: "security-core"
+      propagation:
+        reload:
+          statefulset: "security-core-worker"
+          strategy: "rolling"
+          wait_ready_timeout: "15m"
+    validation:
+      hooks:
+        - id: "db-connect"
+          type: "tcp"
+          host: "db.security-core.svc.cluster.local"
+          port: 5432
+          timeout: "5s"
+    dependencies: []
+
+  # 5) Пароль Redis
+  - id: "redis-password"
+    type: "opaque"
+    path: "k8s://secret/security-core/security-core-secrets:REDIS_URL"
+    schedule:
+      cron: "0 05 * * SUN"
+    strategy: *rotate_in_place
+    generation:
+      provider: "vault"
+      engine: "kv"
+      length: 32
+      charset: "alnum"
+    distribution:
+      targets:
+        - kind: "k8s-secret"
+          name: "security-core-secrets"
+          key: "REDIS_URL"
+          template: "redis://:{{password}}@redis:6379/0"
+          namespace: "security-core"
+    validation:
+      hooks:
+        - id: "redis-ping"
+          type: "tcp"
+          host: "redis.security-core.svc.cluster.local"
+          port: 6379
+          timeout: "3s"
+    dependencies: []
+
+  # 6) TLS сертификат публичного входа
+  - id: "tls-cert-public"
+    type: "tls-cert"
+    path: "cert-manager://certificate/security-core-public"
+    schedule:
+      renew_before: "720h"                 # за 30 дней до истечения
+      cron_fallback: "0 00 * * *"          # ежедневная проверка
+    strategy: *blue_green
+    generation:
+      provider: "cert-manager"
+      cluster_issuer: "letsencrypt-prod"
+      dns_names:
+        - "api.neurocity.example"
+    distribution:
+      targets:
+        - kind: "ingress"
+          name: "security-core-ingress"
+          namespace: "security-core"
+    validation:
+      hooks:
+        - "tls-endpoint-probe"
+    dependencies: []
+
+  # 7) mTLS CA bundle для внутреннего трафика
+  - id: "mtls-ca"
+    type: "ca-bundle"
+    path: "secret://pki/internal-ca"
+    schedule:
+      cron: "0 02 1 */6 *"                 # каждые 6 месяцев
+    strategy: *blue_green
+    generation:
+      provider: "vault"
+      engine: "pki"
+      ca_bits: 4096
+      validity: "365d"
+      overlap: "14d"
+    distribution:
+      targets:
+        - kind: "k8s-configmap"
+          name: "platform-ca"
+          key: "ca.crt"
+          namespace: "security-core"
+      propagation:
+        reload:
+          deployment: "security-core-api"
+          strategy: "rolling"
+    validation:
+      hooks: []
+    dependencies: []
+
+  # 8) AWS KMS CMK (ключ обёртки)
+  - id: "kms-key"
+    type: "aws-kms-key"
+    path: "aws:kms:alias/s3/security-core"
+    schedule:
+      cron: "0 06 1 */3 *"                 # ежеквартально (1‑е число)
+    strategy:
+      method: "create-new-grant-and-reencrypt"
+      overlap_window: "48h"
+      rollback:
+        enabled: true
+        window: "7d"
+    generation:
+      provider: "aws"
+      key_spec: "SYMMETRIC_DEFAULT"
+      rotation: "AWS_MANAGED"              # включение AWS‑ротации
+    distribution:
+      targets:
+        - kind: "s3-bucket"
+          arn: "${S3_BUCKET_ARN}"
+          reencrypt: true
+    validation:
+      hooks:
+        - id: "s3-reencryption-sample"
+          type: "s3-reencryption-progress"
+          bucketArnFrom: "target"
+          thresholdDonePercent: 95
+    dependencies: []
+
+  # 9) GitHub PAT (машинный)
+  - id: "github-pat"
+    type: "opaque"
+    path: "k8s://secret/security-core/ci-secrets:GITHUB_PAT"
+    schedule:
+      cron: "0 00 * * SAT"
+    strategy: *rotate_in_place
+    generation:
+      provider: "external"
+      command: "gh auth refresh --scopes repo,packages"
+    distribution:
+      targets:
+        - kind: "k8s-secret"
+          name: "ci-secrets"
+          key: "GITHUB_PAT"
+          namespace: "security-core"
+    validation:
+      hooks:
+        - id: "gh-api-whoami"
+          type: "http"
+          target: "https://api.github.com/user"
+          expect_status: 200
+    dependencies: []
+
+# -----------------------------
+# ОКРУЖЕНЧЕСКИЕ ОВЕРРАЙДЫ
+# -----------------------------
+environments:
+  production:
+    policy:
+      execution:
+        max_parallel_rotations: 1
+        blackout_windows:
+          - cron: "0 18 * * MON-FRI"
+            reason: "EU business peak hours"
+    resources:
+      - match: "jwt-signing-key"
+        strategy:
+          <<: *blue_green
+          overlap_window: "4h"
+      - match: "db-password"
+        schedule:
+          cron: "0 01 * * SUN"
+  staging:
+    resources:
+      - match: "jwt-signing-key"
+        schedule:
+          cron: "0 01 * * *"
+      - match: "api-root-token"
+        strategy: *canary_25
+  dev:
+    policy:
+      execution:
+        rate_limit_per_minute: 10
+    resources:
+      - match: "redis-password"
+        schedule:
+          cron: "*/30 * * * *"
+
+# -----------------------------
+# ГВАРДЫ/ИНВАРИАНТЫ
+# -----------------------------
+guards:
+  - id: "no-overlap-with-blackout"
+    description: "Расписания ротации не должны пересекаться с blackout окнами"
+    rule: "validate_schedules"
+  - id: "jwt-overlap-min"
+    description: "Для jwt‑ключей overlap >= 1h"
+    when:
+      - type: "resource"
+        match: "jwt-signing-key"
+    assert:
+      - path: "strategy.overlap_window"
+        gte: "1h"
+  - id: "tls-renew-before"
+    description: "TLS должен обновляться минимум за 14 дней"
+    when:
+      - type: "resource"
+        match: "tls-cert-public"
+    assert:
+      - path: "schedule.renew_before"
+        gte: "336h"  # 14d
+
+# -----------------------------
+# АУДИТ‑СЛЕД ДЛЯ ПРОЧТЕНИЯ
+# -----------------------------
+auditTrail:
+  enabled: true
+  record:
+    include:
+      - metadata.revision
+      - resources[*].id
+      - resources[*].type
+      - resources[*].schedule
+      - strategies
+
+notes:
+  - "Реализация ротации производится оператором/джобой, этот файл — источник политики."
+  - "Сами секреты не хранятся в YAML; хранятся только пути и политика."
+  - "Для KMS и TLS предусматривайте длительные окна overlap для безопасной миграции."

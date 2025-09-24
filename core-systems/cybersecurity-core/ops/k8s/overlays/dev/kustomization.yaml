@@ -1,0 +1,171 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: cybersecurity-core-dev
+namePrefix: dev-
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/name: cybersecurity-core
+  app.kubernetes.io/instance: cybersecurity-core-dev
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/part-of: cybersecurity-core
+  app.kubernetes.io/environment: dev
+
+commonAnnotations:
+  maintainer: platform-ops@aethernova.local
+  observability.aethernova.io/log-level: debug
+  security.aethernova.io/profile: hardened
+  checksum/config: "use-generators-hash"
+
+generatorOptions:
+  disableNameSuffixHash: false
+  annotations:
+    generated-by: kustomize
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+
+configMapGenerator:
+  - name: app-config
+    behavior: merge
+    literals:
+      - ENV=dev
+      - LOG_LEVEL=debug
+      - FEATURE_FLAG_X=true
+      - API_RATE_LIMIT_QPS=20
+      - API_RATE_LIMIT_BURST=40
+
+secretGenerator:
+  - name: app-secrets
+    behavior: merge
+    type: Opaque
+    literals:
+      - DATABASE_URL=postgresql://dev:dev@postgres:5432/app?sslmode=disable
+      - JWT_SIGNING_KEY=dev-unsafe-change-in-prod
+      - REDIS_URL=redis://redis:6379/0
+
+images:
+  - name: ghcr.io/your-org/cybersecurity-core
+    newName: ghcr.io/your-org/cybersecurity-core
+    newTag: v0.1.0
+    # При наличии дайджеста он побьёт newTag:
+    digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+
+# Патчи: реплики, ресурсы, политика безопасности контейнера, tolerations/affinity, pullPolicy
+patches:
+  # Реплики и политика перезапуска
+  - target:
+      version: v1
+      kind: Deployment
+      name: cybersecurity-core
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 2
+      - op: add
+        path: /spec/strategy
+        value:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 25%
+  # Ресурсы и pullPolicy
+  - target:
+      version: v1
+      kind: Deployment
+      name: cybersecurity-core
+    patch: |
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+  # SecurityContext контейнера: без root, read-only FS, seccomp
+  - target:
+      version: v1
+      kind: Deployment
+      name: cybersecurity-core
+    patch: |
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          seccompProfile:
+            type: RuntimeDefault
+          fsGroup: 2000
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+  # Вставка переменных окружения из сгенерированных ConfigMap/Secret
+  - target:
+      version: v1
+      kind: Deployment
+      name: cybersecurity-core
+    patch: |
+      - op: add
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: app-config
+          - secretRef:
+              name: app-secrets
+  # Аннотации к Pod для увеличенного логирования и sidecar-интеграций
+  - target:
+      version: v1
+      kind: Deployment
+      name: cybersecurity-core
+    patch: |
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "8080"
+          prometheus.io/path: "/metrics"
+          checksum/app-config: dummy-replace-on-change
+  # Tolerations/affinity для dev-узлов
+  - target:
+      version: v1
+      kind: Deployment
+      name: cybersecurity-core
+    patch: |
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - key: "env"
+            operator: "Equal"
+            value: "dev"
+            effect: "NoSchedule"
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: node-role.kubernetes.io/dev
+                      operator: In
+                      values: ["true"]
+
+# StrategicMerge патч для ServiceAccount: запрет автоподстановки токена
+patchesStrategicMerge:
+  - |-
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: cybersecurity-core
+    automountServiceAccountToken: false

@@ -1,0 +1,219 @@
+# ledger-core/ops/configs/db.yaml
+# Централизованная конфигурация БД для ledger-core.
+# Все чувствительные значения задаются через переменные окружения или внешние Secret Manager.
+# Переключение окружений производится по ключу profiles.<env>.
+# Приложение должно читать секцию "active" и затем слить с profiles[active].
+
+version: 1
+
+active: ${LEDGER_ENV:dev}  # dev | staging | prod
+
+defaults: &defaults
+  driver: postgresql+psycopg  # SQLAlchemy 2.x рекомендуемый драйвер
+  application_name: ledger-core
+  # DSN формируется из составляющих ниже, если database_url не задан
+  database_url: ${DATABASE_URL:}   # если задан, имеет приоритет над host/port/user/...
+  host: ${DB_HOST:localhost}
+  port: ${DB_PORT:5432}
+  user: ${DB_USER:ledger}
+  password: ${DB_PASSWORD:}        # не хранить в файле; задать через секреты/ENV
+  dbname: ${DB_NAME:ledger}
+  # SSL и безопасность
+  ssl:
+    mode: ${DB_SSL_MODE:require}   # disable|require|verify-ca|verify-full
+    root_cert: ${DB_SSL_ROOT_CERT:}  # путь к CA, если verify-*
+    client_cert: ${DB_SSL_CLIENT_CERT:}
+    client_key: ${DB_SSL_CLIENT_KEY:}
+  # Пул соединений
+  pool:
+    # Ограничения пулы для разных окружений переопределяются в profiles.*
+    max_size: 10
+    min_idle: 1
+    max_overflow: 5            # доп. коннекты сверх max_size
+    recycle_seconds: 1800      # перезапуск коннекта для защиты от idle-in-transaction
+    pre_ping: true             # проверка соединения перед выдачей из пула
+    statement_cache_size: 256
+  # Таймауты и ретраи
+  timeouts:
+    connect_seconds: 5
+    socket_read_seconds: 30
+    statement_seconds: 15      # выставляется через SET statement_timeout
+  retries:
+    enabled: true
+    attempts: 5
+    backoff_initial_ms: 50
+    backoff_max_ms: 1000
+    jitter: true
+    # Повторяем при ошибках: сетевые, serialization_failure, deadlock_detected
+    retry_sqlstate:
+      - "40001"   # serialization_failure
+      - "40P01"   # deadlock_detected
+      - "08000"   # connection exception
+      - "08006"   # connection failure
+      - "57P01"   # admin shutdown
+  # Миграции и схема
+  migrations:
+    enabled: true
+    tool: alembic
+    script_location: ledger_core:migrations
+    # Управление базовыми параметрами сеанса в миграциях
+    session:
+      search_path: public
+      lock_timeout_ms: 5000
+      statement_timeout_ms: 0   # без лимита для миграций
+  # Поведение соединения по умолчанию
+  session:
+    read_only: false
+    deferrable: false
+    isolation_level: ${DB_ISOLATION:READ COMMITTED}  # READ COMMITTED|REPEATABLE READ|SERIALIZABLE
+    search_path: public
+    extra_set:
+      - "SET idle_in_transaction_session_timeout = '5min'"
+      - "SET application_name = 'ledger-core'"
+      - "SET timezone = 'UTC'"
+      - "SET lock_timeout = '5s'"
+      - "SET statement_timeout = '15s'"
+  # Профиль реплик для чтения
+  replicas:
+    enabled: false
+    load_balance: round_robin    # round_robin|least_lag
+    max_replica_lag_seconds: 5
+    nodes: []                    # пример заполняется в staging/prod
+  # Здоровье
+  healthcheck:
+    interval_seconds: 15
+    timeout_seconds: 3
+    query: "SELECT 1"
+    require_primary: false
+  # pgBouncer (опционально)
+  pgbouncer:
+    enabled: false
+    dsn: ${PGBOUNCER_DSN:}       # если задан, переопределяет host/port
+    pool_mode: transaction       # recommended для веб-приложений
+    server_reset_query: "DISCARD ALL"
+  # Аудит и телеметрия
+  telemetry:
+    otel:
+      enabled: ${OTEL_DB_INSTRUMENTATION:false}
+      db_system: postgresql
+      attributes:
+        service.name: ${OTEL_SERVICE_NAME:ledger-core}
+        deployment.environment: ${DEPLOY_ENV:dev}
+    metrics:
+      enabled: true
+      emit_pool_metrics: true
+      namespace: ledger_db
+
+profiles:
+  dev:
+    <<: *defaults
+    pool:
+      max_size: 5
+      min_idle: 1
+      max_overflow: 3
+      recycle_seconds: 600
+    timeouts:
+      connect_seconds: 3
+      socket_read_seconds: 15
+      statement_seconds: 10
+    session:
+      isolation_level: READ COMMITTED
+    healthcheck:
+      interval_seconds: 10
+    telemetry:
+      otel:
+        enabled: false
+
+  staging:
+    <<: *defaults
+    host: ${DB_HOST_STG:}
+    port: ${DB_PORT_STG:5432}
+    user: ${DB_USER_STG:ledger}
+    password: ${DB_PASSWORD_STG:}
+    dbname: ${DB_NAME_STG:ledger}
+    pool:
+      max_size: 15
+      min_idle: 2
+      max_overflow: 10
+      recycle_seconds: 1800
+    timeouts:
+      connect_seconds: 5
+      socket_read_seconds: 20
+      statement_seconds: 12
+    replicas:
+      enabled: true
+      load_balance: least_lag
+      max_replica_lag_seconds: 5
+      nodes:
+        - host: ${DB_REPLICA1_HOST_STG:}
+          port: ${DB_REPLICA1_PORT_STG:5432}
+        - host: ${DB_REPLICA2_HOST_STG:}
+          port: ${DB_REPLICA2_PORT_STG:5432}
+    healthcheck:
+      interval_seconds: 15
+      require_primary: false
+    pgbouncer:
+      enabled: ${PGBOUNCER_ENABLED_STG:false}
+      dsn: ${PGBOUNCER_DSN_STG:}
+    telemetry:
+      otel:
+        enabled: ${OTEL_DB_INSTRUMENTATION_STG:true}
+
+  prod:
+    <<: *defaults
+    host: ${DB_HOST_PROD:}
+    port: ${DB_PORT_PROD:5432}
+    user: ${DB_USER_PROD:ledger}
+    password: ${DB_PASSWORD_PROD:}
+    dbname: ${DB_NAME_PROD:ledger}
+    ssl:
+      mode: ${DB_SSL_MODE_PROD:verify-full}
+      root_cert: ${DB_SSL_ROOT_CERT_PROD:/etc/ssl/certs/ca-bundle.crt}
+    pool:
+      max_size: 50
+      min_idle: 5
+      max_overflow: 25
+      recycle_seconds: 2700
+      statement_cache_size: 512
+    timeouts:
+      connect_seconds: 5
+      socket_read_seconds: 30
+      statement_seconds: 15
+    session:
+      isolation_level: REPEATABLE READ
+      extra_set:
+        - "SET idle_in_transaction_session_timeout = '2min'"
+        - "SET application_name = 'ledger-core'"
+        - "SET timezone = 'UTC'"
+        - "SET lock_timeout = '3s'"
+        - "SET statement_timeout = '15s'"
+    replicas:
+      enabled: true
+      load_balance: least_lag
+      max_replica_lag_seconds: 3
+      nodes:
+        - host: ${DB_REPLICA1_HOST_PROD:}
+          port: ${DB_REPLICA1_PORT_PROD:5432}
+        - host: ${DB_REPLICA2_HOST_PROD:}
+          port: ${DB_REPLICA2_PORT_PROD:5432}
+        - host: ${DB_REPLICA3_HOST_PROD:}
+          port: ${DB_REPLICA3_PORT_PROD:5432}
+    healthcheck:
+      interval_seconds: 10
+      require_primary: true
+    pgbouncer:
+      enabled: ${PGBOUNCER_ENABLED_PROD:true}
+      dsn: ${PGBOUNCER_DSN_PROD:}
+      pool_mode: transaction
+    telemetry:
+      otel:
+        enabled: ${OTEL_DB_INSTRUMENTATION_PROD:true}
+
+# Подсказки по интеграции:
+# 1) Если DATABASE_URL задан, приложение использует его напрямую, а параметры host/user/... игнорируются.
+# 2) При включенных replicas драйвер должен направлять read_only транзакции на реплики,
+#    а read_write — на primary. На уровне SQLAlchemy это можно реализовать через кастомный
+#    sessionmaker/route по признаку session.info["read_only"] или через два engine.
+# 3) Миграции Alembic читают секцию migrations; приложение должно временно переопределять
+#    statement_timeout=0 и lock_timeout при выполнении миграций.
+# 4) Для pgBouncer пулы в приложении следует уменьшить (ибо pooling уже на уровне прокси).

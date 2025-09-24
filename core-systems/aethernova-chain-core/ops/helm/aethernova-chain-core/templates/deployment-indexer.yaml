@@ -1,0 +1,196 @@
+{{- /*
+Deployment for Aethernova Chain Core Indexer
+Assumes values under .Values.indexer.* with sensible defaults.
+*/ -}}
+{{- $fullname := include "aethernova-chain-core.fullname" . | printf "%s-indexer" -}}
+{{- $labels := (include "aethernova-chain-core.labels" . | fromYaml) | default dict -}}
+{{- $lbl := dict
+      "app.kubernetes.io/name" (printf "%s-indexer" (include "aethernova-chain-core.name" .))
+      "app.kubernetes.io/instance" .Release.Name
+      "app.kubernetes.io/component" "indexer"
+      "app.kubernetes.io/part-of" (include "aethernova-chain-core.name" .)
+      "app.kubernetes.io/version" (.Chart.AppVersion | default .Chart.Version)
+-}}
+{{- $selector := dict "matchLabels" (merge (dict "app.kubernetes.io/name" (printf "%s-indexer" (include "aethernova-chain-core.name" .))) (pick $lbl "app.kubernetes.io/component")) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- toYaml (merge $lbl $labels) | nindent 4 }}
+  {{- with .Values.indexer.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.indexer.hpa.enabled }}
+  replicas: {{ .Values.indexer.replicas | default 2 }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.indexer.revisionHistoryLimit | default 10 }}
+  selector:
+    {{- toYaml $selector | nindent 4 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.indexer.strategy.maxUnavailable | default "25%" }}
+      maxSurge: {{ .Values.indexer.strategy.maxSurge | default "25%" }}
+  template:
+    metadata:
+      labels:
+        {{- toYaml (merge $lbl (dict "app.kubernetes.io/name" (printf "%s-indexer" (include "aethernova-chain-core.name" .)))) | nindent 8 }}
+      {{- with .Values.indexer.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.scheduling.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scheduling.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.scheduling.priorityClassName }}
+      priorityClassName: {{ .Values.scheduling.priorityClassName }}
+      {{- end }}
+
+      {{- if and .Values.scheduling.topologySpreadConstraints.enabled .Values.scheduling.topologySpreadConstraints.rules }}
+      topologySpreadConstraints:
+        {{- /* Ensure selector targets this pod set */}}
+        {{- range $i, $c := .Values.scheduling.topologySpreadConstraints.rules }}
+        - {{- toYaml $c | nindent 10 }}
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ printf "%s-indexer" (include "aethernova-chain-core.name" $) | quote }}
+        {{- end }}
+      {{- end }}
+
+      serviceAccountName: {{ include "aethernova-chain-core.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.indexer.automountServiceAccountToken | default false }}
+
+      securityContext:
+        {{- /* Pod-level security context aligned with Pod Security Standards: Restricted */}}
+        {{- toYaml (default .Values.security.podSecurityContext dict) | nindent 8 }}
+
+      {{- with .Values.indexer.imagePullSecrets | default .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.indexer.initContainers }}
+      initContainers:
+        {{- toYaml .Values.indexer.initContainers | nindent 8 }}
+      {{- else if (index .Values "initContainers") }}
+      initContainers:
+        {{- toYaml .Values.initContainers | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: indexer
+          image: "{{ .Values.indexer.image.repository | default (printf "%s-indexer" .Values.image.repository) }}:{{ .Values.indexer.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.indexer.image.pullPolicy | default .Values.image.pullPolicy | default "IfNotPresent" }}
+          command:
+            {{- if .Values.indexer.command }}
+            {{- toYaml .Values.indexer.command | nindent 12 }}
+            {{- else }}
+            - /bin/sh
+            - -c
+            - >
+              exec /app/indexer
+              {{- /* pass feature flags to binary as args if required */}}
+              {{- if .Values.featureFlags.btc2_finality }} --btc2-finality{{ end }}
+              {{- if .Values.featureFlags.parallel_exec }} --parallel-exec{{ end }}
+              {{- if .Values.featureFlags.zk_priv_tx }} --zk-privacy{{ end }}
+              {{- range .Values.indexer.extraArgs }} {{ . }}{{ end }}
+            {{- end }}
+
+          args:
+            {{- if .Values.indexer.args }}
+            {{- toYaml .Values.indexer.args | nindent 12 }}
+            {{- end }}
+
+          env:
+            - name: CHAIN_ENV
+              value: {{ .Values.env | default list | toYaml | fromYaml | dig 0 "value" | default "prod" | quote }}
+            - name: AE_FEATURES
+              value: {{ printf "%s%s%s"
+                (ternary "btc2_finality," "" .Values.featureFlags.btc2_finality)
+                (ternary "parallel_exec," "" .Values.featureFlags.parallel_exec)
+                (ternary "zk_priv_tx" "" .Values.featureFlags.zk_priv_tx)
+              | trimSuffix "," | quote }}
+            {{- range $idx, $item := .Values.env | default list }}
+            {{- if $item.name }}- name: {{ $item.name }}
+              {{- if hasKey $item "valueFrom" }}
+              valueFrom:
+                {{- toYaml $item.valueFrom | nindent 16 }}
+              {{- else }}
+              value: {{ $item.value | quote }}
+              {{- end }}
+            {{- end }}
+            {{- end }}
+          {{- with .Values.env.secretRefs }}
+          envFrom:
+            {{- range . }}
+            - secretRef:
+                name: {{ .name }}
+            {{- end }}
+          {{- end }}
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.indexer.ports.http | default 8080 }}
+            - name: metrics
+              containerPort: {{ .Values.service.ports.metrics.targetPort | default 9100 }}
+          {{- if .Values.indexer.readinessProbe.enabled | default true }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.indexer.readinessProbe.path | default "/ready" }}
+              port: {{ .Values.indexer.readinessProbe.port | default "http" }}
+            initialDelaySeconds: {{ .Values.indexer.readinessProbe.initialDelaySeconds | default 10 }}
+            periodSeconds: {{ .Values.indexer.readinessProbe.periodSeconds | default 5 }}
+            timeoutSeconds: {{ .Values.indexer.readinessProbe.timeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.indexer.readinessProbe.failureThreshold | default 6 }}
+          {{- end }}
+          {{- if .Values.indexer.livenessProbe.enabled | default true }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.indexer.livenessProbe.path | default "/healthz" }}
+              port: {{ .Values.indexer.livenessProbe.port | default "http" }}
+            initialDelaySeconds: {{ .Values.indexer.livenessProbe.initialDelaySeconds | default 30 }}
+            periodSeconds: {{ .Values.indexer.livenessProbe.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.indexer.livenessProbe.timeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.indexer.livenessProbe.failureThreshold | default 6 }}
+          {{- end }}
+          {{- if .Values.indexer.startupProbe.enabled | default true }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.indexer.startupProbe.path | default "/startup" }}
+              port: {{ .Values.indexer.startupProbe.port | default "http" }}
+            failureThreshold: {{ .Values.indexer.startupProbe.failureThreshold | default 60 }}
+            periodSeconds: {{ .Values.indexer.startupProbe.periodSeconds | default 5 }}
+            timeoutSeconds: {{ .Values.indexer.startupProbe.timeoutSeconds | default 2 }}
+          {{- end }}
+
+          resources:
+            {{- toYaml ( .Values.indexer.resources | default .Values.resources ) | nindent 12 }}
+
+          securityContext:
+            {{- /* Container-level security context aligned with Restricted PSS */}}
+            {{- toYaml (default .Values.security.containerSecurityContext dict) | nindent 12 }}
+
+          volumeMounts:
+            {{- with .Values.indexer.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+      volumes:
+        {{- with .Values.indexer.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

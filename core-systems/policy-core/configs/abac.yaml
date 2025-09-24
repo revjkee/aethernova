@@ -1,0 +1,323 @@
+# file: policy-core/configs/abac.yaml
+version: 1.0
+metadata:
+  policy_set_id: policy-core-abac
+  revision: "2025-08-28"
+  owner: security@aethernova.example
+  combine_algorithm: deny-overrides        # стратегия комбинирования
+  signature_required: true                 # требование подписи конфигурации
+  description: >
+    ABAC-политики для policy-core. Deny-by-default. Совместимы с Zero-Trust:
+    проверка устройства, сети, гео, MFA, purpose, legal hold, PII, межсервисные токены.
+
+defaults:
+  effect: Deny
+  obligations:
+    - audit-log
+  environment:
+    business_hours_utc: "08:00-20:00"      # пример бизнес-часов
+
+dictionaries:
+  classification_levels: [public, internal, confidential, secret]
+  pii_kinds: [email, phone, ip, iban, ssn, dob, name, address]
+  trusted_networks:
+    cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    labels: ["corp", "vpn"]
+  high_risk_countries: ["CU", "IR", "KP", "SY"]
+  allowed_export_formats: ["csv", "parquet", "jsonl"]
+
+schema:
+  subject:
+    sub.id: { type: string, required: true }
+    sub.tenants: { type: array[string], required: true }
+    sub.role: { type: string, enum: [user, analyst, engineer, dpo, compliance, admin, service], required: true }
+    sub.clearance: { type: string, enum_ref: classification_levels, required: true }
+    sub.mfa: { type: boolean, required: false, default: false }
+    sub.department: { type: string, required: false }
+    sub.device.posture: { type: string, enum: [managed, unmanaged, compromised], required: true }
+    sub.risk.score: { type: number, min: 0, max: 100, required: true }
+    sub.scopes: { type: array[string], required: false, default: [] }  # для межсервисных токенов
+  resource:
+    res.id: { type: string, required: true }
+    res.type: { type: string, enum: [policy, dataset, record, admin, config], required: true }
+    res.owner_tenant: { type: string, required: true }
+    res.classification: { type: string, enum_ref: classification_levels, required: true }
+    res.tags.pii: { type: array[string], enum_ref: pii_kinds, required: false, default: [] }
+    res.legal_hold: { type: boolean, required: false, default: false }
+    res.fields: { type: map[string,string], required: false, default: {} }  # поле -> тип/класс
+  action:
+    act.name: { type: string, enum: [read, write, delete, approve, publish, export, evaluate], required: true }
+    act.export.format: { type: string, enum_ref: allowed_export_formats, required: false }
+  environment:
+    env.ip: { type: string, required: true }
+    env.country: { type: string, required: true }
+    env.time: { type: string, format: iso8601, required: true }
+    env.network.label: { type: string, required: false }
+    env.device_trust: { type: string, enum: [trusted, unknown, untrusted], required: true }
+    env.purpose: { type: string, enum: [support, analytics, fraud, training, admin], required: true }
+    env.breakglass.ticket: { type: string, required: false, default: "" }
+
+conditions:  # библиотека переиспользуемых условий (макросов)
+  isBusinessHours:
+    allOf:
+      - time.inRange: { input: env.time, range_utc: ${defaults.environment.business_hours_utc} }
+  isTrustedNetwork:
+    anyOf:
+      - cidr.contains: { ip: env.ip, cidrs: ${dictionaries.trusted_networks.cidrs} }
+      - equals: { left: env.network.label, rightAny: ${dictionaries.trusted_networks.labels} }
+  isTenantScoped:
+    anyOf:
+      - list.contains: { list: sub.tenants, value: res.owner_tenant }
+      - equals: { left: sub.role, right: "admin" }
+  clearanceDominates:
+    orderDominates:
+      left: sub.clearance
+      right: res.classification
+      order: ${dictionaries.classification_levels}
+  deviceCompliant:
+    anyOf:
+      - equals: { left: sub.device.posture, right: "managed" }
+  requireMFAForSensitive:
+    anyOf:
+      - equals: { left: res.classification, right: "public" }
+      - equals: { left: sub.mfa, right: true }
+  lowRiskUser:
+    lt: { left: sub.risk.score, right: 80 }
+  highRiskUser:
+    gte: { left: sub.risk.score, right: 80 }
+  nonHighRiskCountry:
+    not:
+      in: { value: env.country, list: ${dictionaries.high_risk_countries} }
+  purposeAllowedForPIIRead:
+    anyOf:
+      - equals: { left: env.purpose, rightAny: ["support", "fraud"] }
+  purposeAllowedForTraining:
+    allOf:
+      - equals: { left: env.purpose, right: "training" }
+      - in: { value: res.classification, list: ["public", "internal"] }
+
+obligations:  # описания для обработчиков обязательств
+  audit-log: { kind: audit, level: info }
+  watermark:
+    kind: transform
+    params: { text: "policy-core", fields: ["*"] }
+  mask-default:
+    kind: mask
+    params:
+      fields_by_kind:
+        email: "hash"
+        phone: "last4"
+        ip: "truncate"
+        iban: "last6"
+        ssn: "last4"
+        dob: "year"
+        name: "initials"
+        address: "city"
+  redact-pii:
+    kind: redact
+    params:
+      fields_from: res.tags.pii
+  notify-dlp:
+    kind: notify
+    params: { channel: "dlp", severity: "high" }
+  breakglass-record:
+    kind: annotate
+    params:
+      fields:
+        breakglass: true
+        ticket: env.breakglass.ticket
+  deny-reason-geo:
+    kind: deny-reason
+    params: { code: "GEO_BLOCK", message: "Access from high-risk country is not permitted." }
+  deny-reason-mfa:
+    kind: deny-reason
+    params: { code: "MFA_REQUIRED", message: "MFA required for sensitive operation." }
+  deny-reason-legalhold:
+    kind: deny-reason
+    params: { code: "LEGAL_HOLD", message: "Deletion blocked due to legal hold." }
+
+policies:
+  # P0: Жёсткий отказ при высоком риске пользователя
+  - id: P0-deny-high-risk
+    description: "Отказать, если риск пользователя высокий."
+    effect: Deny
+    target:
+      anyOf:
+        - ref: highRiskUser
+    obligations: [audit-log]
+
+  # P1: Геоблок для чувствительных данных из стран высокого риска
+  - id: P1-geo-block-sensitive
+    description: "Запрет доступа к confidential/secret и PII из high-risk стран, если не доверенная сеть."
+    effect: Deny
+    target:
+      allOf:
+        - not: { ref: isTrustedNetwork }
+        - not: { ref: nonHighRiskCountry }
+        - anyOf:
+            - in: { value: res.classification, list: ["confidential", "secret"] }
+            - gt: { left: len(res.tags.pii), right: 0 }
+    obligations: [audit-log, deny-reason-geo]
+
+  # P2: Требование MFA для write/delete по чувствительным данным
+  - id: P2-mfa-sensitive-mutations
+    description: "MFA обязательно для операций write/delete над confidential/secret."
+    effect: Deny
+    target:
+      allOf:
+        - in: { value: act.name, list: ["write", "delete"] }
+        - in: { value: res.classification, list: ["confidential", "secret"] }
+        - not: { ref: requireMFAForSensitive }
+    obligations: [audit-log, deny-reason-mfa]
+
+  # P3: Базовое чтение внутренних данных. Маскирование PII для неуполномоченных.
+  - id: P3-allow-read-internal
+    description: "Разрешить read для public/internal при соблюдении зоны, тенанта и устройства. Маскировать PII."
+    effect: Permit
+    target:
+      allOf:
+        - equals: { left: act.name, right: "read" }
+        - in: { value: res.classification, list: ["public", "internal"] }
+        - ref: isTenantScoped
+        - ref: deviceCompliant
+        - ref: lowRiskUser
+    obligations: [audit-log, watermark, mask-default]
+
+  # P4: Чтение конфиденциальных данных. Маскирование PII, кроме ролей dpo/compliance/admin или владельца.
+  - id: P4-allow-read-confidential-masked
+    description: "Разрешить read для confidential при достаточном допуске и маскировании PII."
+    effect: Permit
+    target:
+      allOf:
+        - equals: { left: act.name, right: "read" }
+        - equals: { left: res.classification, right: "confidential" }
+        - ref: clearanceDominates
+        - ref: isTenantScoped
+        - ref: deviceCompliant
+        - ref: lowRiskUser
+    obligations:
+      - audit-log
+      - watermark
+      - conditional:
+          when:
+            not:
+              anyOf:
+                - in: { value: sub.role, list: ["admin", "dpo", "compliance"] }
+                - equals: { left: sub.id, right: res.owner_tenant }   # если id пользователя совпадает с владельцем-аккаунтом
+          then: [mask-default, redact-pii]
+
+  # P5: Экспорт данных с PII разрешён только DPO/Compliance, с целью analytics и маскированием
+  - id: P5-restrict-export-pii
+    description: "Экспорт PII разрешён только DPO/Compliance, при purpose=analytics и маскировании."
+    effect: Permit
+    target:
+      allOf:
+        - equals: { left: act.name, right: "export" }
+        - gte: { left: len(res.tags.pii), right: 1 }
+        - in: { value: sub.role, list: ["dpo", "compliance"] }
+        - equals: { left: env.purpose, right: "analytics" }
+        - in: { value: act.export.format, list: ${dictionaries.allowed_export_formats} }
+        - ref: clearanceDominates
+        - ref: isTenantScoped
+    obligations: [audit-log, mask-default, watermark, notify-dlp]
+
+  # P6: Purpose limitation — обучение только на неперсональных данных
+  - id: P6-purpose-training-non-pii
+    description: "Тренировка (purpose=training) разрешена только для public/internal без PII."
+    effect: Permit
+    target:
+      allOf:
+        - ref: purposeAllowedForTraining
+        - equals: { left: act.name, right: "read" }
+        - equals: { left: len(res.tags.pii), right: 0 }
+        - ref: isTenantScoped
+    obligations: [audit-log, watermark]
+
+  # P7: Legal hold — запрет удаления при удержании
+  - id: P7-legal-hold
+    description: "Запретить delete, если на ресурсе legal_hold."
+    effect: Deny
+    target:
+      allOf:
+        - equals: { left: act.name, right: "delete" }
+        - equals: { left: res.legal_hold, right: true }
+    obligations: [audit-log, deny-reason-legalhold]
+
+  # P8: Межсервисное обращение к оценке политик (machine-to-machine)
+  - id: P8-service-to-service-evaluate
+    description: "Разрешить evaluate сервисам со scope=policy.evaluate и из доверенной сети."
+    effect: Permit
+    target:
+      allOf:
+        - equals: { left: sub.role, right: "service" }
+        - list.contains: { list: sub.scopes, value: "policy.evaluate" }
+        - equals: { left: act.name, right: "evaluate" }
+        - ref: isTrustedNetwork
+        - ref: lowRiskUser
+    obligations: [audit-log]
+
+  # P9: Админский break-glass с билетом и низким риском
+  - id: P9-admin-breakglass
+    description: "Админ может выполнить любую операцию при наличии break-glass билета и низком риске."
+    effect: Permit
+    target:
+      allOf:
+        - equals: { left: sub.role, right: "admin" }
+        - ne: { left: env.breakglass.ticket, right: "" }
+        - ref: lowRiskUser
+    obligations: [audit-log, breakglass-record]
+
+  # P10: Бизнес-часы для write/approve/publish, вне часов — только из доверенной сети
+  - id: P10-business-hours-guard
+    description: "Вне бизнес-часов изменения допустимы только из доверенной сети."
+    effect: Deny
+    target:
+      allOf:
+        - in: { value: act.name, list: ["write", "approve", "publish"] }
+        - not: { ref: isBusinessHours }
+        - not: { ref: isTrustedNetwork }
+    obligations: [audit-log]
+
+testing:
+  examples:
+    - name: read-internal-masked
+      input:
+        sub.role: analyst
+        sub.tenants: ["t1"]
+        sub.clearance: internal
+        sub.device.posture: managed
+        sub.risk.score: 12
+        sub.mfa: false
+        res.type: dataset
+        res.owner_tenant: "t1"
+        res.classification: internal
+        res.tags.pii: ["email", "ip"]
+        act.name: read
+        env.ip: "10.1.2.3"
+        env.country: "SE"
+        env.time: "2025-08-28T08:30:00Z"
+        env.device_trust: trusted
+        env.purpose: support
+      expected:
+        effect: Permit
+        obligations: [audit-log, watermark, mask-default]
+    - name: export-pii-deny-non-dpo
+      input:
+        sub.role: analyst
+        sub.tenants: ["t1"]
+        sub.clearance: confidential
+        sub.device.posture: managed
+        sub.risk.score: 10
+        res.type: dataset
+        res.owner_tenant: "t1"
+        res.classification: confidential
+        res.tags.pii: ["email"]
+        act.name: export
+        act.export.format: csv
+        env.ip: "203.0.113.5"
+        env.country: "SE"
+        env.time: "2025-08-28T09:00:00Z"
+        env.device_trust: trusted
+        env.purpose: analytics
+      expected:
+        effect: Deny  # не совпадает роль

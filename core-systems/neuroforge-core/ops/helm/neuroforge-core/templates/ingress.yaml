@@ -1,0 +1,228 @@
+{{- /*
+  Industrial Ingress template for neuroforge-core
+  Supported controllers via .Values.ingress.controller: nginx|traefik|alb|gke|other
+  Values schema (excerpt):
+
+  ingress:
+    enabled: true
+    className: "nginx"        # maps to spec.ingressClassName; legacy annotation added too
+    controller: "nginx"       # affects default annotations
+    annotations: {}           # user-supplied annotations merge after defaults
+    externalDNS:
+      enabled: false
+      ttl: 300
+    certManager:
+      enabled: false
+      clusterIssuer: "letsencrypt-staging"
+    tls:
+      # Either explicit tls blocks or auto via certManager + secretName
+      entries:
+        - secretName: neuroforge-core-tls
+          hosts: ["app.example.com"]
+    hosts:
+      - host: "app.example.com"
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: ""          # default -> computed fullname
+              portName: "http"  # prefer named port
+              # portNumber: 80  # alternatively number
+          - path: /grpc
+            pathType: Prefix
+            service:
+              name: ""
+              portName: "grpc"
+        # Optional per-host extra paths (advanced)
+        extraPaths: []
+    # Global extra paths added to every host (advanced)
+    extraPaths: []
+    nginx:
+      sslRedirect: true
+      proxyBodySize: "1m"
+      proxyReadTimeout: "60s"
+      proxySendTimeout: "60s"
+      backendProtocol: ""        # "GRPC" to force gRPC for all locations (nginx)
+      affinity: ""               # "cookie" to enable sticky sessions
+      sessionCookieName: "route"
+      sessionCookieHash: "sha1"  # md5|sha1
+      rateLimit:
+        enabled: false
+        connections: 0
+        rps: 0
+      rewriteTarget: ""          # e.g. /$1 if regex enabled
+      enableRegex: false
+    canary:
+      enabled: false
+      weight: 20                 # 1..100
+      byHeader: ""               # e.g. "X-Canary"
+      byHeaderValue: ""
+      byCookie: ""               # e.g. "canary"
+*/ -}}
+{{- if .Values.ingress.enabled }}
+
+{{- /* Compute names without relying on helpers */ -}}
+{{- $fullname := printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- $svcDefault := (coalesce (dig "service" "name" "" .Values) $fullname) -}}
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/managed-by: "Helm"
+    app.kubernetes.io/part-of: "neuroforge-core"
+    helm.sh/chart: {{ printf "%s-%s" .Chart.Name (.Chart.Version | replace "+" "_") | quote }}
+  annotations:
+    {{- /* Legacy ingress.class for older controllers */}}
+    {{- if .Values.ingress.className }}
+    kubernetes.io/ingress.class: {{ .Values.ingress.className | quote }}
+    {{- end }}
+
+    {{- /* Controller-specific safe defaults */}}
+    {{- if eq (lower (default "nginx" .Values.ingress.controller)) "nginx" }}
+    nginx.ingress.kubernetes.io/ssl-redirect: {{ ternary "true" "false" (default true .Values.ingress.nginx.sslRedirect) | quote }}
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ default "1m" .Values.ingress.nginx.proxyBodySize | quote }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ default "60s" .Values.ingress.nginx.proxyReadTimeout | quote }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ default "60s" .Values.ingress.nginx.proxySendTimeout | quote }}
+    {{- if .Values.ingress.nginx.backendProtocol }}
+    nginx.ingress.kubernetes.io/backend-protocol: {{ .Values.ingress.nginx.backendProtocol | quote }}
+    {{- end }}
+    {{- if eq (lower (default "" .Values.ingress.nginx.affinity)) "cookie" }}
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: {{ default "route" .Values.ingress.nginx.sessionCookieName | quote }}
+    nginx.ingress.kubernetes.io/session-cookie-hash: {{ default "sha1" .Values.ingress.nginx.sessionCookieHash | quote }}
+    {{- end }}
+    {{- if .Values.ingress.nginx.rateLimit.enabled }}
+    nginx.ingress.kubernetes.io/limit-connections: {{ int (default 0 .Values.ingress.nginx.rateLimit.connections) | quote }}
+    nginx.ingress.kubernetes.io/limit-rps: {{ int (default 0 .Values.ingress.nginx.rateLimit.rps) | quote }}
+    {{- end }}
+    {{- if .Values.ingress.nginx.rewriteTarget }}
+    nginx.ingress.kubernetes.io/rewrite-target: {{ .Values.ingress.nginx.rewriteTarget | quote }}
+    {{- end }}
+    {{- if .Values.ingress.nginx.enableRegex }}
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    {{- end }}
+    {{- if .Values.ingress.canary.enabled }}
+    nginx.ingress.kubernetes.io/canary: "true"
+    {{- if .Values.ingress.canary.weight }}
+    nginx.ingress.kubernetes.io/canary-weight: {{ int .Values.ingress.canary.weight | quote }}
+    {{- end }}
+    {{- if .Values.ingress.canary.byHeader }}
+    nginx.ingress.kubernetes.io/canary-by-header: {{ .Values.ingress.canary.byHeader | quote }}
+    {{- if .Values.ingress.canary.byHeaderValue }}
+    nginx.ingress.kubernetes.io/canary-by-header-value: {{ .Values.ingress.canary.byHeaderValue | quote }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.ingress.canary.byCookie }}
+    nginx.ingress.kubernetes.io/canary-by-cookie: {{ .Values.ingress.canary.byCookie | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- if eq (lower (default "" .Values.ingress.controller)) "alb" }}
+    alb.ingress.kubernetes.io/scheme: "internal"
+    alb.ingress.kubernetes.io/target-type: "ip"
+    {{- end }}
+
+    {{- /* external-dns */}}
+    {{- if .Values.ingress.externalDNS.enabled }}
+    external-dns.alpha.kubernetes.io/ttl: {{ int (default 300 .Values.ingress.externalDNS.ttl) | quote }}
+    {{- /* Set hostname list: join declared hosts */ -}}
+    {{- $hn := list -}}
+    {{- range $i, $h := (default (list (dict "host" (printf "%s.local" $fullname))) .Values.ingress.hosts) }}
+    {{- if $h.host }}{{- $hn = append $hn $h.host -}}{{- end }}
+    {{- end }}
+    external-dns.alpha.kubernetes.io/hostname: {{ join "," $hn | quote }}
+    {{- end }}
+
+    {{- /* cert-manager issuer */}}
+    {{- if .Values.ingress.certManager.enabled }}
+    cert-manager.io/cluster-issuer: {{ required "ingress.certManager.clusterIssuer is required when certManager.enabled=true" .Values.ingress.certManager.clusterIssuer | quote }}
+    {{- end }}
+
+    {{- /* User provided annotations override/extend */}}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+
+  {{- /* TLS blocks */}}
+  {{- with .Values.ingress.tls.entries }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  rules:
+    {{- $hosts := default (list (dict "host" (printf "%s.local" $fullname) "paths" (list (dict "path" "/" "pathType" "Prefix" "service" (dict "name" "" "portName" "http"))))) .Values.ingress.hosts }}
+    {{- range $h := $hosts }}
+    - host: {{ required "ingress.hosts[].host is required" $h.host | quote }}
+      http:
+        paths:
+          {{- /* Global extra paths applied first */}}
+          {{- with $.Values.ingress.extraPaths }}
+          {{- range . }}
+          - path: {{ required "ingress.extraPaths[].path is required" .path | quote }}
+            pathType: {{ default "Prefix" .pathType | quote }}
+            backend:
+              service:
+                name: {{ default $svcDefault .serviceName | quote }}
+                {{- if .portName }}
+                port:
+                  name: {{ .portName | quote }}
+                {{- else if .portNumber }}
+                port:
+                  number: {{ int .portNumber }}
+                {{- else }}
+                port:
+                  name: "http"
+                {{- end }}
+          {{- end }}
+          {{- end }}
+
+          {{- /* Per-host extra paths (before main paths) */}}
+          {{- with $h.extraPaths }}
+          {{- range . }}
+          - path: {{ required "ingress.hosts[].extraPaths[].path is required" .path | quote }}
+            pathType: {{ default "Prefix" .pathType | quote }}
+            backend:
+              service:
+                name: {{ default $svcDefault .serviceName | quote }}
+                {{- if .portName }}
+                port:
+                  name: {{ .portName | quote }}
+                {{- else if .portNumber }}
+                port:
+                  number: {{ int .portNumber }}
+                {{- else }}
+                port:
+                  name: "http"
+                {{- end }}
+          {{- end }}
+          {{- end }}
+
+          {{- /* Main paths */}}
+          {{- range $p := (default (list (dict "path" "/" "pathType" "Prefix" "service" (dict "name" "" "portName" "http"))) $h.paths) }}
+          - path: {{ default "/" $p.path | quote }}
+            pathType: {{ default "Prefix" $p.pathType | quote }}
+            backend:
+              service:
+                name: {{ default $svcDefault $p.service.name | quote }}
+                {{- if $p.service.portName }}
+                port:
+                  name: {{ $p.service.portName | quote }}
+                {{- else if $p.service.portNumber }}
+                port:
+                  number: {{ int $p.service.portNumber }}
+                {{- else }}
+                port:
+                  name: "http"
+                {{- end }}
+          {{- end }}
+    {{- end }}
+{{- end }}

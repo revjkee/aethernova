@@ -1,0 +1,447 @@
+apiVersion: security-core/v1
+kind: SelfInhibitorPolicy
+metadata:
+  name: security-core-self-inhibitor
+  owner: security-core
+  partOf: core-systems
+  environment: prod
+  labels:
+    managed-by: security-core
+    compliance: iso27001
+  annotations:
+    description: "Самоблокирующая политика, предотвращающая деструктивные действия и утечки."
+
+spec:
+  engine:
+    failMode: secure            # secure: блок при сбое движка; monitor: не блокировать
+    defaultDecision: deny       # для неизвестных событий — deny
+    clockSkewTolerance: 2s
+    dryRun: false               # можно включать в stage
+
+  enforcementLevels:
+    - name: observe
+      description: "Только логирование без блокировки"
+      block: false
+      notify: true
+    - name: warn
+      description: "Предупреждение, требует подтверждения в UI"
+      block: false
+      requireAck: true
+      notify: true
+    - name: block
+      description: "Полная блокировка"
+      block: true
+      requireAck: false
+      notify: true
+    - name: quarantine
+      description: "Блокировка + изоляция артефактов/пода"
+      block: true
+      isolate: true
+      notify: true
+
+  rollout:
+    # Градуальный rollout для минимизации риска ложных срабатываний
+    staged:
+      - selector: { environment: "stage" }
+        enforcement: warn
+        sampleRate: 1.0
+      - selector: { environment: "prod" }
+        enforcement: block
+        sampleRate: 1.0
+    freezeOnSpike:
+      errorRateThreshold: 0.02      # если >2% блокировок за окно, авто‑перевод в warn
+      window: 10m
+
+  detectors:
+    git:
+      enabled: true
+      # Анализ git‑диффа, коммит‑месседжа, удалений
+      rules:
+        maxDeletedLines: 5000
+        scanCommitMessage: true
+        prohibitedPhrases:
+          - "[skip-security]"
+          - "disable guard"
+          - "temporary disable inhibitor"
+    secrets:
+      enabled: true
+      # Универсальные шаблоны секретов и пути
+      fileGlobs:
+        - "**/*.env"
+        - "**/secrets/**"
+        - "**/*credentials*"
+        - "**/*key*"
+      patterns:
+        - name: generic_api_key
+          regex: "(?i)(api[_-]?key|access[_-]?key|secret|token)\\s*[:=]\\s*[A-Za-z0-9_\\-]{24,}"
+        - name: aws_access_key
+          regex: "AKIA[0-9A-Z]{16}"
+        - name: aws_secret_key
+          regex: "(?i)aws(.{0,20})?(secret|sk|secret_access_key)\\s*[:=]\\s*[A-Za-z0-9/+=]{40}"
+        - name: private_pem
+          regex: "-----BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY-----"
+    process:
+      enabled: true
+      # RCE/опасные команды в рантайме
+      denylistArgs:
+        - "rm -rf /"
+        - "mkfs"
+        - "dd if=/dev/zero of=/dev/sd"
+        - "chown -R root:root /"
+        - "useradd -o -u 0"
+        - "iptables -F"
+        - "tc qdisc del dev"
+        - "kill -9 1"
+      allowExecFrom:
+        - "/app"
+        - "/usr/local/bin"
+    network:
+      enabled: true
+      egress:
+        defaultAction: deny
+        allowCidrs:
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
+        allowDomains:
+          - "s3.amazonaws.com"
+          - "sts.amazonaws.com"
+          - "secretsmanager.*.amazonaws.com"
+          - "ssm.*.amazonaws.com"
+          - "ecr.*.amazonaws.com"
+          - "logs.*.amazonaws.com"
+        denyDomains:
+          - "pastebin.com"
+          - "transfer.sh"
+          - "anonfiles.com"
+          - "ipfs.io"
+        maxConnRatePerPod: 200/min
+        maxBytesPerMinutePerPod: 100MB
+    k8sAdmission:
+      enabled: true
+      validateImagesSigned: true
+      requireNonRoot: true
+      requireReadOnlyRootFs: true
+      disallowHostNetwork: true
+      disallowPrivileged: true
+      disallowSysctls: ["*"]
+      requiredSeccompProfile: "RuntimeDefault"
+      requiredAppArmor: "runtime/default"
+      requiredCapabilitiesDrop: ["ALL"]
+      allowedCapabilitiesAdd: []
+      imageRegistriesAllow:
+        - "123456789012.dkr.ecr.eu-central-1.amazonaws.com"
+        - "ghcr.io/ORG"
+      resourceLimitsRequired: true
+      maxReplicas: 200
+    terraform:
+      enabled: true
+      # Анализ terraform plan в CI
+      denyDataSources:
+        - "aws_iam_policy_document"   # только при inline-Deny без boundary
+      denyResources:
+        - "aws_iam_user"
+        - "aws_iam_access_key"
+        - "aws_s3_bucket_public_access_block[disable]"
+      planGuards:
+        # Запрет разрушительных действий в prod без approve‑тикета
+        - name: prevent_destroy_prod
+          match:
+            actionKinds: ["destroy"]
+            selectors:
+              - key: environment
+                op: equals
+                value: "prod"
+          requireChangeTicket: true
+          ticketPattern: "(SEC|OPS)-[0-9]+"
+    containerImage:
+      enabled: true
+      maxCriticalVulns: 0
+      maxHighVulns: 5
+      requireSbom: true
+      requireBaseImagePin: true
+      allowedBaseImageDigests:
+        - "sha256:..."
+      disallowLatestTag: true
+    api:
+      enabled: true
+      # Защита служебных endpoints
+      sensitiveEndpoints:
+        - method: DELETE
+          pathRegex: "^/v1/(users|accounts|tenants)/.*"
+        - method: POST
+          pathRegex: "^/admin/.*"
+        - method: ANY
+          pathRegex: "^/internal/.*"
+      rateLimits:
+        default: "300/min"
+        sensitive: "30/min"
+      requireAuthOn:
+        - "^/v1/.*"
+        - "^/admin/.*"
+
+  actions:
+    # Набор доступных действий, комбинируемых правилами
+    block:
+      type: hard_fail
+    warn:
+      type: soft_fail
+    require_approval:
+      type: gate
+      approvers:
+        groups:
+          - "sec-core-oncall"
+          - "platform-owners"
+        minApprovals: 1
+        timeout: 30m
+    quarantine:
+      type: isolate
+      networkPolicy: "deny-all"
+      nodeSelector: { "node-role.kubernetes.io/isolated": "true" }
+    redact:
+      type: transform
+      fields:
+        - "password"
+        - "token"
+        - "authorization"
+    rotate_credentials:
+      type: workflow
+      steps:
+        - "create_temp_cred"
+        - "revoke_leaked_cred"
+        - "notify_owners"
+
+  # Основные правила с логикой ингибирования
+  rules:
+    - id: R001_git_mass_deletion
+      title: Массовое удаление файлов в репозитории
+      description: Блокирует PR/commit с массовым удалением или отключением секьюрити‑проверок.
+      detectors: [git]
+      match:
+        any:
+          - deletedLinesOver: 5000
+          - commitMessageContainsAny: ["[skip-security]", "disable guard", "temporary disable inhibitor"]
+      enforcement: block
+      actions: [block]
+      notify:
+        channels: ["slack:#sec-core-alerts"]
+        severity: high
+
+    - id: R002_secret_exfil
+      title: Утечка секретов
+      description: Обнаружение секретов по паттернам и приватных ключей.
+      detectors: [secrets]
+      match:
+        any:
+          - secretPattern: generic_api_key
+          - secretPattern: aws_access_key
+          - secretPattern: aws_secret_key
+          - secretPattern: private_pem
+      enforcement: quarantine
+      actions: [quarantine, redact, rotate_credentials]
+      notify:
+        channels: ["slack:#sec-core-p0", "pagerduty:sec-core"]
+        severity: critical
+
+    - id: R003_dangerous_syscalls
+      title: Опасные команды в рантайме
+      description: Блокировка выполнения разрушительных команд.
+      detectors: [process]
+      match:
+        any:
+          - argContainsAny:
+              - "rm -rf /"
+              - "mkfs"
+              - "kill -9 1"
+              - "useradd -o -u 0"
+      enforcement: block
+      actions: [block]
+      notify:
+        channels: ["slack:#sec-core-alerts"]
+        severity: high
+
+    - id: R004_egress_exfiltration
+      title: Подозрительный исходящий трафик
+      description: Блок нежелательных доменов, ограничение скорости и объема.
+      detectors: [network]
+      match:
+        any:
+          - domainInDenylist: true
+          - connRateOver: 200/min
+          - bytesPerMinuteOver: 100MB
+      enforcement: quarantine
+      actions: [quarantine, block]
+      notify:
+        channels: ["slack:#sec-core-alerts"]
+        severity: high
+
+    - id: R005_k8s_privilege_escalation
+      title: Привилегированный под/hostNetwork
+      description: Запрет опасных параметров в манифестах.
+      detectors: [k8sAdmission]
+      match:
+        any:
+          - privileged: true
+          - hostNetwork: true
+          - missingSecurityContext: true
+          - addCapabilitiesAny: ["NET_ADMIN", "SYS_ADMIN"]
+          - imageRegistryNotAllowed: true
+      enforcement: block
+      actions: [block]
+      notify:
+        channels: ["slack:#sec-core-alerts"]
+        severity: high
+
+    - id: R006_tf_destroy_prod
+      title: Terraform destroy в продакшене без тикета
+      description: Блок разрушительных изменений в prod без SEC/OPS тикета.
+      detectors: [terraform]
+      match:
+        all:
+          - planHasActionKindsAny: ["destroy"]
+          - contextSelector:
+              key: environment
+              op: equals
+              value: "prod"
+          - hasChangeTicketMatching: "(SEC|OPS)-[0-9]+"
+            negate: true
+      enforcement: block
+      actions: [block]
+      notify:
+        channels: ["slack:#sec-core-p1"]
+        severity: critical
+
+    - id: R007_image_vuln_budget
+      title: Превышение бюджета уязвимостей образа
+      description: Блок, если критических > 0 или высоких > 5.
+      detectors: [containerImage]
+      match:
+        any:
+          - criticalVulnsOver: 0
+          - highVulnsOver: 5
+          - missingSbom: true
+          - usesLatestTag: true
+      enforcement: block
+      actions: [block]
+      notify:
+        channels: ["slack:#sec-core-alerts"]
+        severity: high
+
+    - id: R008_sensitive_api
+      title: Доступ к чувствительным API без авторизации или выше лимита
+      detectors: [api]
+      match:
+        any:
+          - targetEndpointInSensitiveList: true
+            and:
+              - isAuthenticated: false
+          - rateLimitExceeded: "sensitive"
+      enforcement: block
+      actions: [block]
+      notify:
+        channels: ["slack:#sec-core-alerts"]
+        severity: high
+
+  waivers:
+    # Временные исключения с обязательной ссылкой на тикет и TTL
+    requiredFields: ["reason", "owner", "ticket", "expiresAt"]
+    maxDuration: 7d
+    store: "s3://security-core-waivers/prod/"   # или SecretsManager/DB
+    items: []
+    # Пример:
+    # - ruleId: R007_image_vuln_budget
+    #   scope:
+    #     image: "123456789012.dkr.ecr.eu-central-1.amazonaws.com/api@sha256:..."
+    #   reason: "Критическая фикса upstream задержана"
+    #   owner: "team-api"
+    #   ticket: "SEC-1234"
+    #   expiresAt: "2025-08-26T23:59:00Z"
+
+  exemptions:
+    # Постоянные исключения на уровень окружений/неймспейсов/сервисов
+    items:
+      - selector:
+          namespace: "security-core-forensics"
+        rules: ["R004_egress_exfiltration"]
+        note: "Форензика может делать внешние выгрузки артефактов"
+      - selector:
+          serviceAccount: "prometheus"
+        rules: ["R004_egress_exfiltration", "R007_image_vuln_budget"]
+        note: "Системные интеграции"
+
+  notifications:
+    sinks:
+      - name: slack
+        type: slack
+        endpoint: "${SLACK_WEBHOOK_URL}"
+      - name: pagerduty
+        type: pagerduty
+        routingKey: "${PAGERDUTY_ROUTING_KEY}"
+      - name: email
+        type: smtp
+        server: "smtp.relay.local"
+        from: "sec-core@company.local"
+        to:
+          - "oncall@company.local"
+    routing:
+      - match: { severity: critical }
+        send: ["pagerduty", "slack"]
+      - match: { severity: high }
+        send: ["slack"]
+      - match: { severity: medium }
+        send: ["email"]
+
+  audit:
+    sink:
+      type: s3
+      bucket: "security-core-audit"
+      prefix: "self-inhibitor/"
+      kmsKeyArn: "arn:aws:kms:eu-central-1:000000000000:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    redactFields:
+      - "authorization"
+      - "password"
+      - "secret"
+      - "token"
+    retention: 365d
+    integrity:
+      enableMerkle: true
+      anchoring:
+        type: cwlogs
+        group: "/aws/security-core/anchors"
+        interval: 10m
+
+  metrics:
+    enablePrometheus: true
+    namespace: "security_core_self_inhibitor"
+    counters:
+      - "events_total"
+      - "blocked_total"
+      - "waivers_active"
+      - "false_positives"
+    histograms:
+      - "decision_latency_seconds"
+    labels:
+      - "rule_id"
+      - "severity"
+      - "environment"
+
+  health:
+    liveness:
+      failureThreshold: 3
+      interval: 10s
+    readiness:
+      failureThreshold: 3
+      interval: 5s
+    dependencies:
+      - "s3://security-core-audit"
+      - "s3://security-core-waivers/prod/"
+
+  integrity:
+    # Подпись политики для контроля целостности
+    signed: false
+    signer:
+      provider: "aws-kms"
+      keyArn: "arn:aws:kms:eu-central-1:000000000000:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    checksum:
+      algorithm: "sha256"
+      value: ""

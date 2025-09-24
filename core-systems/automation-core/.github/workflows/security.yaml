@@ -1,0 +1,417 @@
+name: security-ci
+
+on:
+  push:
+    branches: [ "main", "master", "release/**" ]
+  pull_request:
+    branches: [ "**" ]
+  schedule:
+    - cron: "0 2 * * 1"   # еженедельно, пн 02:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  checks: write
+
+concurrency:
+  group: security-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Явно фиксируем версии инструментов (можете обновлять централизованно)
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+  GO_VERSION: "1.22"
+  GITLEAKS_VERSION: "8.18.4"
+  TRIVY_VERSION: "0.53.0"
+  TFSEC_VERSION: "1.28.1"
+
+jobs:
+  preflight:
+    name: Preflight / Checkout & Tooling
+    runs-on: ubuntu-latest
+    outputs:
+      has_python: ${{ steps.detect.outputs.has_python }}
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_go: ${{ steps.detect.outputs.has_go }}
+      has_terraform: ${{ steps.detect.outputs.has_terraform }}
+      has_dockerfile: ${{ steps.detect.outputs.has_dockerfile }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect stack
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          has_python="false"
+          has_node="false"
+          has_go="false"
+          has_terraform="false"
+          has_dockerfile="false"
+
+          # simple heuristics
+          if git ls-files | grep -E '(^|/)requirements(-.*)?\.txt$|(^|/)pyproject\.toml$|(^|/)setup\.cfg$' >/dev/null; then has_python="true"; fi
+          if git ls-files | grep -E '(^|/)package\.json$' >/dev/null; then has_node="true"; fi
+          if git ls-files | grep -E '(^|/)go\.mod$' >/dev/null; then has_go="true"; fi
+          if git ls-files | grep -E '(^|/)terraform\.tf$|(^|/).*\.tf$' >/dev/null; then has_terraform="true"; fi
+          if git ls-files | grep -Ei '(^|/)(Dockerfile|containerfile)(\..*)?$' >/dev/null; then has_dockerfile="true"; fi
+
+          echo "has_python=${has_python}" | tee -a $GITHUB_OUTPUT
+          echo "has_node=${has_node}" | tee -a $GITHUB_OUTPUT
+          echo "has_go=${has_go}" | tee -a $GITHUB_OUTPUT
+          echo "has_terraform=${has_terraform}" | tee -a $GITHUB_OUTPUT
+          echo "has_dockerfile=${has_dockerfile}" | tee -a $GITHUB_OUTPUT
+
+  dependency-review:
+    name: PR Dependency Review (GitHub Advisory DB)
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: critical
+          allow-licenses: MIT,Apache-2.0,BSD-2-Clause,BSD-3-Clause,ISC
+          deny-licenses: GPL-1.0,GPL-2.0,GPL-3.0,AGPL-3.0,LGPL-2.1,LGPL-3.0
+          comment-summary-in-pr: true
+
+  codeql:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript-typescript', 'python', 'go' ]  # подберите под ваш стек
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  gitleaks:
+    name: Secret Scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # для анализа истории
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --no-banner -v --redact --report-format sarif --report-path gitleaks.sarif
+
+      - name: Upload SARIF
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  trivy-repo:
+    name: SCA (Trivy Repo Scan)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy FS Scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          format: sarif
+          output: trivy-repo.sarif
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          skip-dirs: |
+            .git
+            node_modules
+            **/venv
+            **/.venv
+            dist
+            build
+
+      - name: Upload SARIF
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: trivy-repo.sarif
+          category: trivy-fs
+
+  trivy-dockerfile:
+    name: Dockerfile Lint (Hadolint) & Image Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: [ preflight ]
+    if: ${{ needs.preflight.outputs.has_dockerfile == 'true' }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: |
+            **/Dockerfile
+            **/dockerfile
+          no-fail: false
+
+      - name: Build minimal image (no push)
+        run: |
+          set -euo pipefail
+          img_name="local/security-ci:${GITHUB_SHA}"
+          docker build -f $(git ls-files | grep -Ei '(Dockerfile|containerfile)$' | head -n1) -t "${img_name}" .
+
+      - name: Trivy Image Scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: local/security-ci:${{ github.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload SARIF
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  python-sec:
+    name: Python Security (pip-audit, bandit, safety)
+    runs-on: ubuntu-latest
+    needs: [ preflight ]
+    if: ${{ needs.preflight.outputs.has_python == 'true' }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install project (best-effort)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if test -f requirements.txt; then pip install -r requirements.txt || true; fi
+          if test -f pyproject.toml; then pip install . || true; fi
+
+      - name: pip-audit (SARIF)
+        uses: pypa/gh-action-pip-audit@v1.0.12
+        with:
+          vulnerability-service: "osv"
+          no-deps: false
+          ignore-vulns: ""
+          vulnerabilities-format: "sarif"
+          output: "pip-audit.sarif"
+
+      - name: Upload SARIF (pip-audit)
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: pip-audit.sarif
+          category: pip-audit
+
+      - name: Bandit (SAST)
+        run: |
+          pip install bandit
+          bandit -r . -f sarif -o bandit.sarif || true
+
+      - name: Upload SARIF (bandit)
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+
+      - name: Safety (advisory DB)
+        run: |
+          pip install safety
+          safety check --full-report || true
+
+  node-sec:
+    name: Node.js Security (audit / eslint)
+    runs-on: ubuntu-latest
+    needs: [ preflight ]
+    if: ${{ needs.preflight.outputs.has_node == 'true' }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install deps
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm i
+          fi
+
+      - name: npm audit (json)
+        run: |
+          npm audit --audit-level=high --json > npm-audit.json || true
+
+      - name: Convert npm audit to SARIF
+        run: |
+          pipx install npm-audit-sarif || python -m pip install npm-audit-sarif
+          npx --yes npm-audit-sarif --input npm-audit.json --output npm-audit.sarif || true
+
+      - name: Upload SARIF (npm-audit)
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: npm-audit.sarif
+          category: npm-audit
+
+      - name: ESLint (if configured)
+        run: |
+          if [ -f .eslintrc* ]; then npx eslint . -f sarif -o eslint.sarif || true; fi
+
+      - name: Upload SARIF (eslint)
+        if: ${{ hashFiles('.eslintrc*') != '' }}
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: eslint.sarif
+          category: eslint
+
+  go-sec:
+    name: Go Security (govulncheck)
+    runs-on: ubuntu-latest
+    needs: [ preflight ]
+    if: ${{ needs.preflight.outputs.has_go == 'true' }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck -format sarif ./... > govulncheck.sarif || true
+
+      - name: Upload SARIF
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: govulncheck.sarif
+          category: govulncheck
+
+  iac-sec:
+    name: IaC Security (tfsec & checkov)
+    runs-on: ubuntu-latest
+    needs: [ preflight ]
+    if: ${{ needs.preflight.outputs.has_terraform == 'true' }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: tfsec (SARIF)
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          additional_args: --format sarif --out tfsec.sarif
+
+      - name: Upload SARIF (tfsec)
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: tfsec.sarif
+          category: tfsec
+
+      - name: Checkov (SARIF)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          output_format: sarif
+          output_file_path: checkov.sarif
+          quiet: true
+
+      - name: Upload SARIF (checkov)
+        uses: github/code-scanning/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+  sbom:
+    name: SBOM (Syft) + Upload
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      security-events: write
+      id-token: write   # для публикации в Dependency Graph
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM (SPDX & CycloneDX)
+        uses: anchore/sbom-action@v0.17.6
+        with:
+          format: spdx-json,cyclonedx-json
+          output-file: |
+            sbom.spdx.json
+            sbom.cdx.json
+
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom.spdx.json
+            sbom.cdx.json
+          if-no-files-found: error
+
+      - name: Publish SBOM to Dependency Graph
+        uses: advanced-security/sbom-action/publish-sbom@v1
+        with:
+          sbom-path: sbom.spdx.json

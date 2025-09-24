@@ -1,0 +1,297 @@
+{{- /*
+policy-core/ops/helm/policy-core/templates/hpa.yaml
+Промышленный шаблон HPA (autoscaling/v2) с поддержкой нескольких целей и всех типов метрик.
+
+Ожидаемое values.yaml (фрагмент):
+autoscaling:
+  enabled: true
+  # Общие аннотации/лейблы для всех HPA
+  annotations: {}
+  labels: {}
+  # Глобальное поведение (можно переопределить в target.behavior)
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+  # Список HPA (если пусто — будет один дефолтный)
+  targets:
+    - name: api                                # суффикс; итоговый Deployment: <fullname>-api, если не задан targetRef
+      minReplicas: 2
+      maxReplicas: 10
+      targetRef:                                # опционально: явная ссылка
+        apiVersion: apps/v1
+        kind: Deployment
+        name: ""                                # если пусто — будет сгенерировано <fullname>-api
+      annotations: {}
+      labels: {}
+      behavior: {}                              # опциональный override поведения
+      metrics:
+        # Пример Resource (cpu utilization)
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization                 # Utilization | AverageValue
+              averageUtilization: 70
+        # Пример Memory AverageValue
+        - type: Resource
+          resource:
+            name: memory
+            target:
+              type: AverageValue
+              averageValue: 800Mi
+        # Пример ContainerResource
+        - type: ContainerResource
+          containerResource:
+            container: web
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+        # Пример External
+        - type: External
+          external:
+            metric:
+              name: requests_per_second
+              selector:
+                matchLabels:
+                  service: policy-core
+            target:
+              type: AverageValue
+              averageValue: "100"
+*/ -}}
+
+{{- /* ----------------- Helpers: имя, метки ----------------- */ -}}
+{{- define "policy-core.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "policy-core.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := include "policy-core.name" . -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "policy-core.labels" -}}
+app.kubernetes.io/name: {{ include "policy-core.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: policy-core
+{{- end -}}
+
+{{- /* ----------------- Helper: безопасная сборка metrics ----------------- */ -}}
+{{- define "policy-core.hpa.renderMetric" -}}
+{{- $m := . -}}
+{{- if eq $m.type "Resource" -}}
+- type: Resource
+  resource:
+    name: {{ required "metrics[].resource.name is required" $m.resource.name }}
+    target:
+      type: {{ required "metrics[].resource.target.type is required" $m.resource.target.type }}
+      {{- if eq $m.resource.target.type "Utilization" }}
+      averageUtilization: {{ required "metrics[].resource.target.averageUtilization is required for Utilization" $m.resource.target.averageUtilization }}
+      {{- else if eq $m.resource.target.type "AverageValue" }}
+      averageValue: {{ required "metrics[].resource.target.averageValue is required for AverageValue" $m.resource.target.averageValue | quote }}
+      {{- else }}
+      {{- fail (printf "Unsupported Resource target.type: %v (allowed: Utilization, AverageValue)" $m.resource.target.type) }}
+      {{- end }}
+{{- else if eq $m.type "ContainerResource" -}}
+- type: ContainerResource
+  containerResource:
+    container: {{ required "metrics[].containerResource.container is required" $m.containerResource.container }}
+    name: {{ required "metrics[].containerResource.name is required" $m.containerResource.name }}
+    target:
+      type: {{ required "metrics[].containerResource.target.type is required" $m.containerResource.target.type }}
+      {{- if eq $m.containerResource.target.type "Utilization" }}
+      averageUtilization: {{ required "metrics[].containerResource.target.averageUtilization is required for Utilization" $m.containerResource.target.averageUtilization }}
+      {{- else if eq $m.containerResource.target.type "AverageValue" }}
+      averageValue: {{ required "metrics[].containerResource.target.averageValue is required for AverageValue" $m.containerResource.target.averageValue | quote }}
+      {{- else }}
+      {{- fail (printf "Unsupported ContainerResource target.type: %v" $m.containerResource.target.type) }}
+      {{- end }}
+{{- else if eq $m.type "Pods" -}}
+- type: Pods
+  pods:
+    metric:
+      name: {{ required "metrics[].pods.metric.name is required" $m.pods.metric.name }}
+      {{- with $m.pods.metric.selector }}
+      selector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    target:
+      type: {{ required "metrics[].pods.target.type is required" $m.pods.target.type }}
+      {{- if eq $m.pods.target.type "AverageValue" }}
+      averageValue: {{ required "metrics[].pods.target.averageValue is required for AverageValue" $m.pods.target.averageValue | quote }}
+      {{- else }}
+      {{- fail "Pods target.type must be AverageValue" }}
+      {{- end }}
+{{- else if eq $m.type "Object" -}}
+- type: Object
+  object:
+    describedObject:
+      apiVersion: {{ required "metrics[].object.describedObject.apiVersion is required" $m.object.describedObject.apiVersion }}
+      kind: {{ required "metrics[].object.describedObject.kind is required" $m.object.describedObject.kind }}
+      name: {{ required "metrics[].object.describedObject.name is required" $m.object.describedObject.name }}
+    metric:
+      name: {{ required "metrics[].object.metric.name is required" $m.object.metric.name }}
+      {{- with $m.object.metric.selector }}
+      selector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    target:
+      type: {{ required "metrics[].object.target.type is required" $m.object.target.type }}
+      {{- if eq $m.object.target.type "Value" }}
+      value: {{ required "metrics[].object.target.value is required for Value" $m.object.target.value | quote }}
+      {{- else if eq $m.object.target.type "AverageValue" }}
+      averageValue: {{ required "metrics[].object.target.averageValue is required for AverageValue" $m.object.target.averageValue | quote }}
+      {{- else }}
+      {{- fail "Object target.type must be Value or AverageValue" }}
+      {{- end }}
+{{- else if eq $m.type "External" -}}
+- type: External
+  external:
+    metric:
+      name: {{ required "metrics[].external.metric.name is required" $m.external.metric.name }}
+      {{- with $m.external.metric.selector }}
+      selector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    target:
+      type: {{ required "metrics[].external.target.type is required" $m.external.target.type }}
+      {{- if eq $m.external.target.type "Value" }}
+      value: {{ required "metrics[].external.target.value is required for Value" $m.external.target.value | quote }}
+      {{- else if eq $m.external.target.type "AverageValue" }}
+      averageValue: {{ required "metrics[].external.target.averageValue is required for AverageValue" $m.external.target.averageValue | quote }}
+      {{- else }}
+      {{- fail "External target.type must be Value or AverageValue" }}
+      {{- end }}
+{{- else -}}
+{{- fail (printf "Unsupported metric.type: %v" $m.type) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* ----------------- Главный рендер ----------------- */ -}}
+{{- if and .Values.autoscaling .Values.autoscaling.enabled }}
+
+{{- $fullname := include "policy-core.fullname" . -}}
+{{- $globalAnn := (default dict .Values.autoscaling.annotations) -}}
+{{- $globalLbl := (default dict .Values.autoscaling.labels) -}}
+{{- $globalBehavior := (default dict .Values.autoscaling.behavior) -}}
+{{- $targets := (default (list dict) .Values.autoscaling.targets) -}}
+
+{{- if not $targets }}
+  {{- /* Дефолтная цель, если список пуст */ -}}
+  {{- $default := dict "name" "" "minReplicas" 2 "maxReplicas" 10 "metrics" (list (dict "type" "Resource" "resource" (dict "name" "cpu" "target" (dict "type" "Utilization" "averageUtilization" 70)))) -}}
+  {{- $targets = (list $default) -}}
+{{- end }}
+
+{{- range $i, $t := $targets }}
+{{- $suffix := (default "" $t.name) -}}
+{{- $targetName := (cond (hasKey $t "targetRef") (default "" $t.targetRef.name) "") -}}
+{{- if eq $targetName "" }}
+  {{- if ne $suffix "" -}}
+    {{- $targetName = printf "%s-%s" $fullname $suffix -}}
+  {{- else -}}
+    {{- $targetName = $fullname -}}
+  {{- end -}}
+{{- end -}}
+{{- $targetAPIVersion := (default "apps/v1" (and (hasKey $t "targetRef") $t.targetRef.apiVersion)) -}}
+{{- $targetKind := (default "Deployment" (and (hasKey $t "targetRef") $t.targetRef.kind)) -}}
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ printf "%s%s" $fullname (ternary (printf "-%s" $suffix) "" (ne $suffix "")) }}
+  labels:
+    {{- include "policy-core.labels" $ | nindent 4 }}
+    {{- if $globalLbl }}
+    {{- toYaml $globalLbl | nindent 4 }}
+    {{- end }}
+    {{- if $t.labels }}
+    {{- toYaml $t.labels | nindent 4 }}
+    {{- end }}
+  {{- if or $globalAnn $t.annotations }}
+  annotations:
+    {{- if $globalAnn }}
+    {{- toYaml $globalAnn | nindent 4 }}
+    {{- end }}
+    {{- if $t.annotations }}
+    {{- toYaml $t.annotations | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: {{ $targetAPIVersion }}
+    kind: {{ $targetKind }}
+    name: {{ $targetName }}
+  minReplicas: {{ default 2 $t.minReplicas }}
+  maxReplicas: {{ required "autoscaling.targets[].maxReplicas is required and should be > minReplicas" (default 10 $t.maxReplicas) }}
+  {{- /* Метрики */}}
+  {{- if $t.metrics }}
+  metrics:
+    {{- range $t.metrics }}
+    {{- include "policy-core.hpa.renderMetric" . | nindent 4 }}
+    {{- end }}
+  {{- else }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  {{- end }}
+  {{- /* Поведение: локальный override поверх глобального */}}
+  {{- $behavior := (merge (deepCopy $globalBehavior) (default dict $t.behavior)) -}}
+  {{- if $behavior }}
+  behavior:
+    {{- with $behavior.scaleUp }}
+    scaleUp:
+      {{- with .stabilizationWindowSeconds }}
+      stabilizationWindowSeconds: {{ . }}
+      {{- end }}
+      {{- with .selectPolicy }}
+      selectPolicy: {{ . }}
+      {{- end }}
+      {{- with .policies }}
+      policies:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- with $behavior.scaleDown }}
+    scaleDown:
+      {{- with .stabilizationWindowSeconds }}
+      stabilizationWindowSeconds: {{ . }}
+      {{- end }}
+      {{- with .selectPolicy }}
+      selectPolicy: {{ . }}
+      {{- end }}
+      {{- with .policies }}
+      policies:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+---
+{{- end }}
+{{- end }}

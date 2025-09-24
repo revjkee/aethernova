@@ -1,0 +1,317 @@
+name: ci
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 3 * * 1" # Еженедельно по понедельникам — регрессионные и security-сканы
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
+  id-token: write  # для provenance и OIDC-подписей при релизах
+  packages: write  # для публикации в GHCR (ограничено условиями jobs)
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSIONS: '["3.10", "3.11", "3.12"]'
+  PIP_CACHE_DIR: ~/.cache/pip
+  POETRY_VERSION: "1.8.3"
+  TRIVY_VERSION: "0.53.0"
+  SYFT_VERSION: "1.17.0"
+  GRYPE_VERSION: "0.77.0"
+  GOVULNCHECK_VERSION: "1.1.0"
+  HADOLINT_VERSION: "2.12.0"
+  YAMLLINT_VERSION: "1.35.1"
+  RUFF_VERSION: "0.5.7"
+  BANDIT_VERSION: "1.7.9"
+  PIP_AUDIT_VERSION: "2.7.3"
+  CACHE_KEY_SUFFIX: v1
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/cybersecurity-core
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  lint_format:
+    name: Lint & Format (multi)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install linters
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==${{ env.RUFF_VERSION }} yamllint==${{ env.YAMLLINT_VERSION }} bandit==${{ env.BANDIT_VERSION }}
+          sudo curl -sSLo /usr/local/bin/hadolint "https://github.com/hadolint/hadolint/releases/download/v${{ env.HADOLINT_VERSION }}/hadolint-Linux-x86_64"
+          sudo chmod +x /usr/local/bin/hadolint
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Ruff (Python)
+        if: ${{ hashFiles('**/*.py') != '' }}
+        run: ruff check --output-format=github .
+
+      - name: Bandit (Python security)
+        if: ${{ hashFiles('**/*.py') != '' }}
+        run: bandit -r -q -x tests -ll .
+
+      - name: YAML lint
+        if: ${{ hashFiles('**/*.y?(a)ml') != '' }}
+        run: yamllint -s .
+
+      - name: ShellCheck
+        if: ${{ hashFiles('**/*.sh') != '' }}
+        run: |
+          find . -type f -name "*.sh" -print0 | xargs -0 -I{} bash -c 'shellcheck "{}"'
+
+      - name: Hadolint (Dockerfile)
+        if: ${{ hashFiles('**/Dockerfile*', '**/*.dockerfile') != '' }}
+        run: |
+          find . -type f \( -name "Dockerfile" -o -name "Dockerfile.*" -o -name "*.dockerfile" \) -print0 | xargs -0 -I{} hadolint "{}"
+
+  tests:
+    name: Unit tests (Python matrix)
+    runs-on: ubuntu-22.04
+    needs: [lint_format]
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJson(env.PYTHON_VERSIONS) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install project
+        if: ${{ hashFiles('pyproject.toml') != '' || hashFiles('requirements*.txt') != '' }}
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "pyproject.toml" ]; then
+            pip install "poetry==${{ env.POETRY_VERSION }}"
+            poetry install --no-root
+          elif [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Run pytest
+        if: ${{ hashFiles('**/tests/**', 'tests/**') != '' }}
+        run: |
+          python -m pip install pytest pytest-cov
+          pytest -q --maxfail=1 --disable-warnings --cov --cov-report=xml
+        continue-on-error: false
+
+      - name: Upload coverage
+        if: ${{ hashFiles('coverage.xml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 7
+
+  security_scan:
+    name: Security Scan (multi-language)
+    runs-on: ubuntu-22.04
+    needs: [tests]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin v${{ env.TRIVY_VERSION }}
+
+      - name: Install Syft & Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin v${{ env.SYFT_VERSION }}
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin v${{ env.GRYPE_VERSION }}
+
+      - name: Setup Python toolchain
+        if: ${{ hashFiles('**/*.py') != '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Python deps audit
+        if: ${{ hashFiles('**/*.py') != '' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit==${{ env.PIP_AUDIT_VERSION }}
+          if [ -f "requirements.txt" ]; then pip-audit -r requirements.txt || true; fi
+          if [ -f "pyproject.toml" ]; then pip-audit -s || true; fi
+
+      - name: Bandit (repeat strict)
+        if: ${{ hashFiles('**/*.py') != '' }}
+        run: bandit -r -q -x tests -iii -ll .
+
+      - name: Node audit
+        if: ${{ hashFiles('package-lock.json') != '' || hashFiles('pnpm-lock.yaml') != '' || hashFiles('yarn.lock') != '' }}
+        run: |
+          corepack enable
+          if [ -f package-lock.json ]; then npm ci --ignore-scripts && npm audit --audit-level=high || true; fi
+          if [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i --frozen-lockfile && pnpm audit || true; fi
+          if [ -f yarn.lock ]; then npm i -g yarn && yarn install --frozen-lockfile && yarn npm audit --all || true; fi
+
+      - name: Go toolchain & govulncheck
+        if: ${{ hashFiles('**/*.go') != '' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Go vet & vuln
+        if: ${{ hashFiles('**/*.go') != '' }}
+        run: |
+          go vet ./...
+          GOBIN=$HOME/bin go install golang.org/x/vuln/cmd/govulncheck@v${{ env.GOVULNCHECK_VERSION }}
+          $HOME/bin/govulncheck ./... || true
+
+      - name: Rust audit
+        if: ${{ hashFiles('**/Cargo.toml') != '' }}
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo audit
+        if: ${{ hashFiles('**/Cargo.toml') != '' }}
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit || true
+
+      - name: Trivy FS (vuln+config+secret)
+        run: |
+          trivy fs --security-checks vuln,config,secret --exit-code 0 --severity HIGH,CRITICAL --format sarif --output trivy-results.sarif .
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Syft SBOM (SPDX-JSON)
+        run: syft packages dir:. -o spdx-json=sbom.spdx.json
+      - name: Grype scan SBOM
+        run: grype sbom:sbom.spdx.json -o sarif > grype-results.sarif || true
+      - name: Upload security artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts
+          path: |
+            sbom.spdx.json
+            trivy-results.sarif
+            grype-results.sarif
+          retention-days: 14
+
+  sbom:
+    name: Build SBOM (container & fs)
+    runs-on: ubuntu-22.04
+    needs: [security_scan]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin v${{ env.SYFT_VERSION }}
+      - name: Generate FS SBOM (SPDX)
+        run: syft dir:. -o spdx-json=sbom-fs.spdx.json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-fs
+          path: sbom-fs.spdx.json
+          retention-days: 14
+
+  docker_build_publish:
+    name: Docker build & publish (GHCR)
+    runs-on: ubuntu-22.04
+    needs: [security_scan, sbom]
+    if: >
+      github.event_name != 'pull_request' &&
+      (startsWith(github.ref, 'refs/heads/main') || startsWith(github.ref, 'refs/tags/'))
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.vendor=Aethernova
+            org.opencontainers.image.title=cybersecurity-core
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: true
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+      - name: Export image digest
+        run: echo "IMAGE_DIGEST=${{ steps.meta.outputs.tags }}" >> $GITHUB_ENV
+
+  provenance:
+    name: SLSA Provenance (tags only)
+    runs-on: ubuntu-22.04
+    needs: [docker_build_publish]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    steps:
+      - name: Generate provenance
+        uses: slsa-framework/slsa-github-generator/actions/generator@v2.0.0
+        with:
+          slsa-recipe-type: "https://slsa.dev/provenance/v1"
+          compile-builder-image: "ghcr.io/slsa-framework/slsa-github-generator/go/builder@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          upload-assets: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,424 @@
+version: 1
+
+meta:
+  service: physical-integration-core
+  component: video
+  env: ${ENVIRONMENT:prod}
+  site_id: ${SITE_ID:default-site}
+  node_id: ${NODE_ID:edge-01}
+  timezone: Europe/Stockholm
+
+security:
+  tls:
+    enable: true
+    cert_file: ${TLS_CERT_PATH:/etc/video/tls/tls.crt}
+    key_file: ${TLS_KEY_PATH:/etc/video/tls/tls.key}
+    ca_file: ${TLS_CA_PATH:/etc/video/tls/ca.crt}
+  auth:
+    api:
+      enable: true
+      type: oauth2
+      issuer: ${OAUTH_ISSUER:https://auth.example.com}
+      audience: ${OAUTH_AUDIENCE:physical-integration-core}
+      jwks_url: ${OAUTH_JWKS:https://auth.example.com/.well-known/jwks.json}
+    playback:
+      basic:
+        enable: false
+      token:
+        enable: true
+        secret: ${PLAYBACK_JWT_SECRET}
+        ttl_seconds: 3600
+  kms:
+    sse_s3: true
+    sse_kms: ${S3_KMS_KEY_ID:null}
+
+sources:
+  defaults:
+    reconnect:
+      max_retries: 0
+      initial_backoff_ms: 500
+      max_backoff_ms: 10000
+      jitter: true
+    latency_mode: low
+    ntp_servers:
+      - ${NTP_SERVER_1:0.pool.ntp.org}
+      - ${NTP_SERVER_2:1.pool.ntp.org}
+    on_error: continue
+    heartbeat_interval_s: 5
+
+  rtsp:
+    - id: cam-lobby
+      name: Lobby Entrance
+      url: rtsp://${LOBBY_CAM_USER}:${LOBBY_CAM_PASS}@${LOBBY_CAM_HOST}:554/Streaming/Channels/101
+      transport: tcp
+      keepalive: true
+      rtsp_timeout_s: 10
+      onvif:
+        enable: true
+        host: ${LOBBY_CAM_HOST}
+        port: 80
+        user: ${LOBBY_CAM_USER}
+        pass: ${LOBBY_CAM_PASS}
+        profiles:
+          - name: main
+        ptz:
+          presets:
+            - name: wide
+              pan: 0
+              tilt: 0
+              zoom: 0
+            - name: door
+              pan: 15
+              tilt: -3
+              zoom: 10
+      privacy_masks:
+        - polygon: [[0.10,0.10],[0.30,0.10],[0.30,0.25],[0.10,0.25]]
+          blur_kernel: 15
+
+    - id: cam-warehouse
+      name: Warehouse Aisle 3
+      url: rtsp://${WH_CAM_USER}:${WH_CAM_PASS}@${WH_CAM_HOST}:554/Streaming/Channels/101
+      transport: tcp
+      keepalive: true
+      onvif:
+        enable: false
+      privacy_masks: []
+
+  usb:
+    - id: usb-checkout-1
+      name: Checkout USB Cam
+      device: ${USB_CAM_PATH:/dev/video0}
+      format: mjpeg
+      width: 1920
+      height: 1080
+      fps: 30
+
+analytics:
+  detector:
+    enable: true
+    engine: ${AI_ENGINE:openvino}
+    models:
+      - id: person-vehicle
+        path: ${MODEL_PV_PATH:/models/person-vehicle-bike-detection.xml}
+        labels: [person, vehicle, bicycle]
+        confidence: 0.6
+      - id: face-blur
+        path: ${MODEL_FACE_PATH:/models/face-detection.xml}
+        labels: [face]
+        confidence: 0.7
+  motion:
+    enable: true
+    sensitivity: medium
+    min_area_pct: 0.003
+    min_duration_ms: 500
+    cooldown_ms: 2000
+  roi:
+    cam-lobby:
+      include:
+        - polygon: [[0.00,0.50],[1.00,0.50],[1.00,1.00],[0.00,1.00]]
+      exclude: []
+    cam-warehouse:
+      include: []
+      exclude:
+        - polygon: [[0.00,0.00],[0.15,0.00],[0.15,0.15],[0.00,0.15]]
+  privacy_blur:
+    enable: true
+    faces: true
+    static_masks: inherit
+
+transcoding:
+  hardware:
+    prefer: ${VIDEO_HW:gpu}
+    nvidia:
+      enable: ${NVIDIA_ENABLE:true}
+      device_ids: ${NVIDIA_DEVICES:all}
+      enc: h264_nvenc
+    vaapi:
+      enable: ${VAAPI_ENABLE:false}
+      device: ${VAAPI_DEVICE:/dev/dri/renderD128}
+      enc: h264_vaapi
+  profiles:
+    - id: main-1080p
+      video_codec: h264
+      audio_codec: aac
+      width: 1920
+      height: 1080
+      fps: 25
+      bitrate_kbps: 5000
+      gop: 50
+      tune: zerolatency
+    - id: mobile-720p
+      video_codec: h264
+      audio_codec: aac
+      width: 1280
+      height: 720
+      fps: 25
+      bitrate_kbps: 2500
+      gop: 50
+      tune: zerolatency
+    - id: thumbnail-360p
+      video_codec: h264
+      audio_codec: aac
+      width: 640
+      height: 360
+      fps: 15
+      bitrate_kbps: 512
+      gop: 30
+      tune: fastdecode
+
+pipelines:
+  - id: lobby-live
+    input: cam-lobby
+    filters:
+      - type: denoise
+        strength: low
+      - type: overlay_timecode
+        fmt: "%Y-%m-%d %H:%M:%S %Z"
+        position: top-left
+      - type: analytics
+        models: [person-vehicle]
+      - type: privacy_blur
+        faces: true
+    outputs:
+      - type: webrtc
+        profile: main-1080p
+        name: lobby
+      - type: hls
+        profile: mobile-720p
+        name: lobby
+      - type: recording
+        profile: main-1080p
+        track_audio: false
+        segment_seconds: 4
+        keyframe_align: true
+        path_template: ${RECORD_PATH:/var/lib/video}/lobby/%Y/%m/%d/%H/%M
+      - type: thumbnails
+        interval_s: 10
+        profile: thumbnail-360p
+        path_template: ${THUMB_PATH:/var/lib/video}/thumbs/lobby/%Y/%m/%d/%H/%M
+
+  - id: warehouse-monitor
+    input: cam-warehouse
+    filters:
+      - type: motion
+      - type: analytics
+        models: [person-vehicle]
+    outputs:
+      - type: dash
+        profile: mobile-720p
+        name: warehouse
+      - type: events
+        topics:
+          kafka: video.events.warehouse
+          mqtt: sites/${SITE_ID}/warehouse/events
+        schema: video_event_v1
+
+  - id: checkout-audit
+    input: usb-checkout-1
+    filters:
+      - type: overlay_text
+        text: "Checkout 1"
+        position: bottom-right
+    outputs:
+      - type: hls
+        profile: mobile-720p
+        name: checkout1
+      - type: recording
+        profile: mobile-720p
+        path_template: ${RECORD_PATH:/var/lib/video}/checkout1/%Y/%m/%d/%H/%M
+
+streaming:
+  webrtc:
+    enable: true
+    listen: 0.0.0.0:8443
+    ice_servers:
+      - urls: stun:stun.l.google.com:19302
+      - urls: turn:${TURN_HOST}
+        username: ${TURN_USER}
+        credential: ${TURN_PASS}
+    max_clients: 200
+    bitrate_cap_kbps: 8000
+  hls:
+    enable: true
+    root: /var/lib/video/hls
+    serve_path: /video/hls
+    segment_seconds: 4
+    window: 8
+    low_latency: true
+    cors:
+      allow_origins: ["*"]
+  dash:
+    enable: true
+    root: /var/lib/video/dash
+    serve_path: /video/dash
+    segment_seconds: 4
+    window: 12
+  http_server:
+    enable: true
+    bind: 0.0.0.0:8444
+    access_log: stdout
+    rate_limit_rps: 50
+
+recording:
+  enable: true
+  storage:
+    local_path: ${RECORD_PATH:/var/lib/video}
+    fs_type: ext4
+    low_space_threshold_pct: 10
+    eviction_policy: oldest-first
+  retention:
+    default_days: 14
+    per_pipeline_days:
+      lobby-live: 30
+      checkout-audit: 7
+  index:
+    database_url: ${VIDEO_DB_URL:sqlite:///var/lib/video/index.db}
+    vacuum_interval_min: 60
+  upload:
+    s3:
+      enable: true
+      endpoint: ${S3_ENDPOINT:s3.amazonaws.com}
+      bucket: ${S3_BUCKET:video-archive}
+      region: ${AWS_REGION:eu-north-1}
+      prefix: ${SITE_ID}/recordings
+      access_key: ${S3_ACCESS_KEY}
+      secret_key: ${S3_SECRET_KEY}
+      multipart_chunk_mb: 64
+      concurrent_uploads: 4
+      glacier_transition_days: 90
+      storage_class: STANDARD_IA
+      server_side_encryption: AES256
+    retry:
+      backoff_initial_ms: 1000
+      backoff_max_ms: 60000
+      max_retries: 0
+
+events:
+  kafka:
+    enable: true
+    brokers: ${KAFKA_BROKERS:localhost:9092}
+    acks: all
+    topic_default: video.events.generic
+    compression: lz4
+    tls:
+      enable: ${KAFKA_TLS:false}
+      ca_file: ${KAFKA_CA:null}
+      cert_file: ${KAFKA_CERT:null}
+      key_file: ${KAFKA_KEY:null}
+  mqtt:
+    enable: true
+    broker_url: ${MQTT_URL:ssl://mqtt.example.com:8883}
+    client_id: ${NODE_ID}-video
+    username: ${MQTT_USER}
+    password: ${MQTT_PASS}
+    topic_prefix: sites/${SITE_ID}/video
+    tls:
+      ca_file: ${MQTT_CA:/etc/mqtt/ca.crt}
+      cert_file: ${MQTT_CERT:/etc/mqtt/client.crt}
+      key_file: ${MQTT_KEY:/etc/mqtt/client.key}
+  schemas:
+    video_event_v1:
+      format: jsonschema
+      schema_uri: https://schemas.example.com/video_event_v1.json
+
+alerts:
+  routes:
+    - id: motion-lobby
+      match:
+        pipeline: lobby-live
+        event: motion
+      throttle_s: 30
+      outputs:
+        - type: mqtt
+          topic: ${events.mqtt.topic_prefix}/alerts
+        - type: webhook
+          url: ${ALERT_WEBHOOK_URL}
+          method: POST
+    - id: camera-down
+      match:
+        event: source_offline
+      throttle_s: 300
+      outputs:
+        - type: email
+          to: ops@example.com
+          from: noreply@example.com
+          subject: Camera offline
+
+control:
+  onvif:
+    enable: true
+    timeout_s: 5
+    rate_limit_rps: 2
+  ptz_presets_on_start:
+    - source_id: cam-lobby
+      preset_name: wide
+
+health:
+  readiness:
+    http: http://127.0.0.1:8444/health/ready
+    interval_s: 5
+    timeout_s: 2
+  liveness:
+    http: http://127.0.0.1:8444/health/live
+    interval_s: 10
+    timeout_s: 2
+    restart_on_fail: true
+  watchdog:
+    gpu_util_floor_pct: 5
+    decode_stall_seconds: 10
+
+observability:
+  logging:
+    level: ${LOG_LEVEL:info}
+    json: true
+    target: stdout
+  metrics:
+    prometheus:
+      enable: true
+      bind: 0.0.0.0:9464
+      labels:
+        site: ${SITE_ID}
+        node: ${NODE_ID}
+  tracing:
+    enable: true
+    exporter: otlp
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://otel-collector:4318}
+    sample_ratio: 0.1
+  audit:
+    enable: true
+    redact:
+      fields: [password, secret, token]
+      video_overlay: true
+
+scaling:
+  autoscaler:
+    enable: true
+    policy:
+      max_pipelines: 20
+      cpu_high_pct: 75
+      gpu_high_pct: 75
+      scale_out_cooldown_s: 30
+      scale_in_cooldown_s: 120
+  scheduling:
+    gpu_affinity: preferred
+    fallback_to_cpu: true
+
+feature_flags:
+  low_latency_end_to_end: true
+  enable_recording_index_cache: true
+  enforce_token_for_playback: true
+
+secrets_ref:
+  vault:
+    enable: ${VAULT_ENABLE:false}
+    addr: ${VAULT_ADDR}
+    token: ${VAULT_TOKEN}
+    paths:
+      - path: kv/video/cameras/lobby
+        map:
+          LOBBY_CAM_USER: username
+          LOBBY_CAM_PASS: password
+      - path: kv/video/s3
+        map:
+          S3_ACCESS_KEY: access_key
+          S3_SECRET_KEY: secret_key

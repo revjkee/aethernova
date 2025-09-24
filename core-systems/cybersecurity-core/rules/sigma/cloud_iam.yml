@@ -1,0 +1,306 @@
+title: AWS IAM Inline/Managed Policy With Wildcards
+id: 2f6a9a33-7c1d-4f9a-9f2e-0d4a1f2b7c11
+status: stable
+description: Detect creation or attachment of IAM policies that contain wildcard Action/Resource which enable over-broad permissions.
+author: Aethernova SecOps
+date: 2025/09/02
+tags:
+  - attack.t1098
+  - attack.t1098.001
+  - attack.t1078
+logsource:
+  product: aws
+  service: cloudtrail
+detection:
+  selection_source:
+    eventSource: iam.amazonaws.com
+  selection_events:
+    eventName:
+      - PutUserPolicy
+      - PutRolePolicy
+      - PutGroupPolicy
+      - CreatePolicy
+      - CreatePolicyVersion
+      - AttachUserPolicy
+      - AttachGroupPolicy
+      - AttachRolePolicy
+  selection_wildcards:
+    requestParameters.policyDocument|contains:
+      - '"Action":"*"'
+      - '"Resource":"*"'
+      - '"Effect":"Allow","Action":"*"'
+      - '"Effect":"Allow","Resource":"*"'
+      - '"iam:*"'
+  condition: selection_source and selection_events and selection_wildcards
+fields:
+  - awsRegion
+  - userIdentity.type
+  - userIdentity.arn
+  - sourceIPAddress
+  - requestParameters.policyArn
+  - requestParameters.policyDocument
+falsepositives:
+  - Legitimate admin baseline changes or break-glass operations
+level: high
+---
+title: AWS IAM CreateAccessKey Without MFA Or For Sensitive Principals
+id: 0a3b1a64-3a0a-4e52-9f0f-7f8b0c8a9a21
+status: stable
+description: Detect creation of new access keys for root/IAM users when MFA not used or outside allowlist.
+author: Aethernova SecOps
+date: 2025/09/02
+tags:
+  - attack.t1098.001
+  - attack.t1078
+  - attack.t1136
+logsource:
+  product: aws
+  service: cloudtrail
+detection:
+  selection_base:
+    eventSource: iam.amazonaws.com
+    eventName: CreateAccessKey
+  selection_sensitive_principals:
+    userIdentity.type:
+      - Root
+      - IAMUser
+  selection_no_mfa:
+    additionalEventData.MFAUsed:
+      - "No"
+      - "false"
+      - ""
+  # Replace with your safe users (CI/CD, rotation bots)
+  filter_allowlist_usernames:
+    userIdentity.userName:
+      - ci-bot
+      - deploy-bot
+  condition: selection_base and selection_sensitive_principals and selection_no_mfa and not filter_allowlist_usernames
+fields:
+  - awsRegion
+  - userIdentity.type
+  - userIdentity.userName
+  - sourceIPAddress
+  - userAgent
+falsepositives:
+  - Planned key rotation by automation with documented CHG
+level: high
+---
+title: AWS IAM Create Or Update Console Password (LoginProfile)
+id: 3b6e2f3a-1a8b-4b6a-8a7e-4b9dc1f22c77
+status: stable
+description: Detect creation or update of an IAM user console password which may enable interactive console access.
+author: Aethernova SecOps
+date: 2025/09/02
+tags:
+  - attack.t1136
+  - attack.t1078
+logsource:
+  product: aws
+  service: cloudtrail
+detection:
+  selection:
+    eventSource: iam.amazonaws.com
+    eventName:
+      - CreateLoginProfile
+      - UpdateLoginProfile
+  filter_allowed:
+    userIdentity.userName:
+      - hr-onboarding-bot
+  condition: selection and not filter_allowed
+fields:
+  - userIdentity.arn
+  - requestParameters.userName
+  - requestParameters.passwordResetRequired
+falsepositives:
+  - Legitimate onboarding with approvals and ticket references
+level: medium
+---
+title: AWS Root Or Break-Glass Doing IAM Changes
+id: 9f0ff2a4-6c07-4d2a-9a0a-1a2c3b4d5e6f
+status: stable
+description: Detect root or break-glass accounts performing sensitive IAM write operations.
+author: Aethernova SecOps
+date: 2025/09/02
+tags:
+  - attack.t1098
+  - attack.t1136
+logsource:
+  product: aws
+  service: cloudtrail
+detection:
+  selection_root:
+    userIdentity.type: Root
+  selection_actions:
+    eventName:
+      - CreateUser
+      - CreateAccessKey
+      - AttachUserPolicy
+      - PutUserPolicy
+      - PutRolePolicy
+      - CreateLoginProfile
+      - AddUserToGroup
+  filter_breakglass:
+    userIdentity.arn|contains: ":user/breakglass-"
+  condition: selection_root and selection_actions and not filter_breakglass
+fields:
+  - eventTime
+  - eventName
+  - userIdentity.arn
+  - sourceIPAddress
+falsepositives:
+  - Authorized break-glass with incident reference
+level: critical
+---
+title: Azure Assign Owner Role (RoleAssignments Write)
+id: 4c2e7a9b-5f61-4a1f-9c22-2b4d6a7e9f10
+status: stable
+description: Detect assignment of Owner built-in role which grants full privileges.
+author: Aethernova SecOps
+date: 2025/09/02
+tags:
+  - attack.t1098
+  - attack.t1136
+logsource:
+  product: azure
+  service: activitylogs
+detection:
+  selection:
+    operationNameValue: "MICROSOFT.AUTHORIZATION/ROLEASSIGNMENTS/WRITE"
+    # Owner roleDefinitionId GUID is constant across tenants
+    properties.roleDefinitionId|endswith: "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+  selection_sp:
+    properties.principalType: "ServicePrincipal"
+  condition: selection or (selection and selection_sp)
+fields:
+  - resourceGroupName
+  - subscriptionId
+  - properties.principalId
+  - properties.principalType
+  - caller
+falsepositives:
+  - Controlled RBAC bootstrap with CAB approval
+level: high
+---
+title: Entra ID (Azure AD) – Add Service Principal Credentials
+id: 7a1b2c3d-4e5f-6789-a0b1-c2d3e4f50607
+status: stable
+description: Detect adding credentials (password or certificate) to an application/service principal.
+author: Aethernova SecOps
+date: 2025/09/02
+tags:
+  - attack.t1098.001
+  - attack.t1078
+logsource:
+  product: azure
+  service: auditlogs
+detection:
+  selection:
+    category: "ApplicationManagement"
+    activityDisplayName:
+      - "Add service principal credentials"
+      - "Update application – Certificates and secrets management"
+  filter_known_apps:
+    targetResources[0].displayName:
+      - "github-oidc-federation"
+      - "ci-cd-deployer"
+  condition: selection and not filter_known_apps
+fields:
+  - initiatedBy.user.userPrincipalName
+  - targetResources[0].displayName
+  - targetResources[0].modifiedProperties
+falsepositives:
+  - CI/CD rotation windows for app secrets
+level: high
+---
+title: GCP – Service Account Key Creation
+id: e1d2c3b4-5a6f-7081-92a3-b4c5d6e7f809
+status: stable
+description: Detect creation of new service account keys in GCP which can be abused for persistence and lateral movement.
+author: Aethernova SecOps
+date: 2025/09/02
+tags:
+  - attack.t1098.001
+  - attack.t1136
+logsource:
+  product: gcp
+  service: audit
+detection:
+  selection:
+    protoPayload.serviceName: "iam.googleapis.com"
+    protoPayload.methodName: "google.iam.admin.v1.CreateServiceAccountKey"
+  filter_allowed_sas:
+    resourceName|contains:
+      - "projects/-/serviceAccounts/ci-deployer@"
+      - "projects/-/serviceAccounts/backup-robot@"
+  condition: selection and not filter_allowed_sas
+fields:
+  - protoPayload.authenticationInfo.principalEmail
+  - resourceName
+  - protoPayload.request.name
+falsepositives:
+  - Controlled key rotation for specific automation accounts
+level: high
+---
+title: GCP – SetIamPolicy Grants Owner/Editor Or TokenCreator
+id: 5d4c3b2a-190e-4c7d-9a8b-7f6e5d4c3b2a
+status: stable
+description: Detect IAM policy changes granting excessive roles like roles/owner, roles/editor or roles/iam.serviceAccountTokenCreator.
+author: Aethernova SecOps
+date: 2025/09/02
+tags:
+  - attack.t1098
+  - attack.t1078
+logsource:
+  product: gcp
+  service: audit
+detection:
+  selection_base:
+    protoPayload.methodName: "SetIamPolicy"
+  selection_roles:
+    protoPayload.request.policy.bindings.role|contains:
+      - "roles/owner"
+      - "roles/editor"
+      - "roles/iam.serviceAccountTokenCreator"
+  condition: selection_base and selection_roles
+fields:
+  - protoPayload.authenticationInfo.principalEmail
+  - protoPayload.request.policy.bindings.role
+  - resourceName
+falsepositives:
+  - Temporary elevation with time-bound access and approvals
+level: high
+---
+title: AWS IAM Enumeration Burst (Priv Discovery)
+id: a0b1c2d3-e4f5-6789-0a1b-2c3d4e5f6a7b
+status: stable
+description: Detect bursts of IAM/STS enumeration APIs which often precede privilege escalation.
+author: Aethernova SecOps
+date: 2025/09/02
+tags:
+  - attack.t1087
+  - attack.t1069
+  - attack.t1033
+logsource:
+  product: aws
+  service: cloudtrail
+detection:
+  selection_source:
+    eventSource: iam.amazonaws.com
+  selection_events:
+    eventName:
+      - ListPolicies
+      - ListAttachedUserPolicies
+      - GetAccountAuthorizationDetails
+      - ListUsers
+      - ListRoles
+      - GetUser
+      - SimulatePrincipalPolicy
+  # Sigma корреляцию по окну времени реализует бэкенд; здесь базовый триггер
+  condition: selection_source and selection_events
+fields:
+  - userIdentity.arn
+  - sourceIPAddress
+  - userAgent
+falsepositives:
+  - Security tooling inventory scans from approved scanners
+level: medium

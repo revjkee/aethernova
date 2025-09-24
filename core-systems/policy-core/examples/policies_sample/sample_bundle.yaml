@@ -1,0 +1,350 @@
+# api: policy-core bundle, suitable for PAP/PDP pipelines
+apiVersion: policy.aethernova.io/v1
+kind: PolicyBundle
+
+metadata:
+  name: core-access-controls
+  namespace: prod
+  version: 1.0.0
+  createdAt: "2025-08-28T00:00:00Z"
+  createdBy: "policy-admin@company.com"
+  revision: 1
+  labels:
+    system: policy-core
+    domain: access
+    env: prod
+  annotations:
+    description: >
+      Industrial policy bundle: RBAC+ABAC with obligations (mask/audit/mfa),
+      environment profiles, JSON Schemas and integrity section.
+
+defaults:
+  decisionStrategy: firstApplicable   # other: denyOverrides, permitOverrides
+  targetLanguage: cel                 # CEL expression language for targets/rules
+  effectValues: ["Permit", "Deny"]
+  logging:
+    level: INFO
+    includeTraceIds: true
+
+profiles:
+  # Named environment profiles; PDP may select profile by deployment label.
+  - name: prod
+    attributes:
+      env.name: "prod"
+      network.trust: "zero-trust"
+      tracing.sampleRatio: 0.1
+  - name: staging
+    attributes:
+      env.name: "staging"
+      network.trust: "restricted"
+      tracing.sampleRatio: 1.0
+
+secrets:
+  # Logical names to be resolved by SecretProvider (e.g., EnvSecretProvider in runtime)
+  # Values are NOT embedded here by design.
+  - name: HMAC_KEY
+  - name: HASH_SALT
+
+schemas:
+  # JSON Schema for incoming AuthorizationContext validation
+  - id: schema.subject.v1
+    type: jsonschema
+    content:
+      $schema: "https://json-schema.org/draft/2020-12/schema"
+      title: "Subject"
+      type: object
+      required: [id, roles, riskScore]
+      properties:
+        id: { type: [string, number] }
+        roles:
+          type: array
+          items: { type: string }
+        attrs:
+          type: object
+          additionalProperties: true
+        riskScore:
+          type: number
+          minimum: 0
+          maximum: 100
+  - id: schema.resource.v1
+    type: jsonschema
+    content:
+      $schema: "https://json-schema.org/draft/2020-12/schema"
+      title: "Resource"
+      type: object
+      required: [type, id]
+      properties:
+        id: { type: [string, number] }
+        type: { type: string }
+        ownerId: { type: [string, number] }
+        attrs:
+          type: object
+          additionalProperties: true
+  - id: schema.environment.v1
+    type: jsonschema
+    content:
+      $schema: "https://json-schema.org/draft/2020-12/schema"
+      title: "Environment"
+      type: object
+      properties:
+        ip: { type: string }
+        geo.country: { type: string }
+        device.posture: { type: string, enum: ["trusted","unknown","compromised"] }
+        time:
+          type: object
+          properties:
+            tz: { type: string }
+            hour: { type: integer, minimum: 0, maximum: 23 }
+
+obligations:
+  # Reusable obligation templates; rules can reference them by name via anchors/aliases
+  - name: redact_customer_pii
+    when: onPermit            # onPermit | onDeny | always
+    actions:
+      - type: mask
+        engine: policy_core.obligations.actions.mask
+        config:
+          rules:
+            - rule_id: email_mask
+              selector: "**.email"
+              mode: partial
+              params: { keep_start: 2, keep_end: 3, fill: "*" }
+            - rule_id: phone_mask
+              selector: "**.phone"
+              mode: charclass
+              params: { digit: "•", alpha: "x", preserve: " +-()"}
+            - rule_id: pan_tokenize
+              selector: "**.pan"
+              mode: tokenize
+              idempotent: true
+              params:
+                key_name: HMAC_KEY
+                prefix: "tok_"
+                length: 26
+            - rule_id: ssn_hash
+              selector: "**.ssn"
+              mode: hash
+              params:
+                salt_name: HASH_SALT
+                encoding: base32
+                truncate: 24
+          report:
+            enabled: true
+            maxEvents: 1000
+  - name: audit_deny_reason
+    when: onDeny
+    actions:
+      - type: audit.log
+        engine: builtin.audit
+        config:
+          level: WARN
+          fields:
+            reason: "${decision.reason}"
+            subject: "${subject.id}"
+            resource: "${resource.type}:${resource.id}"
+            trace_id: "${context.trace_id}"
+
+  - name: require_mfa_for_high_risk
+    when: onPermit
+    actions:
+      - type: mfa.require
+        engine: builtin.mfa
+        config:
+          condition: "subject.riskScore >= 60 || environment.device.posture != 'trusted'"
+          methods: ["totp","webauthn"]
+          ttlSeconds: 300
+
+  - name: notify_security
+    when: onDeny
+    actions:
+      - type: notify
+        engine: builtin.notify
+        config:
+          channel: "security-events"
+          template: "deny_access_v1"
+          payload:
+            subject: "${subject.id}"
+            action: "${action}"
+            resource: "${resource.type}:${resource.id}"
+            geo: "${environment.geo.country}"
+
+policies:
+  # Priority: lower number = higher priority when strategy=firstApplicable
+  - id: policy.read.customer
+    version: 1.2.0
+    status: active           # draft | active | deprecated | revoked
+    priority: 10
+    target:
+      description: "Read access to customer profiles for roles: support, analyst, owner"
+      condition: |
+        action in ['read','get'] &&
+        resource.type == 'customer_profile'
+    rules:
+      - id: owner_can_read
+        effect: Permit
+        condition: "subject.id == resource.ownerId"
+        obligations: [redact_customer_pii]
+      - id: support_can_read_non_sensitive
+        effect: Permit
+        condition: |
+          'support' in subject.roles &&
+          subject.riskScore < 60 &&
+          environment.geo.country in ['SE','FI','NO','DK','DE']
+        obligations: [redact_customer_pii]
+      - id: analyst_read_business_hours
+        effect: Permit
+        condition: |
+          'analyst' in subject.roles &&
+          environment.time.hour >= 8 && environment.time.hour <= 19
+        obligations: [redact_customer_pii]
+      - id: default_deny_read
+        effect: Deny
+        condition: "true"
+        obligations: [audit_deny_reason]
+
+  - id: policy.write.customer
+    version: 1.1.0
+    status: active
+    priority: 20
+    target:
+      description: "Write/update customer profiles reserved to admin and owner"
+      condition: |
+        action in ['create','update','patch','delete'] &&
+        resource.type == 'customer_profile'
+    rules:
+      - id: admin_full_control
+        effect: Permit
+        condition: "'admin' in subject.roles"
+        obligations: [require_mfa_for_high_risk]
+      - id: owner_update_self
+        effect: Permit
+        condition: "action in ['update','patch'] && subject.id == resource.ownerId"
+        obligations: [require_mfa_for_high_risk]
+      - id: write_deny
+        effect: Deny
+        condition: "true"
+        obligations: [audit_deny_reason, notify_security]
+
+  - id: policy.export.finance
+    version: 2.0.0
+    status: active
+    priority: 30
+    target:
+      description: "Finance export requires finance role, trusted device and EU geo"
+      condition: |
+        action == 'export' &&
+        resource.type == 'finance_report'
+    rules:
+      - id: finance_export_permit
+        effect: Permit
+        condition: |
+          'finance' in subject.roles &&
+          environment.device.posture == 'trusted' &&
+          environment.geo.country in ['SE','DE','FR','NL','FI','NO','DK','EE','LT','LV','PL','CZ','AT','BE','IE','ES','PT','IT','LU','GR','SI','SK','HU','RO','BG','HR','CY','MT']
+        obligations: [require_mfa_for_high_risk]
+      - id: export_deny
+        effect: Deny
+        condition: "true"
+        obligations: [audit_deny_reason]
+
+  - id: policy.default
+    version: 1.0.0
+    status: active
+    priority: 1000
+    target:
+      description: "Catch-all"
+      condition: "true"
+    rules:
+      - id: deny_all_else
+        effect: Deny
+        condition: "true"
+        obligations: [audit_deny_reason]
+
+order:
+  # Explicit evaluation order (overrides sorting by priority if provided)
+  - policy.read.customer
+  - policy.write.customer
+  - policy.export.finance
+  - policy.default
+
+integrity:
+  # The following hashes are placeholders; PAP should compute and update them at commit time.
+  algorithm: sha256
+  content:
+    policies:
+      policy.read.customer: "<sha256-of-policy.read.customer-yaml-fragment>"
+      policy.write.customer: "<sha256-of-policy.write.customer-yaml-fragment>"
+      policy.export.finance: "<sha256-of-policy.export.finance-yaml-fragment>"
+      policy.default: "<sha256-of-policy.default-yaml-fragment>"
+    schemas:
+      schema.subject.v1: "<sha256-of-schema.subject>"
+      schema.resource.v1: "<sha256-of-schema.resource>"
+      schema.environment.v1: "<sha256-of-schema.environment>"
+  manifest:
+    signed: false
+    signer:
+      alg: "HMAC-SHA256"
+      keyRef: "POLICY_HMAC_KEY"
+    signature: null   # to be populated by PAP signing step
+
+tests:
+  # Minimal embedded test vectors for PDP regression checks
+  - name: owner_read_permitted_and_redacted
+    input:
+      subject: { id: 42, roles: ["user"], riskScore: 10 }
+      action: "read"
+      resource:
+        type: "customer_profile"
+        id: "c-001"
+        ownerId: 42
+        attrs:
+          email: "owner@example.com"
+          phone: "+46 70 123 45 67"
+          pan: "4111111111111111"
+          ssn: "123-45-6789"
+      environment:
+        geo: { country: "SE" }
+        device: { posture: "trusted" }
+        time: { hour: 10, tz: "Europe/Stockholm" }
+    expect:
+      decision: "Permit"
+      obligationsApplied: ["redact_customer_pii"]
+      # Resulting resource fields will be masked by obligation engine
+  - name: support_read_from_allowed_geo
+    input:
+      subject: { id: "s-77", roles: ["support"], riskScore: 20 }
+      action: "get"
+      resource: { type: "customer_profile", id: "c-002", ownerId: 999, attrs: { email: "x@y.z" } }
+      environment:
+        geo: { country: "DE" }
+        device: { posture: "trusted" }
+        time: { hour: 15, tz: "Europe/Berlin" }
+    expect:
+      decision: "Permit"
+  - name: analyst_read_outside_business_hours
+    input:
+      subject: { id: "a-2", roles: ["analyst"], riskScore: 10 }
+      action: "read"
+      resource: { type: "customer_profile", id: "c-003", ownerId: "o-1" }
+      environment:
+        geo: { country: "SE" }
+        device: { posture: "trusted" }
+        time: { hour: 3, tz: "Europe/Stockholm" }
+    expect:
+      decision: "Deny"
+      obligationsApplied: ["audit_deny_reason"]
+  - name: finance_export_requires_trusted_device
+    input:
+      subject: { id: "f-9", roles: ["finance"], riskScore: 55 }
+      action: "export"
+      resource: { type: "finance_report", id: "r-2025-08" }
+      environment:
+        geo: { country: "SE" }
+        device: { posture: "unknown" }
+        time: { hour: 12, tz: "Europe/Stockholm" }
+    expect:
+      decision: "Deny"
+
+notes:
+  - "This bundle is compatible with CEL evaluation and policy-core obligation engines."
+  - "Integrate with versioning.py for signed manifests and revision tracking."

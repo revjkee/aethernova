@@ -1,0 +1,385 @@
+# path: veilmind-core/schemas/graphql/schema.graphql
+# Industrial GraphQL schema for veilmind-core
+
+# -------------------------------
+# Скаляры
+# -------------------------------
+scalar DateTime      # ISO-8601 UTC
+scalar UUID          # RFC 4122
+scalar JSON          # JSON object/value
+scalar SafeString    # Строка с базовой валидацией/нормализацией
+
+# -------------------------------
+# Директивы (серверные)
+# -------------------------------
+"""
+Требует авторизацию с указанными ролями.
+- roles: список ролей, любая из которых допускается
+- any: если true, достаточно любой роли; иначе требуется все (по умолчанию any=true)
+"""
+directive @auth(roles: [Role!]!, any: Boolean = true) on FIELD_DEFINITION | OBJECT
+
+"""
+Ограничение частоты вызовов.
+- windowSec: окно
+- max: лимит в окне на субъект (user/tenant/ip)
+- key: явный ключ (иначе авто: userId|tenantId|ip)
+"""
+directive @rateLimit(windowSec: Int! = 60, max: Int! = 60, key: String) on FIELD_DEFINITION
+
+"""
+Редакция потенциально чувствительного поля на основе стратегии.
+- types: какие типы PII могут быть редактированы
+- mask: строка-маска
+"""
+directive @redact(types: [PIIType!] = [EMAIL, PHONE, CARD, IBAN], mask: String = "[REDACTED]") on FIELD_DEFINITION
+
+# -------------------------------
+# Перечисления
+# -------------------------------
+enum Role { ADMIN SECURITY_ENGINEER OPERATOR ANALYST VIEWER }
+enum Severity { LOW MEDIUM HIGH CRITICAL }
+enum Category {
+  INJECTION_ATTEMPT
+  DATA_EXFILTRATION
+  PII_PRESENT
+  SEXUAL_MINORS
+  EXPLICIT_SEXUAL
+  SELF_HARM
+  HATE_VIOLENCE
+  ILLEGAL_ACTIVITY
+  MALWARE_CYBERCRIME
+  MEDICAL_ADVICE
+  LEGAL_ADVICE
+  FINANCIAL_ADVICE
+  CODE_EXECUTION
+  COPYRIGHT_RISKY
+  ADULT_NSFW
+}
+enum PIIType { EMAIL PHONE CARD IBAN OTHER }
+enum PolicyStatus { ENABLED DISABLED DRAFT }
+enum SortOrder { ASC DESC }
+enum IncidentStatus { NEW TRIAGE CONTAIN ERADICATE RECOVER MONITOR CLOSED }
+enum DecisionEffect { PERMIT DENY INDETERMINATE }
+
+# -------------------------------
+# Интерфейсы
+# -------------------------------
+interface Node { id: ID! }  # Relay global ID
+
+"""
+Базовый контракт ошибки/проблемы для унионов *Payload.
+"""
+interface Problem {
+  code: String!
+  message: String!
+  details: JSON
+}
+
+# Стандартные типы проблем
+type UnauthorizedProblem implements Problem { code: String!, message: String!, details: JSON }
+type ForbiddenProblem implements Problem { code: String!, message: String!, details: JSON }
+type NotFoundProblem implements Problem { code: String!, message: String!, details: JSON }
+type ValidationProblem implements Problem { code: String!, message: String!, details: JSON }
+type ConflictProblem implements Problem { code: String!, message: String!, details: JSON }
+type RateLimitProblem implements Problem { code: String!, message: String!, details: JSON }
+type InternalProblem implements Problem { code: String!, message: String!, details: JSON }
+
+# -------------------------------
+# Общие структуры (Relay)
+# -------------------------------
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+# -------------------------------
+# Сущности домена
+# -------------------------------
+type Tenant implements Node {
+  id: ID!
+  slug: String!
+  name: String!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type User implements Node {
+  id: ID!
+  tenant: Tenant!
+  email: String! @redact(types: [EMAIL])
+  displayName: String!
+  role: Role!
+  mfaEnabled: Boolean!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type Policy implements Node {
+  id: ID!
+  tenant: Tenant!
+  name: String!
+  version: String!
+  status: PolicyStatus!
+  package: String!         # например, "policies.prompt"
+  sourceRego: SafeString!  # исходник политики (редактируемый)
+  checksum: String!        # sha256
+  createdBy: User!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type Prompt implements Node {
+  id: ID!
+  tenant: Tenant!
+  user: User!
+  text: SafeString! @redact(types: [EMAIL, PHONE, CARD, IBAN])
+  sanitized: SafeString
+  categories: [Category!]!
+  riskScore: Float!        # 0..1
+  severity: Severity!
+  allow: Boolean!
+  obligations: Obligations!
+  version: String!         # версия движка/политики
+  correlationId: String
+  createdAt: DateTime!
+}
+
+type Obligations {
+  disclaimers: [SafeString!]!
+  redactions: [PIIType!]!
+  toolRestrictions: [ToolRestriction!]!
+  answerGuidelines: [AnswerGuideline!]!
+  rateLimitMultiplier: Float!
+}
+
+enum ToolRestriction {
+  NO_WEB_BROWSE
+  NO_CODE_EXEC
+  NO_SHELL
+  NO_IMAGE_EDIT_FACES
+  NO_SYSTEM_PROMPT_ECHO
+  NO_FILE_SYSTEM_READ
+  NO_ENV_LEAK
+  SANDBOX_ONLY
+  NO_NETWORK
+}
+
+enum AnswerGuideline {
+  REFUSE_AND_REDIRECT
+  IGNORE_INJECTIONS_AND_STAY_INSTRUCTIONS
+  PROVIDE_GENERAL_INFO_NOT_ADVICE
+  NOT_A_LAWYER_NO_PERSONAL_ADVICE
+  EDUCATIONAL_ONLY_NO_FINANCIAL_ADVICE
+  SUMMARIZE_NO_LONG_VERBATIM
+  AVOID_EXPLICIT_DESCRIPTIONS
+}
+
+type Detection implements Node {
+  id: ID!
+  tenant: Tenant!
+  ruleId: String!
+  title: String!
+  categories: [Category!]!
+  severity: Severity!
+  artifacts: JSON
+  firedAt: DateTime!
+  relatedPrompt: Prompt
+}
+
+type Incident implements Node {
+  id: ID!
+  tenant: Tenant!
+  title: String!
+  status: IncidentStatus!
+  severity: Severity!
+  detectorIds: [ID!]!
+  owner: User
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  timeline: [AuditLog!]!
+}
+
+type AuditLog implements Node {
+  id: ID!
+  tenant: Tenant!
+  actor: String!
+  action: String!
+  targetType: String!
+  targetId: ID
+  metadata: JSON
+  ts: DateTime!
+}
+
+# -------------------------------
+# Connections
+# -------------------------------
+type UserEdge { cursor: String!, node: User! }
+type UserConnection { edges: [UserEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type PolicyEdge { cursor: String!, node: Policy! }
+type PolicyConnection { edges: [PolicyEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type PromptEdge { cursor: String!, node: Prompt! }
+type PromptConnection { edges: [PromptEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type DetectionEdge { cursor: String!, node: Detection! }
+type DetectionConnection { edges: [DetectionEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type IncidentEdge { cursor: String!, node: Incident! }
+type IncidentConnection { edges: [IncidentEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type AuditLogEdge { cursor: String!, node: AuditLog! }
+type AuditLogConnection { edges: [AuditLogEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+# -------------------------------
+# Input-типы
+# -------------------------------
+input PaginationInput {
+  first: Int
+  after: String
+  last: Int
+  before: String
+}
+
+input SortInput {
+  field: String!
+  order: SortOrder! = DESC
+}
+
+input PromptEvaluateInput {
+  tenantId: ID!
+  userId: ID!
+  text: SafeString!
+  lang: String
+  channel: String = "web"
+  toolsRequested: [String!]
+  correlationId: String
+}
+
+input PolicyUpsertInput {
+  id: ID
+  tenantId: ID!
+  name: String!
+  package: String!
+  sourceRego: SafeString!
+  status: PolicyStatus! = DRAFT
+  version: String
+}
+
+input IncidentUpdateInput {
+  id: ID!
+  status: IncidentStatus
+  ownerId: ID
+  title: String
+}
+
+# -------------------------------
+# Unions для мутаций (успех/ошибка)
+# -------------------------------
+type EvaluatePromptSuccess {
+  prompt: Prompt!
+}
+
+union EvaluatePromptPayload =
+    EvaluatePromptSuccess
+  | UnauthorizedProblem
+  | ForbiddenProblem
+  | ValidationProblem
+  | InternalProblem
+  | RateLimitProblem
+
+type UpsertPolicySuccess { policy: Policy! }
+union UpsertPolicyPayload =
+    UpsertPolicySuccess
+  | UnauthorizedProblem
+  | ForbiddenProblem
+  | ValidationProblem
+  | ConflictProblem
+  | InternalProblem
+
+type UpdateIncidentSuccess { incident: Incident! }
+union UpdateIncidentPayload =
+    UpdateIncidentSuccess
+  | UnauthorizedProblem
+  | ForbiddenProblem
+  | NotFoundProblem
+  | ValidationProblem
+  | InternalProblem
+
+# -------------------------------
+# Query
+# -------------------------------
+type Query {
+  node(id: ID!): Node @auth(roles: [VIEWER, ANALYST, OPERATOR, SECURITY_ENGINEER, ADMIN])
+
+  me: User @auth(roles: [VIEWER, ANALYST, OPERATOR, SECURITY_ENGINEER, ADMIN])
+
+  tenant(slug: String!): Tenant @auth(roles: [VIEWER, ANALYST, OPERATOR, SECURITY_ENGINEER, ADMIN])
+
+  users(tenantId: ID!, page: PaginationInput, sort: SortInput): UserConnection
+    @auth(roles: [ADMIN, SECURITY_ENGINEER])
+
+  policies(tenantId: ID!, search: String, status: PolicyStatus, page: PaginationInput, sort: SortInput): PolicyConnection
+    @auth(roles: [SECURITY_ENGINEER, ADMIN])
+
+  prompts(tenantId: ID!, userId: ID, severity: Severity, allow: Boolean, page: PaginationInput, sort: SortInput): PromptConnection
+    @auth(roles: [ANALYST, SECURITY_ENGINEER, ADMIN])
+
+  detections(tenantId: ID!, severity: Severity, ruleId: String, page: PaginationInput, sort: SortInput): DetectionConnection
+    @auth(roles: [ANALYST, SECURITY_ENGINEER, ADMIN])
+
+  incidents(tenantId: ID!, status: IncidentStatus, page: PaginationInput, sort: SortInput): IncidentConnection
+    @auth(roles: [ANALYST, SECURITY_ENGINEER, ADMIN])
+
+  auditLogs(tenantId: ID!, filter: JSON, page: PaginationInput, sort: SortInput): AuditLogConnection
+    @auth(roles: [SECURITY_ENGINEER, ADMIN])
+    @rateLimit(windowSec: 60, max: 120)
+}
+
+# -------------------------------
+# Mutation
+# -------------------------------
+type Mutation {
+  evaluatePrompt(input: PromptEvaluateInput!): EvaluatePromptPayload
+    @auth(roles: [VIEWER, ANALYST, OPERATOR, SECURITY_ENGINEER, ADMIN])
+    @rateLimit(windowSec: 10, max: 30)
+
+  upsertPolicy(input: PolicyUpsertInput!): UpsertPolicyPayload
+    @auth(roles: [SECURITY_ENGINEER, ADMIN])
+
+  enablePolicy(id: ID!, enable: Boolean!): UpsertPolicyPayload
+    @auth(roles: [SECURITY_ENGINEER, ADMIN])
+
+  updateIncident(input: IncidentUpdateInput!): UpdateIncidentPayload
+    @auth(roles: [ANALYST, SECURITY_ENGINEER, ADMIN])
+
+  acknowledgeDetection(id: ID!): UpdateIncidentPayload
+    @auth(roles: [ANALYST, SECURITY_ENGINEER, ADMIN])
+
+  redactPrompt(id: ID!, strategy: [PIIType!]! = [EMAIL, PHONE, CARD, IBAN]): EvaluatePromptPayload
+    @auth(roles: [ANALYST, SECURITY_ENGINEER, ADMIN])
+}
+
+# -------------------------------
+# Subscription (realtime)
+# -------------------------------
+type Subscription {
+  detectionFired(tenantId: ID!, minSeverity: Severity = MEDIUM): Detection
+    @auth(roles: [ANALYST, SECURITY_ENGINEER, ADMIN])
+
+  incidentCreated(tenantId: ID!, minSeverity: Severity = HIGH): Incident
+    @auth(roles: [ANALYST, SECURITY_ENGINEER, ADMIN])
+}
+
+# -------------------------------
+# Резолвы Union/Interface (описательные комментарии)
+# -------------------------------
+# На сервере следует реализовать:
+# - Node интерфейс (global id <-> typename/id)
+# - Problem union type resolution по полю `code`
+# - Применение @auth на уровне field middleware
+# - Применение @rateLimit по ключу user/tenant/ip
+# - Применение @redact на сериализации полей SafeString

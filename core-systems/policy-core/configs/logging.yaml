@@ -1,0 +1,292 @@
+# policy-core/configs/logging.yaml
+apiVersion: policy-core/v1
+kind: LoggingConfig
+
+metadata:
+  service: policy-core
+  owner: platform-security-core
+  revision: ${LOG_REVISION:-local}
+  generatedAt: ${LOG_GENERATED_AT:-2025-08-28T00:00:00Z}
+
+schema:
+  version: 1.0.0
+  validateOnBoot: true
+  # Внутренняя ссылка на JSON Schema (если используется валидатор)
+  ref: "internal://schemas/logging-config-1.0.0.json"
+
+# ---------------------------
+# Глобальные настройки
+# ---------------------------
+runtime:
+  profile: ${LOG_PROFILE:-dev}        # dev | prod
+  level: ${LOG_LEVEL:-INFO}           # TRACE|DEBUG|INFO|WARN|ERROR|FATAL
+  encoding: ${LOG_ENCODING:-json}     # json | text
+  timezone: ${LOG_TZ:-UTC}
+  includeTimestamp: true
+  includeCaller: ${LOG_CALLER:-true}
+  includeStacktrace: ${LOG_STACKTRACE:-false}
+  # Включить прокладку OTEL-контекста (trace_id, span_id), если библиотека доступна
+  otelContext: ${LOG_OTEL_CONTEXT:-true}
+  # Drop/keep по именам логгеров (грубая отбраковка шума)
+  dropLoggers: ["urllib3.connectionpool", "botocore.hooks"]
+  keepLoggers: []
+
+# ---------------------------
+# Безопасность и редактирование
+# ---------------------------
+redaction:
+  enabled: true
+  # Паттерны, которые маскируются до отправки в sinks
+  patterns:
+    - name: email
+      regex: '(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}'
+      replacement: "***@***"
+    - name: bearer_token
+      regex: '(?i)authorization:\s*bearer\s+[a-z0-9\._\-]+'
+      replacement: "authorization: Bearer ***"
+    - name: credit_card
+      regex: '\b(?:\d[ -]*?){13,16}\b'
+      replacement: "****-****-****-****"
+    - name: password
+      regex: '(?i)"?(password|passwd|pwd)"?\s*:\s*".+?"'
+      replacement: '"\1":"***"'
+  # Журналы аудита не редактируются по умолчанию (переносятся как есть с минимальными полями)
+  skipForLoggers: ["policy_core.audit"]
+
+# ---------------------------
+# Сэмплинг/антиспам
+# ---------------------------
+sampling:
+  enabled: ${LOG_SAMPLING_ENABLED:-true}
+  # не чаще N одинаковых сообщений за окно (per logger+msg)
+  burst: ${LOG_SAMPLING_BURST:-5}
+  ratePerSecond: ${LOG_SAMPLING_RPS:-1}
+
+# ---------------------------
+# Энкодеры
+# ---------------------------
+encoders:
+  json:
+    type: json
+    # Нормализованные поля ECS-подобного формата
+    fields:
+      ts: "@timestamp"
+      lvl: "level"
+      msg: "message"
+      lg: "logger"
+      svc: "service.name"
+      env: "deployment.environment"
+      trace: "trace_id"
+      span: "span_id"
+      caller: "caller"
+      pod: "k8s.pod.name"
+      ns: "k8s.namespace"
+  text:
+    type: text
+    pattern: "%(asctime)s %(levelname)s %(name)s - %(message)s"
+
+# ---------------------------
+# Приёмники (sinks)
+# ---------------------------
+sinks:
+  console:
+    type: stdout
+    level: ${LOG_CONSOLE_LEVEL:-INFO}
+    encoder: ${LOG_CONSOLE_ENCODING:-json}
+  console_err:
+    type: stderr
+    level: ${LOG_CONSOLE_ERR_LEVEL:-WARN}
+    encoder: ${LOG_CONSOLE_ERR_ENCODING:-json}
+
+  file_app:
+    type: file
+    level: ${LOG_FILE_LEVEL:-INFO}
+    path: ${LOG_FILE_PATH:-/var/log/policy-core/app.log}
+    encoder: json
+    rotation:
+      enabled: true
+      maxSizeMB: ${LOG_ROTATE_SIZE_MB:-100}
+      maxBackups: ${LOG_ROTATE_BACKUPS:-7}
+      maxAgeDays: ${LOG_ROTATE_AGE_DAYS:-30}
+      compress: true
+
+  file_audit:
+    type: file
+    level: INFO
+    path: ${LOG_AUDIT_FILE_PATH:-/var/log/policy-core/audit.log}
+    encoder: json
+    rotation:
+      enabled: true
+      maxSizeMB: 200
+      maxBackups: 30
+      maxAgeDays: 365
+      compress: true
+
+  file_security:
+    type: file
+    level: INFO
+    path: ${LOG_SECURITY_FILE_PATH:-/var/log/policy-core/security.log}
+    encoder: json
+    rotation:
+      enabled: true
+      maxSizeMB: 200
+      maxBackups: 30
+      maxAgeDays: 365
+      compress: true
+
+  loki:
+    type: loki
+    enabled: ${LOKI_ENABLED:-false}
+    url: ${LOKI_ENDPOINT:-http://loki:3100/loki/api/v1/push}
+    tenant: ${LOKI_TENANT_ID:-default}
+    labels:
+      job: "policy-core"
+      environment: ${DEPLOY_ENV:-prod}
+      service: "policy-core"
+    batch:
+      size: 1048576
+      timeout: 5s
+    level: ${LOKI_LEVEL:-INFO}
+    encoder: json
+
+  syslog:
+    type: syslog
+    enabled: ${SYSLOG_ENABLED:-false}
+    network: ${SYSLOG_NET:-udp}     # udp | tcp | unix
+    address: ${SYSLOG_ADDR:-127.0.0.1:514}
+    facility: ${SYSLOG_FACILITY:-local1}
+    level: ${SYSLOG_LEVEL:-INFO}
+    encoder: text
+
+# ---------------------------
+# Маршрутизация (routes)
+# ---------------------------
+routes:
+  # Базовый поток приложения
+  - name: app-default
+    match:
+      logger: ["policy_core", "policy_core.*", "uvicorn", "gunicorn", "aiohttp", "fastapi"]
+      minLevel: ${LOG_LEVEL_APP_MIN:-INFO}
+    sinks: ["console", "file_app", "loki"]
+
+  # Ошибки/варнинги — дублирование на stderr
+  - name: app-errors
+    match:
+      minLevel: "WARN"
+    sinks: ["console_err"]
+
+  # Аудит доступа/решений политик
+  - name: audit
+    match:
+      logger: ["policy_core.audit", "policy_core.authz.audit"]
+      minLevel: "INFO"
+    sinks: ["file_audit", "loki", "syslog"]
+
+  # Безопасность/инциденты
+  - name: security
+    match:
+      logger: ["policy_core.security", "policy_core.threats", "policy_core.integrity"]
+      minLevel: "INFO"
+    sinks: ["file_security", "loki", "syslog"]
+
+  # Шумные зависимости — понижаем уровень и не пишем в файл
+  - name: deps-noise
+    match:
+      logger: ["urllib3.*", "botocore.*", "boto3.*", "asyncio", "kazoo", "kafka"]
+      maxLevel: "WARN"
+    sinks: ["console"]
+
+# ---------------------------
+# Логгеры по умолчанию
+# ---------------------------
+loggers:
+  root:
+    level: ${LOG_LEVEL:-INFO}
+    sinks: ["console", "file_app"]
+
+  policy_core:
+    level: ${LOG_LEVEL_APP:-INFO}
+    propagate: false
+
+  policy_core.audit:
+    level: INFO
+    propagate: false
+    sinks: ["file_audit", "loki"]
+
+  policy_core.security:
+    level: INFO
+    propagate: false
+    sinks: ["file_security", "loki"]
+
+  uvicorn:
+    level: WARN
+    propagate: false
+  uvicorn.error:
+    level: WARN
+    propagate: false
+  uvicorn.access:
+    level: WARN
+    propagate: false
+  gunicorn:
+    level: WARN
+    propagate: false
+  opentelemetry:
+    level: WARN
+    propagate: false
+
+# ---------------------------
+# Профили
+# ---------------------------
+profiles:
+  dev:
+    runtime:
+      level: DEBUG
+      encoding: json
+      includeStacktrace: true
+    sinks:
+      loki:
+        enabled: ${LOKI_ENABLED:-false}
+      file_app:
+        rotation:
+          maxBackups: 5
+          maxAgeDays: 7
+    loggers:
+      uvicorn.access:
+        level: INFO
+
+  prod:
+    runtime:
+      level: ${LOG_LEVEL:-INFO}
+      encoding: json
+      includeStacktrace: false
+    sinks:
+      loki:
+        enabled: ${LOKI_ENABLED:-true}
+      console:
+        level: INFO
+      console_err:
+        level: WARN
+      file_app:
+        rotation:
+          maxBackups: 14
+          maxAgeDays: 30
+    # Жёстче режем шумные зависимости
+    routes:
+      - name: deps-noise
+        match:
+          logger: ["urllib3.*", "botocore.*", "boto3.*", "asyncio", "kazoo", "kafka"]
+          maxLevel: "ERROR"
+        sinks: ["console"]
+
+# ---------------------------
+# Guardrails
+# ---------------------------
+bootChecks:
+  requireSinks: ["console", "file_app"]
+  forbidInProd:
+    - runtime.encoding=text
+    - sinks.console.level=DEBUG
+    - sinks.console_err.level=DEBUG
+  warnIfMissing:
+    - sinks.loki.enabled=true AND env(LOKI_ENDPOINT)
+    - runtime.otelContext=true AND env(OTEL_EXPORTER_OTLP_ENDPOINT)

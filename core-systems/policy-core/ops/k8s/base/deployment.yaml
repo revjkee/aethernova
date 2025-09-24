@@ -1,0 +1,168 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: policy-core
+  namespace: policy-core
+  labels:
+    app.kubernetes.io/name: policy-core
+    app.kubernetes.io/instance: policy-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/version: "v0.1.0"
+    app.kubernetes.io/managed-by: github-actions
+  annotations:
+    # Чек-суммы для корректного rollout при изменении конфигов/секретов (заполняются CI)
+    policy-core/checksum-config: "REPLACED_BY_CI_SHA256_CONFIGMAP"
+    policy-core/checksum-secrets: "REPLACED_BY_CI_SHA256_SECRET"
+    # Трассировка происхождения билда
+    policy-core/build.sha: "REPLACED_BY_CI_GIT_SHA"
+    policy-core/build.timestamp: "REPLACED_BY_CI_ISO8601"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: policy-core
+      app.kubernetes.io/instance: policy-core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: policy-core
+        app.kubernetes.io/instance: policy-core
+        app.kubernetes.io/component: api
+      annotations:
+        # Включите нужные аннотации мониторинга, если используете сервис-дискавери
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Минимизируем права по умолчанию
+      automountServiceAccountToken: false
+      serviceAccountName: policy-core
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 20001
+        fsGroupChangePolicy: "OnRootMismatch"
+      imagePullSecrets:
+        - name: registry-credentials
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: policy-core
+              app.kubernetes.io/instance: policy-core
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: policy-core
+                    app.kubernetes.io/instance: policy-core
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: policy-core
+          image: ghcr.io/your-org/policy-core:${IMAGE_TAG:-sha-REPLACED_BY_CI}
+          imagePullPolicy: IfNotPresent
+          # Команда/аргументы — подставьте свои; ниже — пример для uvicorn/gunicorn
+          command: ["/bin/sh","-lc"]
+          args:
+            - >
+              exec policy-core --host 0.0.0.0 --port 8080
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Версионирование через Downward API
+            - name: APP_VERSION
+              valueFrom: { fieldRef: { fieldPath: metadata.labels['app.kubernetes.io/version'] } }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: COMMIT_SHA
+              valueFrom: { fieldRef: { fieldPath: metadata.annotations['policy-core/build.sha'] } }
+            - name: CONFIG_CHECKSUM
+              valueFrom: { fieldRef: { fieldPath: metadata.annotations['policy-core/checksum-config'] } }
+            - name: SECRETS_CHECKSUM
+              valueFrom: { fieldRef: { fieldPath: metadata.annotations['policy-core/checksum-secrets'] } }
+            - name: LOG_LEVEL
+              value: "INFO"
+          envFrom:
+            - configMapRef:
+                name: policy-core-config
+                optional: true
+            - secretRef:
+                name: policy-core-secrets
+                optional: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /etc/policy-core
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+          startupProbe:
+            httpGet:
+              path: /healthz/startup
+              port: http
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            failureThreshold: 12   # до 60 с на холодный старт
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","sleep 5"]  # время на graceful shutdown
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: ""
+        - name: config
+          configMap:
+            name: policy-core-config
+            optional: true

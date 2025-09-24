@@ -1,0 +1,117 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mythos-core
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mythos-core
+    app.kubernetes.io/part-of: mythos
+    app.kubernetes.io/component: monitoring
+    # Если используете kube-prometheus-stack (Helm), укажите его release для автоподхвата:
+    release: prometheus
+spec:
+  # Поле, которое Prometheus будет использовать как job
+  jobLabel: app.kubernetes.io/name
+
+  # Вариант 1: мониторим конкретный namespace приложения
+  namespaceSelector:
+    matchNames:
+      - mythos
+  # Вариант 2 (закомментировано): мониторинг во всех неймспейсах
+  # namespaceSelector:
+  #   any: true
+
+  # Выборка Service по меткам. Сам Service должен публиковать порт с именем `http-metrics`.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mythos-core
+      app.kubernetes.io/component: api
+
+  # Пробрасываем часть лейблов Service/Pod в метки таргетов
+  targetLabels:
+    - app.kubernetes.io/instance
+    - app.kubernetes.io/version
+  podTargetLabels:
+    - app.kubernetes.io/component
+
+  endpoints:
+    # Основной HTTP-эндпоинт метрик приложения
+    - port: http-metrics        # имя порта в Service (обязательно)
+      path: /metrics
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: false
+
+      # Подставляем стабильный instance и контекст к таргетам
+      relabelings:
+        # instance := <pod_ip>:<port>
+        - action: replace
+          sourceLabels: [__address__]
+          targetLabel: instance
+        # Добавляем namespace/pod в набор меток таргета
+        - action: replace
+          sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: kubernetes_namespace
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: kubernetes_pod_name
+        # Нормализуем job лейбл значением jobLabel
+        - action: replace
+          sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_name]
+          targetLabel: job
+
+      # Отбрасываем высокошумные/служебные метрики
+      metricRelabelings:
+        # Пром- и клиентские служебные метрики
+        - action: drop
+          sourceLabels: [__name__]
+          regex: "promhttp_.*|go_.*|process_.*"
+        # Бакеты гистограмм (оставляем sum/count) — опционально
+        - action: drop
+          sourceLabels: [__name__]
+          regex: ".*_bucket"
+
+      # Аутентификация токеном (опционально):
+      # bearerTokenSecret:
+      #   name: mythos-core-metrics-bearer
+      #   key: token
+
+      # TLS (опционально, если метрики публикуются по HTTPS):
+      # scheme: https
+      # tlsConfig:
+      #   insecureSkipVerify: false
+      #   serverName: "metrics.mythos.svc"
+      #   # Используйте один из вариантов ниже (в зависимости от вашей поставки оператора):
+      #   # 1) Файловые пути внутри контейнера Prometheus
+      #   # caFile: /etc/prom-certs/ca.crt
+      #   # certFile: /etc/prom-certs/tls.crt
+      #   # keyFile: /etc/prom-certs/tls.key
+      #   # 2) Секреты (если ваша версия оператора поддерживает secretRef-поля)
+      #   # ca:
+      #   #   secret:
+      #   #     name: mythos-metrics-ca
+      #   #     key: ca.crt
+      #   # cert:
+      #   #   secret:
+      #   #     name: mythos-metrics-client
+      #   #     key: tls.crt
+      #   # keySecret:
+      #   #   name: mythos-metrics-client
+      #   #   key: tls.key
+
+    # Второй эндпоинт (опционально), например sidecar-экспортер gRPC
+    # - port: grpc-metrics
+    #   path: /metrics
+    #   scheme: http
+    #   interval: 30s
+    #   scrapeTimeout: 10s
+    #   honorLabels: false
+    #   relabelings:
+    #     - action: replace
+    #       sourceLabels: [__address__]
+    #       targetLabel: instance
+    #   metricRelabelings:
+    #     - action: drop
+    #       sourceLabels: [__name__]
+    #       regex: "promhttp_.*|process_.*"

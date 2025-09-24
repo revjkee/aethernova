@@ -1,0 +1,389 @@
+version: 1
+policy_id: acl.world
+description: >
+  Глобальная политика доступа «мир» (пользователи вне периметра). Жёсткий default-deny.
+  Точечные разрешения для анонимных и аутентифицированных субъектов. Совместимо с RBAC+ABAC.
+
+evaluation:
+  algorithm: deny_overrides            # любое DENY имеет приоритет
+  default: deny
+
+taxonomy:
+  actions: [read, list, create, update, delete, execute, publish, consume, admin]
+  data_classification:
+    - public
+    - internal
+    - confidential
+    - restricted
+  resources:
+    - api.endpoint
+    - storage.object
+    - queue.topic
+    - db.table
+    - audit.log
+    - config.item
+    - feature.flag
+    - metrics.stream
+    - secrets.item
+
+subjects:
+  roles:
+    anonymous:
+      description: Неаутентифицированный посетитель (мир)
+    user:
+      description: Аутентифицированный пользователь своего тенанта
+    support_readonly:
+      description: Временный доступ поддержки (только чтение, с тикетом)
+    auditor:
+      description: Аудитор (read‑only доступ к аудит‑логам)
+    admin:
+      description: Администратор продукта (полные права в границах тенанта)
+    security_admin:
+      description: Операторы безопасности (конфиги безопасности, аудит, экспорт)
+    service:
+      description: Межсервисные токены (не применимо для world; здесь — deny)
+
+attributes:
+  env: ${APP_ENV:production}           # для условных правил
+  tenant_isolation: true
+  pii_fields: [email, phone, ip, token]
+  admin_cidrs:
+    - "10.0.0.0/8"
+    - "192.168.0.0/16"
+  support_cidrs: []
+  metrics_cidrs: []
+  geo_allow:
+    eu: ["SE","DE","FR","NL","IT","ES","PL","FI","DK","NO","IE","AT","BE","PT","CZ","HU","RO","SK","SI","EE","LV","LT","LU","MT","CY","BG","HR","GR"]
+
+conditions:
+  # Предопределённые предикаты для ссылок в правилах
+  is_eu_user: "ctx.geo.country in attributes.geo_allow.eu"
+  mfa_verified: "ctx.auth.mfa == true"
+  device_hardened: "ctx.device.posture in ['managed','verified']"
+  risk_low: "ctx.risk.score <= 30"
+  within_business_hours: "ctx.time.weekday in [1,2,3,4,5] and ctx.time.hour in 8..20"
+  within_ticket_window: "now() <= ctx.ticket.expires_at and ctx.ticket.id != null"
+  same_tenant: "resource.tenant_id == subject.tenant_id"
+  is_owner: "resource.owner_id == subject.user_id"
+  ip_in_admin_cidrs: "ip_in_cidrs(ctx.ip, attributes.admin_cidrs)"
+  ip_in_support_cidrs: "ip_in_cidrs(ctx.ip, attributes.support_cidrs)"
+  ip_in_metrics_cidrs: "ip_in_cidrs(ctx.ip, attributes.metrics_cidrs)"
+  no_pii_export: "resource.data_class in ['public','internal']"
+  forbid_secrets_world: "resource.kind != 'secrets.item'"
+  captcha_passed: "ctx.anti_bot.solved == true"
+  rate_ok_login: "rate('login', subject.fingerprint) <= limits.login"
+  rate_ok_register: "rate('register', subject.fingerprint) <= limits.register"
+  rate_ok_public: "rate('public', subject.fingerprint) <= limits.public"
+  signed_webhook: "ctx.webhook.signature_valid == true"
+
+limits:
+  # Символические имена для rate('key', identity)
+  login:
+    requests: 10
+    per_seconds: 60
+    burst: 5
+  register:
+    requests: 5
+    per_seconds: 3600
+    burst: 2
+  public:
+    requests: 100
+    per_seconds: 60
+    burst: 50
+
+rules:
+  # ----------------------------
+  # 0. Технические запреты
+  # ----------------------------
+  - id: world-deny-secrets
+    effect: deny
+    subject_roles: [anonymous, user]
+    resource:
+      kind: secrets.item
+    actions: ["*"]
+    reason: "Секреты недоступны из мира"
+
+  - id: world-deny-internal-admin-apis
+    effect: deny
+    subject_roles: [anonymous, user]
+    resource:
+      kind: api.endpoint
+      path: ["/admin/*", "/internal/*", "/_internal/*"]
+    actions: ["*"]
+    reason: "Админ/внутренние API скрыты"
+
+  - id: world-deny-metrics-traces
+    effect: deny
+    subject_roles: [anonymous]
+    resource:
+      kind: api.endpoint
+      path: ["/metrics", "/debug/pprof/*", "/traces/*", "/actuator/*"]
+    actions: ["*"]
+    reason: "Телееметрия недоступна анонимам"
+
+  # ----------------------------
+  # 1. Доступ для anonymous (публичный)
+  # ----------------------------
+  - id: anon-health-read
+    effect: allow
+    subject_roles: [anonymous]
+    resource:
+      kind: api.endpoint
+      path: ["/health", "/status", "/robots.txt"]
+    actions: [read]
+    constraints:
+      - rate_ok_public
+
+  - id: anon-openapi-read
+    effect: allow
+    when: "attributes.env != 'production'"   # в проде закрыто
+    subject_roles: [anonymous]
+    resource:
+      kind: api.endpoint
+      path: ["/openapi.json", "/docs", "/redoc"]
+    actions: [read]
+    constraints:
+      - rate_ok_public
+
+  - id: anon-auth-start
+    effect: allow
+    subject_roles: [anonymous]
+    resource:
+      kind: api.endpoint
+      path: ["/auth/login", "/auth/register", "/auth/refresh", "/auth/forgot-password"]
+    actions: [create]
+    constraints:
+      - captcha_passed
+      - risk_low
+      - rate_ok_login
+    reason: "Только стартовые auth‑эндпойнты, с антиботом и rate‑лимитом"
+
+  - id: anon-static-assets
+    effect: allow
+    subject_roles: [anonymous]
+    resource:
+      kind: storage.object
+      bucket: "engine-assets*"
+      object: ["public/*", "static/*"]
+      data_class: public
+    actions: [read]
+    constraints:
+      - rate_ok_public
+
+  - id: anon-webhooks-deny-post
+    effect: deny
+    subject_roles: [anonymous]
+    resource:
+      kind: api.endpoint
+      path: ["/webhook/*"]
+    actions: [create, update, delete]
+    reason: "Вебхуки принимаются только при валидации подписи/allowlist — см. правило ниже"
+
+  - id: anon-webhooks-allow-signed
+    effect: allow
+    subject_roles: [anonymous]
+    resource:
+      kind: api.endpoint
+      path: ["/webhook/public/*"]
+    actions: [create]
+    constraints:
+      - signed_webhook
+      - rate_ok_public
+
+  # ----------------------------
+  # 2. Аутентифицированный пользователь (собственный тенант)
+  # ----------------------------
+  - id: user-api-read-own
+    effect: allow
+    subject_roles: [user]
+    resource:
+      kind: api.endpoint
+      path: ["/api/v1/*"]
+    actions: [read, list]
+    constraints:
+      - same_tenant
+      - risk_low
+
+  - id: user-api-write-own
+    effect: allow
+    subject_roles: [user]
+    resource:
+      kind: api.endpoint
+      path: ["/api/v1/*"]
+    actions: [create, update, delete]
+    constraints:
+      - same_tenant
+      - risk_low
+      - mfa_verified
+      - device_hardened
+
+  - id: user-storage-own
+    effect: allow
+    subject_roles: [user]
+    resource:
+      kind: storage.object
+      bucket: "engine-uploads*"
+    actions: [read, create, update, delete, list]
+    constraints:
+      - same_tenant
+      - is_owner
+      - risk_low
+
+  - id: user-db-rowlevel
+    effect: allow
+    subject_roles: [user]
+    resource:
+      kind: db.table
+      schema: "public"
+      table: ["profiles","orders","assets"]
+      data_class: [internal, confidential]
+    actions: [read, create, update]
+    constraints:
+      - same_tenant
+      - is_owner
+
+  - id: user-deny-restricted
+    effect: deny
+    subject_roles: [user]
+    resource:
+      data_class: restricted
+    actions: ["*"]
+    reason: "Поля restricted недоступны обычным пользователям"
+
+  # ----------------------------
+  # 3. Поддержка (только чтение, по тикету и из доверенных сетей)
+  # ----------------------------
+  - id: support-read-tenant
+    effect: allow
+    subject_roles: [support_readonly]
+    resource:
+      kind: api.endpoint
+      path: ["/api/v1/*"]
+    actions: [read, list]
+    constraints:
+      - within_ticket_window
+      - ip_in_support_cidrs
+      - mfa_verified
+      - risk_low
+
+  # ----------------------------
+  # 4. Аудиторы
+  # ----------------------------
+  - id: auditor-read-auditlogs
+    effect: allow
+    subject_roles: [auditor]
+    resource:
+      kind: audit.log
+      stream: ["auth","admin_actions","data_export","security_changes"]
+    actions: [read, list]
+    constraints:
+      - ip_in_admin_cidrs
+      - mfa_verified
+      - within_business_hours
+      - no_pii_export
+
+  # ----------------------------
+  # 5. Администраторы (в границах тенанта)
+  # ----------------------------
+  - id: admin-tenant-all
+    effect: allow
+    subject_roles: [admin]
+    resource:
+      kind: ["api.endpoint","storage.object","db.table","queue.topic","config.item","feature.flag"]
+    actions: ["*"]
+    constraints:
+      - same_tenant
+      - mfa_verified
+      - ip_in_admin_cidrs
+      - risk_low
+
+  # ----------------------------
+  # 6. Безопасность
+  # ----------------------------
+  - id: sec-admin-config
+    effect: allow
+    subject_roles: [security_admin]
+    resource:
+      kind: ["config.item","audit.log","feature.flag"]
+    actions: ["*"]
+    constraints:
+      - mfa_verified
+      - ip_in_admin_cidrs
+
+  # ----------------------------
+  # 7. Метрики (только из внутренних сетей observability)
+  # ----------------------------
+  - id: world-metrics-read-internal
+    effect: allow
+    subject_roles: [user, admin, security_admin, auditor]
+    resource:
+      kind: api.endpoint
+      path: ["/metrics"]
+    actions: [read]
+    constraints:
+      - ip_in_metrics_cidrs
+
+  # ----------------------------
+  # 8. Межсервисные токены — запрет из мира
+  # ----------------------------
+  - id: service-tokens-deny-world
+    effect: deny
+    subject_roles: [service]
+    resource:
+      kind: ["*"]
+    actions: ["*"]
+    reason: "Межсервисные токены недопустимы с внешних IP"
+
+# Политика эскалаций/аварий
+break_glass:
+  enabled: true
+  duration_seconds: 900
+  scope:
+    allow_roles: [security_admin, admin]
+    resources:
+      kind: ["api.endpoint","db.table","storage.object"]
+  constraints:
+    - mfa_verified
+    - ip_in_admin_cidrs
+  audit:
+    reason_required: true
+    notify: ["sec-lead@example.com","ops-duty@example.com"]
+
+auditing:
+  enabled: true
+  redact_pii_fields: true
+  record:
+    on_deny: true
+    on_allow_sensitive: true
+  fields:
+    - subject.user_id
+    - subject.role
+    - resource.kind
+    - resource.id
+    - action
+    - decision
+    - conditions_matched
+    - request_id
+    - ip
+    - user_agent
+    - geo.country
+    - risk.score
+  export:
+    allowed: true
+    constraints:
+      - no_pii_export
+
+compatibility:
+  # Карта привязки к RBAC-ролям приложения (для согласованности с security.yaml)
+  map_roles:
+    anonymous: anonymous
+    authenticated: user
+    support_ro: support_readonly
+    auditor: auditor
+    admin: admin
+    security: security_admin
+
+notes:
+  - "Политика применяется после успешной аутентификации (если требуется) и нормализации контекста."
+  - "При конфликте правил действует deny_overrides."
+  - "Секреты, внутренние/админ‑эндпойнты и скрытые метрики по умолчанию закрыты для мира."

@@ -1,0 +1,199 @@
+---
+# =============================================================================
+# Role: security-core
+# File: tasks/main.yml
+# Purpose: Промышленное развёртывание security-core в Kubernetes
+# =============================================================================
+
+- name: "Preflight | Проверка обязательных переменных и контекста kubectl"
+  block:
+    - name: "Assert | Проверка обязательных переменных"
+      ansible.builtin.assert:
+        that:
+          - security_core_namespace is defined
+          - security_core_namespace | length > 0
+          - security_core_enabled_components is iterable
+        fail_msg: "Не заданы обязательные переменные security_core_namespace / security_core_enabled_components"
+        success_msg: "Обязательные переменные заданы"
+
+    - name: "Preflight | Проверка наличия community.kubernetes коллекции"
+      ansible.builtin.assert:
+        that:
+          - "'community.kubernetes' in ansible_collections"
+        fail_msg: "Требуется коллекция community.kubernetes. Установите: ansible-galaxy collection install community.kubernetes"
+        success_msg: "Коллекция community.kubernetes доступна"
+
+    - name: "Preflight | Проверка доступа к кластеру (kubeconfig)"
+      community.kubernetes.k8s_info:
+        api_version: v1
+        kind: Namespace
+      register: _preflight_ns
+  rescue:
+    - name: "Preflight | Ошибка доступа к кластеру"
+      ansible.builtin.fail:
+        msg: "Нет доступа к кластеру Kubernetes или некорректный kubeconfig"
+
+  tags: [preflight, always]
+
+# -----------------------------------------------------------------------------
+# Defaults (могут быть переопределены в vars/)
+# -----------------------------------------------------------------------------
+- name: "Defaults | Подготовка значений по умолчанию"
+  ansible.builtin.set_fact:
+    security_core_defaults:
+      labels:
+        app.kubernetes.io/part-of: security-core
+        security.aethernova.io/profile: baseline
+      annotations: {}
+      pss_labels:
+        "pod-security.kubernetes.io/enforce": "restricted"
+        "pod-security.kubernetes.io/enforce-version": "latest"
+        "pod-security.kubernetes.io/audit": "restricted"
+        "pod-security.kubernetes.io/warn": "restricted"
+      helm:
+        create_namespace: true
+        wait_timeout: "600s"
+        atomic: true
+      images:
+        kyverno: "ghcr.io/kyverno/kyverno:latest"
+        falco: "falcosecurity/falco:latest"
+        trivy_operator: "ghcr.io/aquasecurity/trivy-operator:latest"
+      networkpolicy:
+        apply_baseline: true
+        file: "{{ role_path }}/files/networkpolicy.yaml"
+      kyverno:
+        enabled: true
+        namespace: "kyverno"
+        release_name: "kyverno"
+        chart:
+          repo_name: "kyverno"
+          repo_url: "https://kyverno.github.io/kyverno/"
+          name: "kyverno/kyverno"
+          version: ""
+        values: {}
+      falco:
+        enabled: true
+        namespace: "falco"
+        release_name: "falco"
+        chart:
+          repo_name: "falcosecurity"
+          repo_url: "https://falcosecurity.github.io/charts"
+          name: "falcosecurity/falco"
+          version: ""
+        values:
+          driver:
+            kind: "ebpf"
+      trivy:
+        enabled: true
+        namespace: "trivy-system"
+        release_name: "trivy-operator"
+        chart:
+          repo_name: "aquasecurity"
+          repo_url: "https://aquasecurity.github.io/helm-charts/"
+          name: "aquasecurity/trivy-operator"
+          version: ""
+        values:
+          trivy:
+            ignoreUnfixed: true
+            severity: "CRITICAL,HIGH"
+      kube_bench:
+        enabled: true
+        namespace: "kube-bench"
+        manifest: "{{ role_path }}/files/kube-bench-cronjob.yaml"
+      image_pull_secrets: []   # пример: ['regcred']
+      extra_registry_cas: []   # списки ConfigMap/Secret для доверенных CA
+  tags: [defaults]
+
+- name: "Defaults | Слияние значений с пользовательскими переменными"
+  ansible.builtin.set_fact:
+    scv: "{{ security_core_defaults | combine(security_core_overrides | default({}), recursive=True) }}"
+  tags: [defaults]
+
+# -----------------------------------------------------------------------------
+# Namespace + PSS labels
+# -----------------------------------------------------------------------------
+- name: "Namespace | Создание/метки namespace {{ security_core_namespace }}"
+  community.kubernetes.k8s:
+    api_version: v1
+    kind: Namespace
+    name: "{{ security_core_namespace }}"
+    state: present
+    definition:
+      metadata:
+        name: "{{ security_core_namespace }}"
+        labels: "{{ scv.labels | combine(scv.pss_labels) }}"
+        annotations: "{{ scv.annotations }}"
+  tags: [namespace, pss]
+
+# -----------------------------------------------------------------------------
+# Доп. секреты/CA для офлайн‑реестров (опционально)
+# -----------------------------------------------------------------------------
+- name: "Bootstrap | ImagePullSecrets в {{ security_core_namespace }}"
+  when: scv.image_pull_secrets | length > 0
+  community.kubernetes.k8s:
+    api_version: v1
+    kind: ServiceAccount
+    name: "security-core-sa"
+    namespace: "{{ security_core_namespace }}"
+    state: present
+    definition:
+      metadata:
+        name: security-core-sa
+      imagePullSecrets: "{{ scv.image_pull_secrets | map('community.general.dict_kv', 'name') | list }}"
+  tags: [bootstrap]
+
+# -----------------------------------------------------------------------------
+# Базовые NetworkPolicy (deny-all + allow DNS)
+# -----------------------------------------------------------------------------
+- name: "NetworkPolicy | Применение базового профиля"
+  when: scv.networkpolicy.apply_baseline
+  community.kubernetes.k8s:
+    state: present
+    namespace: "{{ security_core_namespace }}"
+    src: "{{ scv.networkpolicy.file }}"
+    apply: true
+    wait: true
+  tags: [networkpolicy]
+
+# -----------------------------------------------------------------------------
+# Kyverno (Admission Policies)
+# -----------------------------------------------------------------------------
+- name: "Kyverno | Добавление Helm репозитория"
+  when: scv.kyverno.enabled
+  community.kubernetes.helm_repository:
+    name: "{{ scv.kyverno.chart.repo_name }}"
+    repo_url: "{{ scv.kyverno.chart.repo_url }}"
+  tags: [kyverno, helm]
+
+- name: "Kyverno | Установка/обновление чарта"
+  when: scv.kyverno.enabled
+  community.kubernetes.helm:
+    name: "{{ scv.kyverno.release_name }}"
+    chart_ref: "{{ scv.kyverno.chart.name }}"
+    chart_version: "{{ scv.kyverno.chart.version | default(omit) }}"
+    release_namespace: "{{ scv.kyverno.namespace }}"
+    create_namespace: "{{ scv.helm.create_namespace }}"
+    values: "{{ scv.kyverno.values }}"
+    atomic: "{{ scv.helm.atomic }}"
+    wait: true
+    wait_timeout: "{{ scv.helm.wait_timeout }}"
+  register: _kyverno_helm
+  tags: [kyverno, helm]
+  notify: ["rollout status kyverno"]
+
+# -----------------------------------------------------------------------------
+# Falco (Runtime Threat Detection)
+# -----------------------------------------------------------------------------
+- name: "Falco | Добавление Helm репозитория"
+  when: scv.falco.enabled
+  community.kubernetes.helm_repository:
+    name: "{{ scv.falco.chart.repo_name }}"
+    repo_url: "{{ scv.falco.chart.repo_url }}"
+  tags: [falco, helm]
+
+- name: "Falco | Установка/обновление чарта"
+  when: scv.falco.enabled
+  community.kubernetes.helm:
+    name: "{{ scv.falco.release_name }}"
+    chart_ref: "{{ scv.falco.chart.name }}"
+    chart_version: "{{ scv.falco.chart.version | default(omit)

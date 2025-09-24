@@ -1,0 +1,684 @@
+# =====================================================================
+# OmniMind Core — GraphQL Schema (industrial-grade)
+# Version: 1.0.0
+# Notes:
+# - Relay-style connections & Node interface for global object identity.
+# - Operational directives: @auth, @rateLimit, @cacheControl, @cost, @redact.
+# - Consistent payloads with ProblemDetails for error reporting.
+# - Names follow GraphQL best practices; descriptions are provided for tooling.
+# =====================================================================
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+# -----------------------------
+# Scalars
+# -----------------------------
+scalar DateTime   # RFC3339 UTC
+scalar UUID       # RFC4122
+scalar JSON       # Arbitrary JSON object
+scalar URL
+scalar Email
+scalar BigInt
+scalar Duration   # ISO-8601 duration (e.g. PT5S)
+
+# -----------------------------
+# Directives (runtime-enforced)
+# -----------------------------
+directive @auth(
+  requires: [Role!]! = [USER]
+  tenantScoped: Boolean! = true
+) on FIELD_DEFINITION | OBJECT
+
+directive @rateLimit(
+  window: Duration! = "PT1M",
+  max: Int! = 60,
+  key: String = ""
+) on FIELD_DEFINITION
+
+enum CacheControlScope { PUBLIC PRIVATE }
+directive @cacheControl(
+  maxAge: Int,
+  scope: CacheControlScope = PUBLIC,
+  staleWhileRevalidate: Int = 0
+) on FIELD_DEFINITION | OBJECT
+
+directive @cost(value: Int! = 1) on FIELD_DEFINITION
+
+enum RedactPattern { PII SECRETS CREDENTIALS }
+directive @redact(patterns: [RedactPattern!] = [PII]) on FIELD_DEFINITION
+
+# -----------------------------
+# RBAC
+# -----------------------------
+enum Role {
+  ADMIN
+  PLATFORM
+  SECURITY
+  MLE
+  ANALYST
+  USER
+  READONLY
+}
+
+# -----------------------------
+# Relay base
+# -----------------------------
+interface Node {
+  "Global object identifier."
+  id: ID!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+input ConnectionArgs {
+  first: Int
+  after: String
+  last: Int
+  before: String
+}
+
+enum SortOrder { ASC DESC }
+
+# -----------------------------
+# Problem Details (errors)
+# -----------------------------
+interface Error {
+  code: ErrorCode!
+  message: String!
+  details: JSON
+}
+
+enum ErrorCode {
+  VALIDATION
+  NOT_FOUND
+  PERMISSION_DENIED
+  RATE_LIMIT
+  CONFLICT
+  INTERNAL
+  UNAVAILABLE
+  TIMEOUT
+}
+
+type ProblemDetails implements Error {
+  code: ErrorCode!
+  message: String!
+  details: JSON
+  correlationId: String
+  occurredAt: DateTime!
+}
+
+# -----------------------------
+# Common value objects
+# -----------------------------
+type TraceContext {
+  traceId: String
+  spanId: String
+  parentSpanId: String
+  baggage: JSON
+}
+
+type DataPolicy {
+  redactPII: Boolean!
+  storeInputs: Boolean!
+  storeOutputs: Boolean!
+  allowLogging: Boolean!
+  retention: String
+}
+
+type SecurityContext {
+  tenantId: String!
+  actorId: String
+  roles: [Role!]!
+  allowExternalNetwork: Boolean!
+  allowedDomains: [String!]
+  deniedDomains: [String!]
+  allowedTools: [String!]
+  deniedTools: [String!]
+  dataPolicy: DataPolicy
+}
+
+type Budget {
+  wallClock: Duration
+  maxTokens: BigInt
+  maxCostUsd: Float
+  maxSteps: Int
+}
+
+# -----------------------------
+# Tools & Models
+# -----------------------------
+enum ToolClass { LOW STANDARD SENSITIVE CRITICAL }
+
+type Tool implements Node @auth(requires: [ADMIN, PLATFORM, MLE, ANALYST, USER]) {
+  id: ID!
+  toolId: String!
+  class: ToolClass!
+  title: String
+  description: String
+  envs: [String!]!                          # allowed env names
+  rbac: [ToolRoleRule!]!
+  mfaRequired: Boolean!
+  legalAckRequired: Boolean!
+  timeWindows: JSON                         # e.g., { mon: {start:8,end:20}, ... }
+  rateHint: String
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  labels: [Label!]!
+}
+
+type ToolRoleRule {
+  role: Role!
+  scopes: [String!]!
+}
+
+type Label { key: String!, value: String! }
+
+type ToolConnection {
+  edges: [ToolEdge!]!
+  pageInfo: PageInfo!
+  nodes: [Tool!]!
+  totalCount: Int!
+}
+
+type ToolEdge { node: Tool!, cursor: String! }
+
+input ToolFilter {
+  toolId: String
+  classIn: [ToolClass!]
+  env: String
+  text: String
+}
+
+# Models / Providers
+
+type ModelProvider implements Node {
+  id: ID!
+  name: String!
+  baseUrl: URL
+  kind: String!                     # openai|azure_openai|anthropic|hf|ollama|vllm|custom
+  enabled: Boolean!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  labels: [Label!]!
+}
+
+type Model implements Node {
+  id: ID!
+  provider: ModelProvider!
+  modelId: String!
+  task: ModelTask!
+  vision: Boolean!
+  tools: Boolean!
+  maxInputTokens: BigInt
+  maxOutputTokens: BigInt
+  canary: Boolean!
+  preferred: Boolean!
+  metadata: JSON
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+enum ModelTask { CHAT EMBEDDINGS RERANK MODERATION OTHER }
+
+type ModelConnection {
+  edges: [ModelEdge!]!
+  pageInfo: PageInfo!
+  nodes: [Model!]!
+  totalCount: Int!
+}
+
+type ModelEdge { node: Model!, cursor: String! }
+
+input ModelFilter {
+  provider: ID
+  task: ModelTask
+  text: String
+  canary: Boolean
+  preferred: Boolean
+}
+
+# -----------------------------
+# Plan orchestration
+# -----------------------------
+enum PlanStatus { DRAFT RUNNING PAUSED SUCCEEDED FAILED CANCELLED }
+enum StepType { TOOL CODE HTTP CONTROL }
+enum StepStatus { PENDING QUEUED RUNNING SKIPPED RETRYING SUCCEEDED FAILED CANCELED }
+
+type Attachment {
+  id: String!
+  name: String
+  mimeType: String
+  sizeBytes: BigInt
+  uri: URL
+  sha256: String
+}
+
+type StepOutput {
+  text: String
+  structData: JSON
+  contentType: String
+  contentUri: URL
+  tokensInput: BigInt
+  tokensOutput: BigInt
+  costUsd: Float
+  attachments: [Attachment!]
+}
+
+type Step implements Node {
+  id: ID!
+  stepId: String!
+  name: String
+  type: StepType!
+  tool: String
+  inputs: JSON
+  parameters: [Parameter!]!
+  files: [FileRef!]
+  when: String                    # CEL
+  dependsOn: [String!]
+  timeout: Timeout
+  retry: RetryPolicy
+  labels: [Label!]
+  metadata: JSON
+  output: StepOutput
+  error: ProblemDetails
+  status: StepStatus!
+  attempt: Int!
+  concurrencyKey: String
+  cache: CachePolicy
+}
+
+type Parameter {
+  key: String!
+  type: ParamType
+  value: JSON
+  required: Boolean!
+  description: String
+}
+
+enum ParamType { STRING NUMBER BOOL OBJECT LIST }
+
+type FileRef { uri: URL!, name: String, mimeType: String, sizeBytes: BigInt, sha256: String }
+
+type Timeout { execution: Duration, queue: Duration }
+
+type RetryPolicy { maxAttempts: Int!, initialBackoff: Duration, multiplier: Float, maxBackoff: Duration, retryOn: [ErrorCode!] }
+
+type CachePolicy {
+  enabled: Boolean!
+  cacheInputs: Boolean!
+  cacheOutputs: Boolean!
+  ttl: Duration
+  strategy: String
+  cacheKeyFields: [String!]
+}
+
+type EdgeVO { from: String!, to: String!, condition: String } # CEL
+
+type Plan implements Node @auth(requires: [ADMIN, PLATFORM, MLE, ANALYST, USER]) {
+  id: ID!
+  name: String!                     # "plans/{plan}"
+  uid: UUID!
+  tenantId: String!
+  displayName: String
+  status: PlanStatus!
+  params: JSON
+  steps: [Step!]!
+  edges: [EdgeVO!]!
+  labels: [Label!]
+  budget: Budget
+  security: SecurityContext
+  trace: TraceContext
+  idempotencyKey: String
+  attachments: [Attachment!]
+  revision: Int!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  startTime: DateTime
+  endTime: DateTime
+  lastError: ProblemDetails
+}
+
+type PlanConnection {
+  edges: [PlanEdge!]!
+  pageInfo: PageInfo!
+  nodes: [Plan!]!
+  totalCount: Int!
+}
+
+type PlanEdge { node: Plan!, cursor: String! }
+
+input PlanFilter {
+  tenantId: String
+  statusIn: [PlanStatus!]
+  text: String
+  labelSelector: [LabelSelector!]
+  createdFrom: DateTime
+  createdTo: DateTime
+}
+
+input LabelSelector { key: String!, value: String, exists: Boolean = true }
+
+input PlanSort {
+  field: PlanSortField! = CREATED_AT
+  order: SortOrder! = DESC
+}
+
+enum PlanSortField { CREATED_AT UPDATED_AT STATUS DISPLAY_NAME }
+
+# -----------------------------
+# Events & subscriptions
+# -----------------------------
+enum EventType {
+  PLAN_STARTED
+  PLAN_UPDATED
+  PLAN_COMPLETED
+  STEP_STARTED
+  STEP_PROGRESS
+  STEP_COMPLETED
+  STEP_FAILED
+  LOG
+  HEARTBEAT
+}
+
+type PlanEvent {
+  planId: ID!
+  type: EventType!
+  stepId: String
+  stepStatus: StepStatus
+  delta: StepOutput
+  error: ProblemDetails
+  time: DateTime!
+  node: String
+  attributes: JSON
+}
+
+# -----------------------------
+# Queries
+# -----------------------------
+type Query {
+  me: User @auth(requires: [USER]) @cacheControl(maxAge: 5, scope: PRIVATE)
+
+  node(id: ID!): Node
+
+  plan(id: ID!): Plan @auth(requires: [READONLY, USER, ANALYST, MLE, PLATFORM, ADMIN])
+  plans(filter: PlanFilter, sort: PlanSort, paging: ConnectionArgs): PlanConnection
+    @auth(requires: [READONLY, USER, ANALYST, MLE, PLATFORM, ADMIN])
+    @cacheControl(maxAge: 5)
+
+  tool(id: ID!): Tool @auth(requires: [READONLY, USER, ANALYST, MLE, PLATFORM, ADMIN])
+  tools(filter: ToolFilter, paging: ConnectionArgs): ToolConnection
+    @auth(requires: [READONLY, USER, ANALYST, MLE, PLATFORM, ADMIN])
+    @cacheControl(maxAge: 60)
+
+  model(id: ID!): Model @auth(requires: [READONLY, USER, ANALYST, MLE, PLATFORM, ADMIN])
+  models(filter: ModelFilter, paging: ConnectionArgs): ModelConnection
+    @auth(requires: [READONLY, USER, ANALYST, MLE, PLATFORM, ADMIN])
+    @cacheControl(maxAge: 60)
+}
+
+type User implements Node {
+  id: ID!
+  email: Email!
+  displayName: String
+  tenantId: String!
+  roles: [Role!]!
+  createdAt: DateTime!
+}
+
+# -----------------------------
+# Mutations (uniform payloads)
+# -----------------------------
+
+# Generic payload shape with errors and correlation id
+interface Payload {
+  success: Boolean!
+  errors: [ProblemDetails!]
+  correlationId: String
+}
+
+# Plan mutations
+input CreatePlanInput {
+  clientMutationId: String
+  tenantId: String!
+  displayName: String
+  params: JSON
+  steps: [StepInput!]!
+  edges: [EdgeInput!]
+  labels: [LabelInput!]
+  budget: BudgetInput
+  security: SecurityContextInput
+  idempotencyKey: String
+}
+
+input StepInput {
+  stepId: String!
+  name: String
+  type: StepType!
+  tool: String
+  inputs: JSON
+  parameters: [ParameterInput!]
+  files: [FileRefInput!]
+  when: String
+  dependsOn: [String!]
+  timeout: TimeoutInput
+  retry: RetryPolicyInput
+  labels: [LabelInput!]
+  metadata: JSON
+  concurrencyKey: String
+  cache: CachePolicyInput
+}
+
+input ParameterInput {
+  key: String!
+  type: ParamType
+  value: JSON
+  required: Boolean = false
+  description: String
+}
+
+input FileRefInput { uri: URL!, name: String, mimeType: String, sizeBytes: BigInt, sha256: String }
+input TimeoutInput { execution: Duration, queue: Duration }
+input RetryPolicyInput { maxAttempts: Int = 0, initialBackoff: Duration, multiplier: Float, maxBackoff: Duration, retryOn: [ErrorCode!] }
+input CachePolicyInput {
+  enabled: Boolean = false
+  cacheInputs: Boolean = false
+  cacheOutputs: Boolean = false
+  ttl: Duration
+  strategy: String
+  cacheKeyFields: [String!]
+}
+input EdgeInput { from: String!, to: String!, condition: String }
+
+input BudgetInput { wallClock: Duration, maxTokens: BigInt, maxCostUsd: Float, maxSteps: Int }
+input DataPolicyInput { redactPII: Boolean = true, storeInputs: Boolean = false, storeOutputs: Boolean = false, allowLogging: Boolean = true, retention: String }
+input SecurityContextInput {
+  tenantId: String!
+  actorId: String
+  roles: [Role!]
+  allowExternalNetwork: Boolean = false
+  allowedDomains: [String!]
+  deniedDomains: [String!]
+  allowedTools: [String!]
+  deniedTools: [String!]
+  dataPolicy: DataPolicyInput
+}
+input LabelInput { key: String!, value: String }
+
+type CreatePlanPayload implements Payload {
+  success: Boolean!
+  errors: [ProblemDetails!]
+  correlationId: String
+  plan: Plan
+}
+
+input UpdatePlanInput {
+  clientMutationId: String
+  id: ID!
+  displayName: String
+  params: JSON
+  addLabels: [LabelInput!]
+  removeLabelKeys: [String!]
+  budget: BudgetInput
+  security: SecurityContextInput
+}
+
+type UpdatePlanPayload implements Payload {
+  success: Boolean!
+  errors: [ProblemDetails!]
+  correlationId: String
+  plan: Plan
+}
+
+input DeletePlanInput {
+  clientMutationId: String
+  id: ID!
+  force: Boolean = false
+}
+
+type DeletePlanPayload implements Payload {
+  success: Boolean!
+  errors: [ProblemDetails!]
+  correlationId: String
+  deletedId: ID
+}
+
+input ExecutePlanInput {
+  clientMutationId: String
+  id: ID!
+  overrideParams: JSON
+  overrideBudget: BudgetInput
+  overrideExecution: ExecutionPolicyInput
+  trace: TraceInput
+}
+
+input ExecutionPolicyInput {
+  maxParallel: Int = 0
+  failFast: Boolean = false
+  continueOnError: Boolean = false
+  concurrencyLimits: [ConcurrencyLimitInput!]
+  schedule: ScheduleInput
+}
+input ConcurrencyLimitInput { key: String!, limit: Int! }
+input ScheduleInput { enabled: Boolean = false, cron: String, notBefore: DateTime, notAfter: DateTime }
+input TraceInput { traceId: String, spanId: String, parentSpanId: String, baggage: JSON }
+
+type ExecutePlanPayload implements Payload {
+  success: Boolean!
+  errors: [ProblemDetails!]
+  correlationId: String
+  execution: PlanExecution
+}
+
+type PlanExecution implements Node {
+  id: ID!
+  plan: Plan!
+  status: PlanStatus!
+  startedAt: DateTime
+  endedAt: DateTime
+}
+
+input CancelPlanInput {
+  clientMutationId: String
+  id: ID!
+  reason: String
+}
+
+type CancelPlanPayload implements Payload {
+  success: Boolean!
+  errors: [ProblemDetails!]
+  correlationId: String
+  plan: Plan
+}
+
+# Tool/Model upserts (optional subset)
+input UpsertToolInput {
+  clientMutationId: String
+  toolId: String!
+  class: ToolClass! = STANDARD
+  title: String
+  description: String
+  envs: [String!] = ["dev","stage","prod"]
+  rbac: [ToolRoleRuleInput!]
+  mfaRequired: Boolean = false
+  legalAckRequired: Boolean = false
+  timeWindows: JSON
+  rateHint: String
+  labels: [LabelInput!]
+}
+input ToolRoleRuleInput { role: Role!, scopes: [String!]! }
+
+type UpsertToolPayload implements Payload {
+  success: Boolean!
+  errors: [ProblemDetails!]
+  correlationId: String
+  tool: Tool
+}
+
+input UpsertModelInput {
+  clientMutationId: String
+  providerId: ID!
+  modelId: String!
+  task: ModelTask!
+  vision: Boolean = false
+  tools: Boolean = false
+  maxInputTokens: BigInt
+  maxOutputTokens: BigInt
+  canary: Boolean = false
+  preferred: Boolean = false
+  metadata: JSON
+}
+
+type UpsertModelPayload implements Payload {
+  success: Boolean!
+  errors: [ProblemDetails!]
+  correlationId: String
+  model: Model
+}
+
+type Mutation {
+  createPlan(input: CreatePlanInput!): CreatePlanPayload
+    @auth(requires: [MLE, PLATFORM, ADMIN])
+    @rateLimit(window: "PT10S", max: 10)
+    @cost(value: 5)
+
+  updatePlan(input: UpdatePlanInput!): UpdatePlanPayload
+    @auth(requires: [MLE, PLATFORM, ADMIN])
+    @rateLimit(window: "PT10S", max: 20)
+
+  deletePlan(input: DeletePlanInput!): DeletePlanPayload
+    @auth(requires: [PLATFORM, ADMIN])
+    @rateLimit(window: "PT10S", max: 10)
+
+  executePlan(input: ExecutePlanInput!): ExecutePlanPayload
+    @auth(requires: [MLE, PLATFORM, ADMIN])
+    @rateLimit(window: "PT10S", max: 10)
+    @redact(patterns: [PII, SECRETS])
+
+  cancelPlan(input: CancelPlanInput!): CancelPlanPayload
+    @auth(requires: [MLE, PLATFORM, ADMIN])
+    @rateLimit(window: "PT10S", max: 20)
+
+  upsertTool(input: UpsertToolInput!): UpsertToolPayload
+    @auth(requires: [PLATFORM, ADMIN])
+
+  upsertModel(input: UpsertModelInput!): UpsertModelPayload
+    @auth(requires: [PLATFORM, ADMIN])
+}
+
+# -----------------------------
+# Subscriptions
+# -----------------------------
+type Subscription {
+  planEvents(planId: ID!): PlanEvent!
+    @auth(requires: [READONLY, USER, ANALYST, MLE, PLATFORM, ADMIN])
+    @rateLimit(window: "PT1S", max: 5)
+}

@@ -1,0 +1,163 @@
+version: "3.9"
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-healthcheck-default: &default-healthcheck
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 20s
+
+networks:
+  core_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  pg_data:
+  redis_data:
+  minio_data:
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: physical_pg
+    restart: always
+    environment:
+      POSTGRES_USER: veilmind
+      POSTGRES_PASSWORD: secure_password_change_me
+      POSTGRES_DB: physicaldb
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - core_net
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veilmind"]
+      <<: *default-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  redis:
+    image: redis:7-alpine
+    container_name: physical_redis
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - core_net
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *default-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512m
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-07-25T19-45-00Z
+    container_name: physical_minio
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: strongpasswordchange
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - core_net
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      <<: *default-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1g
+
+  api:
+    build:
+      context: ../../
+      dockerfile: ops/docker/Dockerfile.api
+    container_name: physical_api
+    restart: always
+    env_file:
+      - ../../.env
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    ports:
+      - "8080:8080"
+    networks:
+      - core_net
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      <<: *default-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  worker:
+    build:
+      context: ../../
+      dockerfile: ops/docker/Dockerfile.worker
+    container_name: physical_worker
+    restart: always
+    env_file:
+      - ../../.env
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - core_net
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1g
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: physical_prometheus
+    restart: always
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - core_net
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: physical_grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=supersecure
+    networks:
+      - core_net
+    logging: *default-logging

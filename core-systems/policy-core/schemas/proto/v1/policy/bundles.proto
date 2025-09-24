@@ -1,0 +1,264 @@
+syntax = "proto3";
+
+package policy.v1;
+
+option go_package       = "github.com/your-org/policy-core/gen/proto/policy/v1;policyv1";
+option java_multiple_files = true;
+option java_package     = "com.yourorg.policy.v1";
+option csharp_namespace = "YourOrg.Policy.V1";
+option php_namespace    = "YourOrg\\Policy\\V1";
+option ruby_package     = "YourOrg::Policy::V1";
+option optimize_for     = SPEED; // сбалансировано: SPEED для рантайма, CODE_SIZE для клиентов с ограничениями
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// ============================================================
+// Общие типы
+// ============================================================
+
+enum HashAlg {
+  HASH_ALG_UNSPECIFIED = 0;
+  HASH_ALG_SHA256      = 1;
+  HASH_ALG_SHA384      = 2;
+  HASH_ALG_SHA512      = 3;
+  HASH_ALG_BLAKE3      = 4;
+}
+
+message Digest {
+  HashAlg alg  = 1;                       // алгоритм хеширования
+  bytes   sum  = 2;                       // "сырые" байты дайджеста
+  string  hex  = 3;                       // опционально: hex-представление (удобно для текстовых логов)
+}
+
+enum CompressionAlg {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_NONE        = 1;
+  COMPRESSION_ZSTD        = 2;
+  COMPRESSION_GZIP        = 3;
+}
+
+message Compression {
+  CompressionAlg algorithm    = 1;        // алгоритм компрессии полезной нагрузки
+  uint32         level        = 2;        // уровень (если применимо)
+  uint64         original_size= 3;        // исходный размер до сжатия (байт)
+}
+
+enum EncryptionAlg {
+  ENCRYPTION_UNSPECIFIED = 0;
+  ENCRYPTION_NONE        = 1;
+  ENCRYPTION_AES_256_GCM = 2;
+  ENCRYPTION_CHACHA20_POLY1305 = 3;
+}
+
+message Encryption {
+  EncryptionAlg algorithm = 1;            // алгоритм шифрования
+  string        key_id    = 2;            // идентификатор ключа (KMS/HS/Asymmetric)
+  bytes         nonce     = 3;            // nonce/iv
+  bytes         aad       = 4;            // associated data (например, поля манифеста)
+  // Примечание: ключи/теги аутентичности не включаются в бандл; хранение вне полосы.
+}
+
+message LabelSet {
+  map<string, string> labels = 1;         // краткие метки (индексация)
+  map<string, string> annotations = 2;    // произвольные аннотации (неиспользуются в принятии решений)
+}
+
+// ============================================================
+// Модули и содержимое
+// ============================================================
+
+enum ModuleLanguage {
+  MODULE_LANG_UNSPECIFIED = 0;
+  MODULE_LANG_REGO        = 1;            // исходники Rego
+  MODULE_LANG_WASM        = 2;            // OPA Wasm Target
+  MODULE_LANG_CUE         = 3;            // опционально: CUE-описатели
+  MODULE_LANG_BLOB        = 4;            // произвольный бинарный блок
+}
+
+enum ModuleKind {
+  MODULE_KIND_UNSPECIFIED = 0;
+  MODULE_KIND_LIBRARY     = 1;            // библиотечный модуль
+  MODULE_KIND_POLICY      = 2;            // исполняемая политика
+  MODULE_KIND_TEST        = 3;            // тестовые артефакты
+}
+
+message BuildInfo {
+  string tool_name         = 1;           // например, "opa-build", "wasm-opt"
+  string tool_version      = 2;           // семвер
+  string vcs_revision      = 3;           // git SHA
+  string vcs_url           = 4;           // исходный репозиторий
+  google.protobuf.Timestamp built_at = 5; // время сборки
+  map<string, string> parameters = 6;     // флаги сборки/оптимизации
+}
+
+message Module {
+  string          id         = 1;         // стабильный ID (uuid/ulid) внутри бандла
+  string          name       = 2;         // человекочитаемое имя
+  string          path       = 3;         // логический путь (например, "policies/authz/main.rego" или "wasm/authz.wasm")
+  ModuleKind      kind       = 4;
+  ModuleLanguage  language   = 5;
+  string          version    = 6;         // семвер/даты (напр., "v1.2.3" или "2025.08.28")
+  Digest          content_digest = 7;     // дайджест несжатого содержимого
+  uint64          size_bytes = 8;         // размер несжатого содержимого (байт)
+  Compression     compression= 9;         // параметры компрессии
+  Encryption      encryption = 10;        // параметры шифрования (если применимо)
+  LabelSet        meta       = 11;        // метки/аннотации
+  BuildInfo       build_info = 12;        // информация о сборке/инструментах
+  repeated string requires   = 13;        // список module.id, от которых зависим (DAG)
+  // Полезная нагрузка:
+  oneof payload {
+    bytes rego_source   = 100;            // UTF-8 текст Rego (в bytes для универсальности)
+    bytes wasm_module   = 101;            // бинарный модуль Wasm
+    bytes blob          = 102;            // произвольный бинарный блок
+  }
+
+  // Зарезервировано под будущие поля
+  reserved 103 to 119;
+}
+
+// ============================================================
+// Манифест бандла: точки входа, зависимости, ссылки на внешние артефакты
+// ============================================================
+
+message Entrypoint {
+  string ref      = 1;                    // e.g., "data.policy.authz.allow"
+  string module_id= 2;                    // Module.id, реализующий entrypoint (для регистрируемых хук-точек)
+  map<string,string> attributes = 3;      // произвольные доп. атрибуты (например, "kind"="decision")
+}
+
+message DependencyEdge {
+  string from_module_id = 1;              // источник
+  string to_module_id   = 2;              // зависимость
+  string scope          = 3;              // compile/runtime/test
+}
+
+message SBOMReference {
+  string  format = 1;                     // spdx-json|cyclonedx-json|cyclonedx-xml
+  string  uri    = 2;                     // ссылка на внешний SBOM (OCI/URL)
+  Digest  digest = 3;                     // контрольная сумма SBOM
+}
+
+message ExternalArtifact {
+  string  name   = 1;                     // имя артефакта
+  string  media_type = 2;                 // MIME, например "application/wasm"
+  string  uri    = 3;                     // ссылка (oci://, https://, s3://)
+  Digest  digest = 4;                     // дайджест содержимого
+  uint64  size_bytes = 5;                 // размер содержимого
+}
+
+message Manifest {
+  string  bundle_schema   = 1;            // ожидаемая схема бандла, напр. "policy-core.bundle/v1"
+  string  bundle_version  = 2;            // версия контента (семвер/semver+meta)
+  string  bundle_id       = 3;            // стабильный ID (uuid/ulid)
+  string  description     = 4;
+  string  license         = 5;            // SPDX identifier, напр. "Apache-2.0"
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp modified_at= 7;
+  string  source_repo     = 8;            // VCS URL
+  string  source_revision = 9;            // git SHA/tag
+  LabelSet labels         = 10;
+
+  // Внутренние ссылки
+  repeated Entrypoint      entrypoints   = 20;
+  repeated DependencyEdge  dependencies  = 21;
+  repeated SBOMReference   sboms         = 22;
+  repeated ExternalArtifact externals    = 23;
+
+  // Совместимость/требования рантайма (минимальные версии)
+  map<string,string> runtime_requires    = 30; // e.g., {"opa.wasm.min":"0.57.0"}
+}
+
+// ============================================================
+// Подписи и аттестации
+// ============================================================
+
+enum SignatureAlg {
+  SIGN_ALG_UNSPECIFIED = 0;
+  SIGN_ALG_RSA_PSS_SHA256 = 1;
+  SIGN_ALG_ECDSA_P256_SHA256 = 2;
+  SIGN_ALG_ED25519          = 3;
+}
+
+message Signature {
+  SignatureAlg algorithm = 1;
+  bytes        signature = 2;             // подпись над CanonicalBundle (см. ниже)
+  string       key_id    = 3;             // идентификатор ключа/сертификата
+  string       cert_chain_pem = 4;        // опционально: цепочка X.509 (PEM)
+}
+
+message DSSEEnvelope {
+  string payload_type = 1;                // тип полезной нагрузки DSSE (например, "application/vnd.in-toto+json")
+  bytes  payload      = 2;                // сериализованный CanonicalBundle/statement
+  repeated Signature signatures = 3;
+}
+
+message SLSAAttestation {
+  // Сводная форма In-Toto/SLSA v1 statement (см. официальную спецификацию; поля здесь сведены)
+  string build_type  = 1;                 // SLSA buildType
+  map<string,string> builder = 2;         // id/name
+  map<string,string> invocation = 3;      // параметры/окружение
+  google.protobuf.Timestamp build_started = 4;
+  google.protobuf.Timestamp build_finished= 5;
+  repeated ExternalArtifact materials = 6;// входные материалы (репозитории/артефакты)
+  DSSEEnvelope envelope = 10;             // сырое DSSE-обёрнутое заявление
+}
+
+message SignatureBlock {
+  // Подписи бандла на уровне манифеста + контента (каноническое представление)
+  repeated Signature signatures   = 1;
+  DSSEEnvelope      dsse_envelope = 2;    // опционально: DSSE поверх канонического бандла
+  repeated string   policy_refs   = 3;    // ссылки на политики верификации (OID/URI)
+}
+
+// ============================================================
+// Основной бандл
+// ============================================================
+
+message Bundle {
+  Manifest manifest    = 1;               // описание бандла
+  // Модули. Сами модули могут быть сжаты/зашифрованы согласно полям Module.
+  repeated Module modules = 2;
+
+  // Дополнительные бинарные артефакты, связанные с бандлом (по дайджест-ключу)
+  map<string, bytes> artifacts = 3;
+
+  // Целостность/подлинность
+  SignatureBlock signatures = 10;
+  SLSAAttestation attestation = 11;
+
+  // Каноническое представление для подписи: сериализованный Manifest + метаданные Module без payload.
+  // Реальное каноническое представление определяется реализацией и спецификацией "policy-core.bundle/v1".
+  bytes canonical_manifest = 50;
+
+  // Совместимость: резерв на будущее
+  reserved 100 to 119;
+}
+
+// ============================================================
+// Вспомогательные сообщения для обмена/частичных обновлений
+// ============================================================
+
+message ModuleRef {
+  string module_id = 1;
+  Digest digest    = 2;
+}
+
+message BundleDelta {
+  string bundle_id = 1;
+  repeated Module  add_modules    = 2;    // добавить/заменить модули
+  repeated ModuleRef remove_modules = 3;  // удалить по ссылкам
+  google.protobuf.Timestamp issued_at = 4;
+  string reason = 5;                       // причина дельты (security fix, rollout, etc.)
+}
+
+// ============================================================
+// Совместимость/ограничения
+// ============================================================
+// - Все текстовые поля UTF-8.
+// - Полезные нагрузки (rego_source/wasm/blob) могут быть сжаты/зашифрованы; в таком случае
+//   размер/дайджест относятся к несжатому/расшифрованному содержимому.
+// - Для подписи рекомендуется канонизация через детерминированную сериализацию (например, JSON-каноникализация
+//   Manifest + Module без payload) либо DSSE поверх In-Toto Statement.
+// - Рекомендуется валидация DAG зависимостей (acyclic), уникальность module.id, согласованность content_digest.

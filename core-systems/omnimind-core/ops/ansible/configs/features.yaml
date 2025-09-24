@@ -1,0 +1,320 @@
+# omnimind-core/ops/ansible/configs/features.yaml
+# Промышленная конфигурация фич-флагов, экспериментов и динамических параметров.
+# Валидируйте в CI против JSON Schema по ссылке ниже и проверяйте истекающие флаги.
+
+$schema: "https://omnimind-core.local/schemas/features.schema.json"
+schema_version: 1
+generated_at: "2025-08-18T00:00:00Z"
+
+metadata:
+  owner: "platform/feature-delivery"
+  contacts:
+    - "oncall:platform"
+    - "slack:#omnimind-platform"
+  change_control:
+    require_ticket: true
+    require_approval: true
+    approvers:
+      - "cto@omnimind.local"
+      - "head.of.platform@omnimind.local"
+
+defaults:
+  # Глобальные дефолты применяются перед env/tenant/service overrides
+  stickiness:
+    # Ключи для детерминированного распределения (кто увидит фичу при % rollout)
+    keys: ["user_id", "session_id", "device_id"]
+    hash: "sha256"
+  kill_switch:
+    # Один ударный выключатель для всего продукта на случай инцидента
+    enabled: false
+    reason: ""
+  rate_limits:
+    # Глобальные дефолтные ограничения (могут быть переопределены ниже)
+    # Пример формата: "<N>r/<window>"
+    request: "5000r/1m"
+    write: "1000r/1m"
+    burst: 1000
+  schedules:
+    # Дефолтные окна «тихого периода» для релизов (UTC)
+    change_freeze:
+      enabled: false
+      windows: []  # e.g. ["2025-12-24T00:00:00Z..2025-12-27T23:59:59Z"]
+
+environments:
+  # Жестко фиксируем различия между средами
+  prod:
+    change_freeze_inherit: true
+    error_budget_guardrails:
+      enabled: true
+      # Авто-откат фич при превышении SLO ошибок 5xx/таймаутов
+      rollback_on_error_rate:
+        http_5xx_threshold: 0.5  # %
+        latency_p99_ms_threshold: 1500
+  stage:
+    error_budget_guardrails:
+      enabled: false
+  dev:
+    error_budget_guardrails:
+      enabled: false
+
+segments:
+  # Предопределенные аудитории для таргетинга
+  beta_testers:
+    match:
+      any:
+        - in_list: { key: "user_email", list: ["admin@omnimind.local", "qa@omnimind.local"] }
+        - in_list: { key: "tenant", list: ["internal", "sandbox"] }
+  high_value_tenants:
+    match:
+      all:
+        - gte: { key: "tenant_plan_mrr_usd", value: 10000 }
+        - equals: { key: "region", value: "eu" }
+
+services:
+  # Пер-сервисные настройки по умолчанию
+  api:
+    rate_limits:
+      request: "2000r/1m"
+      write: "300r/1m"
+      burst: 500
+  worker:
+    rate_limits:
+      request: "5000r/1m"
+      write: "2000r/1m"
+      burst: 2000
+
+tenants:
+  # Пример явного переопределения для конкретных арендаторов
+  default:
+    overrides: {}
+  acme-inc:
+    overrides:
+      services:
+        api:
+          rate_limits:
+            request: "4000r/1m"
+      features:
+        realtime_collab:
+          enabled: true
+          variants:
+            control: 0
+            v2: 100
+  internal:
+    overrides:
+      features:
+        experimental_llm:
+          enabled: true
+          rollout:
+            percentage: 100
+
+features:
+  # ===== Пример 1: обычный feature-flag с постепенной раскаткой =====
+  realtime_collab:
+    description: "Совместное редактирование в реальном времени"
+    owners: ["team/collab"]
+    tags: ["api", "editor", "realtime"]
+    expires_at: "2026-01-31T23:59:59Z"   # требование удалить или продлить
+    enabled: false                       # дефолт
+    dependencies: []                     # список флагов, которые должны быть включены
+    conflicts: ["legacy_sync"]           # несовместимые флаги
+    rollout:
+      # Постепенная раскатка: сначала 5%, затем 25%, затем 50% и т.д.
+      strategy: "progressive"
+      percentage: 0                      # текущий процент
+      step_plan:
+        - { at: "2025-09-01T09:00:00Z", percentage: 5 }
+        - { at: "2025-09-03T09:00:00Z", percentage: 25 }
+        - { at: "2025-09-05T09:00:00Z", percentage: 50 }
+        - { at: "2025-09-10T09:00:00Z", percentage: 100 }
+      stickiness_key: "user_id"          # приоритетный ключ
+    targeting:
+      include_segments: ["beta_testers"]
+      exclude_segments: []
+      rules:
+        # CEL-подобные предикаты (на стороне рантайма валидируйте)
+        - when: 'region == "eu" && plan in ["pro","enterprise"]'
+          action: "enable"
+        - when: 'request_path.startsWith("/v2/")'
+          action: "enable"
+    limits:
+      rate:
+        request: "1000r/1m"
+        burst: 200
+      quotas:
+        daily_ops_per_user: 10000
+    schedule:
+      windows: []  # можно включать только в рабочие часы, если требуется
+    kill_switch:
+      enabled: false
+      auto_on_conditions:
+        - metric: "http_5xx_rate"
+          operator: ">"
+          threshold: 1.0   # %
+          for: "5m"
+        - metric: "latency_p99_ms"
+          operator: ">"
+          threshold: 2000
+          for: "10m"
+
+  # ===== Пример 2: эксперимент A/B/n с весами и пейлоадами =====
+  checkout_flow_v2:
+    description: "Эксперимент по новому чекауту"
+    owners: ["team/growth"]
+    tags: ["api", "frontend", "ab-test"]
+    enabled: true
+    type: "experiment"
+    sampling:
+      population: 50           # % пользователей, включаемых в эксперимент
+      stickiness_key: "user_id"
+      namespace: "checkout:v2" # изолированный неймспейс для хэша
+    variants:
+      control:
+        weight: 50
+        payload: { version: "v1", ui: "legacy" }
+      variant_a:
+        weight: 30
+        payload: { version: "v2", ui: "new", upsell: true }
+      variant_b:
+        weight: 20
+        payload: { version: "v2", ui: "new-minimal", upsell: false }
+    metrics:
+      primary: ["conv_rate"]
+      guardrails: ["http_5xx_rate", "latency_p95_ms"]
+    stops:
+      auto_stop:
+        # Останавливаем эксперимент при ухудшении метрик
+        guardrail_thresholds:
+          http_5xx_rate: { operator: ">", threshold: 1.0, for: "10m" }
+          latency_p95_ms: { operator: ">", threshold: 1200, for: "10m" }
+        min_samples: 10000
+        horizon: "14d"
+
+  # ===== Пример 3: флаг-«предохранитель» для отключения ресурсоемкой фичи =====
+  expensive_llm_feature:
+    description: "Фича с высокой стоимостью токенов (LLM)"
+    owners: ["team/ai-platform"]
+    tags: ["ai", "costly"]
+    enabled: true
+    limits:
+      spend:
+        # Сквозной бюджет в условных кредитах на окружение/сутки
+        daily_budget_credits: 1_000_000
+        per_user_daily_credits: 10_000
+      rate:
+        request: "200r/1m"
+        burst: 50
+    kill_switch:
+      enabled: false
+      manual_only: true     # отключается вручную по сигналу FinOps/SRE
+    targeting:
+      exclude_segments: ["high_value_tenants"] # пример обратного таргетинга
+    dependencies:
+      - "realtime_collab"  # включается только вместе
+
+  # ===== Пример 4: конфигурационный параметр без UI-флага =====
+  http_timeouts:
+    description: "Таймауты HTTP-клиентов"
+    owners: ["team/platform"]
+    enabled: true
+    config:
+      # dynamic config (поставляется сервисам через конфиг-сервис)
+      connect_timeout_ms: 300
+      read_timeout_ms: 2000
+      write_timeout_ms: 2000
+    rollout:
+      strategy: "instant"
+    schedule:
+      windows: []
+
+overrides:
+  # Явные переопределения по окружениям/сервисам/тенантам
+  by_environment:
+    prod:
+      features:
+        realtime_collab:
+          rollout:
+            percentage: 0
+        expensive_llm_feature:
+          limits:
+            rate:
+              request: "120r/1m"
+              burst: 30
+    stage:
+      features:
+        realtime_collab:
+          rollout:
+            percentage: 50
+    dev:
+      features:
+        realtime_collab:
+          enabled: true
+          rollout:
+            percentage: 100
+
+  by_service:
+    api:
+      features:
+        http_timeouts:
+          config:
+            read_timeout_ms: 1500
+    worker:
+      features:
+        http_timeouts:
+          config:
+            read_timeout_ms: 2500
+
+  by_tenant:
+    acme-inc:
+      features:
+        expensive_llm_feature:
+          limits:
+            spend:
+              per_user_daily_credits: 20000
+    internal:
+      features:
+        checkout_flow_v2:
+          sampling:
+            population: 100
+
+validation:
+  # Статическая валидация, которую должен применять CI перед мёрджем
+  rules:
+    - name: "expires_at_must_be_in_future"
+      type: "datetime"
+      path: "$.features.*.expires_at"
+      operator: ">"
+      value: "now"
+    - name: "no_conflicts_enabled_simultaneously"
+      type: "conflicts"
+      path: "$.features.*"
+    - name: "weights_sum_100_for_experiments"
+      type: "sum"
+      path: "$.features.*.variants.*.weight"
+      equals: 100
+    - name: "guardrails_requirements"
+      type: "presence"
+      when: "$.features.*.type == 'experiment'"
+      required:
+        - "$.features.*.metrics.guardrails"
+
+audit:
+  last_change:
+    author: "deploy-bot"
+    ticket: "OP-1234"
+    approved_by: ["cto@omnimind.local"]
+    at: "2025-08-18T00:00:00Z"
+  history:
+    - { at: "2025-08-10T10:00:00Z", author: "j.doe", change: "init features.yaml", ticket: "OP-1000" }
+
+telemetry:
+  # Канал оповещения рантайма об изменениях (long-poll/stream)
+  update_channel:
+    type: "sse"     # sse | grpc | polling
+    endpoint: "https://config.omnimind.local/v1/stream"
+    polling_interval_sec: 30
+  metrics_mapping:
+    # Единое соглашение об именах метрик для guardrails/stops
+    http_5xx_rate: "http_server_errors_ratio"
+    latency_p95_ms: "http_server_duration_p95_ms"
+    latency_p99_ms: "http_server_duration_p99_ms"
+    conv_rate: "checkout_conversion_ratio"

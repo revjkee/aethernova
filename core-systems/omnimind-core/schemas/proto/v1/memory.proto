@@ -1,0 +1,452 @@
+// path: omnimind-core/schemas/proto/v1/memory.proto
+syntax = "proto3";
+
+package omnimind.v1;
+
+option go_package        = "github.com/aethernova/omnimind-core/gen/go/omnimind/v1;omnimindv1";
+option java_multiple_files = true;
+option java_package      = "com.aethernova.omnimind.v1";
+option java_outer_classname = "MemoryProto";
+option csharp_namespace  = "Aethernova.Omnimind.V1";
+option ruby_package      = "Aethernova::Omnimind::V1";
+option objc_class_prefix = "OMN";
+option php_namespace     = "Aethernova\\Omnimind\\V1";
+
+// Well-known types
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+import "google/rpc/status.proto";
+
+// =============================
+// Core domain
+// =============================
+
+message Memory {
+  // Уникальный идентификатор памяти (UUID v4 в строковом представлении).
+  string id = 1;
+
+  // Идемпотентный ключ для upsert (если задан, повторные upsert будут безопасны).
+  string idempotency_key = 2;
+
+  // Пространство (tenant/project) и владелец.
+  string namespace = 3;    // напр. "prod"
+  string owner_id = 4;     // субъект (user/service/principal)
+
+  // Семантическая типизация памяти (например: "note", "contact", "conversation", "document").
+  string kind = 5;
+
+  // Высокоуровневое содержимое. Только один вариант активен.
+  oneof content {
+    string text = 10;                       // Нормализованный текст.
+    bytes blob = 11;                        // Бинарные данные (до лимита; крупные — по ссылке в Source).
+    google.protobuf.Struct structured = 12; // Свободно-типизированный объект.
+  }
+
+  // Разбиение на части для индексации/поиска (опционально).
+  repeated Chunk chunks = 20;
+
+  // Происхождение (источники), цепочка поставок данных.
+  repeated SourceRef sources = 30;
+
+  // Метаданные (инвариантные/индексируемые).
+  MemoryMetadata metadata = 40;
+
+  // Контроль доступа.
+  AccessControl acl = 50;
+
+  // Политика хранения/удаления.
+  RetentionPolicy retention = 60;
+
+  // Служебные поля.
+  Lifecycle lifecycle = 90;
+
+  // Зарезервировано для будущих полей.
+  reserved 100 to 119;
+}
+
+message Chunk {
+  // Устойчивый локальный id чанка (stable across reindex).
+  string id = 1;
+
+  // Позиция в документе/памяти.
+  uint32 index = 2;
+
+  // Текст чанка (нормализованный).
+  string text = 3;
+
+  // Векторные эмбеддинги (несколько пространств/моделей).
+  repeated Embedding embeddings = 4;
+
+  // Хеш для дедупликации (напр. SHA-256 в hex).
+  string content_hash = 5;
+
+  // Пользовательские метки и ключ-значение.
+  map<string, string> tags = 6;
+
+  // Зарезервировано.
+  reserved 10 to 19;
+}
+
+message Embedding {
+  // Идентификатор пространства/модели эмбеддинга (например, "text-embedding-3-large").
+  string space = 1;
+
+  // Размерность вектора (для валидации).
+  uint32 dim = 2;
+
+  // Сам вектор.
+  repeated float vector = 3;
+
+  // Нормализация/версия препроцессинга.
+  string preprocessing = 4;
+
+  // Шкала/норма (косинус, L2 и т.п.) — для подсказки ранжирования.
+  Similarity similarity = 5;
+
+  enum Similarity {
+    SIMILARITY_UNSPECIFIED = 0;
+    COSINE = 1;
+    DOT = 2;
+    EUCLIDEAN = 3;
+  }
+
+  // Таймстемп генерации.
+  google.protobuf.Timestamp created_at = 10;
+}
+
+message SourceRef {
+  // Тип источника (URL, S3, GCS, Git, Email, Chat, DB и т.п.).
+  string kind = 1;
+
+  // Локатор (URI/URL/ARN/DSN/issue-id).
+  string locator = 2;
+
+  // Хеш содержимого источника (если применимо).
+  string content_hash = 3;
+
+  // Атрибуты источника (например, commit sha, branch, message-id).
+  map<string, string> attributes = 4;
+
+  // Автор/поставщик.
+  string author = 5;
+
+  // Метки классификации/чувствительности.
+  repeated string labels = 6;
+
+  // Временные печати.
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message MemoryMetadata {
+  // Произвольные индексируемые поля (key/value) — для фильтров.
+  map<string, string> attributes = 1;
+
+  // Гео/локаль/язык.
+  string locale = 2;
+  string language = 3;
+
+  // Версионность пользовательских данных.
+  string user_version = 4;
+
+  // Размеры.
+  uint64 approx_tokens = 10;
+  uint64 approx_bytes = 11;
+
+  // Корреляционные id (trace/span/request/user session).
+  map<string, string> correlations = 20;
+
+  // Классификация содержания.
+  repeated string classifications = 30;
+}
+
+message AccessControl {
+  // Простая ACL-модель: владелец + группы + публичность.
+  bool is_public = 1;
+
+  // Белый список субъектов (ARN/UUID/Principal).
+  repeated string allow = 2;
+
+  // Черный список субъектов.
+  repeated string deny = 3;
+
+  // Политики на уровне полей (маскирование/редакция).
+  map<string, FieldPolicy> field_policies = 4;
+
+  message FieldPolicy {
+    // Маскирование значения при выдаче.
+    bool redact = 1;
+    // Список ролей/субъектов, кому показывать оригинал.
+    repeated string reveal_to = 2;
+  }
+}
+
+message RetentionPolicy {
+  // Мягкое удаление после TTL (soft delete).
+  google.protobuf.Duration ttl = 1;
+
+  // Жесткое удаление (hard) после доп. периода после soft.
+  google.protobuf.Duration hard_delete_after = 2;
+
+  // Иммутабельность (WORM-период).
+  google.protobuf.Duration write_protect = 3;
+
+  // Маркеры блокировок (legal hold).
+  bool legal_hold = 4;
+}
+
+message Lifecycle {
+  // Ревизия (версия записи, инкрементируется при изменениях).
+  uint64 revision = 1;
+
+  // Временные печати.
+  google.protobuf.Timestamp created_at = 2;
+  google.protobuf.Timestamp updated_at = 3;
+  google.protobuf.Timestamp soft_deleted_at = 4;
+
+  // Состояние.
+  State state = 5;
+
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    ACTIVE = 1;
+    SOFT_DELETED = 2;
+    ARCHIVED = 3;
+  }
+}
+
+// =============================
+// Requests / Responses
+// =============================
+
+message UpsertMemoryRequest {
+  // Полная или частичная сущность Memory.
+  Memory memory = 1;
+
+  // Если true — патч только указанных полей (partial update).
+  bool partial_update = 2;
+
+  // Принудительно регенерировать эмбеддинги (иначе — только при изменении текста).
+  bool force_reembed = 3;
+
+  // Вычислить чанки на сервере по стратегииям (если chunks не переданы).
+  ChunkingStrategy chunking = 4;
+
+  // Идемпотентный ключ на уровне запроса (перекроет memory.idempotency_key).
+  string idempotency_key = 5;
+
+  // Токен консистентности (для CAS/optimistic locking по revision).
+  google.protobuf.UInt64Value expected_revision = 6;
+
+  // Запрашиваемые представления в ответе.
+  ResponseView view = 7;
+
+  message ChunkingStrategy {
+    enum Mode {
+      MODE_UNSPECIFIED = 0;
+      BY_TOKENS = 1;
+      BY_SENTENCES = 2;
+      BY_SEMANTIC = 3;
+    }
+    Mode mode = 1;
+    uint32 max_tokens = 2;
+    uint32 overlap_tokens = 3;
+  }
+}
+
+message UpsertMemoryResponse {
+  Memory memory = 1;
+  bool created = 2;
+}
+
+message GetMemoryRequest {
+  string id = 1;
+  ResponseView view = 2;
+  // Включать soft-deleted записи.
+  bool include_soft_deleted = 3;
+}
+
+message GetMemoryResponse {
+  Memory memory = 1;
+}
+
+message DeleteMemoryRequest {
+  string id = 1;
+  // Мягкое удаление (по умолчанию true).
+  google.protobuf.BoolValue soft = 2;
+  // Жесткое удаление (требует soft=false или ранее soft-deleted).
+  google.protobuf.BoolValue hard = 3;
+  // Каскадно удалять чанки/индексы.
+  bool cascade = 4;
+}
+
+message DeleteMemoryResponse {
+  // Итоговое состояние записи.
+  Lifecycle.State state = 1;
+}
+
+message ListMemoriesRequest {
+  string namespace = 1;
+  string owner_id = 2;
+  // Фильтры по kind, labels, attributes.
+  repeated string kinds = 3;
+  map<string, string> attribute_equals = 4;
+
+  // Пагинация.
+  uint32 page_size = 10;
+  string page_token = 11;
+
+  // Сортировка (поле и порядок).
+  string order_by = 12;   // e.g. "updated_at desc"
+  ResponseView view = 13;
+
+  // Фильтрация по состоянию.
+  repeated Lifecycle.State states = 14;
+}
+
+message ListMemoriesResponse {
+  repeated Memory memories = 1;
+  string next_page_token = 2;
+}
+
+message QueryMemoryRequest {
+  // Текстовый запрос (BM25/FTS).
+  string text_query = 1;
+
+  // Векторный запрос (один из пространств).
+  oneof vector_query {
+    Embedding embed = 2;
+    // Альтернатива: сервер сам вычислит embed по тексту (если модель настроена).
+    string text_for_embedding = 3;
+  }
+
+  // Ограничение по пространству эмбеддинга при ранжировании.
+  string embedding_space = 4;
+
+  // Фильтры и контекст.
+  string namespace = 10;
+  string owner_id = 11;
+  repeated string kinds = 12;
+  map<string, string> attribute_equals = 13;
+  repeated string must_have_labels = 14;
+  repeated string must_not_have_labels = 15;
+
+  // Режим смешанной релевантности.
+  Scoring scoring = 20;
+  uint32 top_k = 21;
+
+  // Пагинация/страница для гибридных запросов.
+  uint32 page_size = 22;
+  string page_token = 23;
+
+  ResponseView view = 30;
+
+  message Scoring {
+    // [0..1] вес векторного скора vs текстового.
+    float vector_weight = 1;
+    float text_weight = 2;
+    // Нормализация и агрегация.
+    enum Aggregate {
+      AGGREGATE_UNSPECIFIED = 0;
+      SUM = 1;
+      MAX = 2;
+      MEAN = 3;
+    }
+    Aggregate aggregate = 3;
+  }
+}
+
+message QueryMemoryResponse {
+  repeated SearchHit hits = 1;
+  string next_page_token = 2;
+}
+
+message SearchHit {
+  Memory memory = 1;           // Может быть урезан по view.
+  float score = 2;             // Итоговый агрегированный скор.
+  float vector_score = 3;      // Компонента векторной релевантности.
+  float text_score = 4;        // Компонента текстовой релевантности.
+  // Фрагменты подсветки/сниппеты по чанкам.
+  repeated Snippet snippets = 5;
+
+  message Snippet {
+    string chunk_id = 1;
+    string text = 2;
+    // Позиции совпадений (смещения по символам).
+    repeated Match matches = 3;
+  }
+  message Match {
+    uint32 start = 1;
+    uint32 end = 2;
+    string term = 3;
+  }
+}
+
+message BatchUpsertMemoriesRequest {
+  repeated UpsertMemoryRequest requests = 1;
+}
+
+message BatchUpsertMemoriesResponse {
+  repeated UpsertMemoryResponse results = 1;
+  // Общий статус партии.
+  google.rpc.Status status = 2;
+}
+
+message BatchDeleteMemoriesRequest {
+  repeated DeleteMemoryRequest requests = 1;
+}
+
+message BatchDeleteMemoriesResponse {
+  repeated DeleteMemoryResponse results = 1;
+  google.rpc.Status status = 2;
+}
+
+// Какие поля возвращать в ответах (для снижения нагрузки на сеть/CPU).
+enum ResponseView {
+  RESPONSE_VIEW_UNSPECIFIED = 0;
+  // Только заголовки/метаданные (без content и chunks).
+  HEADERS = 1;
+  // Без эмбеддингов (text + метаданные + chunks без vector).
+  BASIC = 2;
+  // Полный объект (включая embeddings).
+  FULL = 3;
+}
+
+// =============================
+// Service
+// =============================
+
+service MemoryService {
+  // Идемпотентный upsert памяти.
+  rpc UpsertMemory(UpsertMemoryRequest) returns (UpsertMemoryResponse);
+
+  // Пакетный upsert.
+  rpc BatchUpsertMemories(BatchUpsertMemoriesRequest) returns (BatchUpsertMemoriesResponse);
+
+  // Получение по id.
+  rpc GetMemory(GetMemoryRequest) returns (GetMemoryResponse);
+
+  // Листинг с фильтрами и пагинацией.
+  rpc ListMemories(ListMemoriesRequest) returns (ListMemoriesResponse);
+
+  // Удаление (soft/hard).
+  rpc DeleteMemory(DeleteMemoryRequest) returns (DeleteMemoryResponse);
+
+  // Поиск (гибридный).
+  rpc QueryMemory(QueryMemoryRequest) returns (QueryMemoryResponse);
+
+  // Серверный стриминг хитов для больших выборок/длинных поисков.
+  rpc StreamQueryMemory(QueryMemoryRequest) returns (stream SearchHit);
+}
+
+// =============================
+// Notes / Conventions
+// =============================
+// - Все time поля — UTC.
+// - UUID — строка в формате RFC4122 (v4).
+// - Атрибуты metadata.attributes должны быть нормализованы к snake_case.
+// - Для приватных полей используйте ACL.field_policies.
+// - Пагинация page_token — непрозрачная строка, выданная сервером.
+// - Рекомендуется лимит размера сообщения на уровне сервера и нарезка больших blob через SourceRef.

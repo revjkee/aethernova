@@ -1,0 +1,500 @@
+# Industrial-grade sample for chronowatch-core
+schema_version: 1.0.0
+generated_at: "2025-08-29T07:00:00Z"
+description: >
+  Canonical schedules configuration for chronowatch-core:
+  on-call rotations, maintenance, release freezes, blackout periods,
+  environment-specific overrides, SLA windows, and escalation policies.
+
+metadata:
+  owner_team: "platform-ops"
+  reviewers: ["sre-lead@company.com", "release-manager@company.com"]
+  change_control:
+    requires_approval: true
+    approvers:
+      - "sre-duty"
+      - "release-cab"
+    audit_tag: "chronowatch:v1"
+
+defaults:
+  timezone: "Europe/Stockholm"
+  locale: "en_US"
+  calendar_engine: "ical_rrule"   # supported: ical_rrule, cron, quartz
+  observability:
+    emit_metrics: true
+    emit_audit: true
+    trace_context: "w3c"
+  notifications:
+    throttle_seconds: 30
+    deduplicate_by: ["schedule_id", "event_type", "start_time"]
+  rbac:
+    roles:
+      - id: "sre-duty"
+        can: ["override.schedule", "silence.alerts", "start.maintenance", "stop.maintenance"]
+      - id: "release-cab"
+        can: ["approve.change", "create.freeze", "lift.freeze"]
+      - id: "sec-ops"
+        can: ["declare.blackout", "lift.blackout"]
+      - id: "owner"
+        can: ["create.schedule", "update.schedule", "delete.schedule"]
+
+anchors:
+  # Notification channels reusable across schedules
+  contact_channels: &contact_channels
+    email:
+      primary: "noc@company.com"
+      secondary: "sre@company.com"
+    chatops:
+      slack_channels: ["#incidents", "#deployments"]
+      ms_teams: []
+    voice:
+      primary: "+46-8-1234-0001"
+      fallback: "+46-8-1234-0002"
+    pager:
+      vendor: "pagerduty"
+      service_id: "PXXXXXXX"
+    webhooks:
+      - name: "soar-ingest"
+        url: "https://soar.company.com/hooks/chronowatch"
+        method: "POST"
+        timeout_ms: 4000
+        retries: 3
+
+  escalation_policies: &escalation_policies
+    standard:
+      steps:
+        - after: "0m"
+          to: ["pager", "chatops"]
+        - after: "15m"
+          to: ["voice", "email"]
+        - after: "30m"
+          to: ["voice", "email", "chatops"]
+          notify_roles: ["sre-lead", "owner"]
+    security:
+      steps:
+        - after: "0m"
+          to: ["pager", "chatops"]
+        - after: "10m"
+          to: ["voice", "email"]
+        - after: "20m"
+          to: ["voice", "email", "chatops"]
+          notify_roles: ["sec-ops", "owner"]
+    release_blocker:
+      steps:
+        - after: "0m"
+          to: ["chatops", "email"]
+        - after: "10m"
+          to: ["voice"]
+          notify_roles: ["release-cab", "sre-lead"]
+
+  holidays_eu_se: &holidays_eu_se
+    # canonical external calendar of Swedish public holidays
+    kind: "ics"
+    source: "https://cal.company.com/holidays/sweden.ics"
+    respect: true
+    # optional static exceptions if ICS unavailable
+    static:
+      - "2025-12-24"
+      - "2025-12-25"
+      - "2025-12-26"
+      - "2026-01-01"
+
+calendars:
+  timezones:
+    # authoritative map for services that need TZ resolution
+    default: "Europe/Stockholm"
+    backups:
+      - "UTC"
+      - "Europe/Berlin"
+
+  enterprise_holidays:
+    se_public: *holidays_eu_se
+    eu_common:
+      kind: "ics"
+      source: "https://cal.company.com/holidays/eu.ics"
+      respect: true
+
+  # Business hours per region for 9x5 definitions
+  business_hours:
+    se_headquarters:
+      timezone: "Europe/Stockholm"
+      weekly:
+        mon: ["09:00-12:00", "13:00-18:00"]
+        tue: ["09:00-12:00", "13:00-18:00"]
+        wed: ["09:00-12:00", "13:00-18:00"]
+        thu: ["09:00-12:00", "13:00-18:00"]
+        fri: ["09:00-12:00", "13:00-17:00"]
+        sat: []
+        sun: []
+      exclude_holidays: ["enterprise_holidays.se_public"]
+
+integrations:
+  # External systems aware of schedule state flips
+  cd_systems:
+    - name: "argo-cd"
+      api: "https://argo.company.com/api"
+      token_ref: "secret://argo/token"
+      respect_freeze: true
+      respect_blackout: true
+  incident_management:
+    - name: "pagerduty"
+      api: "https://api.pagerduty.com"
+      token_ref: "secret://pagerduty/token"
+    - name: "jira"
+      api: "https://jira.company.com"
+      token_ref: "secret://jira/token"
+      create_change_tickets: true
+
+sla_profiles:
+  - id: "gold"
+    rto: "15m"
+    rpo: "0m"
+    ack_timeout: "5m"
+    resolve_timeout: "30m"
+    coverage: "24x7"
+  - id: "silver"
+    rto: "30m"
+    rpo: "5m"
+    ack_timeout: "10m"
+    resolve_timeout: "2h"
+    coverage: "9x5:se_headquarters"
+  - id: "bronze"
+    rto: "2h"
+    rpo: "15m"
+    ack_timeout: "30m"
+    resolve_timeout: "8h"
+    coverage: "best-effort"
+
+environments:
+  - id: "prod"
+    inherits: "global"
+    timezone: "Europe/Stockholm"
+    rules:
+      respect_blackout: true
+      respect_freeze: true
+      require_change_ticket_for_deploy: true
+    notification_channels: *contact_channels
+    escalation_policy: *escalation_policies
+  - id: "stage"
+    inherits: "global"
+    timezone: "Europe/Stockholm"
+    rules:
+      respect_blackout: true
+      respect_freeze: false
+      require_change_ticket_for_deploy: false
+    notification_channels: *contact_channels
+    escalation_policy: *escalation_policies
+  - id: "dev"
+    inherits: "global"
+    timezone: "Europe/Stockholm"
+    rules:
+      respect_blackout: false
+      respect_freeze: false
+      require_change_ticket_for_deploy: false
+    notification_channels: *contact_channels
+    escalation_policy: *escalation_policies
+
+schedules:
+  # =======================
+  # ON-CALL ROTATIONS
+  # =======================
+  - id: "oncall-sre-core"
+    kind: "oncall"
+    environment: "prod"
+    sla_profile: "gold"
+    timezone: "Europe/Stockholm"
+    rotation:
+      type: "weekly"
+      start: "2025-08-04T08:00:00+02:00"
+      length_days: 7
+      handoff_time: "08:00"
+      participants:
+        primary:
+          - user: "alice@company.com"
+          - user: "bob@company.com"
+          - user: "carol@company.com"
+        secondary:
+          - user: "dave@company.com"
+          - user: "erin@company.com"
+      # RRULE for calendar export
+      rrule: "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO;WKST=MO"
+    exclusions:
+      holidays: ["enterprise_holidays.se_public"]
+      custom_dates:
+        - "2025-12-31"
+    overrides:
+      # Planned swap approved by SRE lead
+      - start: "2025-09-15T08:00:00+02:00"
+        end:   "2025-09-22T08:00:00+02:00"
+        primary: "carol@company.com"
+        secondary: "dave@company.com"
+        approved_by: "sre-lead@company.com"
+        ticket: "JIRA-CHG-12345"
+    notifications:
+      channels: ["pager", "chatops", "email"]
+      escalation_policy_ref: "standard"
+      incident_tags: ["sev1", "sev2", "infra"]
+    health_checks:
+      ack_timeout: "5m"
+      page_retries: 2
+      heartbeat:
+        expect_every: "60s"
+        miss_after: 3
+
+  - id: "oncall-security"
+    kind: "oncall"
+    environment: "prod"
+    sla_profile: "gold"
+    timezone: "Europe/Stockholm"
+    rotation:
+      type: "daily"
+      start: "2025-08-01T09:00:00+02:00"
+      length_days: 1
+      handoff_time: "09:00"
+      participants:
+        primary:
+          - user: "zoe@company.com"
+          - user: "yuri@company.com"
+          - user: "xavier@company.com"
+    notifications:
+      channels: ["pager", "chatops", "voice"]
+      escalation_policy_ref: "security"
+
+  # =======================
+  # BUSINESS HOURS WINDOWS
+  # =======================
+  - id: "support-9x5-se"
+    kind: "business-hours"
+    environment: "stage"
+    timezone: "Europe/Stockholm"
+    window_ref: "calendars.business_hours.se_headquarters"
+    effective_from: "2025-08-01"
+    notes: "Used to route non-sev1 incidents to ticket queue during off-hours."
+    notifications:
+      channels: ["chatops", "email"]
+      escalation_policy_ref: "standard"
+
+  # =======================
+  # RELEASE FREEZE WINDOWS
+  # =======================
+  - id: "release-freeze-holiday"
+    kind: "freeze"
+    environment: "prod"
+    enforce:
+      block_deployments: true
+      block_config_changes: true
+    windows:
+      - name: "Winter break"
+        start: "2025-12-20T00:00:00+01:00"
+        end:   "2026-01-05T08:00:00+01:00"
+        reason: "Holiday freeze"
+        exceptions:
+          # Allow emergency security patches with CAB approval
+          - kind: "security-patch"
+            require_roles: ["sec-ops", "release-cab"]
+            notify: ["chatops", "email"]
+    notifications:
+      channels: ["chatops", "email"]
+      escalation_policy_ref: "release_blocker"
+
+  - id: "release-freeze-quarterly"
+    kind: "freeze"
+    environment: "prod"
+    enforce:
+      block_deployments: true
+    recurrence:
+      rrule: "FREQ=MONTHLY;INTERVAL=3;BYDAY=FR;BYHOUR=16;BYMINUTE=0;BYSECOND=0;WKST=MO"
+      duration: "72h"
+    notes: "Quarter-end accounting stability window."
+
+  # =======================
+  # BLACKOUT PERIODS (NO CHANGES, NO TRAFFIC SWITCHES)
+  # =======================
+  - id: "payment-blackout"
+    kind: "blackout"
+    environment: "prod"
+    enforce:
+      block_traffic_switches: true
+      block_migrations: true
+      require_change_ticket_for_exception: true
+    recurrence:
+      rrule: "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=22;BYMINUTE=0;BYSECOND=0"
+      duration: "2h"
+    description: "End-of-day payment reconciliation window."
+    notifications:
+      channels: ["chatops"]
+      escalation_policy_ref: "standard"
+
+  # =======================
+  # MAINTENANCE WINDOWS
+  # =======================
+  - id: "db-maintenance"
+    kind: "maintenance"
+    environment: "prod"
+    orchestrator: "dba-ops"
+    change_ticket_required: true
+    approval_roles: ["sre-duty", "release-cab"]
+    windows:
+      - name: "Monthly Postgres vacuum/analyze"
+        recurrence:
+          rrule: "FREQ=MONTHLY;BYDAY=SA;BYHOUR=01;BYMINUTE=00;BYSECOND=00;WKST=MO"
+          duration: "3h"
+        drain_strategy: "connection-quorum"
+        dependencies:
+          pre_checks:
+            - "db:replication_healthy"
+            - "db:lag_lt_5s"
+          post_checks:
+            - "db:primary_writable"
+            - "metrics:error_budget_intact"
+        blast_radius: "single-az"
+        rollback:
+          plan: "promote-standby"
+          max_time: "20m"
+    notifications:
+      channels: ["chatops", "email"]
+      escalation_policy_ref: "standard"
+
+  - id: "k8s-cluster-upgrade"
+    kind: "maintenance"
+    environment: "stage"
+    orchestrator: "platform-ops"
+    change_ticket_required: true
+    windows:
+      - name: "Minor version upgrade"
+        start: "2025-09-07T00:00:00+02:00"
+        end:   "2025-09-07T04:00:00+02:00"
+        drain_strategy: "pdb-eviction"
+        dependencies:
+          pre_checks:
+            - "kube:nodes_ready>=95%"
+            - "alerts:critical==0"
+          post_checks:
+            - "deploys:rollout_complete"
+            - "sli:availability>=99.9%"
+        blast_radius: "cluster"
+        rollback:
+          plan: "rollback-node-image"
+          max_time: "30m"
+    notifications:
+      channels: ["chatops"]
+      escalation_policy_ref: "standard"
+
+  # =======================
+  # RUNTIME WINDOWS FOR JOBS
+  # =======================
+  - id: "etl-nightly"
+    kind: "job-window"
+    environment: "prod"
+    runtime:
+      allowed:
+        - "01:00-05:30"
+      timezone: "Europe/Stockholm"
+      concurrency: 3
+      queue: "etl"
+    dependencies:
+      must_not_overlap:
+        - "payment-blackout"
+      must_respect:
+        - "release-freeze-holiday"
+    notifications:
+      channels: ["chatops", "email"]
+
+  - id: "ml-training-batch"
+    kind: "job-window"
+    environment: "stage"
+    runtime:
+      allowed:
+        - "22:00-06:00"
+      timezone: "Europe/Stockholm"
+      concurrency: 1
+      queue: "ml-train"
+    cost_guardrails:
+      max_hourly_cost_usd: 150
+      stop_on_breach: true
+    notifications:
+      channels: ["chatops"]
+
+# =======================
+# OVERRIDES BY DATES (COMPANY EVENTS, EXTERNAL INCIDENTS)
+# =======================
+overrides:
+  - id: "company-summit-2025"
+    effective:
+      start: "2025-09-10T08:00:00+02:00"
+      end:   "2025-09-12T18:00:00+02:00"
+    notes: "Reduced staffing during annual summit."
+    apply:
+      schedules:
+        - ref: "oncall-sre-core"
+          rotation:
+            participants:
+              primary:
+                - user: "bob@company.com"
+                - user: "dave@company.com"
+              secondary:
+                - user: "alice@company.com"
+          notifications:
+            channels: ["pager", "chatops", "voice", "email"]
+
+  - id: "external-cloud-provider-incident"
+    effective:
+      start: "2025-10-02T12:00:00+02:00"
+      end:   "2025-10-03T00:00:00+02:00"
+    notes: "Temporary freeze for safety."
+    apply:
+      schedules:
+        - ref: "release-freeze-quarterly"
+          enforce:
+            block_deployments: true
+        - ref: "etl-nightly"
+          runtime:
+            allowed: []  # disable
+          notifications:
+            channels: ["chatops"]
+
+# =======================
+# VALIDATION AND GUARDRAILS
+# =======================
+validation:
+  strict: true
+  rules:
+    - id: "no-overlap-blackout-maintenance"
+      description: "Maintenance must not overlap with blackout periods in the same environment."
+      kind: "temporal"
+      severity: "error"
+    - id: "freeze-blocks-prod-deploys"
+      description: "Freeze windows in prod must block deployments."
+      kind: "policy"
+      severity: "error"
+    - id: "holidays-respected"
+      description: "On-call must exclude listed public holidays or have explicit overrides."
+      kind: "policy"
+      severity: "warning"
+    - id: "rrule-valid"
+      description: "All RRULE strings must be RFC 5545 compliant."
+      kind: "schema"
+      severity: "error"
+
+# =======================
+# EXPORT/RENDER TARGETS
+# =======================
+export:
+  calendars:
+    - name: "prod-oncall.ics"
+      sources: ["oncall-sre-core", "oncall-security"]
+      timezone: "Europe/Stockholm"
+    - name: "prod-freezes.ics"
+      sources: ["release-freeze-holiday", "release-freeze-quarterly"]
+    - name: "ops-blackouts.ics"
+      sources: ["payment-blackout"]
+  dashboards:
+    - name: "NOC Schedule Overview"
+      widgets:
+        - type: "calendar"
+          sources: ["oncall-sre-core", "oncall-security", "release-freeze-holiday", "payment-blackout"]
+        - type: "kpi"
+          metrics: ["oncall_coverage_hours", "freeze_active", "blackout_active"]
+  notify_on_reload:
+    channels: ["chatops"]
+    message: "chronowatch-core schedules reloaded successfully"

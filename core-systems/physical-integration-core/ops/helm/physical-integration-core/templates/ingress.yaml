@@ -1,0 +1,236 @@
+# physical-integration-core/ops/helm/physical-integration-core/templates/ingress.yaml
+{{- /*
+Industrial-grade Ingress template for physical-integration-core
+Features:
+- networking.k8s.io/v1
+- Multi-host, multi-path
+- IngressClassName
+- TLS (global or per host), cert-manager issuer support
+- NGINX controller hardening (HSTS, security headers, rate limit, body size)
+- Canary (NGINX annotations)
+- IP allowlist / source ranges
+- Optional Basic Auth and OIDC (auth-url/auth-signin)
+- Optional mTLS (client cert verification)
+- Safe defaults + strict validation
+*/ -}}
+
+{{- /* =========================
+      Local helpers
+      ========================= */ -}}
+{{- define "pic.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "pic.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name (include "pic.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "pic.labels" -}}
+app.kubernetes.io/name: {{ include "pic.name" . }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: physical-integration-core
+{{- if .Values.labels }}
+{{- toYaml .Values.labels | nindent 0 }}
+{{- end }}
+{{- end -}}
+
+{{- define "pic.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "pic.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "pic.serviceName" -}}
+{{- if and .Values.service (hasKey .Values.service "name") (ne .Values.service.name "") -}}
+{{- .Values.service.name -}}
+{{- else -}}
+{{- include "pic.fullname" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* =========================
+      Input aliases + validation
+      ========================= */ -}}
+{{- $ing := .Values.ingress | default dict -}}
+{{- if and ($ing.enabled | default false) (not ($ing.hosts)) -}}
+{{- fail "ingress.enabled=true requires ingress.hosts (list) to be provided." -}}
+{{- end -}}
+
+{{- if $ing.enabled }}
+{{- $controller := default "nginx" $ing.controller -}}
+
+{{- /* Build annotations map with safe defaults for NGINX */ -}}
+{{- $ann := deepCopy (default (dict) $ing.annotations) -}}
+
+{{- /* Common: cert-manager issuer */ -}}
+{{- if $ing.certManager }}
+  {{- if $ing.certManager.clusterIssuer }}
+    {{- $_ := set $ann "cert-manager.io/cluster-issuer" $ing.certManager.clusterIssuer -}}
+  {{- else if $ing.certManager.issuer }}
+    {{- $_ := set $ann "cert-manager.io/issuer" $ing.certManager.issuer -}}
+  {{- end -}}
+{{- end -}}
+
+{{- if eq $controller "nginx" -}}
+  {{- /* Security headers via server-snippet (only if not explicitly set) */ -}}
+  {{- $serverSnippet := "" -}}
+  {{- if $ing.securityHeaders.enabled | default true -}}
+    {{- $hstsMax := default "63072000" $ing.securityHeaders.hstsMaxAge -}}
+    {{- $contentSecPolicy := $ing.securityHeaders.contentSecurityPolicy -}}
+    {{- $serverSnippet = printf (printf "more_set_headers \"X-Content-Type-Options: nosniff\";\nmore_set_headers \"X-Frame-Options: DENY\";\nmore_set_headers \"Referrer-Policy: no-referrer\";\nmore_set_headers \"X-XSS-Protection: 1; mode=block\";\nmore_set_headers \"Strict-Transport-Security: max-age=%s; includeSubDomains; preload\";\n" $hstsMax) -}}
+    {{- if $contentSecPolicy }}
+      {{- $serverSnippet = printf "%smore_set_headers \"Content-Security-Policy: %s\";\n" $serverSnippet $contentSecPolicy -}}
+    {{- end -}}
+    {{- if not (hasKey $ann "nginx.ingress.kubernetes.io/server-snippet") -}}
+      {{- $_ := set $ann "nginx.ingress.kubernetes.io/server-snippet" $serverSnippet -}}
+    {{- end -}}
+  {{- end -}}
+
+  {{- /* Body size, timeouts, buffer tuning */ -}}
+  {{- if not (hasKey $ann "nginx.ingress.kubernetes.io/proxy-body-size") -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/proxy-body-size" (default "64m" $ing.proxyBodySize) -}}
+  {{- end -}}
+  {{- if not (hasKey $ann "nginx.ingress.kubernetes.io/proxy-read-timeout") -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/proxy-read-timeout" (default "75" $ing.proxyReadTimeout) -}}
+  {{- end -}}
+  {{- if not (hasKey $ann "nginx.ingress.kubernetes.io/proxy-send-timeout") -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/proxy-send-timeout" (default "75" $ing.proxySendTimeout) -}}
+  {{- end -}}
+
+  {{- /* SSL redirect default on */ -}}
+  {{- if not (hasKey $ann "nginx.ingress.kubernetes.io/ssl-redirect") -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/ssl-redirect" (toString (default true $ing.sslRedirect)) -}}
+  {{- end -}}
+
+  {{- /* Rate limits */ -}}
+  {{- if $ing.rateLimit }}
+    {{- if $ing.rateLimit.rps }}
+      {{- $_ := set $ann "nginx.ingress.kubernetes.io/limit-rps" (toString $ing.rateLimit.rps) -}}
+    {{- end -}}
+    {{- if $ing.rateLimit.concurrent }}
+      {{- $_ := set $ann "nginx.ingress.kubernetes.io/limit-connections" (toString $ing.rateLimit.concurrent) -}}
+    {{- end -}}
+  {{- end -}}
+
+  {{- /* IP allowlist / source ranges */ -}}
+  {{- if $ing.whitelistSourceRange }}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/whitelist-source-range" (join "," $ing.whitelistSourceRange) -}}
+  {{- end -}}
+
+  {{- /* Basic Auth */ -}}
+  {{- if and $ing.auth $ing.auth.basic $ing.auth.basic.enabled }}
+    {{- if not $ing.auth.basic.secretName }}
+      {{- fail "ingress.auth.basic.enabled=true requires ingress.auth.basic.secretName" -}}
+    {{- end -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/auth-type" "basic" -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/auth-secret" $ing.auth.basic.secretName -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/auth-realm" (default "Authentication Required" $ing.auth.basic.realm) -}}
+  {{- end -}}
+
+  {{- /* OIDC / oauth2-proxy style auth */ -}}
+  {{- if and $ing.auth $ing.auth.oidc $ing.auth.oidc.enabled }}
+    {{- if or (not $ing.auth.oidc.authURL) (not $ing.auth.oidc.signinURL) }}
+      {{- fail "ingress.auth.oidc.enabled=true requires authURL and signinURL" -}}
+    {{- end -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/auth-url" $ing.auth.oidc.authURL -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/auth-signin" $ing.auth.oidc.signinURL -}}
+  {{- end -}}
+
+  {{- /* mTLS (Client cert) */ -}}
+  {{- if and $ing.mtls $ing.mtls.enabled }}
+    {{- if not $ing.mtls.secretName }}
+      {{- fail "ingress.mtls.enabled=true requires ingress.mtls.secretName with CA bundle" -}}
+    {{- end -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/auth-tls-secret" (printf "%s/%s" (.Release.Namespace) $ing.mtls.secretName) -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/auth-tls-verify-client" (default "on" $ing.mtls.verifyClient) -}}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/auth-tls-verify-depth" (toString (default 2 $ing.mtls.verifyDepth)) -}}
+    {{- if $ing.mtls.passCertToUpstream }}
+      {{- $_ := set $ann "nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream" "true" -}}
+    {{- end -}}
+  {{- end -}}
+
+  {{- /* Canary */ -}}
+  {{- if and $ing.canary $ing.canary.enabled }}
+    {{- $_ := set $ann "nginx.ingress.kubernetes.io/canary" "true" -}}
+    {{- if $ing.canary.weight }}
+      {{- $_ := set $ann "nginx.ingress.kubernetes.io/canary-weight" (toString $ing.canary.weight) -}}
+    {{- end -}}
+    {{- if $ing.canary.byHeader }}
+      {{- $_ := set $ann "nginx.ingress.kubernetes.io/canary-by-header" $ing.canary.byHeader -}}
+    {{- end -}}
+    {{- if $ing.canary.byCookie }}
+      {{- $_ := set $ann "nginx.ingress.kubernetes.io/canary-by-cookie" $ing.canary.byCookie -}}
+    {{- end -}}
+    {{- if $ing.canary.headerValue }}
+      {{- $_ := set $ann "nginx.ingress.kubernetes.io/canary-by-header-value" $ing.canary.headerValue -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}} {{/* end nginx defaults */}}
+
+{{- /* =========================
+      TLS assembly (global or per host)
+      ========================= */ -}}
+{{- $tls := list -}}
+{{- if $ing.tls }}
+  {{- /* Direct pass-through from values.ingress.tls (list of {secretName, hosts[]}) */ -}}
+  {{- $tls = $ing.tls -}}
+{{- else if and ($ing.globalTLSSecretName) ($ing.hosts) }}
+  {{- $hosts := list -}}
+  {{- range $ing.hosts }}
+    {{- if .host }}
+      {{- $hosts = append $hosts .host -}}
+    {{- end -}}
+  {{- end -}}
+  {{- $tls = (list (dict "secretName" $ing.globalTLSSecretName "hosts" $hosts)) -}}
+{{- end -}}
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "pic.fullname" . }}-ing
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pic.labels" . | nindent 4 }}
+    {{- with $ing.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- if $ann }}
+    {{- toYaml $ann | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with $ing.ingressClassName }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if $tls }}
+  tls:
+    {{- toYaml $tls | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $h := $ing.hosts }}
+    {{- if not $h.host }}{{- fail "ingress.hosts[].host is required" }}{{- end }}
+    - host: {{ $h.host | quote }}
+      http:
+        paths:
+          {{- $paths := default (list (dict "path" "/" "pathType" "Prefix")) $h.paths }}
+          {{- range $p := $paths }}
+          - path: {{ default "/" $p.path | quote }}
+            pathType: {{ default "Prefix" $p.pathType }}
+            backend:
+              service:
+                name: {{- if and $p.backend $p.backend.service $p.backend.service.name -}}
+                  {{- $p.backend.service.name -}}
+                {{- else -}}
+                  {{- include "pic.serviceName" $ -}}
+                {{- end }}
+                port:
+                  {{- $sp := (cond (and $p.backend $p.backend.service $p.backend.service.port) $p.backend.service.port (default 80 (default  .Values.service.port 80))) -}}
+                  number: {{ $sp }}
+          {{- end }}
+    {{- end }}
+{{- end }} {{/* if ingress.enabled */}}

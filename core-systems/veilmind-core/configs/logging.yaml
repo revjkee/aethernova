@@ -1,0 +1,255 @@
+version: 1
+disable_existing_loggers: false
+incremental: false
+
+# ========= FORMATTERS =========
+formatters:
+  json:
+    "()": pythonjsonlogger.jsonlogger.JsonFormatter
+    fmt: >
+      timestamp:%(asctime)s
+      level:%(levelname)s
+      logger:%(name)s
+      message:%(message)s
+      module:%(module)s
+      func:%(funcName)s
+      line:%(lineno)d
+      process:%(process)d
+      thread:%(thread)d
+      service:%(service)s
+      env:%(env)s
+      version:%(version)s
+      trace_id:%(trace_id)s
+      span_id:%(span_id)s
+      request_id:%(request_id)s
+      user_id:%(user_id)s
+      client_ip:%(client_ip)s
+      http_method:%(http_method)s
+      http_path:%(http_path)s
+      http_status:%(http_status)s
+      duration_ms:%(duration_ms)s
+    datefmt: "%Y-%m-%dT%H:%M:%S%z"
+  console:
+    "()": colorlog.ColoredFormatter
+    format: "%(log_color)s%(asctime)s | %(levelname)-8s | %(name)s | %(message)s%(reset)s"
+    datefmt: "%H:%M:%S"
+  access_json:
+    "()": pythonjsonlogger.jsonlogger.JsonFormatter
+    fmt: >
+      ts:%(asctime)s level:%(levelname)s logger:%(name)s kind:access
+      method:%(http_method)s path:%(http_path)s status:%(http_status)s
+      duration_ms:%(duration_ms)s size:%(response_bytes)s ip:%(client_ip)s
+      trace_id:%(trace_id)s span_id:%(span_id)s service:%(service)s env:%(env)s
+    datefmt: "%Y-%m-%dT%H:%M:%S%z"
+  audit_json:
+    "()": pythonjsonlogger.jsonlogger.JsonFormatter
+    fmt: >
+      ts:%(asctime)s level:%(levelname)s logger:%(name)s kind:audit
+      actor:%(user_id)s action:%(action)s target:%(target)s result:%(result)s
+      reason:%(reason)s trace_id:%(trace_id)s request_id:%(request_id)s
+      service:%(service)s env:%(env)s
+    datefmt: "%Y-%m-%dT%H:%M:%S%z"
+
+# ========= FILTERS (custom classes реализуются в veilmind/logging/filters.py) =========
+filters:
+  context:
+    "()": veilmind.logging.filters.ContextFilter
+    service: "veilmind-core"
+    env: "prod"
+    version: "1.0.0"
+  correlation:
+    "()": veilmind.logging.filters.CorrelationFilter
+  redact:
+    "()": veilmind.logging.filters.RedactFilter
+    patterns:
+      - "(?i)authorization\\s*:\\s*Bearer\\s+[A-Za-z0-9\\-\\._~\\+\\/]+=*"
+      - "(?i)api[_-]?key\\s*[=:]\\s*[A-Za-z0-9\\-]{16,}"
+      - "(?i)password\\s*[=:]\\s*[^\\s]+"
+      - "(?i)secret\\s*[=:]\\s*[^\\s]+"
+      - "(?i)token\\s*[=:]\\s*[A-Za-z0-9\\._\\-]{8,}"
+      - "(?i)email\\s*[:=]\\s*[^\\s]+@[^\\s]+"
+    replacement: "[REDACTED]"
+  healthcheck:
+    "()": veilmind.logging.filters.HealthcheckFilter
+    paths: ["/healthz", "/readyz", "/livez"]
+  ratelimit:
+    "()": veilmind.logging.filters.RateLimitFilter
+    interval_seconds: 1
+    max_records: 1000
+
+# ========= HANDLERS =========
+handlers:
+  stdout_info:
+    class: logging.StreamHandler
+    level: INFO
+    stream: ext://sys.stdout
+    formatter: console
+    filters: [context, correlation, redact, healthcheck]
+  stderr_warn:
+    class: logging.StreamHandler
+    level: WARNING
+    stream: ext://sys.stderr
+    formatter: console
+    filters: [context, correlation, redact]
+  json_rotating:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    filename: "logs/app.log"
+    maxBytes: 104857600         # 100 MiB
+    backupCount: 10
+    encoding: utf-8
+    delay: true
+    formatter: json
+    filters: [context, correlation, redact, ratelimit]
+  json_error_rotating:
+    class: logging.handlers.RotatingFileHandler
+    level: WARNING
+    filename: "logs/error.log"
+    maxBytes: 52428800          # 50 MiB
+    backupCount: 20
+    encoding: utf-8
+    delay: true
+    formatter: json
+    filters: [context, correlation, redact]
+  json_timed:
+    class: logging.handlers.TimedRotatingFileHandler
+    level: INFO
+    filename: "logs/app_by_day.log"
+    when: "midnight"
+    interval: 1
+    backupCount: 14
+    encoding: utf-8
+    delay: true
+    formatter: json
+    filters: [context, correlation, redact]
+  syslog:
+    class: logging.handlers.SysLogHandler
+    level: INFO
+    address: ["127.0.0.1", 514]
+    socktype: 2  # socket.SOCK_DGRAM
+    formatter: json
+    filters: [context, correlation, redact]
+  buffer_flush_to_file:
+    class: logging.handlers.MemoryHandler
+    level: INFO
+    capacity: 10000
+    flushLevel: ERROR
+    target: json_rotating
+
+  # Специализированные каналы
+  access_json:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    filename: "logs/access.log"
+    maxBytes: 104857600
+    backupCount: 10
+    encoding: utf-8
+    delay: true
+    formatter: access_json
+    filters: [context, correlation, redact, healthcheck]
+  audit_json:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    filename: "logs/audit.log"
+    maxBytes: 104857600
+    backupCount: 20
+    encoding: utf-8
+    delay: true
+    formatter: audit_json
+    filters: [context, correlation, redact]
+
+# ========= LOGGERS =========
+loggers:
+  # Приложение
+  veilmind:
+    level: INFO
+    handlers: [stdout_info, buffer_flush_to_file, json_error_rotating, syslog]
+    propagate: false
+
+  veilmind.access:
+    level: INFO
+    handlers: [access_json, stdout_info]
+    propagate: false
+
+  veilmind.audit:
+    level: INFO
+    handlers: [audit_json, json_rotating]
+    propagate: false
+
+  veilmind.security:
+    level: INFO
+    handlers: [json_error_rotating, syslog, stderr_warn]
+    propagate: false
+
+  # Сторонние логгеры — приглушаем шум
+  uvicorn:
+    level: INFO
+    handlers: [stdout_info]
+    propagate: false
+  uvicorn.error:
+    level: WARNING
+    handlers: [stderr_warn, json_error_rotating]
+    propagate: false
+  uvicorn.access:
+    level: INFO
+    handlers: [access_json]
+    propagate: false
+
+  gunicorn:
+    level: INFO
+    handlers: [stdout_info]
+    propagate: false
+  gunicorn.error:
+    level: WARNING
+    handlers: [stderr_warn, json_error_rotating]
+    propagate: false
+  gunicorn.access:
+    level: INFO
+    handlers: [access_json]
+    propagate: false
+
+  sqlalchemy.engine:
+    level: WARNING
+    handlers: [json_rotating]
+    propagate: false
+
+  httpx:
+    level: WARNING
+    handlers: [json_rotating]
+    propagate: false
+
+  urllib3:
+    level: WARNING
+    handlers: [json_rotating]
+    propagate: false
+
+  # По умолчанию — только консоль и файл
+  "":
+    level: INFO
+    handlers: [stdout_info, json_rotating]
+    propagate: false
+
+# ========= ROOT / SERVICE =========
+root:
+  level: INFO
+  handlers: [stdout_info, json_rotating]
+
+# ========= STRUCTLOG (читать в коде и инициализировать отдельно) =========
+structlog:
+  processors:
+    - structlog.processors.add_log_level
+    - structlog.processors.TimeStamper:
+        fmt: iso
+        utc: true
+    - structlog.processors.StackInfoRenderer
+    - structlog.processors.format_exc_info
+    - structlog.processors.CallsiteParameterAdder:
+        parameters: [lineno, func_name, process, thread]
+    - veilmind.logging.structlog.add_correlation  # добавляет trace_id/span_id/request_id из контекста
+    - veilmind.logging.structlog.redact_processor # повторная защита
+    - structlog.processors.EventRenamer:
+        to: message
+    - structlog.processors.JSONRenderer
+  wrapper_class: structlog.make_filtering_bound_logger
+  cache_logger_on_first_use: true
+  context_class: dict

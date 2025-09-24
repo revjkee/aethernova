@@ -1,0 +1,189 @@
+// datafabric-core/schemas/proto/v1/error.proto
+// Industrial error contract for Datafabric Core.
+// - Canonical codes compatible with gRPC/HTTP semantics.
+// - Severity for alerting/SLO routing.
+// - Retry hints with recommended delay and reason.
+// - Cause chain for debugging across process boundaries.
+// - Rich domain details via well-known types and Any.
+// - Stable evolution: only additive changes, reserved tags kept.
+
+syntax = "proto3";
+
+package datafabric.v1.errors;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// =============================================================================
+// Language-specific package options (feel free to adjust to your org standards)
+// =============================================================================
+option go_package             = "github.com/company/datafabric-core/pkg/api/errors;errorsv1";
+option java_multiple_files    = true;
+option java_package           = "com.company.datafabric.v1.errors";
+option java_outer_classname   = "ErrorsProto";
+option csharp_namespace       = "Company.Datafabric.V1.Errors";
+option objc_class_prefix      = "DFE";
+option php_namespace          = "Company\\Datafabric\\V1\\Errors";
+option ruby_package           = "Company::Datafabric::V1::Errors";
+
+// =============================================================================
+// Canonical error codes (align with gRPC codes where possible)
+// =============================================================================
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  OK                     = 1;   // Not an error; for completeness.
+
+  CANCELLED              = 2;
+  UNKNOWN                = 3;
+  INVALID_ARGUMENT       = 4;   // 400
+  DEADLINE_EXCEEDED      = 5;   // 504
+  NOT_FOUND              = 6;   // 404
+  ALREADY_EXISTS         = 7;   // 409
+  PERMISSION_DENIED      = 8;   // 403
+  UNAUTHENTICATED        = 9;   // 401
+  RESOURCE_EXHAUSTED     = 10;  // 429 / quota
+  FAILED_PRECONDITION    = 11;  // 412
+  ABORTED                = 12;  // 409 / concurrency
+  OUT_OF_RANGE           = 13;  // 400
+  UNIMPLEMENTED          = 14;  // 501
+  INTERNAL               = 15;  // 500
+  UNAVAILABLE            = 16;  // 503
+  DATA_LOSS              = 17;  // 500 severe
+}
+
+// Severity drives alert routing and ticketing.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  INFO    = 1;
+  WARNING = 2;
+  ERROR   = 3;
+  CRITICAL= 4;
+}
+
+// Where the error originated (used for triage/ownership).
+enum ErrorSource {
+  ERROR_SOURCE_UNSPECIFIED = 0;
+  CLIENT    = 1; // Input/contract issues
+  SERVER    = 2; // Business logic/runtime
+  NETWORK   = 3; // Transport/proxy
+  DEPENDENCY= 4; // Downstream (DB, cache, bus, external API)
+  SECURITY  = 5; // AuthZ/AuthN/Policy
+}
+
+// A machine-actionable hint whether and how to retry.
+message RetryHint {
+  bool retryable = 1;                                    // If false, do not retry automatically
+  google.protobuf.Duration recommended_delay = 2;        // Backoff suggestion
+  string reason = 3;                                     // Human-friendly reason (stable keywords preferred)
+  // reserved tags for future: 4,5
+}
+
+// A single cause in a cause chain, captured at some boundary.
+message ErrorCause {
+  string type        = 1; // Exception/typename or domain category
+  string message     = 2;
+  string file        = 3; // Best-effort source location
+  string function    = 4;
+  uint32 line        = 5;
+  string stack       = 6; // Optional compact stack (trimmed for size)
+  map<string, string> attributes = 7; // Free-form small map (e.g., sqlstate=22001)
+}
+
+// Domain-specific details that can be attached in ErrorStatus.details.
+// Keep payloads compact and privacy-safe. Prefer stable fields over free-form text.
+
+// HTTP transport detail (both server and client sides).
+message HttpDetail {
+  uint32 status_code = 1;
+  string method      = 2;
+  string url         = 3;   // Redact query if PII present
+  string route       = 4;   // Matched route template
+  map<string, string> headers = 5; // Small subset, e.g. x-request-id
+  google.protobuf.Duration duration = 6;
+}
+
+// Database detail (SQL/NoSQL). Use sqlstate/vendor_code for precise triage.
+message DbDetail {
+  string system        = 1;   // postgres|mysql|clickhouse|redis|mongo|...
+  string sqlstate      = 2;   // e.g. 23505 for Postgres
+  int32  vendor_code   = 3;   // driver/library error code
+  string operation     = 4;   // connect|query|exec|transaction
+  string collection    = 5;   // table/collection name (if known)
+  google.protobuf.Duration duration = 6;
+}
+
+// Kafka/NATS/RabbitMQ detail (messaging dependency).
+message MessagingDetail {
+  string system      = 1;   // kafka|nats|rabbitmq
+  string topic       = 2;
+  string group       = 3;
+  string partition   = 4;
+  int64  offset      = 5;
+  string action      = 6;   // produce|consume|commit|subscribe
+}
+
+// Validation errors for user-facing bad requests.
+message ValidationDetail {
+  message FieldViolation {
+    string field   = 1; // dotted path, e.g. "user.email"
+    string rule    = 2; // e.g. required|min|max|format:email
+    string message = 3; // localized/user-friendly if available
+  }
+  repeated FieldViolation violations = 1;
+}
+
+// Rate limit/quota detail for client guidance.
+message QuotaDetail {
+  string quota_name = 1;
+  int64  limit      = 2;
+  int64  remaining  = 3;
+  google.protobuf.Timestamp reset_at = 4;
+}
+
+// Top-level error status, akin to google.rpc.Status but extended for ops.
+message ErrorStatus {
+  ErrorCode code     = 1;        // Machine code
+  string message     = 2;        // Human-friendly message (no secrets/PII)
+  Severity severity  = 3;
+
+  // Observability & correlation
+  string trace_id    = 4;        // W3C traceparent trace-id or B3
+  string span_id     = 5;
+  string correlation_id = 6;     // External correlation if provided
+  ErrorSource source = 7;
+  google.protobuf.Timestamp occurred_at = 8; // When the error was observed
+
+  // Service identity (for multi-tenant/multi-region systems)
+  string service     = 9;        // logical service name
+  string instance    = 10;       // pod/host identifier
+  string region      = 11;       // e.g., eu-central-1
+  string namespace   = 12;       // k8s namespace or logical domain
+
+  RetryHint retry    = 13;
+
+  // Short key-value attributes (avoid large payloads; use details for bigger data)
+  map<string, string> attributes = 14;
+
+  // Structured domain details. Use well-known messages above or pack custom Any payloads.
+  repeated google.protobuf.Any details = 15;
+
+  // Cause chain from innermost (index 0) to outermost boundary.
+  repeated ErrorCause causes = 16;
+
+  // Optional machine-readable context (small, PII-safe)
+  google.protobuf.Struct context = 17;
+
+  // Reserved to allow non-breaking evolution
+  reserved 18, 19, 20;
+}
+
+// ----------------------------------------------------------------------------
+// Recommended type URLs for packing into ErrorStatus.details (examples):
+//   type.googleapis.com/datafabric.v1.errors.HttpDetail
+//   type.googleapis.com/datafabric.v1.errors.DbDetail
+//   type.googleapis.com/datafabric.v1.errors.MessagingDetail
+//   type.googleapis.com/datafabric.v1.errors.ValidationDetail
+//   type.googleapis.com/datafabric.v1.errors.QuotaDetail
+// ----------------------------------------------------------------------------

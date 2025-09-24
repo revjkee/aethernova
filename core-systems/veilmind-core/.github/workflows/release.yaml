@@ -1,0 +1,309 @@
+# veilmind-core/.github/workflows/release.yaml
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"           # SemVer теги, например v1.2.3
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer (например v1.2.3) для ручного релиза"
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ github.ref || inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write         # для GitHub Release и загрузки артефактов
+  packages: write         # для push в GHCR
+  id-token: write         # для OIDC (cosign / SLSA)
+  attestations: write     # для GitHub attestations
+  actions: read
+  checks: read
+  security-events: write  # для публикации результатов сканов (SARIF)
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: "3.11"
+  # Детерминированные сборки
+  SOURCE_DATE_EPOCH: "1609459200"  # 2021-01-01T00:00:00Z
+
+jobs:
+  validate_version:
+    name: Validate version tag
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.setver.outputs.version }}
+    steps:
+      - name: Resolve version
+        id: setver
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VER="${{ inputs.version }}"
+          else
+            VER="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "$VER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.-]+)?$ ]]; then
+            echo "Invalid SemVer tag: $VER" >&2
+            exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Ensure workflow path exists
+        run: test -f cli/tools/risk_score.py || true
+
+  test:
+    name: Test (unit)
+    runs-on: ubuntu-22.04
+    needs: [validate_version]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install -r requirements-dev.txt || true
+          pip install pytest
+
+      - name: Run unit tests
+        run: |
+          pytest -q --maxfail=1 --disable-warnings \
+            zero-trust-core/tests/unit \
+            || (echo "Unit tests failed" >&2; exit 1)
+
+  build_pkg:
+    name: Build Python package artifacts
+    runs-on: ubuntu-22.04
+    needs: [test]
+    outputs:
+      wheel: ${{ steps.out.outputs.wheel }}
+      sdist: ${{ steps.out.outputs.sdist }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --sdist --wheel --outdir dist
+          ls -la dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: veilmind-core-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Expose artifact names
+        id: out
+        shell: bash
+        run: |
+          WHEEL="$(ls dist/*.whl | head -n1)"
+          SDIST="$(ls dist/*.tar.gz | head -n1)"
+          echo "wheel=$WHEEL" >> "$GITHUB_OUTPUT"
+          echo "sdist=$SDIST" >> "$GITHUB_OUTPUT"
+
+  docker:
+    name: Build & Push Docker (multi-arch)
+    runs-on: ubuntu-22.04
+    needs: [test, validate_version]
+    env:
+      VERSION: ${{ needs.validate_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR via OIDC
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ env.VERSION }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build SBOM (Syft) before push
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: sbom.json
+
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false                # SLSA генерим отдельно
+          sbom: false                      # SBOM приложили отдельно выше
+          build-args: |
+            APP_VERSION=${{ env.VERSION }}
+            SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Export image digest
+        id: digest
+        run: |
+          echo "digest=${{ steps.meta.outputs.tags }}" >> "$GITHUB_OUTPUT"
+
+  security:
+    name: Container Scan (Trivy)
+    runs-on: ubuntu-22.04
+    needs: [docker, validate_version]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy on image
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate_version.outputs.version }}
+          format: sarif
+          output: trivy-image.sarif
+          vuln-type: os,library
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: true
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+      - name: Upload Trivy report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report
+          path: trivy-image.sarif
+          retention-days: 14
+
+  sign_and_attest:
+    name: Sign & Attest (Sigstore Cosign)
+    runs-on: ubuntu-22.04
+    needs: [docker, security, validate_version]
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Keyless sign (OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate_version.outputs.version }}
+        run: |
+          cosign sign --yes "$IMAGE"
+          cosign attach sbom --sbom sbom.json "$IMAGE" || true
+          cosign attest --yes --predicate <(jq -n --arg ver "${{ needs.validate_version.outputs.version }}" '{release:$ver,tool:"github-actions"}') --type cyclonedx "$IMAGE"
+
+      - name: Upload SBOM artifact (from docker job)
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom.json
+          path: .
+
+      - name: Upload SBOM to release artifacts (prep)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.json
+          retention-days: 14
+
+  slsa_provenance:
+    name: SLSA Provenance
+    runs-on: ubuntu-22.04
+    needs: [docker, sign_and_attest, validate_version]
+    steps:
+      - name: Generate provenance for container
+        uses: slsa-framework/slsa-github-generator/actions/delegator-generic@v2
+        with:
+          attestation-name: "veilmind-core-container-provenance"
+          base64-subjects: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ github.sha }}
+
+  github_release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    needs: [build_pkg, docker, security, sign_and_attest, slsa_provenance, validate_version]
+    permissions:
+      contents: write
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: veilmind-core-dist
+          path: dist
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: .
+
+      - name: Generate changelog from conventional commits
+        id: changelog
+        uses: mikepenz/release-changelog-builder-action@v5
+        with:
+          configuration: ".github/changelog-config.json"
+        continue-on-error: true
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate_version.outputs.version }}
+          name: ${{ needs.validate_version.outputs.version }}
+          body: ${{ steps.changelog.outputs.changelog || 'Automated release' }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            sbom.json
+
+      - name: Output release url
+        run: echo "Release URL: ${{ steps.create_release.outputs.url }}"

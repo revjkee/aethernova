@@ -1,0 +1,202 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: security-core-staging
+nameSuffix: -stg
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/part-of: core-systems
+  app.kubernetes.io/name: security-core
+  app.kubernetes.io/instance: security-core
+  app.kubernetes.io/managed-by: kustomize
+  env: staging
+
+commonAnnotations:
+  owner: platform-security
+  contact: security@neurocity.local
+  runbook: https://runbooks.neurocity.local/security-core
+  tier: backend
+
+# Единый трансформ для селекторов/шаблонов
+labels:
+  - pairs:
+      env: staging
+    includeSelectors: true
+    includeTemplates: true
+
+# Образ и версия для staging
+images:
+  - name: ghcr.io/neurocity/security-core
+    newName: ghcr.io/neurocity/security-core
+    newTag: v0.1.0-stg
+
+# Количество реплик для staging
+replicas:
+  - name: security-core
+    count: 3
+
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    env: staging
+
+configMapGenerator:
+  - name: security-core-config
+    behavior: merge
+    literals:
+      - APP_ENV=staging
+      - LOG_LEVEL=INFO
+      - CORS_ALLOW_ORIGINS=https://staging.neurocity.local
+      - RATE_LIMIT_PER_MINUTE=180
+      - PROMETHEUS_PORT=9090
+
+# Секреты с плейсхолдерами (реальные значения подставляются в CI/CD или через External Secrets)
+secretGenerator:
+  - name: security-core-secrets
+    behavior: replace
+    literals:
+      - OIDC_CLIENT_SECRET=REPLACE_IN_CI
+      - SESSION_SECRET=REPLACE_IN_CI
+    type: Opaque
+
+patches:
+  # Усиление Deployment: ресурсы, probes, безопасный securityContext, антиаффинити и spread
+  - target:
+      kind: Deployment
+      name: security-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: security-core
+      spec:
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 25%
+        template:
+          metadata:
+            labels:
+              env: staging
+          spec:
+            serviceAccountName: security-core
+            priorityClassName: medium-priority
+            dnsPolicy: ClusterFirst
+            enableServiceLinks: false
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: topology.kubernetes.io/zone
+                whenUnsatisfiable: ScheduleAnyway
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: security-core
+            affinity:
+              podAntiAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 100
+                    podAffinityTerm:
+                      topologyKey: kubernetes.io/hostname
+                      labelSelector:
+                        matchLabels:
+                          app.kubernetes.io/name: security-core
+            containers:
+              - name: security-core
+                imagePullPolicy: IfNotPresent
+                envFrom:
+                  - configMapRef:
+                      name: security-core-config
+                  - secretRef:
+                      name: security-core-secrets
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                resources:
+                  requests:
+                    cpu: "250m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "1500m"
+                    memory: "1Gi"
+                ports:
+                  - name: http
+                    containerPort: 8080
+                    protocol: TCP
+                  - name: metrics
+                    containerPort: 9090
+                    protocol: TCP
+                readinessProbe:
+                  httpGet:
+                    path: /health/ready
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  failureThreshold: 6
+                livenessProbe:
+                  httpGet:
+                    path: /health/live
+                    port: 8080
+                  initialDelaySeconds: 15
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                startupProbe:
+                  httpGet:
+                    path: /health/startup
+                    port: 8080
+                  failureThreshold: 30
+                  periodSeconds: 2
+                volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+                  - name: var-run
+                    mountPath: /var/run
+            volumes:
+              - name: tmp
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 128Mi
+              - name: var-run
+                emptyDir: {}
+
+  # Актуализируем основной Service (если нужно добавить аннотации/политику)
+  - target:
+      kind: Service
+      name: security-core
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: security-core
+        annotations:
+          service.kubernetes.io/topology-aware-hints: "auto"
+      spec:
+        internalTrafficPolicy: Cluster
+        sessionAffinity: None
+
+  # Явная маркировка сервиса метрик для Prometheus
+  - target:
+      kind: Service
+      name: security-core-metrics
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: security-core-metrics
+        labels:
+          monitoring: "true"
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9090"
+          prometheus.io/path: "/metrics"

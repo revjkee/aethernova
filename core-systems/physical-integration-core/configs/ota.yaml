@@ -1,0 +1,362 @@
+# physical-integration-core/configs/ota.yaml
+apiVersion: aethernova.io/v1
+kind: OTAConfig
+metadata:
+  name: physical-integration-core
+  env: prod
+  owner: platform-security-core
+  labels:
+    project: neurocity
+    module: physical-integration-core
+    component: ota
+spec:
+  schemaVersion: "1.0.0"
+
+  defaults: &defaults
+    artifactType: firmware  # firmware | container | bundle | fpga_bitstream | driver
+    compression: zstd       # zstd | gzip | none
+    hash:
+      algo: sha256
+      required: true
+    signing: &signing
+      required: true
+      algorithm: ed25519     # ed25519 | ecdsa-p256 | rsa-pss-2048
+      trustStoreRef: platform-truststore-v3
+      keyRotation:
+        policy: strict       # strict | warn
+        maxKeyAgeDays: 180
+      timestamping:
+        rfc3161: true
+        tsaUrl: https://tsa.neurocity.local/rfc3161
+    encryption:
+      atRest: aws-kms        # aws-kms | gcp-kms | vault-transit | none
+      inTransit: tls12
+      minTLS: "1.2"
+      mutualTLS:
+        required: true
+        caBundleRef: iac/ca/ota-clients-bundle
+    delivery: &delivery
+      protocols:
+        https:
+          enabled: true
+          endpoint: https://artifacts.neurocity.local
+          s3Compatible:
+            bucket: ota-artifacts
+            region: eu-north-1
+            pathStyle: false
+        mqtt:
+          enabled: true
+          broker: mqtts://mqtt.neurocity.local:8883
+          qos: 1
+          retain: false
+          topicTemplate: devices/${device.id}/ota
+      rateLimit:
+        globalPerSecond: 200
+        perSitePerMinute: 100
+        perDeviceBurst: 5
+      backoff:
+        strategy: exponential
+        baseSeconds: 10
+        maxSeconds: 900
+        jitter: true
+      retry:
+        maxAttempts: 10
+        httpCodes: [408, 425, 429, 500, 502, 503, 504]
+    storage:
+      registryPrimary: artifacts-registry-primary
+      registries:
+        - name: artifacts-registry-primary
+          type: s3
+          url: s3://ota-artifacts
+          region: eu-north-1
+        - name: artifacts-registry-dr
+          type: s3
+          url: s3://ota-artifacts-dr
+          region: eu-central-1
+      replication:
+        enabled: true
+        policy: async
+        rpoSeconds: 60
+    updateEngine: &engine
+      mode: A/B
+      delta:
+        enabled: true
+        format: courgette   # bsdiff | courgette | xdelta3
+        minSavingsPercent: 20
+      fs:
+        type: ext4
+        verifyFsIntegrity: true
+      boot:
+        grubEnvSlotVar: OTA_ACTIVE_SLOT
+        rollbackOnBootFail: true
+        healthCheck:
+          timeoutSeconds: 600
+          successSignal: /run/ota/healthy
+      preInstallHooks:
+        - name: quiesce-services
+          timeoutSeconds: 120
+          command: ["/usr/local/bin/ota-hooks", "quiesce"]
+      postInstallHooks:
+        - name: resume-services
+          timeoutSeconds: 120
+          command: ["/usr/local/bin/ota-hooks", "resume"]
+      postRebootHooks:
+        - name: verify-app
+          timeoutSeconds: 300
+          command: ["/usr/local/bin/ota-hooks", "verify"]
+    observability: &obs
+      metrics:
+        pushGateway: https://metrics.neurocity.local/push
+        namespace: ota
+        labels:
+          env: prod
+      logs:
+        level: info
+        sink: loki
+        endpoint: https://loki.neurocity.local
+      tracing:
+        otlpEndpoint: https://otlp.neurocity.local
+        sampleRate: 0.1
+    audit: &audit
+      enabled: true
+      sink: https://audit.neurocity.local/ingest
+      redact:
+        fields: ["device.serial", "network.ip"]
+    maintenanceWindows:
+      timezone: Europe/Stockholm
+      windows:
+        - name: weekday-nights
+          cron: "0 0-4 * * 1-5"   # каждый час с 00:00 до 04:59 по будням
+        - name: weekend
+          cron: "0 0-6 * * 6,0"   # 00:00-06:59 в выходные
+      blackout:
+        - name: quarter-close
+          cron: "0 0 * 3,6,9,12 *"  # весь день первого числа квартальных месяцев
+    compliance: &compliance
+      sbom:
+        required: true
+        format: spdx-json
+        minCompleteness: high
+      cveGates:
+        maxSeverity: "high"   # критичнее high запрещено
+        allowlist: []         # CVE-IDs, разрешенные по риск‑акцепту
+        dataSource:
+          nvdMirror: https://cve-mirror.neurocity.local
+          osv: true
+      notarization:
+        cosign:
+          required: true
+          keyRef: cosign-pubkey-v2
+      policyAsCode:
+        engine: opa
+        bundleRef: s3://ota-policies/bundles/v5
+    approvals: &approvals
+      required: true
+      gates:
+        - name: security
+          approversGroup: secops
+          minApprovals: 1
+        - name: sre
+          approversGroup: sre-oncall
+          minApprovals: 1
+      changeTicket:
+        system: jira
+        projectKey: NC
+        required: true
+
+  targeting:
+    dimensions:
+      - key: device.model
+      - key: device.hwRev
+      - key: device.site
+      - key: device.region
+      - key: software.version
+    rules:
+      - name: block-legacy-hw
+        type: deny
+        match:
+          device.hwRev: ["A0","A1"]
+      - name: allow-eu-prod
+        type: allow
+        match:
+          device.region: ["eu"]
+          device.model: ["PI-Core-Edge","PI-Core-Gateway"]
+    safetyLimits:
+      maxConcurrentPerSite: 50
+      minBatteryPercent: 40
+      minFreeDiskMB: 512
+      requireACPower: true
+      network:
+        minThroughputKbps: 512
+        maxPacketLossPercent: 5
+
+  rollout:
+    strategy: &rollout
+      type: staged         # immediate | canary | staged
+      staged:
+        waves:
+          - name: wave-0-canary
+            percentage: 1
+            soakMinutes: 60
+            successCriteria:
+              maxFailurePercent: 1
+              maxRollbacks: 1
+              healthSignals:
+                - metric: app_errors_total
+                  window: 10m
+                  lt: 5
+          - name: wave-1
+            percentage: 10
+            soakMinutes: 60
+            successCriteria:
+              maxFailurePercent: 2
+          - name: wave-2
+            percentage: 30
+            soakMinutes: 60
+            successCriteria:
+              maxFailurePercent: 2
+          - name: wave-3
+            percentage: 59
+            soakMinutes: 60
+            successCriteria:
+              maxFailurePercent: 2
+      canary:
+        samplePercent: 2
+        soakMinutes: 120
+        autoPromote: false
+      haltConditions:
+        - type: metric
+          expr: "rate(device_reboot_loops_total[5m]) > 0.02"
+        - type: log
+          pattern: "kernel: panic"
+      autoPauseOnAlert: true
+      rollback:
+        trigger:
+          failurePercent: 3
+          healthSignalTimeoutMinutes: 15
+        action:
+          mode: flip-slot   # flip-slot | reinstall-previous
+          keepArtifacts: true
+        auditNote: "Auto-rollback by controller"
+
+  artifacts:
+    registries: *defaults.storage.registries
+    primary: artifacts-registry-primary
+    rules:
+      - name: enforce-hash-and-signature
+        requireHash: true
+        requireSignature: true
+      - name: size-limit
+        maxMB: 2048
+      - name: delta-preference
+        preferDeltaOverFull: true
+
+  plans:
+    - name: core-edge-2.4.1
+      description: "PI Core Edge firmware 2.4.1 with security fixes"
+      inherits:
+        - *defaults
+      overrides:
+        <<: *delivery
+        updateEngine:
+          <<: *engine
+          delta:
+            enabled: true
+            format: bsdiff
+        observability: *obs
+        audit: *audit
+        compliance:
+          <<: *compliance
+          cveGates:
+            maxSeverity: "high"
+            allowlist:
+              - "CVE-2024-12345"   # риск‑акцепт, закрывается в 2.4.2
+        approvals: *approvals
+      targeting:
+        query:
+          device.model: ["PI-Core-Edge"]
+          device.hwRev: ["B2","B3","C0"]
+          software.version__lt: "2.4.1"
+      rollout: *rollout
+      artifacts:
+        manifest:
+          version: "2.4.1"
+          buildId: "pi-core-edge-2.4.1+20250821"
+          files:
+            - name: rootfs.img.zst
+              path: s3://ota-artifacts/pi-core-edge/2.4.1/rootfs.img.zst
+              sha256: "<PUT_SHA256_HERE>"
+              sizeBytes: 734003200
+              signature: "cosign:sig:sha256-<PUT_SIG>"
+            - name: delta-from-2.4.0.patch
+              path: s3://ota-artifacts/pi-core-edge/2.4.1/delta-2.4.0-to-2.4.1.patch
+              sha256: "<PUT_SHA256_HERE>"
+              sizeBytes: 98765432
+              signature: "cosign:sig:sha256-<PUT_SIG>"
+          sbom:
+            path: s3://ota-artifacts/pi-core-edge/2.4.1/sbom.spdx.json
+            sha256: "<PUT_SHA256_HERE>"
+
+    - name: gateway-1.9.0
+      description: "Gateway container bundle 1.9.0"
+      inherits:
+        - *defaults
+      overrides:
+        artifactType: container
+        delivery:
+          <<: *delivery
+          protocols:
+            https:
+              enabled: true
+              endpoint: https://registry.neurocity.local
+        updateEngine:
+          mode: container
+          containerRuntime: containerd
+          preInstallHooks:
+            - name: drain-queue
+              timeoutSeconds: 90
+              command: ["/usr/local/bin/ota-hooks", "drain"]
+      targeting:
+        query:
+          device.model: ["PI-Core-Gateway"]
+          device.site__in: ["stockholm-dc1","helsinki-edge1"]
+      rollout:
+        type: canary
+        canary:
+          samplePercent: 3
+          soakMinutes: 90
+          autoPromote: true
+        haltConditions:
+          - type: metric
+            expr: "rate(gateway_disconnects_total[10m]) > 0.05"
+
+profiles:
+  staging:
+    <<: *defaults
+    observability:
+      <<: *obs
+      logs:
+        level: debug
+      metrics:
+        labels:
+          env: staging
+    approvals:
+      required: false
+  dr:
+    <<: *defaults
+    storage:
+      registryPrimary: artifacts-registry-dr
+    delivery:
+      <<: *delivery
+      rateLimit:
+        globalPerSecond: 50
+        perSitePerMinute: 30
+
+status:
+  lastValidated: "2025-08-22T07:30:00Z"
+  validation:
+    signaturePolicy: passed
+    schemaCheck: passed
+    opaPolicies: passed
+  notes:
+    - "Готово к употреблению в контроллере OTA. Замените значения <PUT_...>."

@@ -1,0 +1,253 @@
+# File: cybersecurity-core/cybersecurity/adversary_emulation/scenarios/templates/ransomware.yaml
+apiVersion: adversary-emulation.aethernova/v1
+kind: ScenarioTemplate
+metadata:
+  name: ransomware-benign-simulation
+  id: 7e2d4a42-1cf4-4b3a-b4e8-2b7e2f0d3b11
+  version: 1.0.0
+  description: >
+    Безопасная эмуляция поведения ransomware в тестовой песочнице для тренировки детектов и процедур IR.
+    По умолчанию выполняется симуляция (SIMULATED_ENCRYPTION), без удаления/блокировки восстановления.
+  references:
+    mitre_attack:
+      - id: T1486  # Data Encrypted for Impact
+        url: https://attack.mitre.org/techniques/T1486/
+      - id: T1490  # Inhibit System Recovery
+        url: https://attack.mitre.org/techniques/T1490/
+      - id: T1562.001  # Impair Defenses: Disable or Modify Tools
+        url: https://attack.mitre.org/techniques/T1562/001/
+      - id: T1489  # Service Stop
+        url: https://attack.mitre.org/techniques/T1489/
+      - id: T1059  # Command and Scripting Interpreter
+        url: https://attack.mitre.org/techniques/T1059/
+    nist:
+      - title: NIST SP 800-84 (TT&E)
+        url: https://csrc.nist.gov/pubs/sp/800/84/final
+      - title: NIST SP 800-61 Rev.2 (IR)
+        url: https://csrc.nist.gov/pubs/sp/800/61/r2/final
+    cisa:
+      - title: CISA #StopRansomware Guide (updated)
+        url: https://www.cisa.gov/resources-tools/resources/stopransomware-guide
+classification:
+  intent: benign-training-and-validation
+  risk_level: low
+  legal_notice: >
+    Выполнять ТОЛЬКО в изолированной тестовой среде. Шаблон реализует симуляцию и предохранители.
+safety:
+  mode_default: simulate            # simulate | encrypt
+  destructive_operations_allowed: false
+  required_markers:
+    - "{{ SANDBOX_PATH }}/.ALLOW_EMULATION"
+  encrypt_mode_requirements:
+    enabled: false                  # по умолчанию отключено
+    must_set_env:
+      - SCENARIO_MODE=encrypt
+      - I_UNDERSTAND_RISKS=true
+    additional_marker: "{{ SANDBOX_PATH }}/.I_UNDERSTAND_RISKS"
+  path_guard:
+    must_contain_any:
+      - "EMULATION_SANDBOX"
+    deny_if_matches:
+      - "/etc"
+      - "/var"
+      - "/root"
+      - "\\Windows"
+      - "C:\\Program Files"
+      - "C:\\Windows"
+  safeguards:
+    never_delete_originals: true
+    network_exfiltration: disabled
+    forbid_shadow_copy_deletion: true
+    forbid_service_stops: true
+
+environment:
+  supported_os: [windows, linux, macos]
+  dependencies:
+    windows:
+      - powershell
+    linux:
+      - bash
+      - uuidgen|optional
+    macos:
+      - bash
+      - uuidgen|optional
+    common_optional:
+      - openssl|optional  # используется только в encrypt-режиме
+  logging_requirements:
+    windows:
+      - "Security 4688 (Process Creation)"
+      - "Sysmon Event ID 1 (Process Create)"
+    linux:
+      - "auditd execve / journald"
+    macos:
+      - "Unified Logging (process exec)"
+
+variables:
+  SANDBOX_PATH: "{{ default('/tmp/EMULATION_SANDBOX/' ~ random_uuid(), windows('%TEMP%\\EMULATION_SANDBOX\\' ~ random_uuid())) }}"
+  FILE_COUNT: 5
+  FILE_SIZE_MB: 1
+  SCENARIO_MODE: "{{ env('SCENARIO_MODE', 'simulate') }}"
+  ENCRYPTION_KEY_B64: "{{ random_base64(32) }}"   # используется только в encrypt-режиме
+  ENCRYPTION_ITER: 100000
+
+phases:
+  - name: preparation
+    description: Создание песочницы, маркеров и тестовых файлов
+    steps:
+      - id: prep.make_sandbox.win
+        when: os == 'windows'
+        executor: powershell
+        command: |
+          $sb = "{{ SANDBOX_PATH }}"; New-Item -ItemType Directory -Force -Path $sb | Out-Null
+          New-Item -ItemType File -Path (Join-Path $sb ".ALLOW_EMULATION") -Force | Out-Null
+          1..{{ FILE_COUNT }} | ForEach-Object {
+            fsutil file createnew (Join-Path $sb ("doc$_.txt")) {{ FILE_SIZE_MB }}000000
+          }
+      - id: prep.make_sandbox.nix
+        when: os in ['linux','macos']
+        executor: bash
+        command: |
+          set -euo pipefail
+          SB="{{ SANDBOX_PATH }}"; mkdir -p "$SB"
+          : > "$SB/.ALLOW_EMULATION"
+          for i in $(seq 1 {{ FILE_COUNT }}); do
+            dd if=/dev/zero of="$SB/doc${i}.txt" bs=1M count={{ FILE_SIZE_MB }} status=none
+          done
+
+  - name: execution.simulated_encryption
+    technique: T1486
+    description: Безопасная симуляция «шифрования» — создаём *.simenc рядом с исходником
+    steps:
+      - id: exec.sim.win
+        when: os == 'windows'
+        executor: powershell
+        command: |
+          $sb = "{{ SANDBOX_PATH }}"
+          if (!(Test-Path (Join-Path $sb ".ALLOW_EMULATION"))) { throw "Marker missing" }
+          Get-ChildItem -Path $sb -Filter *.txt | ForEach-Object {
+            $dst = "$($_.FullName).simenc"
+            "SIMULATED_ENCRYPTION`n" | Set-Content -NoNewline -Path $dst -Encoding UTF8
+            Add-Content -Path $dst -Value (Get-Content -Raw -Path $_.FullName)
+          }
+      - id: exec.sim.nix
+        when: os in ['linux','macos']
+        executor: bash
+        command: |
+          set -euo pipefail
+          SB="{{ SANDBOX_PATH }}"
+          [ -f "$SB/.ALLOW_EMULATION" ] || { echo "Marker missing"; exit 2; }
+          for f in "$SB"/*.txt; do
+            printf 'SIMULATED_ENCRYPTION\n' | cat - "$f" > "${f}.simenc"
+          done
+
+  - name: optional.execution.encrypt_real
+    enabled: "{{ SCENARIO_MODE == 'encrypt' }}"
+    technique: T1486
+    description: Опциональное реальное шифрование ТОЛЬКО в песочнице (оригиналы сохраняются)
+    steps:
+      - id: exec.enc.win
+        when: os == 'windows'
+        executor: powershell
+        command: |
+          if ($env:I_UNDERSTAND_RISKS -ne "true") { throw "Encrypt mode not acknowledged" }
+          $sb = "{{ SANDBOX_PATH }}"
+          if (!(Test-Path (Join-Path $sb ".I_UNDERSTAND_RISKS"))) { throw "Additional marker missing" }
+          $key = [Convert]::FromBase64String("{{ ENCRYPTION_KEY_B64 }}")
+          Get-ChildItem -Path $sb -Filter *.txt | ForEach-Object {
+            $src=$_.FullName; $dst="$src.enc"
+            $aes = [System.Security.Cryptography.Aes]::Create()
+            $aes.Key = $key; $aes.Mode="CBC"; $aes.GenerateIV()
+            $iv = $aes.IV
+            $enc = $aes.CreateEncryptor()
+            $data = [System.IO.File]::ReadAllBytes($src)
+            $cipher = $enc.TransformFinalBlock($data,0,$data.Length)
+            [System.IO.File]::WriteAllBytes($dst, ($iv + $cipher))
+          }
+      - id: exec.enc.nix
+        when: os in ['linux','macos']
+        executor: bash
+        command: |
+          set -euo pipefail
+          [ "${I_UNDERSTAND_RISKS:-}" = "true" ] || { echo "Encrypt mode not acknowledged"; exit 3; }
+          SB="{{ SANDBOX_PATH }}"
+          [ -f "$SB/.I_UNDERSTAND_RISKS" ] || { echo "Additional marker missing"; exit 4; }
+          KEY_B64="{{ ENCRYPTION_KEY_B64 }}"
+          export SCENARIO_KEY="$(printf '%s' "$KEY_B64" | base64 -d)"
+          for f in "$SB"/*.txt; do
+            # Требуется openssl; оригиналы не удаляем
+            if command -v openssl >/dev/null 2>&1; then
+              openssl enc -aes-256-cbc -salt -pbkdf2 -iter {{ ENCRYPTION_ITER }} -in "$f" -out "${f}.enc" -pass env:SCENARIO_KEY
+            else
+              printf 'SIMULATED_ENCRYPTION\n' | cat - "$f" > "${f}.enc"
+            fi
+          done
+
+  - name: inhibit_recovery.validation_only
+    technique: T1490
+    description: НЕ выполняет блокировку восстановления. Только валидация запрета (safety.forbid_shadow_copy_deletion=true)
+    steps:
+      - id: recovery.noop
+        executor: bash
+        command: |
+          echo "Shadow copy deletion and recovery inhibition are FORBIDDEN in this scenario."
+
+  - name: impair_defenses.benign_probe
+    technique: T1562.001
+    description: Только чтение статуса защитных средств, без отключения
+    steps:
+      - id: av.status.win
+        when: os == 'windows'
+        executor: powershell
+        command: |
+          Get-MpComputerStatus | Select-Object AMServiceEnabled, AntispywareEnabled, RealTimeProtectionEnabled | Out-String
+      - id: av.status.nix
+        when: os in ['linux','macos']
+        executor: bash
+        command: |
+          command -v systemctl >/dev/null && systemctl is-active clamav-daemon 2>/dev/null || true
+
+  - name: service_stop.validation_only
+    technique: T1489
+    description: НЕ останавливает сервисы. Только демонстрация запрета
+    steps:
+      - id: svc.noop
+        executor: bash
+        command: |
+          echo "Service stop operations are FORBIDDEN in this scenario."
+
+  - name: cleanup
+    description: Очистка песочницы (опционально)
+    steps:
+      - id: cleanup.nix
+        when: os in ['linux','macos']
+        executor: bash
+        command: |
+          rm -rf "{{ SANDBOX_PATH }}"
+      - id: cleanup.win
+        when: os == 'windows'
+        executor: powershell
+        command: |
+          Remove-Item -Recurse -Force "{{ SANDBOX_PATH }}" -ErrorAction SilentlyContinue
+
+validations:
+  expected_observables:
+    windows:
+      - event: "Security 4688 / Sysmon ID 1 for powershell.exe"
+      - command_contains: ["SIMULATED_ENCRYPTION", "{{ SANDBOX_PATH }}"]
+    linux_macos:
+      - process_exec: ["bash", "dd", "cat", "printf", "openssl?"]
+      - path_contains: ["{{ SANDBOX_PATH }}"]
+  expected_artifacts:
+    - glob: "{{ SANDBOX_PATH }}/*.simenc"
+    - when: "{{ SCENARIO_MODE == 'encrypt' }}"
+      glob: "{{ SANDBOX_PATH }}/*.enc"
+
+reporting:
+  metrics:
+    - name: mean_time_to_detect_seconds
+      description: Время до срабатывания детекта от запуска execution.simulated_encryption
+    - name: detection_rate
+      description: Доля успешных детектов среди прогонов
+  notes:
+    - "Сопоставляйте события с ATT&CK техниками (T1486, T1490, T1562.001, T1489, T1059)."
+

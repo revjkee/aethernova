@@ -1,0 +1,118 @@
+# ops/ansible/roles/omnimind-core/tasks/logrotate.yml
+---
+- name: "Logrotate | Ensure logrotate package present"
+  package:
+    name: logrotate
+    state: present
+  when: omnimind_core_logging.logrotate.enabled | default(true)
+
+- name: "Logrotate | Ensure log directory exists with secure permissions"
+  file:
+    path: "{{ omnimind_core_logging.file.path | default(omnimind_core_paths.log ~ '/' ~ omnimind_core_service_name ~ '.log') | dirname }}"
+    state: directory
+    owner: "{{ omnimind_core_logging.file.owner | default(omnimind_core_user) }}"
+    group: "{{ omnimind_core_logging.file.group | default(omnimind_core_group) }}"
+    mode: "0750"
+  when: omnimind_core_logging.logrotate.enabled | default(true)
+
+- name: "Logrotate | Restore SELinux context for log directory (if managed)"
+  command: "restorecon -Rv {{ omnimind_core_logging.file.path | default(omnimind_core_paths.log ~ '/' ~ omnimind_core_service_name ~ '.log') | dirname }}"
+  changed_when: false
+  when:
+    - omnimind_core_logging.logrotate.enabled | default(true)
+    - omnimind_core_selinux.manage | default(false)
+
+- name: "Logrotate | Render /etc/logrotate.d/omnimind-core"
+  copy:
+    dest: /etc/logrotate.d/omnimind-core
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {{ (omnimind_core_logging.file.path | default(omnimind_core_paths.log ~ '/' ~ omnimind_core_service_name ~ '.log')) }}
+      {
+          {% set rotate_count = (omnimind_core_logging.logrotate.rotate | default(7)) %}
+          {% set daily = (omnimind_core_logging.logrotate.daily | default(true)) %}
+          {% set weekly = (omnimind_core_logging.logrotate.weekly | default(false)) %}
+          {% set compress = (omnimind_core_logging.logrotate.compress | default(true)) %}
+          {% set delaycompress = (omnimind_core_logging.logrotate.delaycompress | default(true)) %}
+          {% set maxsize = (omnimind_core_logging.logrotate.maxsize | default(omit)) %}
+          {% set size = (omnimind_core_logging.logrotate.size | default(omit)) %}
+          {% set copytruncate = (omnimind_core_logging.logrotate.copytruncate | default(true)) %}
+          {% set missingok = (omnimind_core_logging.logrotate.missingok | default(true)) %}
+          {% set notifempty = (omnimind_core_logging.logrotate.notifempty | default(true)) %}
+          {% set dateext = (omnimind_core_logging.logrotate.dateext | default(true)) %}
+          {% set create_mode = (omnimind_core_logging.logrotate.create_mode | default(omnimind_core_logging.file.mode | default('0640'))) %}
+          {% set create_owner = (omnimind_core_logging.logrotate.create_owner | default(omnimind_core_logging.file.owner | default(omnimind_core_user))) %}
+          {% set create_group = (omnimind_core_logging.logrotate.create_group | default(omnimind_core_logging.file.group | default(omnimind_core_group))) %}
+          rotate {{ rotate_count }}
+          {% if daily %}daily{% endif %}
+          {% if (not daily) and weekly %}weekly{% endif %}
+          {% if compress %}compress{% endif %}
+          {% if delaycompress %}delaycompress{% endif %}
+          {% if dateext %}dateext{% endif %}
+          {% if missingok %}missingok{% endif %}
+          {% if notifempty %}notifempty{% endif %}
+          {% if maxsize is not none and maxsize is not string and maxsize != omit %}
+          maxsize {{ maxsize }}
+          {% elif maxsize is string %}
+          maxsize {{ maxsize }}
+          {% endif %}
+          {% if size is not none and size is not string and size != omit %}
+          size {{ size }}
+          {% elif size is string %}
+          size {{ size }}
+          {% endif %}
+          {% if copytruncate %}copytruncate{% else %}nocopytruncate{% endif %}
+          su {{ create_owner }} {{ create_group }}
+          create {{ create_mode }} {{ create_owner }} {{ create_group }}
+
+          sharedscripts
+          postrotate
+              # Reload app to rotate file descriptors if not using copytruncate
+              {% set post_cmd = omnimind_core_logging.logrotate.postrotate_cmd | default('') %}
+              {% if not copytruncate %}
+              {{ (post_cmd | length > 0) | ternary(post_cmd, 'systemctl kill -s HUP ' ~ omnimind_core_service_name) }}
+              {% else %}
+              # copytruncate used; graceful reload is optional
+              {{ (post_cmd | length > 0) | ternary(post_cmd, ':') }}
+              {% endif %}
+          endscript
+      }
+  notify: "Logrotate | Force rotate now"
+  when: omnimind_core_logging.logrotate.enabled | default(true)
+
+- name: "Logrotate | Ensure logrotate.timer is enabled (best-effort)"
+  systemd:
+    name: logrotate.timer
+    state: started
+    enabled: true
+    daemon_reload: yes
+  failed_when: false
+  when: omnimind_core_logging.logrotate.enabled | default(true)
+
+- name: "Logrotate | Validate configuration (dry run)"
+  command: "logrotate -dv /etc/logrotate.d/omnimind-core"
+  register: _logrotate_validate
+  changed_when: false
+  failed_when: _logrotate_validate.rc != 0
+  when:
+    - omnimind_core_logging.logrotate.enabled | default(true)
+    - omnimind_core_logging.logrotate.validate | default(true)
+
+# Опциональный немедленный прогон ротации (по умолчанию — через handler)
+- name: "Logrotate | Optional immediate rotate run"
+  command: "logrotate -f /etc/logrotate.d/omnimind-core"
+  when:
+    - omnimind_core_logging.logrotate.enabled | default(true)
+    - omnimind_core_logging.logrotate.force_rotate | default(false)
+
+# Handlers (локально в tasks для автономности файла; можно перенести в handlers/main.yml)
+- name: "Set handlers for logrotate"
+  meta: noop
+
+# Используйте include_tasks/handlers в роли; пример локального handler ниже:
+# handlers/main.yml:
+# - name: "Logrotate | Force rotate now"
+#   command: "logrotate -f /etc/logrotate.d/omnimind-core"
+#   listen: "Logrotate | Force rotate now"

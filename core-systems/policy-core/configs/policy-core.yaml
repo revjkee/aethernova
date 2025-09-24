@@ -1,0 +1,412 @@
+# =============================================================================
+# policy-core — Industrial configuration
+# Schema version and defaults are safe for production; override via ENV.
+# =============================================================================
+
+schema:
+  version: 1
+  # Optional JSON Schema URL for external validation
+  url: https://config.neurocity/policy-core/schema/v1.json
+
+app:
+  name: policy-core
+  instance: ${APP_INSTANCE:default}
+  environment: ${APP_ENV:dev}        # dev | stage | prod
+  region: ${APP_REGION:eu-central}
+  zone: ${APP_ZONE:eu-central-1a}
+  # Immutable build metadata (injected at build/CI time)
+  build:
+    commit: ${GIT_COMMIT_SHA:unknown}
+    tag: ${GIT_TAG:dev}
+    date: ${BUILD_DATE:1970-01-01T00:00:00Z}
+
+server:
+  host: ${SERVER_HOST:0.0.0.0}
+  port: ${SERVER_PORT:8080}
+  # HTTP timeouts
+  timeouts:
+    read_ms: ${SERVER_READ_MS:10000}
+    write_ms: ${SERVER_WRITE_MS:10000}
+    idle_ms: ${SERVER_IDLE_MS:60000}
+    shutdown_grace_ms: ${SERVER_SHUTDOWN_GRACE_MS:20000}
+  # Max request sizes and connection limits
+  limits:
+    max_request_bytes: ${SERVER_MAX_REQ_BYTES:10485760}   # 10 MiB
+    max_header_bytes: ${SERVER_MAX_HEADER_BYTES:1048576}
+    max_concurrent_requests: ${SERVER_MAX_CONCURRENT:2048}
+    keep_alive_connections: ${SERVER_KEEP_ALIVE:1024}
+  cors:
+    enabled: ${CORS_ENABLED:false}
+    allowed_origins: ${CORS_ALLOWED_ORIGINS:https://app.example.com}
+    allowed_methods: GET,POST,PUT,PATCH,DELETE,OPTIONS
+    allowed_headers: Authorization,Content-Type,X-Request-Id
+    allow_credentials: true
+    max_age_seconds: 600
+  security_headers:
+    csp: "default-src 'none'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; frame-ancestors 'none'"
+    referrer_policy: no-referrer
+    x_content_type_options: nosniff
+    x_frame_options: DENY
+    permissions_policy: "geolocation=(), microphone=(), camera=()"
+  tls:
+    enabled: ${TLS_ENABLED:false}
+    certificate_file: ${TLS_CERT_FILE:}
+    private_key_file: ${TLS_KEY_FILE:}
+    min_version: TLS1.2
+    ciphers: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+    client_auth:
+      # mTLS for north-south traffic
+      required: ${MTLS_REQUIRED:false}
+      ca_file: ${MTLS_CA_FILE:}
+
+routing:
+  # Public API HTTP paths
+  http:
+    base_path: /api
+    # Health and readiness
+    healthz: /healthz
+    readyz: /readyz
+    # Policy evaluation endpoints
+    evaluate: /v1/policy/evaluate
+    simulate: /v1/policy/simulate
+    admin:
+      base_path: /admin
+      reload: /admin/reload
+      metrics: /admin/metrics
+  # gRPC (optional)
+  grpc:
+    enabled: ${GRPC_ENABLED:false}
+    host: ${GRPC_HOST:0.0.0.0}
+    port: ${GRPC_PORT:9090}
+    reflection: ${GRPC_REFLECTION:true}
+    max_recv_bytes: ${GRPC_MAX_RECV_BYTES:10485760}
+
+logging:
+  level: ${LOG_LEVEL:info}            # trace|debug|info|warn|error
+  format: ${LOG_FORMAT:json}          # json|text
+  sample_rate: ${LOG_SAMPLE_RATE:1.0}
+  redact:
+    enabled: true
+    fields:
+      - request.headers.authorization
+      - user.email
+      - user.token
+      - pii.*
+  outputs:
+    - type: stderr
+    - type: file
+      enabled: ${LOG_FILE_ENABLED:false}
+      path: ${LOG_FILE_PATH:/var/log/policy-core/policy-core.log}
+      rotate:
+        max_size_mb: 100
+        max_backups: 5
+        max_age_days: 7
+        compress: true
+
+auth:
+  # Authentication providers
+  oidc:
+    enabled: ${OIDC_ENABLED:false}
+    issuer: ${OIDC_ISSUER:}
+    client_id: ${OIDC_CLIENT_ID:}
+    audience: ${OIDC_AUDIENCE:policy-core}
+    jwks_cache_ttl_s: 600
+    clock_skew_s: 60
+  jwt:
+    enabled: ${JWT_ENABLED:true}
+    algorithms: ${JWT_ALG:RS256}
+    jwks_url: ${JWT_JWKS_URL:}
+    static_secrets:
+      - kid: ${JWT_KID:local}
+        secret: ${JWT_HMAC_SECRET:change_me}
+        alg: HS256
+    leeway_s: 30
+    required_claims:
+      - sub
+      - iat
+      - exp
+  api_keys:
+    enabled: ${API_KEYS_ENABLED:false}
+    header: X-API-Key
+    keys: []   # use secret manager in production
+  access:
+    # Role-based access control map: route -> required roles
+    rbac:
+      - route: /admin/*
+        roles: [admin]
+      - route: /v1/policy/*
+        roles: [service, admin]
+    # Per-route rate limits (overrides global)
+    rate_limits:
+      - route: /v1/policy/evaluate
+        limit_qps: 100
+        burst: 200
+        key: "user.sub"              # dimension to key-by
+
+rate_limiting:
+  enabled: ${RATE_LIMIT_ENABLED:true}
+  # Global token bucket per client key
+  global:
+    qps: ${RATE_LIMIT_QPS:200}
+    burst: ${RATE_LIMIT_BURST:400}
+    key_strategy: ${RATE_LIMIT_KEY:user.ip}   # user.ip | user.sub | api.key
+  # Sliding window error-based backoff
+  adaptive_backoff:
+    enabled: ${ADAPTIVE_BACKOFF:true}
+    error_ratio_threshold: 0.2
+    cooldown_s: 30
+
+quotas:
+  enabled: ${QUOTAS_ENABLED:false}
+  provider: local                     # local|redis
+  redis_prefix: policy:quota:
+  default:
+    monthly_requests: 100000
+    concurrent_requests: 200
+
+policies:
+  engine: ${POLICY_ENGINE:rego}       # rego|cel|wasm
+  # Hot reload and sources
+  reload:
+    on_sighup: true
+    interval_s: ${POLICY_RELOAD_INTERVAL_S:60}
+  sources:
+    # Filesystem bundle
+    - type: fs
+      path: ${POLICY_BUNDLE_PATH:./policies}
+      include: ["**/*.rego","**/*.yaml"]
+    # Remote bundle (OPA/OCI)
+    - type: oci
+      enabled: ${POLICY_OCI_ENABLED:false}
+      image: ${POLICY_OCI_IMAGE:}
+      tag: ${POLICY_OCI_TAG:latest}
+      pull_interval_s: 300
+      auth:
+        username: ${POLICY_OCI_USER:}
+        password: ${POLICY_OCI_PASS:}
+  # Input shaping and defaults
+  defaults:
+    deny_on_error: true
+    decision_timeout_ms: ${POLICY_DECISION_TIMEOUT_MS:800}
+    max_input_bytes: ${POLICY_MAX_INPUT_BYTES:262144}
+  # Named entrypoints (OPA-style)
+  entrypoints:
+    allow: "policy/allow"
+    mask: "policy/mask"
+    route: "policy/route"
+  # Post-processor chains (masking, enrichment)
+  postprocessors:
+    - name: mask_pii
+      enabled: true
+    - name: audit_log
+      enabled: true
+
+storage:
+  # Primary relational database
+  postgres:
+    enabled: ${PG_ENABLED:true}
+    dsn: ${PG_DSN:postgresql://user:pass@localhost:5432/policy_core}
+    pool:
+      min: ${PG_POOL_MIN:2}
+      max: ${PG_POOL_MAX:20}
+      max_lifetime_s: 3600
+      idle_timeout_s: 300
+    migrations:
+      enabled: true
+      path: ${PG_MIGRATIONS_PATH:./migrations}
+      strict: true
+  # Cache / KV
+  redis:
+    enabled: ${REDIS_ENABLED:true}
+    address: ${REDIS_ADDR:localhost:6379}
+    db: ${REDIS_DB:0}
+    username: ${REDIS_USER:}
+    password: ${REDIS_PASS:}
+    tls:
+      enabled: ${REDIS_TLS:false}
+      insecure_skip_verify: ${REDIS_TLS_INSECURE:false}
+    pool:
+      size: ${REDIS_POOL_SIZE:32}
+      min_idle: 4
+      max_conn_age_s: 1800
+  # Object storage for bundles, exports
+  object_store:
+    enabled: ${S3_ENABLED:false}
+    provider: ${S3_PROVIDER:s3}       # s3|gcs|minio
+    bucket: ${S3_BUCKET:policy-core}
+    endpoint: ${S3_ENDPOINT:}
+    region: ${S3_REGION:}
+    access_key: ${S3_ACCESS_KEY:}
+    secret_key: ${S3_SECRET_KEY:}
+    force_path_style: ${S3_FORCE_PATH_STYLE:false}
+    sse: ${S3_SSE:none}               # none|AES256|aws:kms
+
+messaging:
+  # Choose one: kafka or rabbitmq
+  kafka:
+    enabled: ${KAFKA_ENABLED:false}
+    brokers: ${KAFKA_BROKERS:localhost:9092}
+    client_id: policy-core
+    acks: all
+    compression: snappy
+    tls:
+      enabled: ${KAFKA_TLS:false}
+      ca_file: ${KAFKA_CA_FILE:}
+      cert_file: ${KAFKA_CERT_FILE:}
+      key_file: ${KAFKA_KEY_FILE:}
+    topics:
+      audit: policy.audit
+      decision: policy.decision
+  rabbitmq:
+    enabled: ${RMQ_ENABLED:false}
+    url: ${RMQ_URL:amqp://guest:guest@localhost:5672/}
+    prefetch: 100
+    exchanges:
+      audit: policy.audit
+      decision: policy.decision
+
+observability:
+  metrics:
+    prometheus:
+      enabled: ${METRICS_ENABLED:true}
+      path: /admin/metrics
+      # Histogram buckets for HTTP request durations
+      buckets_seconds: [0.05, 0.1, 0.2, 0.5, 1, 2, 5]
+      labels:
+        app: policy-core
+        component: policy
+  tracing:
+    otel:
+      enabled: ${OTEL_ENABLED:true}
+      exporter: ${OTEL_EXPORTER:otlp}   # otlp|jaeger|zipkin
+      endpoint: ${OTEL_ENDPOINT:http://localhost:4318}
+      protocol: ${OTEL_PROTOCOL:http/protobuf}
+      sampler: ${OTEL_SAMPLER:parentbased_traceidratio}
+      ratio: ${OTEL_SAMPLER_RATIO:0.1}
+      service_name: policy-core
+      resource:
+        service.version: ${GIT_TAG:dev}
+        deployment.environment: ${APP_ENV:dev}
+  logging_pipeline:
+    # Ship logs to collector via stdout; keep section for future sinks
+    enabled: true
+  health:
+    # Internal self-check intervals
+    interval_s: 15
+    checks:
+      postgres: ${PG_ENABLED:true}
+      redis: ${REDIS_ENABLED:true}
+      policy_sources: true
+      object_store: ${S3_ENABLED:false}
+
+slo:
+  # SLOs used both by service and alerting templates
+  availability:
+    target: ${SLO_AVAIL:99.9}
+    window: 28d
+  latency:
+    p95_ms: ${SLO_LAT_P95_MS:500}
+    p99_ms: ${SLO_LAT_P99_MS:1500}
+  error_rate:
+    max_ratio: ${SLO_ERR_RATIO:0.01}
+
+i18n:
+  default_lang: ${I18N_DEFAULT:en}
+  supported: [en,ru]
+  # For CLI/tooling exporters
+  catalogs:
+    path: ${I18N_PATH:./i18n}
+    fallback_on_missing: true
+
+features:
+  # Progressive rollout with percentage gates and allowlists
+  gates:
+    new_policy_pipeline:
+      enabled: ${FF_NEW_POLICY:false}
+      percentage: ${FF_NEW_POLICY_PCT:0}
+      allowlist_subs: []
+    async_eval:
+      enabled: ${FF_ASYNC_EVAL:false}
+      percentage: 0
+  # Kill-switches
+  kill_switches:
+    disable_policy_reload: ${KS_DISABLE_RELOAD:false}
+
+timeouts:
+  upstream:
+    http_ms: ${UPSTREAM_HTTP_MS:1500}
+    grpc_ms: ${UPSTREAM_GRPC_MS:1200}
+  datastore:
+    pg_ms: ${PG_TIMEOUT_MS:800}
+    redis_ms: ${REDIS_TIMEOUT_MS:300}
+  policy:
+    evaluate_ms: ${POLICY_EVAL_MS:700}
+    simulate_ms: ${POLICY_SIM_MS:1200}
+
+validation:
+  # Hard guards to prevent unsafe runtime changes
+  deny_if:
+    missing_env: []     # e.g., [JWT_JWKS_URL]
+    invalid_ranges:
+      - key: slo.latency.p99_ms
+        min: 100
+        max: 5000
+      - key: rate_limiting.global.qps
+        min: 10
+        max: 100000
+  on_error: fail          # fail | warn
+
+audit:
+  enabled: ${AUDIT_ENABLED:true}
+  sink: ${AUDIT_SINK:stdout}      # stdout|kafka|rabbit|s3
+  redact_fields:
+    - input.pii.*
+    - decision.context.token
+  # GDPR-like retention
+  retention_days: ${AUDIT_RETENTION_DAYS:14}
+
+# -----------------------------------------------------------------------------
+# Profiles: overlay specific tweaks per environment
+# -----------------------------------------------------------------------------
+profiles:
+  dev:
+    logging:
+      level: debug
+      format: text
+    rate_limiting:
+      enabled: false
+    auth:
+      jwt:
+        leeway_s: 120
+    observability:
+      tracing:
+        otel:
+          ratio: 1.0
+  stage:
+    rate_limiting:
+      global:
+        qps: 100
+        burst: 200
+    slo:
+      latency:
+        p95_ms: 700
+        p99_ms: 2000
+  prod:
+    server:
+      timeouts:
+        read_ms: 5000
+        write_ms: 5000
+        idle_ms: 60000
+    rate_limiting:
+      global:
+        qps: 2000
+        burst: 4000
+    policies:
+      defaults:
+        decision_timeout_ms: 600
+    observability:
+      tracing:
+        otel:
+          ratio: 0.2
+    audit:
+      retention_days: 30

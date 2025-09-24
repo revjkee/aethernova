@@ -1,0 +1,335 @@
+// veilmind-core/schemas/proto/v1/veilmind/detect.proto
+syntax = "proto3";
+
+package veilmind.v1.veilmind;
+
+option csharp_namespace = "VeilMind.Proto.V1";
+option go_package        = "github.com/your-org/veilmind-core/schemas/proto/v1/veilmind;veilmindpb";
+option java_multiple_files = true;
+option java_package        = "org.veilmind.proto.v1";
+option java_outer_classname = "DetectProto";
+option objc_class_prefix   = "VMD";
+option optimize_for        = SPEED;
+
+// Well-known & common types
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/empty.proto";
+import "google/type/latlng.proto";
+
+// -----------------------------------------------------------------------------
+// ENUMERATIONS
+// -----------------------------------------------------------------------------
+
+// Итоговое решение механизма Zero Trust.
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  DECISION_ALLOW       = 1;
+  DECISION_MFA         = 2;
+  DECISION_LIMITED     = 3; // частичный доступ/контейнеризация
+  DECISION_DENY        = 4;
+  DECISION_QUARANTINE  = 5;
+}
+
+// Высокоуровневая причина/триггер решения.
+enum ReasonCode {
+  REASON_UNSPECIFIED            = 0;
+  REASON_THRESHOLD              = 1;  // общий порог риска
+  REASON_HARD_RULE              = 2;  // жёсткое правило
+  REASON_GEO_VELOCITY           = 3;
+  REASON_THREAT_INTEL           = 4;
+  REASON_DEVICE_POSTURE         = 5;
+  REASON_BEHAVIOR_ANOMALY       = 6;
+  REASON_POLICY_OVERRIDE        = 7;  // ручная политика/исключение
+}
+
+// Источник события для трассировки.
+enum Source {
+  SOURCE_UNSPECIFIED = 0;
+  SOURCE_WEB         = 1;
+  SOURCE_MOBILE      = 2;
+  SOURCE_API         = 3;
+  SOURCE_WORKER      = 4;
+}
+
+// Степень серьёзности обнаруженной угрозы (не равна решению, но влияет на него).
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO        = 1;
+  SEVERITY_LOW         = 2;
+  SEVERITY_MEDIUM      = 3;
+  SEVERITY_HIGH        = 4;
+  SEVERITY_CRITICAL    = 5;
+}
+
+// Код состояния обработки в батче/стриме.
+enum StatusCode {
+  STATUS_OK                = 0;
+  STATUS_INVALID_ARGUMENT  = 1;
+  STATUS_UNAUTHENTICATED   = 2;
+  STATUS_PERMISSION_DENIED = 3;
+  STATUS_UNAVAILABLE       = 4;
+  STATUS_INTERNAL          = 5;
+  STATUS_RESOURCE_EXHAUSTED= 6;
+  STATUS_ALREADY_EXISTS    = 7; // идемпотентность
+}
+
+// -----------------------------------------------------------------------------
+// CORE DOMAIN TYPES
+// -----------------------------------------------------------------------------
+
+// Идентификация актора/учётки.
+message Actor {
+  string actor_id     = 1; // стабильный ID (UUID/ULID/внешний)
+  string tenant_id    = 2; // мульти‑арендность (если применимо)
+  string org_id       = 3; // альтернатива tenant_id
+  map<string,string> attributes = 10; // роль, отдел, SSO provider и т.п.
+}
+
+// Идентификация и состояние устройства.
+message Device {
+  string device_id    = 1;
+  string os           = 2;  // "iOS 17", "Windows 11" и т.п.
+  string os_build     = 3;
+  string model        = 4;
+  bool   managed      = 5;  // MDM/управляемое
+  string posture      = 6;  // "compliant"/"non-compliant"/custom
+  map<string,string> attributes = 10; // версия агента, патчи и т.п.
+}
+
+// Сетевой контекст.
+message Network {
+  string ip           = 1;  // IPv4/IPv6 (строкой)
+  string asn          = 2;  // автономная система (если доступно)
+  string isp          = 3;
+  string city         = 4;
+  string country      = 5;
+  google.type.LatLng geo = 6;
+  bool   tor          = 7;
+  bool   proxy        = 8;
+  map<string,string> attributes = 10;
+}
+
+// Описатель защищаемого ресурса/операции.
+message Resource {
+  string resource_id  = 1;  // стабильный ID, например "repo:42" или "db:account:read"
+  string kind         = 2;  // "http", "db", "s3", "k8s" и т.п.
+  string action       = 3;  // "read", "write", "delete", "login", "admin"
+  string path         = 4;  // URI/путь, если применимо
+  map<string,string> attributes = 10; // sensitivity="high" и т.п.
+}
+
+// Свободные измерения риска (интеграция с внешними источниками).
+message RiskSignals {
+  double identity_risk         = 1;  // 0..100
+  double device_posture        = 2;  // 0..100
+  double network_risk          = 3;  // 0..100
+  double resource_sensitivity  = 4;  // 0..100
+  double behavior_risk         = 5;  // 0..100
+  double threat_intel          = 6;  // 0..100
+  double time_risk             = 7;  // 0..100
+  map<string,double> extra     = 10; // расширяемые числовые признаки 0..100
+}
+
+// Единой событийный вход для детекции/скоринга.
+message DetectEvent {
+  string correlation_id     = 1;  // ULID/UUID, клиент может прислать; если пусто, сервер установит
+  google.protobuf.Timestamp ts = 2;
+  Source source             = 3;
+
+  Actor   actor             = 10;
+  Device  device            = 11;
+  Network network           = 12;
+  Resource resource         = 13;
+
+  RiskSignals signals       = 20;
+
+  // Произвольные структурированные данные (доп. признаки).
+  google.protobuf.Struct context = 30;
+
+  // Идемпотентность: ключ запроса. Сервер может ответить STATUS_ALREADY_EXISTS.
+  string request_id         = 40;
+
+  // Зарезервировано для будущего (эволюция без ломки).
+  reserved 100 to 119;
+}
+
+// Вклад отдельного фактора в итоговый скор (для объяснимости).
+message FactorContribution {
+  string name    = 1;  // например "device_posture"
+  double value   = 2;  // нормализовано 0..100
+  double weight  = 3;  // вес агрегатора
+  double impact  = 4;  // вклад в итог, единицы как у score_raw
+}
+
+// Итог работы детектора.
+message DetectResult {
+  string correlation_id     = 1;  // перенос из входа или сгенерированный ULID
+  google.protobuf.Timestamp evaluated_at = 2;
+
+  // Скор до/после калибровки.
+  double score_raw          = 10; // 0..100
+  double score              = 11; // 0..100
+
+  Decision decision         = 12;
+  ReasonCode reason         = 13;
+  Severity severity         = 14;
+
+  // Сработавшее жёсткое правило, если было (идентификатор правила).
+  string hard_rule_id       = 15;
+
+  // Пороговые значения применённой политики.
+  double thr_allow          = 20;
+  double thr_mfa            = 21;
+  double thr_deny           = 22;
+  double thr_quarantine     = 23;
+
+  // Объяснимость.
+  repeated FactorContribution factors = 30;
+
+  // Обязательства/требования к последующим шагам (например, "require_mfa":"totp").
+  map<string,string> obligations = 40;
+
+  // Диагностические теги/метки для трассировки (не должны содержать PII).
+  map<string,string> diagnostics = 50;
+
+  // Зарезервировано под расширения.
+  reserved 100 to 119;
+}
+
+// Обёртки для unary/stream/batch режимов.
+// -------------------------------
+
+message EvaluateRequest {
+  DetectEvent event = 1;
+  // Если true — сервер вернёт factors/diagnostics; иначе может урезать.
+  bool explain = 2;
+}
+
+message EvaluateResponse {
+  StatusCode status = 1;
+  string     message = 2; // человекочитаемое описание ошибки/статуса
+  DetectResult result = 3;
+}
+
+// Для батча — частично‑успешная обработка с индексами.
+message BatchEvaluateRequest {
+  // Идентификатор партии, для идемпотентности/трассировки.
+  string batch_id = 1;
+  repeated DetectEvent events = 2;
+  bool explain = 3;
+}
+
+message BatchEvaluateItem {
+  int32 index = 1; // индекс элемента в исходном списке
+  StatusCode status = 2;
+  string message = 3;
+  DetectResult result = 4;
+}
+
+message BatchEvaluateResponse {
+  string batch_id = 1;
+  repeated BatchEvaluateItem items = 2;
+}
+
+// Для потоковой обработки — bidirectional с упорядочиванием в пределах session_id.
+message StreamEvaluateRequest {
+  string session_id = 1; // логический поток клиента
+  DetectEvent event = 2;
+  bool explain = 3;
+}
+
+message StreamEvaluateResponse {
+  string session_id = 1;
+  StatusCode status = 2;
+  string message = 3;
+  DetectResult result = 4;
+}
+
+// Метаданные/сводка модели и политики.
+message ModelInfoRequest {
+  // Опционально: идентификатор/хэш набора весов или политики
+  string policy_id = 1;
+}
+
+message ModelInfoResponse {
+  string  detector_version = 1; // семантическая версия
+  string  policy_version   = 2;
+  string  build_sha        = 3;
+  google.protobuf.Timestamp updated_at = 4;
+
+  // Описание факторов и весов (без секретов).
+  map<string,double> factor_weights = 10;
+
+  // Параметры калибровки.
+  double calibration_k   = 20;
+  double calibration_x0  = 21;
+
+  // Документация по жёстким правилам.
+  repeated string hard_rules = 30;
+}
+
+// Аудит‑лог (запись события и результата) — может использоваться отдельным сервисом.
+message AuditRecord {
+  DetectEvent  event  = 1;
+  DetectResult result = 2;
+  // Криптодоказуемость (например, JWS/подпись).
+  string proof_type = 10; // "jws"|"log_chain"|...
+  string proof      = 11;
+}
+
+// Пагинация и фильтрация для выборок аудита (если понадобится расширять API).
+message ListAuditRecordsRequest {
+  string actor_id = 1;
+  google.protobuf.Timestamp from = 2;
+  google.protobuf.Timestamp to   = 3;
+  string page_token = 4;
+  int32  page_size  = 5; // <= 1000
+}
+
+message ListAuditRecordsResponse {
+  repeated AuditRecord records = 1;
+  string next_page_token = 2;
+}
+
+// -----------------------------------------------------------------------------
+// SERVICE DEFINITION
+// -----------------------------------------------------------------------------
+
+service DetectService {
+  // Синхронная оценка одного события.
+  rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
+
+  // Батч‑оценка: допускает частичные ошибки; порядок ответов соответствует порядку входа.
+  rpc BatchEvaluate(BatchEvaluateRequest) returns (BatchEvaluateResponse);
+
+  // Полноценный bidi‑stream: сервер отвечает по мере поступления событий.
+  rpc StreamEvaluate(stream StreamEvaluateRequest)
+      returns (stream StreamEvaluateResponse);
+
+  // Метаданные модели/политики для отладки и совместимости клиентов.
+  rpc GetModelInfo(ModelInfoRequest) returns (ModelInfoResponse);
+
+  // (Опционально) Запись аудита — если аудит вынесен в детектор.
+  rpc WriteAudit(AuditRecord) returns (google.protobuf.Empty);
+}
+
+// -----------------------------------------------------------------------------
+// DESIGN NOTES
+// -----------------------------------------------------------------------------
+// 1) Эволюция схемы:
+//    - Новые поля добавлять с новыми номерами; не переиспользовать удалённые — используйте reserved.
+//    - В местах расширения предусмотрены карты и Struct.
+// 2) Безопасность:
+//    - PII не помещать в diagnostics/labels/обязательства.
+//    - correlation_id — ULID/UUID строкой (сервер может перегенерировать).
+// 3) Идемпотентность:
+//    - request_id и batch_id используются сервером для защиты от повторной обработки.
+//    - При повторе допустим STATUS_ALREADY_EXISTS с прежним DetectResult.
+// 4) Потоки:
+//    - session_id позволяет упорядочивание и семантику back‑pressure.
+// 5) Производительность:
+//    - explain=false может существенно уменьшать размер ответа.
+// 6) Совместимость генераторов:
+//    - Используются только well‑known types; без сторонних опций, чтобы SDK генерировались «из коробки».

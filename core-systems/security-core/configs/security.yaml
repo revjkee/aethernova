@@ -1,0 +1,403 @@
+# core-systems/security-core/configs/security.yaml
+# Schema: security-core/v1
+version: 1
+schema: security-core/v1
+updated_at: "2025-08-19T00:00:00Z"
+
+metadata:
+  system: core-systems
+  module: security-core
+  owner_team: security-engineering
+  environment: prod
+  tags:
+    zero_trust: "true"
+    managed_by: "IaC"
+    compliance: ["iso27001", "soc2", "gdpr"]
+
+defaults: &defaults
+  zero_trust:
+    enforce: true
+    least_privilege: true
+    verify_explicitly: true
+    assume_breach: true
+
+  identity:
+    user_oidc:
+      issuer_url: "https://auth.CHANGE_ME.com"
+      audience: "core-systems"
+      jwks_cache_ttl_seconds: 300
+      required_claims: ["sub", "aud", "exp", "iat"]
+      optional_claims: ["email", "groups", "roles"]
+      clock_skew_seconds: 60
+      token_lifetime_seconds:
+        access: 900         # 15m
+        id: 900
+        refresh: 0          # disable refresh by default
+      mfa:
+        enforce_for_roles: ["admin", "security", "ops"]
+        allowed_factors: ["webauthn", "totp"]
+    service_identity:
+      spiffe:
+        trust_domain: "example.internal"
+        svid_ttl_seconds: 3600
+        rotation_jitter_seconds: 120
+        audience: ["core-systems"]
+      workload_selector:
+        require_labels: ["app", "env", "version"]
+
+  transport:
+    tls:
+      min_version: "1.3"
+      cipher_suites: ["TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"]
+      hsts:
+        enabled: true
+        max_age_seconds: 31536000
+        include_subdomains: true
+        preload: false
+    mtls:
+      required_for:
+        inbound: ["*"]     # all inbound to services must be mTLS
+        outbound: ["*"]    # all egress from services must be mTLS
+      client_cert_required: true
+
+  crypto:
+    kms:
+      provider: "gcp-kms"        # gcp-kms|aws-kms|azure-kv|hsm
+      keyring: "core-systems"
+      keys:
+        - name: "jwt-signing"
+          purpose: "asym-sign"
+          algorithm: "RSA_PSS_2048_SHA256"
+          rotation_days: 30
+          primary: true
+        - name: "data-at-rest"
+          purpose: "sym-encrypt"
+          algorithm: "AES_256_GCM"
+          rotation_days: 90
+    hashing:
+      password: { algorithm: "argon2id", time_cost: 3, memory_cost_kib: 65536, parallelism: 1 }
+      generic: { algorithm: "sha3-256" }
+
+  pki:
+    root_ca_offline: true
+    intermediate_cas: 2
+    crl:
+      enabled: true
+      publish_interval_seconds: 600
+    ocsp:
+      stapling: true
+      must_staple: true
+    key_usages:
+      leaf: ["digitalSignature", "keyEncipherment", "keyAgreement"]
+      ca: ["keyCertSign", "cRLSign"]
+
+  secrets:
+    broker: "vault"
+    mount_prefix: "kv/core"
+    default_ttl_seconds: 900
+    max_ttl_seconds: 3600
+    dynamic_backends:
+      database:
+        enabled: true
+        rotation: "on_lease_renewal"
+      cloud:
+        aws_iam: false
+        gcp_sa: true
+    secret_scanning:
+      deny_env_plaintext: true
+      block_on_detection: true
+
+  policy:
+    opa:
+      enforcement_mode: "fail-closed"
+      bundles:
+        - name: "authz-core"
+          url: "https://opa-bundles.CHANGE_ME.com/authz-core.tar.gz"
+          signing:
+            cosign:
+              key_ref: "COSIGN_PUB_KEY://CHANGE_ME"
+          poll_seconds: 60
+      decision_log:
+        enabled: true
+        sink: "tls://opa-logs.CHANGE_ME.internal:6514"
+    pep:
+      envoy_ext_authz:
+        connect_timeout_ms: 800
+        failure_mode_allow: false
+
+  data_protection:
+    classification:
+      levels: ["public", "internal", "confidential", "restricted"]
+      default_level: "internal"
+    at_rest:
+      require_encryption: true
+      min_algorithm: "AES_256_GCM"
+    in_transit:
+      require_tls: true
+    dlp:
+      enabled: true
+      detectors: ["pii", "secrets", "ccn", "iban"]
+      actions:
+        on_detect: ["block", "alert", "quarantine"]
+
+  observability:
+    logging:
+      level: "INFO"
+      json: true
+      pii_scrubbing: true
+      sinks:
+        - type: "syslog-tls"
+          endpoint: "tls://logs.CHANGE_ME.internal:6514"
+          verify_peer: true
+    tracing:
+      enabled: true
+      sampler: "parentbased_always_on"
+      exporter: "otlp"
+      endpoint: "http://otel-collector.CHANGE_ME.svc:4317"
+    metrics:
+      exporter: "prometheus"
+      endpoint: "0.0.0.0:9464"
+    audit:
+      enabled: true
+      immutable_storage: true
+      retention_days: 365
+      redact_fields: ["token", "secret", "password", "set-cookie"]
+
+  network:
+    egress:
+      allowed_destinations: ["com.amazonaws.*", "gcr.io", "ghcr.io", "CHANGE_ME.private"]
+      block_privnet_outside_mesh: true
+    kubernetes:
+      default_network_policy:
+        ingress: "deny_all"
+        egress: "deny_all"
+      pod_security_standard: "restricted"
+      admission_controls:
+        require_signed_images: true
+        require_sbom: true
+        block_privileged: true
+        forbid_host_namespace: true
+
+  supply_chain:
+    sbom:
+      required: true
+      format: ["spdx-json", "cyclonedx-json"]
+    signing:
+      cosign:
+        required: true
+        verify_in_admission: true
+        issuer: "sigstore"
+    build_attestations:
+      slsa_level_target: 3
+      verify_in_cd: true
+    dependencies:
+      allowlist_patterns: ["^org\\.trusted\\.", "^github\\.com/trusted/.+"]
+      deny_licenses: ["GPL-3.0-only", "AGPL-3.0-only"]
+      vuln_gate:
+        severity_threshold: "high"  # block high/critical
+
+  vuln_management:
+    scanners: ["trivy", "grype"]
+    schedule_cron: "0 */6 * * *"
+    exceptions:
+      expiry_days_max: 30
+      require_risk_acceptance_ticket: true
+
+  access_control:
+    models_enabled: ["rbac", "abac", "pbac"]
+    periodic_review_days: 30
+    admin_roles: ["security-admin"]
+    breakglass:
+      enabled: true
+      ttl_seconds: 900
+      require_mfa: true
+      audit_strict: true
+
+  rate_limits:
+    default_rps_per_client: 50
+    burst_multiplier: 3
+    quota_per_day: 100000
+
+  ir_bcp:
+    rto_minutes: 30
+    rpo_minutes: 15
+    contacts:
+      security_oncall: ["sec-oncall@CHANGE_ME.com"]
+      dpo: ["dpo@CHANGE_ME.com"]
+    playbooks:
+      token_leak: "runbooks/IR-PL-001-token-leak.md"
+      service_compromise: "runbooks/IR-PL-002-service-compromise.md"
+      key_compromise: "runbooks/IR-PL-003-key-compromise.md"
+
+profiles:
+  prod:
+    <<: *defaults
+    observability:
+      <<: *defaults.observability
+      logging:
+        <<: *defaults.observability.logging
+        level: "INFO"
+      audit:
+        <<: *defaults.observability.audit
+        retention_days: 730
+    crypto:
+      <<: *defaults.crypto
+      kms:
+        <<: *defaults.crypto.kms
+        keys:
+          - name: "jwt-signing"
+            purpose: "asym-sign"
+            algorithm: "RSA_PSS_3072_SHA256"
+            rotation_days: 30
+            primary: true
+          - name: "data-at-rest"
+            purpose: "sym-encrypt"
+            algorithm: "AES_256_GCM"
+            rotation_days: 60
+    secrets:
+      <<: *defaults.secrets
+      default_ttl_seconds: 600
+      max_ttl_seconds: 1800
+    supply_chain:
+      <<: *defaults.supply_chain
+      build_attestations:
+        slsa_level_target: 3
+        verify_in_cd: true
+    vuln_management:
+      <<: *defaults.vuln_management
+      scanners: ["trivy"]
+  stage:
+    <<: *defaults
+    observability:
+      <<: *defaults.observability
+      logging:
+        <<: *defaults.observability.logging
+        level: "DEBUG"
+      audit:
+        <<: *defaults.observability.audit
+        retention_days: 180
+    secrets:
+      <<: *defaults.secrets
+      default_ttl_seconds: 900
+      max_ttl_seconds: 3600
+  dev:
+    <<: *defaults
+    zero_trust:
+      <<: *defaults.zero_trust
+      enforce: true
+    observability:
+      <<: *defaults.observability
+      logging:
+        <<: *defaults.observability.logging
+        level: "DEBUG"
+      audit:
+        <<: *defaults.observability.audit
+        enabled: true
+        retention_days: 30
+    supply_chain:
+      <<: *defaults.supply_chain
+      signing:
+        cosign:
+          required: false
+          verify_in_admission: false
+
+policy_inputs:
+  # Нормализованные входы для PDP (OPA)
+  subject_schema:
+    user:
+      required: ["sub", "roles", "groups"]
+      optional: ["email", "dept"]
+    service:
+      required: ["spiffe_id", "namespace", "service_account"]
+      optional: ["workload_labels"]
+  resource_schema:
+    generic:
+      required: ["type", "name", "namespace"]
+  actions:
+    - read
+    - write
+    - delete
+    - rotate
+    - deploy
+    - exec
+
+authorizations:
+  # Базовые разрешения (должны дополняться Rego-политиками)
+  defaults:
+    deny_by_default: true
+  grants:
+    - name: "admin-read-all"
+      when:
+        subject.kind: "user"
+        subject.roles: ["security-admin"]
+      allow:
+        actions: ["read"]
+        resources: ["*"]
+    - name: "svc-to-svc-write-ledger"
+      when:
+        subject.kind: "service"
+        subject.spiffe_id: "spiffe://example.internal/ns/prod/sa/payments"
+      allow:
+        actions: ["write"]
+        resources: ["ledger:prod:*"]
+
+admission_controls:
+  require_image_signatures: true
+  verify_sbom: true
+  block_latest_tag: true
+  prohibit_root_user: true
+  seccomp_profile: "RuntimeDefault"
+  apparmor_profile: "runtime/default"
+  read_only_root_fs: true
+
+api_gateway:
+  auth:
+    mode: "oidc-mtls"          # слитый режим: OIDC для пользователя, mTLS для канала
+    require_pfs: true
+  rate_limit:
+    per_ip_rps: 20
+    per_token_rps: 50
+
+token_policies:
+  paseto:
+    version: "v4"
+    purpose: "local"
+    lifetime_seconds: 900
+    rotation_days: 30
+  jwt:
+    alg: "PS256"
+    lifetime_seconds: 900
+    kid_header: true
+    jwks_cache_ttl_seconds: 300
+
+compliance_mapping:
+  iso27001_annex_a:
+    A_5_Information_Security_Policies: "policy repository refs"
+    A_8_Asset_Management: "data classification + SBOM"
+    A_9_Access_Control: "RBAC/ABAC/PBAC + reviews"
+    A_12_Operations_Security: "logging, monitoring, vuln mgmt"
+    A_14_System_Acquisition: "supply chain controls"
+    A_16_Incident_Management: "runbooks + oncall"
+  soc2_cc:
+    CC2: "change management + attestations"
+    CC6: "logical access controls"
+    CC7: "monitoring + incident response"
+
+overrides:
+  # Пример точечной переопределяемой настройки через env-vars/Helm values
+  env:
+    OIDC_ISSUER_URL: "profiles.prod.identity.user_oidc.issuer_url"
+    LOG_LEVEL: "profiles.prod.observability.logging.level"
+
+bootstrap_checks:
+  # Минимальный набор pre-flight проверок при старте сервисов security-core
+  require_items:
+    - "profiles.${ENV}.identity.user_oidc.issuer_url != 'https://auth.CHANGE_ME.com'"
+    - "profiles.${ENV}.policy.opa.bundles[0].url not contains 'CHANGE_ME'"
+    - "profiles.${ENV}.observability.logging.sinks[0].endpoint startswith 'tls://'"
+    - "profiles.${ENV}.crypto.kms.provider in ['gcp-kms','aws-kms','azure-kv','hsm']"
+    - "profiles.${ENV}.secrets.broker == 'vault'"
+
+notes:
+  - "Все значения CHANGE_ME заменить через CI/CD и секрет‑менеджер."
+  - "Конфиг валидируется в пайплайне: схему/ссылки/политики/ключи."

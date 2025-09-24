@@ -1,0 +1,311 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cybersecurity-core-config
+  namespace: cybersecurity-core
+  labels:
+    app.kubernetes.io/name: cybersecurity-core
+    app.kubernetes.io/part-of: platform-security-core
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: kustomize
+    security.aethernova.io/tier: "critical"
+  annotations:
+    reloader.stakater.com/match: "true"
+    config.kubernetes.io/description: "Base security configuration, OPA policies, Falco rules. No secrets."
+data:
+  security.yaml: |
+    service:
+      name: cybersecurity-core
+      mode: hardened
+      namespace: cybersecurity-core
+
+    auth:
+      oidc:
+        enabled: true
+        # issuerURL, clientID, clientSecret берутся из Secret/ENV. Здесь только включение механизма.
+        issuerURLRef: "secret://cybersecurity-core/oidc#issuer"   # ссылка-указатель, не секрет
+        claimMappings:
+          - sub
+          - email
+          - groups
+      mtls:
+        required: true
+        trustDomain: cluster.local
+        caProviderRef: "secret://cybersecurity-core/mtls-ca#ca.crt"
+
+    admission:
+      enabled: true
+      failurePolicy: Fail
+      timeoutSeconds: 10
+      policies:
+        - name: require-nonroot
+        - name: disallow-privileged
+        - name: require-readonly-fs
+        - name: block-host-namespaces
+        - name: require-image-signature
+
+    rbac:
+      enforcement: true
+      defaultRole: "viewer"
+      # Политики привилегий реализуются в подсистеме RBAC/OPA, здесь только флаги.
+
+    network:
+      defaultDenyEgress: true
+      allowDNS: true
+      allowedDestinations:
+        - host: "otel-collector.observability.svc.cluster.local"
+          ports: [4317]
+          protocol: tcp
+          purpose: telemetry
+        - host: "security-syslog.platform-security.svc.cluster.local"
+          ports: [514]
+          protocol: tcp
+          purpose: audit-forward
+      # Любые внешние egress должны быть явно перечислены через overlays.
+
+    runtime:
+      seccompProfile: "RuntimeDefault"
+      appArmor: "runtime/default"
+      dropCapabilities:
+        - ALL
+      allowPrivilegeEscalation: false
+      falco:
+        enabled: true
+        rulesRef: "cybersecurity-core-falco-rules"
+
+    logging:
+      level: "info"
+      format: "json"
+      fields:
+        - timestamp
+        - level
+        - msg
+        - trace_id
+        - span_id
+      redaction:
+        enabled: true
+        patterns:
+          - "(?i)password=\\S+"
+          - "(?i)authorization: Bearer [A-Za-z0-9._-]+"
+          - "(?i)secret=\\S+"
+
+    audit:
+      enabled: true
+      pii:
+        redact: true
+      sinks:
+        otlp:
+          endpoint: "otel-collector.observability.svc.cluster.local:4317"
+          protocol: grpc
+        syslog:
+          endpoint: "security-syslog.platform-security.svc.cluster.local:514"
+          protocol: tcp
+        loki:
+          url: "http://loki.observability.svc.cluster.local:3100"
+          tenant: "platform"
+
+    telemetry:
+      tracing:
+        exporter: otlp
+        sampling: 0.05
+      metrics:
+        exporter: otlp
+        interval: "15s"
+      logs:
+        exporter: otlp
+
+    compliance:
+      frameworks:
+        - "CIS-Kubernetes-1.24"
+        - "NIST-800-53"
+      mode: "monitor" # enforce включается на окружениях через overlays
+
+    features:
+      enableOPA: true
+      enableAdmissionControl: true
+      enableSBOMVerification: true
+      enableExternalSecrets: true
+
+  opa-policies.rego: |
+    package admission
+
+    # Запрет привилегированных контейнеров
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      some i
+      container := input.request.object.spec.containers[i]
+      container.securityContext.privileged == true
+      msg := "privileged containers are not allowed"
+    }
+
+    # Обязательное исполнение без root
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      some i
+      container := input.request.object.spec.containers[i]
+      not container.securityContext.runAsNonRoot
+      msg := "containers must set securityContext.runAsNonRoot: true"
+    }
+
+    # Обязательный readOnlyRootFilesystem
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      some i
+      container := input.request.object.spec.containers[i]
+      not container.securityContext.readOnlyRootFilesystem
+      msg := "containers must set readOnlyRootFilesystem: true"
+    }
+
+    # Блокировка hostPID/hostIPC/hostNetwork
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      input.request.object.spec.hostPID == true
+      msg := "hostPID is not allowed"
+    }
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      input.request.object.spec.hostIPC == true
+      msg := "hostIPC is not allowed"
+    }
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      input.request.object.spec.hostNetwork == true
+      msg := "hostNetwork is not allowed"
+    }
+
+    # Запрет hostPath volumes
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      some i
+      vol := input.request.object.spec.volumes[i]
+      vol.hostPath
+      msg := "hostPath volumes are not allowed"
+    }
+
+    # Минимальный пользователь
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      some i
+      sc := input.request.object.spec.securityContext
+      not sc.runAsUser
+      msg := "pod.securityContext.runAsUser must be set"
+    }
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      sc := input.request.object.spec.securityContext
+      sc.runAsUser < 10000
+      msg := "pod.securityContext.runAsUser must be >= 10000"
+    }
+
+    # Требование "подписанного" образа (упрощённо через аннотацию)
+    deny[msg] {
+      input.request.kind.kind == "Pod"
+      some i
+      container := input.request.object.spec.containers[i]
+      not input.request.object.metadata.annotations["cosign.sigstore.dev/signed"]
+      msg := sprintf("image %q must be signed (cosign.sigstore.dev/signed)", [container.image])
+    }
+
+    # Разрешение (для отладки) — если есть аннотация bypass в ограниченной среде monitor
+    allow[msg] {
+      input.request.kind.kind == "Pod"
+      input.request.object.metadata.annotations["security.aethernova.io/admission-bypass"] == "true"
+      msg := "bypass allowed for monitored namespaces only"
+    }
+
+  falco-rules.yaml: |
+    # Минимальный базовый набор правил Falco для обнаружения подозрительных действий
+    falco_rules:
+      - rule: Launching Shell Inside Container
+        desc: Detect shell spawned by container entrypoint or exec
+        condition: >
+          container and proc.name in (bash, sh, zsh, ash) and
+          not proc.pname in (runc, docker, containerd-shim)
+        output: >
+          Falco: shell spawned in container (user=%user.name command=%proc.cmdline
+          container_id=%container.id container_name=%container.name image=%container.image.repository)
+        priority: WARNING
+        tags: [container, mitre_execution]
+
+      - rule: Write Below Etcd
+        desc: Detect write operations to etcd paths on host
+        condition: >
+          evt.type in (open,openat,creat) and fd.name startswith /var/lib/etcd and
+          not container
+        output: "Falco: write below /var/lib/etcd (user=%user.name file=%fd.name cmd=%proc.cmdline)"
+        priority: CRITICAL
+        tags: [k8s, mitre_lateral_movement]
+
+      - rule: Read Sensitive Files Untrusted
+        desc: Non-root read of shadow/passwd files inside container
+        condition: >
+          container and (fd.name in (/etc/shadow, /etc/sudoers) or fd.name startswith /root/) and
+          user.uid != 0
+        output: "Falco: suspicious read of sensitive file (user=%user.name file=%fd.name container=%container.name)"
+        priority: WARNING
+        tags: [container, mitre_credential_access]
+
+  auditors.yaml: |
+    # Конфигурация аудит-форвардинга и маскирования
+    masking:
+      enablePIIRedaction: true
+      rules:
+        - name: redact-tokens
+          match: "(?i)(token|apikey|authorization)\\s*[:=]\\s*[^\\s]+"
+          replacement: "<redacted>"
+    forward:
+      otlp:
+        endpoint: "otel-collector.observability.svc.cluster.local:4317"
+        protocol: grpc
+      syslog:
+        endpoint: "security-syslog.platform-security.svc.cluster.local:514"
+        protocol: tcp
+    retain:
+      days: 30
+      rotateMB: 100
+
+  scanners.yaml: |
+    # Базовая конфигурация для SCA/Container scanning агентов (пример для trivy/clair)
+    trivy:
+      severity: "CRITICAL,HIGH"
+      ignoreUnfixed: true
+      timeout: "5m"
+      db:
+        refresh: "12h"
+      sbom:
+        required: true
+    policy:
+      blockOn:
+        vulnerability:
+          critical: true
+          high: true
+        misconfiguration:
+          critical: true
+
+  log-collector.conf: |
+    # Пример минимальной конфигурации Fluent Bit (встраиваемой через sidecar)
+    [SERVICE]
+        Flush        1
+        Parsers_File parsers.conf
+        Log_Level    info
+
+    [INPUT]
+        Name         tail
+        Path         /var/log/app/*.log
+        Tag          app.*
+        Mem_Buf_Limit 10MB
+        Skip_Long_Lines On
+
+    [FILTER]
+        Name         grep
+        Match        app.*
+        Exclude      message (?i)password=\S+|authorization:\s*Bearer\s+\S+
+
+    [OUTPUT]
+        Name         loki
+        Match        app.*
+        Host         loki.observability.svc.cluster.local
+        Port         3100
+        Labels       job=cybersecurity-core,app=cybersecurity-core
+        Auto_Kubernetes_Labels On

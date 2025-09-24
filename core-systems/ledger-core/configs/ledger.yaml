@@ -1,0 +1,499 @@
+# Ledger Core — unified configuration
+schemaVersion: 1.3.0
+kind: LedgerConfig
+metadata:
+  service: ledger-core
+  owner: finance-platform
+  team: ledger
+  environment: ${ENVIRONMENT:-dev}        # может переопределяться ENV
+  versionFromEnv: LEDGER_BUILD_VERSION     # считывается приложением
+  instanceIdFromEnv: HOSTNAME
+  # Детерминированная подпись (подставляется через Helm tpl для переката подов)
+  checksum: "{{ toJson .Values | sha256sum }}"
+
+# =========================
+# Глобальные анкоры/шаблоны
+# =========================
+x-templates:
+  postgres-ssl: &postgres-ssl
+    ssl:
+      mode: verify-full
+      rootCA:
+        source: file
+        path: /etc/ssl/certs/ca.pem
+  pool-defaults: &pool-defaults
+    maxOpenConns: 64
+    maxIdleConns: 16
+    connMaxLifetime: 30m
+    connMaxIdleTime: 10m
+    healthCheckInterval: 15s
+  redis-tls: &redis-tls
+    tls:
+      enabled: true
+      insecureSkipVerify: false
+  kafka-tls: &kafka-tls
+    tls:
+      enabled: true
+      insecureSkipVerify: false
+  kafka-producer-defaults: &kafka-producer-defaults
+    acks: all
+    idempotent: true
+    maxInFlight: 5
+    retries: 10
+    retryBackoff: 200ms
+    compression: zstd
+    linger: 10ms
+    batchBytes: 1048576 # 1 MiB
+  kafka-consumer-defaults: &kafka-consumer-defaults
+    groupId: ledger-core
+    sessionTimeout: 30s
+    maxPollInterval: 5m
+    maxPollRecords: 500
+    fetchMinBytes: 1
+    fetchMaxBytes: 5242880 # 5 MiB
+    autoOffsetReset: latest
+
+# =========================
+# Секьюрити и доступ
+# =========================
+security:
+  tls:
+    enabled: true
+    minVersion: TLS1.2
+    preferServerCipherSuites: true
+    certFile: /etc/ledger/tls/tls.crt
+    keyFile: /etc/ledger/tls/tls.key
+    clientAuth:
+      mtlsRequired: true
+      clientCAs: /etc/ledger/tls/clients_ca.pem
+
+  network:
+    allowCIDRs:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+    denyCIDRs: []
+
+  auth:
+    mode: oidc
+    oidc:
+      issuer: https://auth.example.com/oidc
+      audience: ledger-core
+      jwksURL: https://auth.example.com/oidc/jwks.json
+      cacheTTL: 10m
+    jwt:
+      allowedAlgs: [RS256, ES256]
+      leeway: 30s
+
+  rbac:
+    enabled: true
+    policyFile: /etc/ledger/policy/rbac.yaml
+
+  abac:
+    enabled: true
+    engine: opa
+    opa:
+      url: http://opa:8181
+      decisionPath: /v1/data/ledger/allow
+      bundles:
+        enabled: true
+        service: http://opal-bundle:7000
+        pollingInterval: 60s
+
+  secrets:
+    provider: vault      # vault|env|sops
+    envelopeEncryption:
+      kmsKeyArn: "arn:aws:kms:{{ .Values.aws.account }}:key/{{ .Values.kms.keys.primary }}"
+      enabled: true
+    vault:
+      addr: https://vault.example.com
+      authMethod: k8s
+      k8sRole: ledger-core
+      mount: kv
+      # Пример путей c версиями
+      paths:
+        app: kv/ledger/{{ .Values.global.env }}/app?version=1
+        db:  kv/ledger/{{ .Values.global.env }}/db?version=3
+        kafka: kv/ledger/{{ .Values.global.env }}/kafka?version=1
+        redis: kv/ledger/{{ .Values.global.env }}/redis?version=1
+    env:
+      # Фолбэк (если provider=env)
+      vars:
+        DATABASE_URL: ${DATABASE_URL}
+        REDIS_URL: ${REDIS_URL}
+        KAFKA_SASL_USER: ${KAFKA_SASL_USER}
+        KAFKA_SASL_PASS: ${KAFKA_SASL_PASS}
+
+# =========================
+# Серверы
+# =========================
+server:
+  http:
+    host: 0.0.0.0
+    port: 8080
+    readTimeout: 15s
+    writeTimeout: 15s
+    idleTimeout: 60s
+    maxHeaderBytes: 1048576
+    cors:
+      enabled: true
+      allowedOrigins: ["https://*.example.com"]
+      allowedMethods: ["GET","POST","PUT","PATCH","DELETE"]
+      allowedHeaders: ["Authorization","Content-Type","X-Request-ID"]
+      allowCredentials: true
+      maxAge: 600
+  grpc:
+    host: 0.0.0.0
+    port: 9090
+    maxRecvMsgSize: 10485760
+    maxSendMsgSize: 10485760
+    keepalive:
+      time: 30s
+      timeout: 10s
+      minTimeBetweenPings: 30s
+
+# =========================
+# Базы данных
+# =========================
+database:
+  engine: postgres
+  primary:
+    # DSN/секрет из Vault; приложение само извлекает секрет по этому пути
+    secretRef: vault:kv/ledger/{{ .Values.global.env }}/db#DATABASE_URL
+    <<: *postgres-ssl
+    pool:
+      <<: *pool-defaults
+  replicas:
+    - name: read-1
+      secretRef: vault:kv/ledger/{{ .Values.global.env }}/db#READONLY_URL_1
+      weight: 60
+      <<: *postgres-ssl
+    - name: read-2
+      secretRef: vault:kv/ledger/{{ .Values.global.env }}/db#READONLY_URL_2
+      weight: 40
+      <<: *postgres-ssl
+  schema:
+    migrateOnStart: false
+    migrationDir: file:///etc/ledger/migrations
+    lockTimeout: 30s
+    statementTimeout: 60s
+    searchPath: ["public"]
+  performance:
+    preparedStatements: true
+    statementCacheSize: 2048
+    queryTimeoutDefault: 30s
+  partitioning:
+    enabled: true
+    strategy: time
+    granularity: daily
+  retention:
+    transactions: 365d
+    audit: 1095d
+  constraints:
+    maxAmount: "100000000.00"
+    allowedCurrencies: ["USD","EUR","SEK","RUB","GBP","USDT","USDC"]
+    maxSkew: 5m
+
+# =========================
+# Кэш/Idempotency
+# =========================
+cache:
+  driver: redis
+  redis:
+    mode: cluster
+    nodes:
+      - redis-0.redis:6379
+      - redis-1.redis:6379
+      - redis-2.redis:6379
+    username: default
+    passwordSecretRef: vault:kv/ledger/{{ .Values.global.env }}/redis#PASSWORD
+    db: 0
+    dialingTimeout: 5s
+    readTimeout: 500ms
+    writeTimeout: 500ms
+    poolSize: 128
+    minIdleConns: 16
+    <<: *redis-tls
+  idempotency:
+    prefix: idem:
+    ttl: 24h
+    enabled: true
+
+# =========================
+# Очереди/События
+# =========================
+queue:
+  driver: kafka
+  kafka:
+    brokers:
+      - kafka-0.kafka:9092
+      - kafka-1.kafka:9092
+      - kafka-2.kafka:9092
+    sasl:
+      mechanism: SCRAM-SHA-512
+      usernameSecretRef: vault:kv/ledger/{{ .Values.global.env }}/kafka#USERNAME
+      passwordSecretRef: vault:kv/ledger/{{ .Values.global.env }}/kafka#PASSWORD
+    <<: *kafka-tls
+    producer:
+      <<: *kafka-producer-defaults
+    consumer:
+      <<: *kafka-consumer-defaults
+    topics:
+      tx-incoming: ledger.tx.incoming.v1
+      tx-posted:   ledger.tx.posted.v1
+      tx-failed:   ledger.tx.failed.v1
+      audit:       ledger.audit.v1
+  outbox:
+    enabled: true
+    flushInterval: 500ms
+    batchSize: 500
+
+# =========================
+# Наблюдаемость
+# =========================
+observability:
+  logging:
+    level: info          # trace|debug|info|warn|error
+    json: true
+    includeCaller: true
+    includeStacktrace: false
+    fields:
+      service: ledger-core
+      env: "{{ .Values.global.env }}"
+    redact:
+      enabled: true
+      fields: ["password","secret","token","card","cvv","ssn","iban"]
+  tracing:
+    enabled: true
+    otlp:
+      protocol: grpc
+      endpoint: otel-collector:4317
+      timeout: 5s
+    sampling:
+      type: parentbased_traceidratio
+      ratio: 0.2
+    resource:
+      service.name: ledger-core
+      service.version: ${LEDGER_BUILD_VERSION:-0.0.0}
+      deployment.environment: "{{ .Values.global.env }}"
+  metrics:
+    prometheus:
+      enabled: true
+      path: /metrics
+      port: 9091
+  health:
+    liveness:
+      path: /health/live
+      failureThreshold: 3
+      periodSeconds: 10
+      initialDelaySeconds: 10
+    readiness:
+      path: /health/ready
+      failureThreshold: 3
+      periodSeconds: 10
+      initialDelaySeconds: 10
+    checks:
+      db: true
+      cache: true
+      queue: true
+      dependenciesTimeout: 3s
+  audit:
+    enabled: true
+    sink:
+      type: s3
+      s3:
+        bucket: ledger-audit-{{ .Values.aws.account }}-{{ .Values.global.env }}
+        prefix: year=!{yyyy}/month=!{MM}/day=!{dd}/
+        sseKmsKeyArn: "arn:aws:kms:{{ .Values.aws.account }}:key/{{ .Values.kms.keys.audit }}"
+    format: jsonl
+    include:
+      requestHeaders: ["x-request-id","x-user-id","authorization"]
+      responseCodes: [400,401,403,409,500]
+    dropPII: true
+
+# =========================
+# Функциональные правила Ledger
+# =========================
+ledger:
+  mode: double-entry            # двойная запись
+  decimalPrecision: 2
+  rounding: bankers             # банковское округление
+  baseCurrency: EUR
+  currencies:
+    enabled: ["EUR","USD","SEK","RUB","GBP","USDT","USDC"]
+    fx:
+      source: oracle            # oracle|manual|disabled
+      oracleURL: https://fx.example.com
+      cacheTTL: 10m
+      maxSkew: 2m
+  posting:
+    allowBackdated: false
+    bookingWindow:
+      open: "08:00:00Z"
+      close: "19:00:00Z"
+    duplicateWindow: 5m
+    idempotencyRequired: true
+  reconciliation:
+    enabled: true
+    schedule: "CRON_TZ=UTC */5 * * * *"
+    tolerance:
+      amount: "0.01"
+      timeSkew: 2m
+  closePeriods:
+    enabled: true
+    schedule: "CRON_TZ=UTC 0 0 1 * *" # первое число месяца
+  chartOfAccounts:
+    file: /etc/ledger/coA.yaml
+    schemaVersion: 1.0.0
+  validation:
+    requireCounterparty: true
+    requireCurrencyMatchOnTransfer: true
+    negativeBalancesAllowed: false
+
+# =========================
+# Ограничения и фич-флаги
+# =========================
+ratelimit:
+  global:
+    rps: 500
+    burst: 200
+    strategy: token-bucket
+  endpoints:
+    - path: /v1/transactions
+      rps: 200
+      burst: 80
+    - path: /v1/accounts
+      rps: 100
+      burst: 40
+
+features:
+  enableReconciliation: true
+  enableLedgerPruning: true
+  enableOutboxRelay: true
+  enablePIIRedaction: true
+  enableIdempotency: true
+
+# =========================
+# Вебхуки и внешние интеграции
+# =========================
+webhooks:
+  outgoing:
+    signature:
+      alg: HMAC-SHA256
+      secretRef: vault:kv/ledger/{{ .Values.global.env }}/app#WEBHOOK_SECRET
+      header: X-Ledger-Signature
+    retry:
+      maxAttempts: 10
+      initialBackoff: 1s
+      maxBackoff: 2m
+      jitter: true
+    circuitBreaker:
+      failureRateThreshold: 50
+      slidingWindowSize: 20
+      openStateDuration: 30s
+  endpoints:
+    - name: payments-core
+      url: https://payments.example.com/hooks/ledger
+      timeout: 5s
+      headers:
+        X-Source: ledger-core
+
+# =========================
+# Соответствие требованиям/Retention
+# =========================
+compliance:
+  gdpr:
+    dataSubjectAccessEnabled: true
+    eraseAPIEnabled: true
+    defaultRetention: 365d
+  pci:
+    enforceTLSStrongCiphers: true
+    cardDataInAudit: false
+  pii:
+    scanOnIngress: true
+    redactOnEgress: true
+    fields:
+      - email
+      - phone
+      - iban
+      - card
+      - ssn
+
+# =========================
+# Резервное копирование / DR
+# =========================
+backup:
+  postgres:
+    method: wal-g
+    schedule: "CRON_TZ=UTC 0 * * * *" # ежечасно
+    s3:
+      bucket: ledger-backup-{{ .Values.aws.account }}-{{ .Values.global.env }}
+      prefix: wal-g/
+      sseKmsKeyArn: "arn:aws:kms:{{ .Values.aws.account }}:key/{{ .Values.kms.keys.backup }}"
+    retention:
+      fullDays: 7
+      walDays: 7
+
+dr:
+  rpo: 60s
+  rto: 5m
+  primaryRegion: eu-west-1
+  secondaryRegion: eu-north-1
+  failover:
+    mode: manual       # manual|auto
+    healthProbe: https://status.example.com/ledger
+    promoteReadReplica: true
+
+# =========================
+# Фоновые задания
+# =========================
+jobs:
+  - name: prune-ledger
+    schedule: "CRON_TZ=UTC 15 3 * * *"
+    concurrencyPolicy: Forbid
+    ttlSecondsAfterFinished: 600
+  - name: rotate-keys
+    schedule: "CRON_TZ=UTC 0 0 1 */3 *"  # раз в квартал
+    concurrencyPolicy: Forbid
+    ttlSecondsAfterFinished: 600
+
+# =========================
+# Профили окружений
+# =========================
+environments:
+  prod:
+    server:
+      http:
+        port: 8080
+      grpc:
+        port: 9090
+    observability:
+      logging:
+        level: info
+      tracing:
+        sampling:
+          ratio: 0.15
+  stage:
+    observability:
+      logging:
+        level: debug
+      tracing:
+        sampling:
+          ratio: 0.5
+    ratelimit:
+      global:
+        rps: 200
+        burst: 80
+  dev:
+    observability:
+      logging:
+        level: debug
+      tracing:
+        sampling:
+          ratio: 1.0
+    security:
+      tls:
+        clientAuth:
+          mtlsRequired: false
+    features:
+      enableLedgerPruning: false

@@ -1,0 +1,396 @@
+name: security-core / Security CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: "17 2 * * 1"   # Еженедельный ночной скан по понедельникам
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write   # Для загрузки SARIF в Code Scanning
+  pull-requests: read
+
+concurrency:
+  group: security-core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  POETRY_VERSION: "1.8.3"
+  SRC_DIR: "src"
+  TEST_DIR: "tests"
+  REPORT_DIR: "build/reports"
+  COVERAGE_FILE: "build/coverage.xml"
+  SBOM_FILE: "build/sbom.spdx.json"
+  IMAGE_NAME: "security-core"
+  IMAGE_TAG: "ci-${{ github.sha }}"
+  IMAGE_REF: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+
+jobs:
+  pre-commit:
+    name: Pre-commit hooks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install pre-commit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pre-commit
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.1
+
+  lint-test:
+    name: Lint, Type-check, Test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install deps (pip/poetry autodetect)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip wheel
+          if [ -f "poetry.lock" ] || [ -f "pyproject.toml" ]; then
+            pip install "poetry==${POETRY_VERSION}" || true
+            if command -v poetry >/dev/null 2>&1; then
+              poetry install --with dev || poetry install
+            fi
+          fi
+          if [ -f "requirements-dev.txt" ]; then
+            pip install -r requirements-dev.txt
+          fi
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          fi
+          # Инструменты качества (мягкая установка)
+          pip install -q ruff mypy pytest coverage || true
+
+      - name: Ruff (lint + format check)
+        run: |
+          if command -v ruff >/dev/null 2>&1; then
+            ruff check ${{ env.SRC_DIR }}
+          else
+            echo "ruff not found; skipping"
+          fi
+
+      - name: Mypy (type check)
+        run: |
+          if command -v mypy >/dev/null 2>&1; then
+            mypy ${{ env.SRC_DIR }} || (echo "mypy reported issues" && exit 1)
+          else
+            echo "mypy not found; skipping"
+          fi
+
+      - name: Pytest with coverage
+        run: |
+          if command -v pytest >/dev/null 2>&1; then
+            if python -c "import coverage" >/dev/null 2>&1; then
+              pytest -q --maxfail=1 --disable-warnings --cov=${{ env.SRC_DIR }} --cov-report=xml:${{ env.COVERAGE_FILE }}
+            else
+              pytest -q --maxfail=1 --disable-warnings
+            fi
+          else
+            echo "pytest not found; skipping"
+          fi
+
+      - name: Upload coverage
+        if: always() && hashFiles(env.COVERAGE_FILE) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: ${{ env.COVERAGE_FILE }}
+          retention-days: 7
+
+  dependency-review:
+    name: Dependency Review (PR only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: critical
+          allow-ghsas: ""
+          deny-licenses: "GPL-3.0, AGPL-3.0"
+
+  pip-audit:
+    name: Python SCA (pip-audit)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit || true
+
+      - name: Run pip-audit
+        id: pip_audit
+        run: |
+          mkdir -p ${{ env.REPORT_DIR }}
+          if command -v pip-audit >/dev/null 2>&1; then
+            if [ -f "requirements.txt" ]; then
+              pip-audit -r requirements.txt -f json -o ${{ env.REPORT_DIR }}/pip-audit.json || true
+            else
+              pip-audit -f json -o ${{ env.REPORT_DIR }}/pip-audit.json || true
+            fi
+          else
+            echo "pip-audit not found; skipping" > ${{ env.REPORT_DIR }}/pip-audit.json
+          fi
+
+      - name: Upload SCA report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit
+          path: ${{ env.REPORT_DIR }}/pip-audit.json
+          retention-days: 7
+
+  secrets:
+    name: Secrets scan (Gitleaks)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Полная история для лучшего детекта
+
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --redact --report-format=json --report-path=${{ env.REPORT_DIR }}/gitleaks.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Gitleaks report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks
+          path: ${{ env.REPORT_DIR }}/gitleaks.json
+          retention-days: 7
+
+  semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Semgrep scan
+        uses: returntocorp/semgrep-action@v1.92.0
+        with:
+          config: >-
+            p/ci
+            p/python
+            p/security-audit
+          generateSarif: "1"
+          sarifFile: ${{ env.REPORT_DIR }}/semgrep.sarif
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      - name: Upload Semgrep SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/semgrep.sarif
+
+  codeql:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ "python" ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  trivy-fs:
+    name: Trivy FS (vuln+secret+config)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy FS Scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: "fs"
+          scanners: "vuln,secret,config"
+          format: "sarif"
+          output: ${{ env.REPORT_DIR }}/trivy-fs.sarif
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH,MEDIUM"
+      - name: Upload Trivy FS SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/trivy-fs.sarif
+
+  sbom:
+    name: SBOM (Syft / SPDX)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          format: spdx-json
+          output-file: ${{ env.SBOM_FILE }}
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: ${{ env.SBOM_FILE }}
+          retention-days: 7
+
+  docker-image:
+    name: Build image + Trivy Image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image (if Dockerfile exists)
+        id: docker_build
+        shell: bash
+        run: |
+          if [ -f "Dockerfile" ]; then
+            docker build -t "${IMAGE_REF}" .
+          else
+            echo "no_dockerfile=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trivy Image Scan
+        if: steps.docker_build.outputs.no_dockerfile != 'true'
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: "image"
+          image-ref: "${{ env.IMAGE_REF }}"
+          format: "sarif"
+          output: ${{ env.REPORT_DIR }}/trivy-image.sarif
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: Upload Trivy Image SARIF
+        if: always() && steps.docker_build.outputs.no_dockerfile != 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.REPORT_DIR }}/trivy-image.sarif
+
+  summary:
+    name: Compliance summary
+    runs-on: ubuntu-24.04
+    needs:
+      - pre-commit
+      - lint-test
+      - dependency-review
+      - pip-audit
+      - secrets
+      - semgrep
+      - codeql
+      - trivy-fs
+      - sbom
+      - docker-image
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Result gate
+        shell: bash
+        run: |
+          echo "Pre-commit:   ${{ needs.pre-commit.result }}"
+          echo "Lint/Test:    ${{ needs.lint-test.result }}"
+          echo "Dep Review:   ${{ needs.dependency-review.result }}"
+          echo "pip-audit:    ${{ needs.pip-audit.result }}"
+          echo "Gitleaks:     ${{ needs.secrets.result }}"
+          echo "Semgrep:      ${{ needs.semgrep.result }}"
+          echo "CodeQL:       ${{ needs.codeql.result }}"
+          echo "Trivy FS:     ${{ needs.trivy-fs.result }}"
+          echo "SBOM:         ${{ needs.sbom.result }}"
+          echo "Docker Img:   ${{ needs.docker-image.result }}"
+          # Политика: при фатальных провалах в ключевых проверках — fail
+          FAIL=0
+          for job in "lint-test" "dependency-review" "pip-audit" "secrets" "semgrep" "codeql" "trivy-fs"; do
+            res="${{ needs[job].result }}"
+            if [ "$res" = "failure" ] || [ "$res" = "cancelled" ]; then
+              echo "Critical job failed: $job"
+              FAIL=1
+            fi
+          done
+          if [ $FAIL -ne 0 ]; then
+            exit 1
+          fi

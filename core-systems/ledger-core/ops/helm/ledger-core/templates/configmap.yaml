@@ -1,0 +1,170 @@
+{{- /*
+  ledger-core/ops/helm/configmap.yaml
+  Промышленный шаблон ConfigMap с поддержкой:
+  - одиночной карты (.Values.configMap) и массива карт (.Values.configMaps)
+  - immutable, extraLabels/extraAnnotations
+  - data/binaryData с tpl-рендерингом
+  - fromFiles / binaryFromFiles из .Files
+  - детерминированного порядка ключей
+*/ -}}
+
+{{- /* =========================
+     Хелперы (самодостаточно)
+========================= */ -}}
+{{- define "ledger-core.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ledger-core.fullname" -}}
+{{- $name := include "ledger-core.name" . -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s" $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ledger-core.labels" -}}
+app.kubernetes.io/name: {{ include "ledger-core.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
+{{- if .Values.global }}
+{{- if .Values.global.team }}owner.team: {{ .Values.global.team | quote }}{{ end }}
+{{- if .Values.global.env }}env: {{ .Values.global.env | quote }}{{ end }}
+{{- end }}
+{{- end -}}
+
+{{- define "ledger-core.mergeLabels" -}}
+{{- $ctx := index . 0 -}}
+{{- $extra := index . 1 | default dict -}}
+{{- $base := fromYaml (include "ledger-core.labels" $ctx) | default dict -}}
+{{- $merged := merge $base $extra -}}
+{{- toYaml $merged -}}
+{{- end -}}
+
+{{- define "ledger-core.mergeAnnotations" -}}
+{{- $extra := . | default dict -}}
+{{- toYaml $extra -}}
+{{- end -}}
+
+{{- /* =========================
+     Функции рендера tpl map
+========================= */ -}}
+{{- define "ledger-core.tplMap" -}}
+{{- $ctx := index . 0 -}}
+{{- $m := (index . 1) | default dict -}}
+{{- $out := dict -}}
+{{- range $k, $v := $m | toYaml | fromYaml }}
+  {{- $str := (tpl (toString $v) $ctx) -}}
+  {{- $_ := set $out $k $str -}}
+{{- end -}}
+{{- toYaml $out -}}
+{{- end -}}
+
+{{- define "ledger-core.fromFiles" -}}
+{{- /* items: [ {path: "...", key: "optional"}, ... ] */ -}}
+{{- $items := .items | default list -}}
+{{- $files := $.ctx.Files -}}
+{{- $out := dict -}}
+{{- range $i, $it := $items }}
+  {{- $path := $it.path | required (printf "fromFiles[%d].path is required" $i) -}}
+  {{- $key := default (base $path) $it.key -}}
+  {{- $content := $files.Get $path | required (printf "file %s not found" $path) -}}
+  {{- $_ := set $out $key $content -}}
+{{- end -}}
+{{- toYaml $out -}}
+{{- end -}}
+
+{{- define "ledger-core.fromBinaryFilesB64" -}}
+{{- /* items: [ {path: "...", key: "optional"}, ... ] -> base64-строки */ -}}
+{{- $items := .items | default list -}}
+{{- $files := $.ctx.Files -}}
+{{- $out := dict -}}
+{{- range $i, $it := $items }}
+  {{- $path := $it.path | required (printf "binaryFromFiles[%d].path is required" $i) -}}
+  {{- $key := default (base $path) $it.key -}}
+  {{- $raw := $files.Get $path | required (printf "file %s not found" $path) -}}
+  {{- $b64 := b64enc $raw -}}
+  {{- $_ := set $out $key $b64 -}}
+{{- end -}}
+{{- toYaml $out -}}
+{{- end }}
+
+{{- /* =========================
+     Рендер ОДНОЙ карты
+========================= */ -}}
+{{- define "ledger-core.renderConfigMap" -}}
+{{- $ctx := index . 0 -}}
+{{- $cm := index . 1 -}}
+
+{{- $name := (default "app-config" $cm.name) -}}
+{{- $ns := $cm.namespace | default $ctx.Release.Namespace -}}
+{{- $immutable := $cm.immutable | default false -}}
+
+{{- $extraLabels := $cm.labels | default dict -}}
+{{- $extraAnn := $cm.annotations | default dict -}}
+
+{{- $data := $cm.data | default dict -}}
+{{- $binaryData := $cm.binaryData | default dict -}}
+{{- $fromFiles := $cm.fromFiles | default list -}}
+{{- $binaryFromFiles := $cm.binaryFromFiles | default list -}}
+
+{{- $renderedData := fromYaml (include "ledger-core.tplMap" (list $ctx $data)) | default dict -}}
+{{- $renderedBin := dict -}} {{/* binaryData не tpl-ится, но оставляем как есть */}}
+
+{{- /* Слияние data из файлов */ -}}
+{{- if $fromFiles }}
+  {{- $filesData := fromYaml (include "ledger-core.fromFiles" (dict "ctx" $ctx "items" $fromFiles)) | default dict -}}
+  {{- $renderedData = merge $filesData $renderedData -}}
+{{- end -}}
+
+{{- /* Слияние binaryData из файлов (b64) и из Values */ -}}
+{{- if $binaryFromFiles }}
+  {{- $filesBin := fromYaml (include "ledger-core.fromBinaryFilesB64" (dict "ctx" $ctx "items" $binaryFromFiles)) | default dict -}}
+  {{- $renderedBin = merge $filesBin $binaryData -}}
+{{- else }}
+  {{- $renderedBin = $binaryData -}}
+{{- end -}}
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name | trunc 253 | trimSuffix "-" }}
+  namespace: {{ $ns | quote }}
+  labels:
+{{ include "ledger-core.mergeLabels" (list $ctx $extraLabels) | indent 4 }}
+  annotations:
+{{ include "ledger-core.mergeAnnotations" $extraAnn | indent 4 }}
+{{- if $immutable }}
+immutable: true
+{{- end }}
+{{- if or $renderedData $renderedBin }}
+data:
+{{- range $k, $v := $renderedData | default dict | toYaml | fromYaml | sortAlpha }}
+  {{ $k }}: |
+{{ $v | nindent 4 }}
+{{- end }}
+{{- if $renderedBin }}
+binaryData:
+{{- range $bk, $bv := $renderedBin | sortAlpha }}
+  {{ $bk }}: {{ $bv | quote }}
+{{- end }}
+{{- end }}
+{{- else }}
+data: {}
+{{- end }}
+{{- end -}}
+
+{{- /* =========================
+     Точка входа
+========================= */ -}}
+{{- if .Values.configMaps }}
+{{- range $i, $cm := .Values.configMaps }}
+{{- include "ledger-core.renderConfigMap" (list $ $cm) }}
+---
+{{- end }}
+{{- else if .Values.configMap }}
+{{- include "ledger-core.renderConfigMap" (list . .Values.configMap) }}
+{{- end }}

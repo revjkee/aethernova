@@ -1,0 +1,416 @@
+// File: security-core/schemas/proto/v1/security/authz.proto
+syntax = "proto3";
+
+package aethernova.security.v1;
+
+option go_package = "github.com/aethernova/security-core/gen/proto/v1/security;securityv1";
+option java_multiple_files = true;
+option java_package = "ai.aethernova.security.v1";
+option java_outer_classname = "AuthzProto";
+option csharp_namespace = "Aethernova.Security.V1";
+option php_namespace = "Aethernova\\Security\\V1";
+option ruby_package = "Aethernova::Security::V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/empty.proto";
+import "google/type/expr.proto";
+import "google/rpc/status.proto";
+import "google/api/field_behavior.proto";
+import "google/api/resource.proto";
+
+// -------------------------------
+// Core enums
+// -------------------------------
+
+enum Effect {
+  EFFECT_UNSPECIFIED = 0;
+  EFFECT_ALLOW = 1;
+  EFFECT_DENY = 2;
+}
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  DECISION_PERMIT = 1;
+  DECISION_DENY = 2;
+  DECISION_NOT_APPLICABLE = 3;
+  DECISION_INDETERMINATE = 4;
+}
+
+enum EvaluationMode {
+  EVAL_MODE_UNSPECIFIED = 0;
+  // Standard combination: explicit DENY > ALLOW; no implicit allow.
+  EVAL_MODE_DEFAULT = 1;
+  // Defensive bias: any uncertainty -> DENY.
+  EVAL_MODE_DENY_BIASED = 2;
+  // Permissive bias: useful for simulation, never for production.
+  EVAL_MODE_PERMIT_BIASED = 3;
+}
+
+enum TrustLevel {
+  TRUST_LEVEL_UNSPECIFIED = 0;
+  TRUST_LEVEL_LOW = 1;
+  TRUST_LEVEL_MEDIUM = 2;
+  TRUST_LEVEL_HIGH = 3;
+}
+
+enum MfaLevel {
+  MFA_LEVEL_UNSPECIFIED = 0;
+  MFA_NONE = 1;
+  MFA_STANDARD = 2;
+  MFA_PHISHING_RESISTANT = 3; // e.g., FIDO2/WebAuthn
+}
+
+// -------------------------------
+// Generic attribute values
+// -------------------------------
+
+message StringList { repeated string values = 1; }
+message IntList    { repeated int64  values = 1; }
+message DoubleList { repeated double values = 1; }
+message BoolList   { repeated bool   values = 1; }
+
+message AttributeValue {
+  oneof kind {
+    string string_value = 1;
+    int64 int_value = 2;
+    double double_value = 3;
+    bool bool_value = 4;
+    bytes bytes_value = 5;
+    google.protobuf.Timestamp time_value = 6;
+    StringList string_list = 7;
+    IntList int_list = 8;
+    DoubleList double_list = 9;
+    BoolList bool_list = 10;
+    // Arbitrary JSON-like structures when strongly-typed attrs are not feasible.
+    google.protobuf.Struct json_value = 11;
+  }
+}
+
+// -------------------------------
+// Zero-Trust context
+// -------------------------------
+
+message DevicePosture {
+  string device_id = 1;
+  string platform = 2;           // windows, macos, linux, ios, android
+  string os_version = 3;
+  bool is_managed = 4;           // EDR/MDM managed
+  TrustLevel trust = 5;
+  repeated string compliance_tags = 6; // e.g., "cis_level_1", "edr_ok"
+  map<string, AttributeValue> attributes = 7;
+}
+
+message SessionContext {
+  string session_id = 1;
+  MfaLevel mfa_level = 2;
+  google.protobuf.Timestamp auth_time = 3;
+  string ip = 4;
+  string user_agent = 5;
+  double risk_score = 6;                 // 0..100
+  repeated string risk_reasons = 7;      // model explanations
+  string client_id = 8;                  // OIDC/OAuth client
+  string geohash = 9;
+  string location = 10;                  // ISO country/region/city
+  map<string, AttributeValue> attributes = 11;
+}
+
+message Environment {
+  google.protobuf.Timestamp timestamp = 1;
+  string ip = 2;
+  repeated string network_tags = 3; // "corp", "vpn", "prod-seg"
+  map<string, AttributeValue> attributes = 4;
+}
+
+// -------------------------------
+// Subject / Resource / Action
+// -------------------------------
+
+message Subject {
+  string tenant_id = 1 [(google.api.field_behavior) = REQUIRED];
+  string principal_id = 2 [(google.api.field_behavior) = REQUIRED]; // user/service id
+  string principal_type = 3; // "user", "service", "device"
+  string display_name = 4;
+  string did = 5; // Decentralized Identifier (DID)
+  repeated string groups = 6;
+  repeated string roles = 7;
+  map<string, AttributeValue> attributes = 8;
+  DevicePosture device = 9;
+}
+
+message Resource {
+  string tenant_id = 1;
+  string type = 2 [(google.api.field_behavior) = REQUIRED]; // e.g., "document", "dataset", "wallet"
+  string id = 3 [(google.api.field_behavior) = REQUIRED];
+  string parent = 4;                 // resource name of parent, if any
+  repeated string ancestors = 5;     // full path for hierarchy-based checks
+  map<string, AttributeValue> attributes = 6;
+  repeated string owners = 7;        // canonical owners
+  map<string, string> labels = 8;    // lightweight tags
+  string project_id = 9;             // multi-project tenancy within tenant
+}
+
+message Action {
+  string name = 1; // "read", "write", "transfer", "approve"
+}
+
+// -------------------------------
+// Policy model (RBAC + ABAC + CEL)
+// -------------------------------
+
+message Obligation {
+  // Key-value instructions PEP must enforce if PERMIT.
+  string key = 1;                         // e.g., "mask_fields", "ttl_seconds"
+  AttributeValue value = 2;               // arbitrary data for obligation
+}
+
+message SubjectSelector {
+  repeated string principals = 1;         // principal_ids
+  repeated string roles = 2;              // role names
+  repeated string groups = 3;             // group ids/names
+  map<string, AttributeValue> attributes_eq = 4; // exact match attributes
+  // Additional matching logic over "subject", "session", "env".
+  google.type.Expr match = 5;             // CEL: e.g., subject.attributes["geo"].string_value == "SE"
+}
+
+message ResourceSelector {
+  string type = 1;                        // target type filter
+  repeated string ids = 2;                // target resource ids
+  map<string, string> labels = 3;         // label filters
+  map[string, AttributeValue] attributes_eq = 4; // exact attr match
+  // Additional matching logic over "resource", "env".
+  google.type.Expr match = 5;             // CEL: resource.attributes["classification"] == "confidential"
+}
+
+message Rule {
+  string id = 1;                          // unique within policy
+  Effect effect = 2;                      // ALLOW / DENY
+  // CEL expression evaluated with bindings:
+  // subject, resource, action, env, session
+  google.type.Expr condition = 3;         // e.g., 'session.mfa_level == 3 && env.ip.startsWith("10.")'
+  SubjectSelector subjects = 4;
+  ResourceSelector resources = 5;
+  repeated string actions = 6;            // actions this rule applies to
+  repeated Obligation obligations = 7;
+  string description = 8;
+  int64 priority = 9;                     // rule-level priority (higher first)
+}
+
+message PolicyVersion {
+  int64 revision = 1;                     // monotonically increasing
+  string version = 2;                     // semantic or date-based
+  bool published = 3;                     // published to PDPs
+  string author = 4;
+  string change_notes = 5;
+  google.protobuf.Timestamp create_time = 6;
+}
+
+message SigningInfo {
+  string key_id = 1;                      // KMS or key fingerprint
+  string algorithm = 2;                   // "ed25519", "ecdsa_p256_sha256"
+  bytes signature = 3;                    // signature over canonicalized payload
+  bytes signed_payload = 4;               // optional: stored for audit
+}
+
+message Target {
+  // Global narrowing for policy applicability.
+  SubjectSelector subjects = 1;
+  ResourceSelector resources = 2;
+  repeated string actions = 3;
+}
+
+message Policy {
+  option (google.api.resource) = {
+    type: "aethernova.security.v1/Policy"
+    pattern: "tenants/{tenant}/policies/{policy}"
+  };
+
+  string name = 1 [(google.api.field_behavior) = REQUIRED]; // tenants/{tenant}/policies/{policy}
+  string uid = 2;                          // server-assigned immutable id
+  string tenant_id = 3;
+  string display_name = 4;
+  string description = 5;
+  int64 priority = 6;                      // policy evaluation order (higher first)
+  Target target = 7;
+  repeated Rule rules = 8;
+  repeated string applies_to_actions = 9;  // optional action scope
+  map<string, string> labels = 10;
+  PolicyVersion version = 11;
+  string etag = 12;                        // optimistic concurrency
+  SigningInfo signature = 13;              // optional tamper-evidence
+  google.protobuf.Timestamp create_time = 14 [(google.api.field_behavior) = OUTPUT_ONLY];
+  google.protobuf.Timestamp update_time = 15 [(google.api.field_behavior) = OUTPUT_ONLY];
+  bool disabled = 16;                      // if true, policy is skipped
+}
+
+// Bundle published to PDPs, pinned by etag for reproducibility.
+message PolicyBundle {
+  string tenant_id = 1;
+  string etag = 2;                         // content hash/fingerprint
+  repeated Policy policies = 3;
+  google.protobuf.Timestamp create_time = 4;
+}
+
+// -------------------------------
+// Evaluation & Explainability
+// -------------------------------
+
+message CheckAccessRequest {
+  string tenant_id = 1 [(google.api.field_behavior) = REQUIRED];
+  Subject subject = 2 [(google.api.field_behavior) = REQUIRED];
+  string action = 3 [(google.api.field_behavior) = REQUIRED];
+  Resource resource = 4 [(google.api.field_behavior) = REQUIRED];
+  SessionContext session = 5;
+  Environment environment = 6;
+  EvaluationMode mode = 7;
+  bool include_explanation = 8;
+  bool include_obligations = 9;
+  // Optional restriction to a subset of policies by resource name.
+  repeated string policy_names = 10;
+  string request_id = 11;                  // idempotency/trace
+}
+
+message PolicyMatch {
+  string policy_name = 1;
+  string rule_id = 2;
+  Effect effect = 3;
+  bool matched = 4;
+  string detail = 5;                       // brief reasoning
+  google.type.Expr condition = 6;          // echoed condition
+  int64 policy_priority = 7;
+  int64 rule_priority = 8;
+}
+
+message Explanation {
+  Decision decision = 1;
+  repeated string reasons = 2;             // human-readable reasons
+  repeated PolicyMatch matches = 3;        // ordered trace
+}
+
+message CheckAccessResponse {
+  Decision decision = 1;
+  repeated Obligation obligations = 2;     // enforce if PERMIT
+  Explanation explanation = 3;             // present if requested
+  google.rpc.Status status = 4;            // errors/warnings in evaluation
+  string bundle_etag = 5;                  // bundle snapshot used
+}
+
+message BatchCheckAccessRequest {
+  repeated CheckAccessRequest requests = 1 [(google.api.field_behavior) = REQUIRED];
+}
+
+message BatchCheckAccessResponse {
+  repeated CheckAccessResponse responses = 1;
+}
+
+// Compute all effective actions permitted for subject on resource.
+message ListEffectivePermissionsRequest {
+  string tenant_id = 1 [(google.api.field_behavior) = REQUIRED];
+  Subject subject = 2 [(google.api.field_behavior) = REQUIRED];
+  Resource resource = 3 [(google.api.field_behavior) = REQUIRED];
+  SessionContext session = 4;
+  Environment environment = 5;
+  EvaluationMode mode = 6;
+}
+
+message ListEffectivePermissionsResponse {
+  repeated string permitted_actions = 1;
+  string bundle_etag = 2;
+  Explanation explanation = 3; // optional high-level summary
+}
+
+// A dedicated explain RPC, useful for UIs and audits.
+message ExplainDecisionRequest {
+  CheckAccessRequest request = 1 [(google.api.field_behavior) = REQUIRED];
+}
+
+message ExplainDecisionResponse {
+  Explanation explanation = 1;
+}
+
+// -------------------------------
+// Policy Admin API (authoritative control plane)
+// -------------------------------
+
+message CreatePolicyRequest {
+  Policy policy = 1 [(google.api.field_behavior) = REQUIRED];
+}
+
+message UpdatePolicyRequest {
+  Policy policy = 1 [(google.api.field_behavior) = REQUIRED];
+  google.protobuf.FieldMask update_mask = 2; // paths to update
+}
+
+message DeletePolicyRequest {
+  // tenants/{tenant}/policies/{policy}
+  string name = 1 [(google.api.field_behavior) = REQUIRED];
+  string etag = 2; // if present, must match
+}
+
+message GetPolicyRequest {
+  string name = 1 [(google.api.field_behavior) = REQUIRED];
+}
+
+message ListPoliciesRequest {
+  string parent = 1 [(google.api.field_behavior) = REQUIRED]; // tenants/{tenant}
+  int32 page_size = 2;
+  string page_token = 3;
+  string filter = 4; // CEL-like filter over labels/disabled/priority
+  string order_by = 5;
+}
+
+message ListPoliciesResponse {
+  repeated Policy policies = 1;
+  string next_page_token = 2;
+}
+
+message PublishPolicyRequest {
+  string name = 1 [(google.api.field_behavior) = REQUIRED];
+  string notes = 2;
+}
+
+message PublishPolicyResponse {
+  Policy policy = 1;
+  PolicyBundle bundle = 2; // optional: new bundle snapshot
+}
+
+message GetPolicyBundleRequest {
+  string tenant_id = 1 [(google.api.field_behavior) = REQUIRED];
+}
+
+message GetPolicyBundleResponse {
+  PolicyBundle bundle = 1;
+}
+
+// -------------------------------
+// Services
+// -------------------------------
+
+service AuthorizationService {
+  // PDP: single decision
+  rpc CheckAccess (CheckAccessRequest) returns (CheckAccessResponse);
+
+  // PDP: batch decisions for low-latency fanout
+  rpc BatchCheckAccess (BatchCheckAccessRequest) returns (BatchCheckAccessResponse);
+
+  // PDP: compute effective actions
+  rpc ListEffectivePermissions (ListEffectivePermissionsRequest) returns (ListEffectivePermissionsResponse);
+
+  // PDP: detailed explanation/trace for UI/audit
+  rpc ExplainDecision (ExplainDecisionRequest) returns (ExplainDecisionResponse);
+}
+
+service PolicyAdminService {
+  // CRUD
+  rpc CreatePolicy (CreatePolicyRequest) returns (Policy);
+  rpc UpdatePolicy (UpdatePolicyRequest) returns (Policy);
+  rpc DeletePolicy (DeletePolicyRequest) returns (google.protobuf.Empty);
+  rpc GetPolicy (GetPolicyRequest) returns (Policy);
+  rpc ListPolicies (ListPoliciesRequest) returns (ListPoliciesResponse);
+
+  // Release & distribution
+  rpc PublishPolicy (PublishPolicyRequest) returns (PublishPolicyResponse);
+  rpc GetPolicyBundle (GetPolicyBundleRequest) returns (GetPolicyBundleResponse);
+}

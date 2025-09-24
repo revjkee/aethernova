@@ -1,0 +1,283 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.neuroforge.ai/jsonschema/v1/route.schema.json",
+  "title": "NeuroForge RouteSet v1",
+  "description": "Схема маршрутов инференс-шлюза NeuroForge. Валидирует имя/путь/методы/модели/канареечные раскатки/таймауты/конкуренцию и др.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "routes"],
+  "properties": {
+    "schemaVersion": {
+      "description": "Версия схемы маршрутов.",
+      "const": 1
+    },
+    "routes": {
+      "description": "Список маршрутов.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/route" }
+    }
+  },
+  "$defs": {
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "methods", "primaryModel"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Уникальное имя маршрута (kebab-case).",
+          "maxLength": 63,
+          "pattern": "^[a-z][a-z0-9-]{1,62}$"
+        },
+        "path": {
+          "type": "string",
+          "description": "HTTP-путь (должен начинаться с /).",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^/.*"
+        },
+        "methods": {
+          "type": "array",
+          "description": "Разрешенные HTTP-методы.",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/httpMethod" }
+        },
+        "primaryModel": {
+          "$ref": "#/$defs/modelRef",
+          "description": "Основная модель для маршрута."
+        },
+        "canaryRoute": {
+          "$ref": "#/$defs/canaryRoute",
+          "description": "Параметры канареечного трафика."
+        },
+        "fallback": {
+          "$ref": "#/$defs/fallback",
+          "description": "Политика отказоустойчивости и порядок попыток."
+        },
+        "timeoutsMs": {
+          "$ref": "#/$defs/timeoutsMs",
+          "description": "Таймауты (мс)."
+        },
+        "concurrency": {
+          "$ref": "#/$defs/concurrency",
+          "description": "Лимиты конкурентности."
+        },
+        "auth": {
+          "$ref": "#/$defs/authOverride",
+          "description": "Переопределение аутентификации на уровне маршрута."
+        },
+        "tags": {
+          "type": "object",
+          "description": "Произвольные метки (до 32).",
+          "maxProperties": 32,
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "annotations": {
+          "type": "object",
+          "description": "Аннотации (до 64).",
+          "maxProperties": 64,
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "canaryRoute": {
+                "type": "object",
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              }
+            },
+            "required": ["canaryRoute"]
+          },
+          "then": {
+            "properties": {
+              "canaryRoute": {
+                "required": ["model", "weight"]
+              }
+            }
+          }
+        }
+      ],
+      "examples": [
+        {
+          "name": "chat-completions",
+          "path": "/v1/chat/completions",
+          "methods": ["POST"],
+          "primaryModel": "llm-main",
+          "canaryRoute": { "enabled": false },
+          "fallback": {
+            "order": ["llm-main", "llm-draft"],
+            "on": ["timeout", "overloaded", "internal-error"]
+          },
+          "timeoutsMs": { "queue": 200, "inference": 60000 },
+          "concurrency": { "maxConcurrent": 128, "perIpLimit": 16 }
+        }
+      ]
+    },
+    "httpMethod": {
+      "type": "string",
+      "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+    },
+    "modelRef": {
+      "type": "string",
+      "description": "Ссылка на модель (алфанум., '.', '_', ':', '-'; до 64).",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+    },
+    "canaryRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "model": { "$ref": "#/$defs/modelRef" },
+        "weight": {
+          "type": "number",
+          "description": "Доля трафика 0 ≤ w < 1.",
+          "minimum": 0,
+          "exclusiveMaximum": 1
+        },
+        "headers": {
+          "type": "object",
+          "description": "Доп. HTTP-заголовки для canary-запросов.",
+          "maxProperties": 32,
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        }
+      }
+    },
+    "fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "order": {
+          "type": "array",
+          "description": "Упорядоченный список моделей для попыток.",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/modelRef" }
+        },
+        "on": {
+          "type": "array",
+          "description": "Список причин, при которых срабатывает fallback.",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/failureReason" }
+        }
+      }
+    },
+    "failureReason": {
+      "type": "string",
+      "enum": [
+        "timeout",
+        "overloaded",
+        "internal-error",
+        "bad-gateway",
+        "rate-limited",
+        "network-error",
+        "invalid-response"
+      ]
+    },
+    "timeoutsMs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inference"],
+      "properties": {
+        "queue": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 600000,
+          "description": "Макс. ожидание в очереди, мс."
+        },
+        "inference": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600000,
+          "description": "Таймаут инференса, мс."
+        }
+      }
+    },
+    "concurrency": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxConcurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000,
+          "description": "Глобальный лимит одновременных запросов."
+        },
+        "perIpLimit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000,
+          "description": "Лимит на IP."
+        }
+      }
+    },
+    "authOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["inherit", "none", "apiKey", "jwt"],
+          "default": "inherit",
+          "description": "Переопределение режима аутентификации."
+        },
+        "apiKeyHeader": {
+          "type": "string",
+          "default": "X-API-Key",
+          "description": "Имя заголовка API-ключа."
+        },
+        "jwksUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "JWKS для JWT-проверки (при mode=jwt)."
+        },
+        "audience": { "type": "string" },
+        "issuer": { "type": "string" }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schemaVersion": 1,
+      "routes": [
+        {
+          "name": "chat-completions",
+          "path": "/v1/chat/completions",
+          "methods": ["POST"],
+          "primaryModel": "llm-main",
+          "canaryRoute": { "enabled": true, "model": "llm-main", "weight": 0.05 },
+          "fallback": {
+            "order": ["llm-main", "llm-draft"],
+            "on": ["timeout", "overloaded", "internal-error"]
+          },
+          "timeoutsMs": { "queue": 200, "inference": 60000 },
+          "concurrency": { "maxConcurrent": 128, "perIpLimit": 16 }
+        },
+        {
+          "name": "embeddings",
+          "path": "/v1/embeddings",
+          "methods": ["POST"],
+          "primaryModel": "text-emb",
+          "fallback": { "order": ["text-emb"], "on": ["timeout", "overloaded"] },
+          "timeoutsMs": { "inference": 15000 },
+          "concurrency": { "maxConcurrent": 256, "perIpLimit": 64 },
+          "auth": { "mode": "inherit" }
+        }
+      ]
+    }
+  ]
+}

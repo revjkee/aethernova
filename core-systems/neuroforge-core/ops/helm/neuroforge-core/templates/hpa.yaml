@@ -1,0 +1,255 @@
+{{- /*
+File: ops/helm/neuroforge-core/templates/hpa.yaml
+Purpose: HorizontalPodAutoscaler (autoscaling/v2) for api, worker, scheduler
+Notes:
+- No helper dependency: fullname computed locally.
+- Supports custom metrics via .Values.hpa.<comp>.metrics
+- Behavior (scaleUp/scaleDown) configurable; safe defaults provided.
+- Works on Kubernetes >= 1.23 (autoscaling/v2).
+*/ -}}
+{{- $nameOverride := default .Chart.Name .Values.nameOverride -}}
+{{- $fullname := printf "%s-%s" .Release.Name $nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- $commonLabels := dict "app.kubernetes.io/part-of" "neuroforge" "app.kubernetes.io/managed-by" "Helm" "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_") -}}
+{{- $globalHpaLabels := default dict .Values.hpa.common.labels -}}
+{{- $globalHpaAnnotations := default dict .Values.hpa.common.annotations -}}
+
+{{- /* ---------- API HPA ---------- */ -}}
+{{- $api := default dict .Values.hpa.api -}}
+{{- if $api.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ default (printf "%s-api" $fullname) $api.name | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- toYaml $commonLabels | nindent 4 }}
+    app.kubernetes.io/name: {{ $nameOverride }}
+    app.kubernetes.io/component: api
+    {{- toYaml $globalHpaLabels | nindent 4 }}
+    {{- toYaml (default dict $api.labels) | nindent 4 }}
+  annotations:
+    {{- toYaml $globalHpaAnnotations | nindent 4 }}
+    {{- toYaml (default dict $api.annotations) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: {{ default "apps/v1" (get $api "targetRef.apiVersion") }}
+    kind:       {{ default "Deployment" (get $api "targetRef.kind") }}
+    name:       {{ default (printf "%s-api" $fullname) (get $api "targetRef.name") }}
+  minReplicas: {{ default 2 $api.minReplicas }}
+  maxReplicas: {{ default 10 $api.maxReplicas }}
+  {{- if $api.metrics }}
+  metrics:
+    {{- /* user-supplied full metrics list (Resource/Object/Pods/External) */}}
+    {{- toYaml $api.metrics | nindent 4 }}
+  {{- else }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ default 70 $api.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ default 80 $api.targetMemoryUtilizationPercentage }}
+  {{- end }}
+  behavior:
+    {{- $beh := default dict $api.behavior -}}
+    {{- if $beh.scaleUp }}
+    scaleUp:
+      {{- toYaml $beh.scaleUp | nindent 6 }}
+    {{- else }}
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+    {{- end }}
+    {{- if $beh.scaleDown }}
+    scaleDown:
+      {{- toYaml $beh.scaleDown | nindent 6 }}
+    {{- else }}
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 20
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    {{- end }}
+{{- end }}
+
+{{- /* ---------- WORKER HPA ---------- */ -}}
+{{- $worker := default dict .Values.hpa.worker -}}
+{{- if $worker.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ default (printf "%s-worker" $fullname) $worker.name | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- toYaml $commonLabels | nindent 4 }}
+    app.kubernetes.io/name: {{ $nameOverride }}
+    app.kubernetes.io/component: worker
+    {{- toYaml $globalHpaLabels | nindent 4 }}
+    {{- toYaml (default dict $worker.labels) | nindent 4 }}
+  annotations:
+    {{- toYaml $globalHpaAnnotations | nindent 4 }}
+    {{- toYaml (default dict $worker.annotations) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: {{ default "apps/v1" (get $worker "targetRef.apiVersion") }}
+    kind:       {{ default "Deployment" (get $worker "targetRef.kind") }}
+    name:       {{ default (printf "%s-worker" $fullname) (get $worker "targetRef.name") }}
+  minReplicas: {{ default 1 $worker.minReplicas }}
+  maxReplicas: {{ default 20 $worker.maxReplicas }}
+  {{- if $worker.metrics }}
+  metrics:
+    {{- toYaml $worker.metrics | nindent 4 }}
+  {{- else }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ default 75 $worker.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ default 85 $worker.targetMemoryUtilizationPercentage }}
+    {{- if hasKey $worker "queueDepthObject" }}
+    - type: Object
+      object:
+        describedObject:
+          apiVersion: {{ default "v1" (get $worker.queueDepthObject "apiVersion") }}
+          kind:       {{ default "Service" (get $worker.queueDepthObject "kind") }}
+          name:       {{ default (printf "%s-worker" $fullname) (get $worker.queueDepthObject "name") }}
+        metric:
+          name: {{ default "celery_queue_messages_ready" (get $worker.queueDepthObject "metricName") }}
+        target:
+          type: AverageValue
+          averageValue: {{ default "10" (get $worker.queueDepthObject "averageValue") }}
+    {{- end }}
+  {{- end }}
+  behavior:
+    {{- $behw := default dict $worker.behavior -}}
+    {{- if $behw.scaleUp }}
+    scaleUp:
+      {{- toYaml $behw.scaleUp | nindent 6 }}
+    {{- else }}
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 200
+          periodSeconds: 60
+        - type: Pods
+          value: 8
+          periodSeconds: 60
+    {{- end }}
+    {{- if $behw.scaleDown }}
+    scaleDown:
+      {{- toYaml $behw.scaleDown | nindent 6 }}
+    {{- else }}
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 30
+          periodSeconds: 60
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    {{- end }}
+{{- end }}
+
+{{- /* ---------- SCHEDULER HPA ---------- */ -}}
+{{- $sched := default dict .Values.hpa.scheduler -}}
+{{- if $sched.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ default (printf "%s-scheduler" $fullname) $sched.name | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- toYaml $commonLabels | nindent 4 }}
+    app.kubernetes.io/name: {{ $nameOverride }}
+    app.kubernetes.io/component: scheduler
+    {{- toYaml $globalHpaLabels | nindent 4 }}
+    {{- toYaml (default dict $sched.labels) | nindent 4 }}
+  annotations:
+    {{- toYaml $globalHpaAnnotations | nindent 4 }}
+    {{- toYaml (default dict $sched.annotations) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: {{ default "apps/v1" (get $sched "targetRef.apiVersion") }}
+    kind:       {{ default "Deployment" (get $sched "targetRef.kind") }}
+    name:       {{ default (printf "%s-scheduler" $fullname) (get $sched "targetRef.name") }}
+  minReplicas: {{ default 1 $sched.minReplicas }}
+  maxReplicas: {{ default 5  $sched.maxReplicas }}
+  {{- if $sched.metrics }}
+  metrics:
+    {{- toYaml $sched.metrics | nindent 4 }}
+  {{- else }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ default 60 $sched.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ default 70 $sched.targetMemoryUtilizationPercentage }}
+  {{- end }}
+  behavior:
+    {{- $behs := default dict $sched.behavior -}}
+    {{- if $behs.scaleUp }}
+    scaleUp:
+      {{- toYaml $behs.scaleUp | nindent 6 }}
+    {{- else }}
+    scaleUp:
+      stabilizationWindowSeconds: 120
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    {{- end }}
+    {{- if $behs.scaleDown }}
+    scaleDown:
+      {{- toYaml $behs.scaleDown | nindent 6 }}
+    {{- else }}
+    scaleDown:
+      stabilizationWindowSeconds: 900
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 20
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    {{- end }}
+{{- end }}

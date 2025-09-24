@@ -1,0 +1,431 @@
+# cybersecurity-core / configs / edr.yaml
+# Industrial-grade EDR configuration
+
+version: "1.0"
+metadata:
+  product: "cybersecurity-core-edr"
+  environment: "production"
+  tenant_id: "default"
+  generated_at: "auto"
+  owner: "secops@your-org.example"
+  schema_version: "2025-09-02"
+
+security:
+  tls:
+    enabled: true
+    min_version: "1.2"
+    # mTLS для агентов
+    mutual_tls: true
+    ca_file: "/etc/cybersecurity-core/pki/ca.pem"
+    cert_file: "/etc/cybersecurity-core/pki/edr.pem"
+    key_file: "/etc/cybersecurity-core/pki/edr.key"
+    cipher_suites:
+      - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+      - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+  signing:
+    enable_event_signing: true
+    key_id: "edr-kms-key"
+  encryption_at_rest:
+    enabled: true
+    provider: "linux_fs_xfs_aes256"
+  allow_unencrypted_transit: false
+  pii_handling:
+    redact_usernames: true
+    hash_hostnames: true
+    fields:
+      - cmdline
+      - env
+      - file.path
+
+agent:
+  id: "auto"
+  platform:
+    allow:
+      - linux
+      - windows
+      - darwin
+    deny: []
+  privileges:
+    drop_root: true
+    selinux: enforce
+    apparmor_profile: "runtime/default"
+  sandbox:
+    filesystem_readonly: true
+    network_namespaces: true
+  update_policy:
+    channel: "stable"
+    schedule_cron: "17 3 * * *"
+    verify_signature: true
+  buffers:
+    spill_to_disk: true
+    max_mem_mb: 256
+    max_disk_mb: 2048
+  rate_limits:
+    events_per_sec: 5000
+    burst: 20000
+  backpressure:
+    action: "shed_low_value"
+    low_value_event_classes: ["filestat","netstat_sample"]
+
+collection:
+  sampling:
+    enable_adaptive: true
+    target_eps: 1500
+  process:
+    exec: true
+    fork: true
+    terminate: true
+    cmdline_max_len: 8192
+    environment: false
+    include_kernel_threads: false
+  file:
+    create: true
+    write: true
+    delete: true
+    attrib: true
+    read_sampling:
+      enabled: true
+      every_n: 100
+    watch_paths:
+      - "/usr/bin"
+      - "/usr/sbin"
+      - "/etc"
+      - "/var/tmp"
+      - "/tmp"
+      - "C:\\Windows\\System32"
+      - "C:\\ProgramData"
+    exclude_paths:
+      - "/proc/**"
+      - "/sys/**"
+      - "/var/log/**"
+  registry_windows:
+    enabled: true
+    hives:
+      - "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run*"
+      - "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run*"
+      - "HKLM\\System\\CurrentControlSet\\Services\\*"
+  network:
+    connect: true
+    listen: true
+    dns_query: true
+    http_headers: false
+    capture_payloads: false
+    enrich_with_geoip: false
+  auth:
+    logon: true
+    sudo: true
+    rdp: true
+    ssh: true
+  kernel_integrity:
+    lkm_load_unload: true
+    selinux_avc: true
+  osquery:
+    enabled: true
+    schedule:
+      processes_quick:
+        interval_s: 60
+        query: "select pid, name, path, cmdline, uid from processes;"
+      startup_items:
+        interval_s: 600
+        query: "select * from startup_items;"
+  auditd_linux:
+    enabled: true
+    rules:
+      - "-a always,exit -F arch=b64 -S execve -k proc_exec"
+      - "-w /etc/passwd -p wa -k passwd_changes"
+      - "-w /etc/shadow -p wa -k shadow_changes"
+
+normalization:
+  timezone: "UTC"
+  hostname_strategy: "fqdn"
+  schema:
+    version: "1.0"
+    fields_required:
+      - "@timestamp"
+      - "event.kind"
+      - "event.category"
+      - "host.id"
+      - "host.name"
+      - "agent.id"
+      - "process.pid"
+  drop_invalid_events: true
+  coerce_types: true
+
+enrichment:
+  mitre_mapping:
+    enable: true
+    table:
+      process_injection:
+        techniques: ["T1055"]
+        tactics: ["Defense Evasion","Privilege Escalation"]
+      persistence_registry:
+        techniques: ["T1060","T1547.001"]
+        tactics: ["Persistence"]
+      suspicious_powershell:
+        techniques: ["T1059.001"]
+        tactics: ["Execution"]
+      credential_dumping:
+        techniques: ["T1003"]
+        tactics: ["Credential Access"]
+      lateral_mimikatz_like:
+        techniques: ["T1021"]
+        tactics: ["Lateral Movement"]
+  threat_intel:
+    ioc_sources:
+      - name: "otx"
+        type: "url"
+        url: "https://example.invalid/otx.ioc"
+        enabled: false
+      - name: "internal-ti"
+        type: "file"
+        path: "/etc/cybersecurity-core/ioc/indicators.yaml"
+        enabled: true
+    cache_ttl: "6h"
+  file_hashing:
+    algorithms: ["sha256","sha1"]
+    max_size_mb: 50
+  yara:
+    enabled: true
+    rules_dir: "/etc/cybersecurity-core/yara"
+    max_scan_mb: 50
+
+detections:
+  global:
+    enabled: true
+    severity_threshold: "low"
+    dedup_window: "2m"
+    suppression:
+      - field: "process.executable"
+        equals:
+          - "/usr/bin/apt"
+          - "/usr/bin/yum"
+  rules:
+    - id: "WIN-PERSIST-RUNKEY-001"
+      name: "Windows Persistence via Run/RunOnce Keys"
+      description: "Создание автозапуска в Run/RunOnce."
+      enabled: true
+      severity: "medium"
+      where: "event.category == 'registry' and registry.path ~= /\\\\(Run|RunOnce)\\\\/i and registry.operation in ['create','set']"
+      mitre:
+        techniques: ["T1060","T1547.001"]
+        tactics: ["Persistence"]
+      response:
+        - action: "isolate_host"
+          condition: "event.severity == 'high'"
+        - action: "quarantine_file"
+          path_field: "registry.value_data"
+        - action: "ticket"
+          priority: "P2"
+
+    - id: "LINUX-SUID-ESC-001"
+      name: "Suspicious SUID/SGID Creation"
+      description: "Выставление SUID/SGID на бинарь."
+      enabled: true
+      severity: "high"
+      where: "event.category == 'file' and file.change == 'attrib' and file.mode contains 's' and not process.executable in ['/usr/bin/passwd','/usr/bin/sudo']"
+      mitre:
+        techniques: ["T1548.001"]
+        tactics: ["Privilege Escalation","Defense Evasion"]
+      response:
+        - action: "revert_permissions"
+          path_field: "file.path"
+        - action: "kill_process_tree"
+          pid_field: "process.pid"
+        - action: "ticket"
+          priority: "P1"
+
+    - id: "PS-ENCODED-COMMAND-001"
+      name: "Encoded PowerShell Command"
+      description: "Исполнение PowerShell с -EncodedCommand."
+      enabled: true
+      severity: "high"
+      where: "event.category == 'process' and process.name in ['powershell.exe','pwsh.exe'] and process.args any '-EncodedCommand'"
+      mitre:
+        techniques: ["T1059.001"]
+        tactics: ["Execution"]
+      response:
+        - action: "block_binary"
+          path_field: "process.executable"
+        - action: "isolate_host"
+        - action: "ticket"
+          priority: "P1"
+
+    - id: "CRED-DUMP-TOOLING-001"
+      name: "Credential Dumping Tooling Heuristics"
+      description: "Heuristic по строкам/импорту API."
+      enabled: true
+      severity: "critical"
+      where: "event.category == 'process' and (process.cmdline ~= /(lsass|sekurlsa|mimikatz|procdump)/i)"
+      mitre:
+        techniques: ["T1003"]
+        tactics: ["Credential Access"]
+      response:
+        - action: "kill_process_tree"
+        - action: "isolate_host"
+        - action: "ticket"
+          priority: "P0"
+
+    - id: "LATERAL-RDP-BRUTE-001"
+      name: "RDP brute-force pattern"
+      description: "Подозрительный поток неуспешных RDP логонов."
+      enabled: true
+      severity: "medium"
+      where: "event.category == 'authentication' and auth.protocol == 'RDP'"
+      window: "5m"
+      threshold:
+        fails: ">=10"
+        unique_src_ips: ">=3"
+      mitre:
+        techniques: ["T1110","T1021.001"]
+        tactics: ["Credential Access","Lateral Movement"]
+      response:
+        - action: "block_ip"
+          field: "source.ip"
+        - action: "ticket"
+          priority: "P2"
+
+correlation:
+  enabled: true
+  windows:
+    default: "5m"
+  rules:
+    - id: "KILLCHAIN-EXEC-PERSIST-001"
+      description: "Exec → Persistence в коротком окне"
+      sequence:
+        - where: "event.category == 'process' and event.action == 'start'"
+        - where: "event.category == 'registry' and registry.path ~= /Run|RunOnce/"
+      window: "3m"
+      severity: "high"
+      response:
+        - action: "ticket"
+          priority: "P1"
+
+response:
+  isolation:
+    network:
+      enabled: true
+      mode: "block-all-except-edr"
+      allowlist_cidrs:
+        - "10.0.0.0/8"
+      allowlist_ports:
+        - 443
+  quarantine:
+    enabled: true
+    directory:
+      linux: "/var/lib/cybersecurity-core/quarantine"
+      windows: "C:\\ProgramData\\CybersecurityCore\\Quarantine"
+    hash_alg: "sha256"
+    max_size_mb: 200
+  playbooks:
+    - id: "PB-PS-ENC"
+      trigger_rules: ["PS-ENCODED-COMMAND-001"]
+      steps:
+        - type: "collect"
+          artifacts: ["process_tree","netstat","recent_files"]
+        - type: "kill"
+          target: "process_tree"
+        - type: "forensics"
+          yara_scan: true
+        - type: "notify"
+          channel: "secops"
+    - id: "PB-CRED-DUMP"
+      trigger_rules: ["CRED-DUMP-TOOLING-001"]
+      steps:
+        - type: "isolate"
+        - type: "memory_dump"
+          tool: "lime"
+        - type: "quarantine"
+          target: "process_image"
+        - type: "notify"
+          channel: "oncall-p0"
+
+logging:
+  level: "info"
+  format: "json"
+  redact:
+    enabled: true
+    fields:
+      - "user.name"
+      - "host.name"
+  sinks:
+    - type: "file"
+      path: "/var/log/cybersecurity-core/edr.log"
+      rotate:
+        max_size_mb: 200
+        max_backups: 20
+        max_age_days: 30
+        compress: true
+    - type: "stdout"
+      enabled: false
+    - type: "siem"
+      protocol: "tcp"
+      host: "siem.internal.local"
+      port: 6514
+      tls: true
+      cef: false
+      ecs: true
+    - type: "opensearch"
+      url: "https://opensearch.logging.svc.cluster.local:9200"
+      index: "edr-%{+yyyy.MM.dd}"
+      auth:
+        type: "token"
+        token_file: "/etc/cybersecurity-core/tokens/opensearch.token"
+
+retention:
+  local_events_days: 7
+  quarantined_files_days: 30
+  max_local_store_mb: 4096
+  eviction_policy: "oldest_first"
+
+health:
+  self_test_interval_s: 60
+  liveness:
+    enabled: true
+    endpoint: "/healthz"
+    failure_threshold: 3
+  readiness:
+    enabled: true
+    endpoint: "/readyz"
+    min_buffers_free_mb: 64
+  telemetry:
+    metrics:
+      enabled: true
+      bind_address: "0.0.0.0:9090"
+    traces:
+      enabled: false
+
+compliance:
+  standards:
+    - "CIS-Controls-v8"
+    - "ISO-27001"
+    - "NIST-800-53"
+  controls:
+    tamper_protection: true
+    prevent_uninstall_without_token: true
+    audit_mode:
+      enabled: false
+
+exclusions:
+  processes:
+    - "/usr/sbin/rsyslogd"
+    - "/usr/bin/containerd"
+  paths:
+    - "/var/log/**"
+  hashes:
+    - "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+validation:
+  enabled: true
+  rules:
+    - type: "field_presence"
+      fields: ["@timestamp","event.kind","host.id"]
+    - type: "type_check"
+      field_types:
+        "process.pid": "number"
+        "source.ip": "ip"
+        "destination.port": "number"
+    - type: "range_check"
+      ranges:
+        "destination.port": { min: 0, max: 65535 }
+
+# Конец файла

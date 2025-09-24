@@ -1,0 +1,255 @@
+syntax = "proto3";
+
+package datafabric.v1.stream;
+
+option go_package           = "github.com/company/datafabric-core/pkg/api/v1/stream;stream";
+option java_package         = "com.company.datafabric.v1.stream";
+option java_multiple_files  = true;
+option csharp_namespace     = "Company.DataFabric.V1.Stream";
+option objc_class_prefix    = "DFCS";
+
+// Зависимости на общие типы (UUID/Timestamp/Status/KeyValue)
+import "datafabric/v1/common.proto"; // пакет datafabric.v1.common
+
+// ===================== Общие перечисления/константы =====================
+
+enum ReasonCode {
+  REASON_UNSPECIFIED = 0;
+  REASON_OPERATOR_REQUEST = 1;     // ручная операция
+  REASON_DEPLOY_ROLLING   = 2;     // перекат релиза/деплой
+  REASON_BACKPRESSURE     = 3;     // давление потребителя/сети
+  REASON_REBALANCE        = 4;     // ребаланс партиций
+  REASON_IDLE_TIMEOUT     = 5;     // простой/таймаут бездействия
+  REASON_ERROR            = 6;     // ошибка
+  REASON_MAINTENANCE      = 7;     // регламент/работы
+}
+
+enum AckCode {
+  ACK_UNSPECIFIED = 0;
+  ACK_OK          = 1;
+  ACK_RETRY       = 2;   // просим ретрай (не меняем коммит)
+  ACK_FAIL        = 3;   // фатал для данного сообщения
+}
+
+// Направление для упорядочивания
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  ASC  = 1;
+  DESC = 2;
+}
+
+// ===================== Базовые структуры =====================
+
+message ControlHeader {
+  // Идентификаторы и трассировка
+  datafabric.v1.common.UUID stream_id      = 1;  // логический поток
+  string partition          = 2;                 // идентификатор партиции (если применимо)
+  string correlation_id     = 3;                 // для связывания запрос/ответ
+  string tenant             = 4;                 // namespace/арендатор
+  map<string, string> labels = 5;               // произвольные метки (env, region, etc.)
+  datafabric.v1.common.Timestamp sent_at   = 6;  // когда отправлено
+  // Идемпотентность/упорядочивание управляющих команд
+  string command_id         = 7;                 // UUID/ULID команды
+  uint64 sequence           = 8;                 // порядковый номер в рамках stream_id+partition
+}
+
+// Смещение в потоке
+message Offset {
+  oneof kind {
+    int64 absolute = 1;                           // абсолютное смещение (Kafka offset и т.п.)
+    datafabric.v1.common.Timestamp timestamp = 2; // поиск по времени
+    string sequence_id = 3;                       // произвольная метка (например, Snowflake id)
+    Predefined predefined = 4;                    // EARLIEST/LATEST
+  }
+  enum Predefined {
+    PREDEFINED_UNSPECIFIED = 0;
+    EARLIEST = 1;
+    LATEST   = 2;
+  }
+}
+
+// Назначение партиций/шардов потребителю
+message PartitionAssignment {
+  repeated string partitions = 1;                 // имена/ключи партиций
+  datafabric.v1.common.Timestamp effective_at = 2;
+  string group = 3;                               // consumer group
+}
+
+// Параметры флоуконтроля (credit-based)
+message FlowControl {
+  // Количество кредитов (допустимых in-flight сообщений или байтов)
+  uint64 credits           = 1;
+  // true — кредиты в штуках сообщений, false — в байтах
+  bool per_message         = 2;
+  // Дополнительные лимиты
+  uint64 max_inflight_msgs = 3;
+  uint64 max_inflight_bytes = 4;
+}
+
+// Сигнал бэкпрешера
+message Backpressure {
+  enum Level {
+    LEVEL_UNSPECIFIED = 0;
+    SOFT  = 1;  // просим притормозить (увеличить задержки/уменьшить кредиты)
+    HARD  = 2;  // необходимо быстро уменьшить скорость
+  }
+  Level level = 1;
+  string cause = 2;
+}
+
+// Окно и водяные знаки
+message Watermark {
+  datafabric.v1.common.Timestamp event_time_low  = 1;
+  datafabric.v1.common.Timestamp event_time_high = 2;
+}
+
+// Чекпоинт/барьер согласованности
+message CheckpointBarrier {
+  string checkpoint_id = 1;          // генерация на source/координаторе
+  datafabric.v1.common.Timestamp emit_time = 2;
+  bool flush = 3;                     // требование сбросить состояние до ack
+}
+
+// ===================== Команды управления (payload'ы) =====================
+
+message StartRequest {
+  Offset from = 1;                           // с какого места начинать
+  PartitionAssignment assignment = 2;        // назначенные партиции
+  Direction order = 3;                       // упорядочивание (если применимо)
+  uint32 max_batch_size = 4;                 // желаемый размер партии
+  FlowControl initial_flow = 5;              // стартовые кредиты
+}
+
+message StopRequest {
+  ReasonCode reason = 1;
+  string details = 2;
+  bool drain = 3;                            // дождаться ack'ов и остановиться
+}
+
+message PauseRequest {
+  ReasonCode reason = 1;
+  string details = 2;
+}
+
+message ResumeRequest {
+  string details = 1;
+}
+
+message SeekRequest {
+  Offset to = 1;
+  bool clear_inflight = 2;                   // сбросить незавершённые сообщения
+}
+
+message SetFlowRequest {
+  FlowControl flow = 1;                      // новая политика кредитов
+}
+
+message BackpressureSignal {
+  Backpressure bp = 1;
+}
+
+message WatermarkUpdate {
+  Watermark watermark = 1;
+}
+
+message CommitRequest {
+  // Коммит смещения (per partition)
+  map<string, Offset> offsets = 1;
+  string checkpoint_id = 2;                  // опционально привязать к чекпоинту
+}
+
+message Ack {
+  // Подтверждение конкретного элемента/батча
+  repeated string message_ids = 1;
+  AckCode code = 2;
+  string reason = 3;
+}
+
+message Nack {
+  repeated string message_ids = 1;
+  string reason = 2;
+  bool retry = 3;                            // системный намёк на ретрай
+}
+
+message Heartbeat {
+  datafabric.v1.common.Timestamp at = 1;
+  map<string, string> stats = 2;             // latency_ms, inflight, lag, и т.д.
+}
+
+message ErrorReport {
+  datafabric.v1.common.Status status = 1;    // код/сообщение/детали
+  ReasonCode reason = 2;
+}
+
+message SnapshotRequest {
+  string snapshot_id = 1;
+  bool include_state = 2;                    // попросить снапшот пользовательского состояния
+}
+
+message RebalanceNotice {
+  PartitionAssignment new_assignment = 1;
+  ReasonCode reason = 2; // REASON_REBALANCE
+}
+
+// ===================== Конверт/обёртки =====================
+
+message ControlEnvelope {
+  ControlHeader header = 1;
+
+  oneof payload {
+    // Команды от координатора к воркеру/сервису
+    StartRequest        start            = 10;
+    StopRequest         stop             = 11;
+    PauseRequest        pause            = 12;
+    ResumeRequest       resume           = 13;
+    SeekRequest         seek             = 14;
+    SetFlowRequest      set_flow         = 15;
+    BackpressureSignal  backpressure     = 16;
+    WatermarkUpdate     watermark_update = 17;
+    CommitRequest       commit           = 18;
+    CheckpointBarrier   checkpoint       = 19;
+    SnapshotRequest     snapshot         = 20;
+    RebalanceNotice     rebalance        = 21;
+
+    // Сообщения телеметрии/состояния в обе стороны
+    Ack                 ack              = 40;
+    Nack                nack             = 41;
+    Heartbeat           heartbeat        = 42;
+    ErrorReport         error            = 43;
+
+    // Расширяемость: произвольная полезная нагрузка
+    datafabric.v1.common.AnyValue extension = 90;
+  }
+}
+
+// Стандартный ответ на команду (опционален при bidi-потоке)
+message ControlAcknowledge {
+  datafabric.v1.common.Status status = 1;
+  string command_id = 2;                     // на какую команду отвечаем
+  string correlation_id = 3;                 // эхом из заголовка
+  map<string, string> details = 4;
+}
+
+// Ping/Pong для независимого health-чека
+message HealthPing {
+  string ping_id = 1;
+  datafabric.v1.common.Timestamp sent_at = 2;
+}
+
+message HealthPong {
+  string ping_id = 1;
+  datafabric.v1.common.Timestamp received_at = 2;
+  datafabric.v1.common.Timestamp responded_at = 3;
+  map<string, string> info = 4;              // версия, build, region
+}
+
+// ===================== gRPC сервис =====================
+
+service StreamControl {
+  // Основной двунаправленный канал управления.
+  // Обе стороны отправляют ControlEnvelope; применяйте idempotency по header.command_id.
+  rpc Control (stream ControlEnvelope) returns (stream ControlEnvelope);
+
+  // Лёгкий health-check вне основного канала.
+  rpc HealthCheck (HealthPing) returns (HealthPong);
+}

@@ -1,0 +1,99 @@
+name: Test Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Run Tests and Security Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LANG: en_US.UTF-8
+
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run linters (flake8, mypy)
+        run: |
+          flake8 .
+          mypy .
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest --cov=./ --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+      - name: Static code analysis - Bandit (security checks)
+        run: |
+          pip install bandit
+          bandit -r ./ -lll -f json -o bandit-report.json
+
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v3
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+      - name: Check secrets with GitGuardian
+        uses: GitGuardian/gg-shield-action@v1
+        with:
+          api-key: ${{ secrets.GITGUARDIAN_API_KEY }}
+
+      - name: Notify on failures
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "⚠️ Tests or security checks failed. Please review."
+            })
+
+  deploy:
+    name: Deploy to Staging
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && success()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy script
+        run: |
+          ./deploy_scripts/deploy_staging.sh
+

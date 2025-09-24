@@ -1,0 +1,261 @@
+# ops/helm/aethernova-chain-core/templates/statefulset-redis.yaml
+{{- /*
+  StatefulSet Redis:
+  - primary = pod ordinal 0; replicas = ordinals >=1 (replicaof primary)
+  - password берётся из существующего секрета или имени по умолчанию "<release>-redis-auth" с ключом "password"
+  - headless service ожидается с именем "<release>-redis-headless" (указать в .Values.redis.serviceName при отличии)
+  - включаем sidecar redis_exporter при .Values.redis.metrics.exporter.enabled=true
+*/ -}}
+{{- $release := .Release.Name -}}
+{{- $name := default (printf "%s-redis" $release) .Values.redis.nameOverride -}}
+{{- $labels := dict
+      "app.kubernetes.io/name" "redis"
+      "app.kubernetes.io/instance" $release
+      "app.kubernetes.io/part-of" "aethernova-chain-core"
+      "app.kubernetes.io/component" "cache"
+      "app.kubernetes.io/managed-by" "Helm"
+-}}
+{{- $svcHeadless := default (printf "%s-redis-headless" $release) .Values.redis.serviceName -}}
+{{- $imageRepo := default "redis" .Values.redis.image.repository -}}
+{{- $imageTag := default "7.2-alpine" .Values.redis.image.tag -}}
+{{- $imagePullPolicy := default "IfNotPresent" .Values.redis.image.pullPolicy -}}
+{{- $exporterEnabled := default true .Values.redis.metrics.exporter.enabled -}}
+{{- $exporterRepo := default "oliver006/redis_exporter" .Values.redis.metrics.exporter.image.repository -}}
+{{- $exporterTag := default "v1.61.0" .Values.redis.metrics.exporter.image.tag -}}
+{{- $exporterPullPolicy := default "IfNotPresent" .Values.redis.metrics.exporter.image.pullPolicy -}}
+{{- $port := default 6379 .Values.redis.port -}}
+{{- $exporterPort := default 9121 .Values.redis.metrics.exporter.port -}}
+{{- $replicas := default 3 .Values.redis.replicaCount -}}
+{{- $scName := .Values.redis.persistence.storageClass | default nil -}}
+{{- $size := default "10Gi" .Values.redis.persistence.size -}}
+{{- $mountPath := default "/data" .Values.redis.persistence.mountPath -}}
+{{- $cfgCM := .Values.redis.config.existingConfigMap | default (printf "%s-redis-config" $release) -}}
+{{- $cfgPath := default "/etc/redis/redis.conf" .Values.redis.config.path -}}
+{{- $authSecret := .Values.redis.auth.existingSecret | default (printf "%s-redis-auth" $release) -}}
+{{- $authKey := default "password" .Values.redis.auth.existingSecretKey -}}
+{{- $podAnnotations := .Values.redis.podAnnotations | default dict -}}
+{{- $topologySpread := .Values.redis.topologySpreadConstraints | default list -}}
+{{- $updateStrategy := .Values.redis.updateStrategy | default dict -}}
+{{- $terminationGrace := default 30 .Values.redis.terminationGracePeriodSeconds -}}
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+spec:
+  serviceName: {{ $svcHeadless }}
+  replicas: {{ $replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+      app.kubernetes.io/instance: {{ $release }}
+      app.kubernetes.io/component: cache
+  updateStrategy:
+    {{- if $updateStrategy.type }}
+    type: {{ $updateStrategy.type }}
+    {{- if $updateStrategy.rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml $updateStrategy.rollingUpdate | nindent 6 }}
+    {{- end }}
+    {{- else }}
+    type: RollingUpdate
+    {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- toYaml $labels | nindent 8 }}
+      annotations:
+        # Перекаты при изменении конфигурации/секрета:
+        checksum/redis-config: {{ include (print $.Template.BasePath "/configmap-redis.yaml") . | default (toYaml .Values.redis.config | sha256sum) | sha256sum }}
+        checksum/redis-auth: {{ printf "%s/%s" $authSecret $authKey | sha256sum }}
+        {{- if $podAnnotations }}
+        {{- toYaml $podAnnotations | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.redis.serviceAccountName }}
+      serviceAccountName: {{ .Values.redis.serviceAccountName }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $terminationGrace }}
+      securityContext:
+        fsGroup: {{ default 1001 .Values.redis.podSecurity.fsGroup }}
+        fsGroupChangePolicy: {{ default "OnRootMismatch" .Values.redis.podSecurity.fsGroupChangePolicy }}
+      {{- if .Values.redis.hostAliases }}
+      hostAliases:
+        {{- toYaml .Values.redis.hostAliases | nindent 8 }}
+      {{- end }}
+      {{- if .Values.redis.priorityClassName }}
+      priorityClassName: {{ .Values.redis.priorityClassName }}
+      {{- end }}
+      {{- if $topologySpread }}
+      topologySpreadConstraints:
+        {{- toYaml $topologySpread | nindent 8 }}
+      {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+              app.kubernetes.io/instance: {{ $release }}
+              app.kubernetes.io/component: cache
+      {{- end }}
+      {{- if .Values.redis.affinity }}
+      affinity:
+        {{- toYaml .Values.redis.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: redis
+                    app.kubernetes.io/instance: {{ $release }}
+                    app.kubernetes.io/component: cache
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- if .Values.redis.tolerations }}
+      tolerations:
+        {{- toYaml .Values.redis.tolerations | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: redis
+          image: "{{ $imageRepo }}:{{ $imageTag }}"
+          imagePullPolicy: {{ $imagePullPolicy }}
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -euo pipefail
+              HOSTNAME="$(hostname)"
+              ORD="${HOSTNAME##*-}"
+              if [ "${ORD}" = "0" ]; then
+                exec redis-server {{ $cfgPath }} \
+                  --bind 0.0.0.0 \
+                  --port {{ $port }} \
+                  --protected-mode yes \
+                  --requirepass "${REDIS_PASSWORD}"
+              else
+                exec redis-server {{ $cfgPath }} \
+                  --bind 0.0.0.0 \
+                  --port {{ $port }} \
+                  --protected-mode yes \
+                  --requirepass "${REDIS_PASSWORD}" \
+                  --masterauth "${REDIS_PASSWORD}" \
+                  --replicaof {{ printf "%s-redis-0.%s" $name $svcHeadless }} {{ $port }}
+              fi
+          ports:
+            - name: tcp-redis
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: {{ $authKey }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ $mountPath }}
+            - name: redis-config
+              mountPath: {{ $cfgPath }}
+              subPath: redis.conf
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" -h 127.0.0.1 -p {{ $port }} ping | grep -q PONG
+            initialDelaySeconds: {{ default 20 .Values.redis.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ default 10 .Values.redis.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ default 5 .Values.redis.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ default 3 .Values.redis.probes.liveness.failureThreshold }}
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" -h 127.0.0.1 -p {{ $port }} ping | grep -q PONG
+            initialDelaySeconds: {{ default 10 .Values.redis.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ default 5 .Values.redis.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ default 3 .Values.redis.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ default 3 .Values.redis.probes.readiness.failureThreshold }}
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - redis-cli -h 127.0.0.1 -p {{ $port }} ping || exit 1
+            failureThreshold: {{ default 30 .Values.redis.probes.startup.failureThreshold }}
+            periodSeconds: {{ default 5 .Values.redis.probes.startup.periodSeconds }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: {{ default true .Values.redis.containerSecurity.runAsNonRoot }}
+            runAsUser: {{ default 1001 .Values.redis.containerSecurity.runAsUser }}
+            runAsGroup: {{ default 1001 .Values.redis.containerSecurity.runAsGroup }}
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml (default (dict "limits" (dict "cpu" "500m" "memory" "1Gi") "requests" (dict "cpu" "100m" "memory" "256Mi")) .Values.redis.resources) | nindent 12 }}
+        {{- if $exporterEnabled }}
+        - name: redis-exporter
+          image: "{{ $exporterRepo }}:{{ $exporterTag }}"
+          imagePullPolicy: {{ $exporterPullPolicy }}
+          args:
+            - "--redis.addr=redis://127.0.0.1:{{ $port }}"
+            - "--web.listen-address=:{{ $exporterPort }}"
+            {{- if .Values.redis.metrics.exporter.extraArgs }}
+            {{- range .Values.redis.metrics.exporter.extraArgs }}
+            - "{{ . }}"
+            {{- end }}
+            {{- end }}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: {{ $authKey }}
+          ports:
+            - name: metrics
+              containerPort: {{ $exporterPort }}
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml (default (dict "limits" (dict "cpu" "200m" "memory" "256Mi") "requests" (dict "cpu" "50m" "memory" "64Mi")) .Values.redis.metrics.exporter.resources) | nindent 12 }}
+        {{- end }}
+      volumes:
+        - name: redis-config
+          configMap:
+            name: {{ $cfgCM }}
+            items:
+              - key: redis.conf
+                path: redis.conf
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- toYaml $labels | nindent 10 }}
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        {{- if $scName }}
+        storageClassName: {{ $scName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $size }}

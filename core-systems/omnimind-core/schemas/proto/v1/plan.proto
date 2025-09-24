@@ -1,0 +1,518 @@
+syntax = "proto3";
+
+package omnimind.core.v1;
+
+// ---------- Language-specific options ----------
+option go_package        = "github.com/omnimind/omnimind-core/schemas/gen/go/omnimind/core/v1;corev1";
+option java_multiple_files = true;
+option java_package      = "ai.omnimind.core.v1";
+option java_outer_classname = "PlanProto";
+option csharp_namespace  = "OmniMind.Core.V1";
+option php_namespace     = "OmniMind\\Core\\V1";
+option ruby_package      = "OmniMind::Core::V1";
+option objc_class_prefix = "OMC";
+option optimize_for      = SPEED;
+option cc_enable_arenas  = true;
+
+// ---------- Imports ----------
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+import "google/type/expr.proto";
+// Optional (enable if used in REST gateway / validation toolchain)
+import "google/api/annotations.proto";
+import "google/api/field_behavior.proto";
+import "google/api/resource.proto";
+import "validate/validate.proto";
+
+// ======================================================================
+// Resource: Plan
+// ======================================================================
+
+message Plan {
+  option (google.api.resource) = {
+    type: "omnimind.core/Plan"
+    pattern: "plans/{plan}"
+  };
+
+  // Resource name: "plans/{plan}"
+  string name = 1 [
+    (google.api.field_behavior) = OUTPUT_ONLY,
+    (validate.rules).string = {pattern: "^plans/[a-zA-Z0-9._\\-]{3,128}$"}
+  ];
+
+  // Immutable server UID (UUIDv4).
+  string uid = 2 [
+    (google.api.field_behavior) = OUTPUT_ONLY,
+    (validate.rules).string.uuid = true
+  ];
+
+  // Tenant/organization identifier.
+  string tenant_id = 3 [
+    (validate.rules).string = {min_len: 1, max_len: 128}
+  ];
+
+  // Human-readable title.
+  string display_name = 4 [(validate.rules).string = {max_len: 256}];
+
+  PlanStatus status = 5 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Top-level plan parameters (stable inputs for templating).
+  google.protobuf.Struct params = 8;
+
+  // Steps of the plan. See edges for DAG wiring.
+  repeated Step steps = 6 [(validate.rules).repeated = {min_items: 1, max_items: 1000}];
+
+  // Directed edges "from" -> "to" (DAG). Cycles are invalid at runtime.
+  repeated Edge edges = 19;
+
+  // Key-value labels for search/rbac.
+  map<string, string> labels = 7 [
+    (validate.rules).map = {
+      keys   : {string: {max_len: 63, pattern: "^[a-z0-9A-Z_.\\-]+$"}},
+      values : {string: {max_len: 256}}
+    }
+  ];
+
+  Budget budget = 9;                       // Cost/time/token limits.
+  SecurityContext security = 10;           // RBAC/PII/egress settings.
+  TraceContext trace = 11;                 // W3C-like tracing.
+  string idempotency_key = 12 [(validate.rules).string = {max_len: 128}];
+  Timestamps timestamps = 13 [(google.api.field_behavior) = OUTPUT_ONLY];
+  Error last_error = 14 [(google.api.field_behavior) = OUTPUT_ONLY];
+  repeated Attachment attachments = 15;
+
+  // Monotonic revision, increments on mutation.
+  int32 revision = 18 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Execution policy for orchestrator.
+  ExecutionPolicy execution_policy = 20;
+
+  // Reserved to avoid field reuse after removals.
+  reserved 16, 17;
+  // reserved "deprecated_field_foo";
+}
+
+// Plan lifecycle.
+enum PlanStatus {
+  PLAN_STATUS_UNSPECIFIED = 0;
+  PLAN_DRAFT    = 1;
+  PLAN_RUNNING  = 2;
+  PLAN_PAUSED   = 3;
+  PLAN_SUCCEEDED= 4;
+  PLAN_FAILED   = 5;
+  PLAN_CANCELLED= 6;
+}
+
+// ======================================================================
+// DAG Edge
+// ======================================================================
+
+message Edge {
+  // Step IDs within Plan.steps.id
+  string from = 1 [(validate.rules).string = {min_len: 1, max_len: 128}];
+  string to   = 2 [(validate.rules).string = {min_len: 1, max_len: 128}];
+  // Optional CEL condition for dynamic routing. If false -> edge not taken.
+  google.type.Expr condition = 3;
+}
+
+// ======================================================================
+// Step
+// ======================================================================
+
+message Step {
+  // Unique within plan.
+  string id = 1 [(validate.rules).string = {min_len: 1, max_len: 128, pattern: "^[a-zA-Z0-9._\\-]+$"}];
+
+  string name = 2 [(validate.rules).string = {max_len: 256}];
+
+  StepType type = 3;
+
+  // Tool registry id (for TOOL), language/runtime hint (for CODE), URL (for HTTP) etc.
+  string tool = 4;
+
+  ToolInvocation invocation = 5; // Inputs/args for the step.
+
+  // CEL predicate; when false, step is SKIPPED.
+  Condition when = 6;
+
+  // Simple dependency list in addition to edges (fan-in barrier).
+  repeated string depends_on = 7;
+
+  Timeout timeout = 8;
+  RetryPolicy retry = 9;
+
+  map<string,string> labels = 10;
+
+  // Free-form metadata (opaque to orchestrator, visible to clients).
+  google.protobuf.Struct metadata = 11;
+
+  // Execution result (mutually exclusive).
+  oneof result {
+    StepOutput output = 12;
+    Error error = 13;
+  }
+
+  StepStatus status = 14 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Current attempt number (1-based).
+  int32 attempt = 15 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Concurrency group for throttling (e.g., "tool:web-search").
+  string concurrency_key = 16;
+
+  // Caching controls for this step.
+  CachePolicy cache = 17;
+
+  reserved 18;
+}
+
+enum StepType {
+  STEP_TYPE_UNSPECIFIED = 0;
+  STEP_TOOL    = 1; // External tool/integration
+  STEP_CODE    = 2; // Inline code (sandbox) or worker task
+  STEP_HTTP    = 3; // HTTP call with request template
+  STEP_CONTROL = 4; // Control-flow (branch/join/foreach)
+}
+
+enum StepStatus {
+  STEP_STATUS_UNSPECIFIED = 0;
+  STEP_PENDING   = 1;
+  STEP_QUEUED    = 2;
+  STEP_RUNNING   = 3;
+  STEP_SKIPPED   = 4;
+  STEP_RETRYING  = 5;
+  STEP_SUCCEEDED = 6;
+  STEP_FAILED    = 7;
+  STEP_CANCELED  = 8;
+}
+
+// ======================================================================
+// Invocation / Parameters
+// ======================================================================
+
+message ToolInvocation {
+  // Canonical name of the tool or code entrypoint.
+  string name = 1 [(validate.rules).string = {min_len: 1, max_len: 128}];
+
+  // Structured inputs for the tool.
+  google.protobuf.Struct inputs = 2;
+
+  // Explicit parameter list with types, if tool uses typed interface.
+  repeated Parameter parameters = 3;
+
+  // Referenced files/blobs (by URI; fetch by executor).
+  repeated FileRef files = 4;
+}
+
+message Parameter {
+  string key = 1 [(validate.rules).string = {min_len: 1, max_len: 128}];
+
+  // Optional type hint for UIs/validation.
+  ParamType type = 9;
+
+  // Default/value.
+  oneof value {
+    string string_value = 2;
+    double number_value = 3;
+    bool bool_value     = 4;
+    google.protobuf.Struct object_value = 5;
+    google.protobuf.ListValue list_value = 6;
+  }
+
+  bool required = 10;
+  string description = 11 [(validate.rules).string = {max_len: 512}];
+}
+
+enum ParamType {
+  PARAM_TYPE_UNSPECIFIED = 0;
+  PARAM_STRING = 1;
+  PARAM_NUMBER = 2;
+  PARAM_BOOL   = 3;
+  PARAM_OBJECT = 4;
+  PARAM_LIST   = 5;
+}
+
+// ======================================================================
+// Conditions / Policies
+// ======================================================================
+
+message Condition {
+  // CEL expression evaluated against plan/step context.
+  // Variables: plan, step, inputs, outputs, labels, now, attrs.
+  google.type.Expr expr = 1;
+}
+
+message Timeout {
+  // Total wall-clock for the step execution.
+  google.protobuf.Duration execution = 1;
+  // Max queueing time before start (for schedulers).
+  google.protobuf.Duration queue = 2;
+}
+
+message RetryPolicy {
+  int32 max_attempts = 1 [(validate.rules).int32 = {gte: 0, lte: 20}];
+  google.protobuf.Duration initial_backoff = 2;
+  double multiplier = 3 [(validate.rules).double = {gte: 1.0, lte: 10.0}];
+  google.protobuf.Duration max_backoff = 4;
+  // Retry only on selected error codes.
+  repeated ErrorCode retry_on = 5;
+}
+
+message CachePolicy {
+  bool enabled = 1;
+  bool cache_inputs  = 2;
+  bool cache_outputs = 3;
+  google.protobuf.Duration ttl = 4;
+  // Key composition strategy (e.g., "inputs+tool+version").
+  string strategy = 5;
+  // Explicit fields from inputs to include in cache key.
+  repeated string cache_key_fields = 6;
+}
+
+message ExecutionPolicy {
+  int32 max_parallel = 1 [(validate.rules).int32 = {gte: 0, lte: 1024}];
+  bool fail_fast = 2;
+  bool continue_on_error = 3;
+  // Concurrency limits by key (e.g., tool id -> limit)
+  map<string, int32> concurrency_limits = 4;
+  Schedule schedule = 5; // For delayed/recurring plans (optional)
+}
+
+message Schedule {
+  bool enabled = 1;
+  // Cron expression in UTC if enabled.
+  string cron = 2;
+  google.protobuf.Timestamp not_before = 3;
+  google.protobuf.Timestamp not_after  = 4;
+}
+
+// ======================================================================
+// Output / Errors / Attachments
+// ======================================================================
+
+message StepOutput {
+  // Generic payload. Prefer 'text' for small textual outputs.
+  oneof payload {
+    string text = 1;
+    google.protobuf.Struct struct_data = 2;
+    bytes binary = 3;
+    google.protobuf.Any any = 4;
+  }
+
+  // Secondary artifacts.
+  repeated Attachment attachments = 10;
+
+  // Accounting/telemetry.
+  int64 tokens_input  = 20;
+  int64 tokens_output = 21;
+  double cost_usd     = 22;
+  string content_type = 23; // MIME of primary payload when binary/text.
+  string content_uri  = 24; // External storage reference, if any.
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+  google.protobuf.Struct details = 3;
+  string origin = 4; // component name
+  string step_id = 5;
+  google.protobuf.Timestamp occurred_at = 6;
+  string correlation_id = 7;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_VALIDATION = 1;
+  ERROR_TIMEOUT = 2;
+  ERROR_RATE_LIMIT = 3;
+  ERROR_PERMISSION_DENIED = 4;
+  ERROR_NOT_FOUND = 5;
+  ERROR_UNAVAILABLE = 6;
+  ERROR_INTERNAL = 7;
+  ERROR_CANCELLED = 8;
+  ERROR_ABORTED = 9;
+  ERROR_FAILED_PRECONDITION = 10;
+}
+
+message Attachment {
+  string id = 1;
+  string name = 2;
+  string mime_type = 3;
+  int64 size_bytes = 4;
+  string uri = 5;
+  bytes sha256 = 6;
+}
+
+message FileRef {
+  string uri = 1;         // e.g., s3://bucket/key, gs://..., file://, http(s)://
+  string name = 2;
+  string mime_type = 3;
+  int64 size_bytes = 4;
+  bytes sha256 = 5;
+}
+
+// ======================================================================
+// Security / Tracing / Budget / Timestamps
+// ======================================================================
+
+message SecurityContext {
+  string tenant_id = 1;
+  string actor_id  = 2;
+  repeated string roles = 3;
+  bool allow_external_network = 4;
+  repeated string allowed_domains = 5;
+  repeated string denied_domains  = 6;
+  repeated string allowed_tools   = 7;
+  repeated string denied_tools    = 8;
+  DataPolicy data_policy = 9;
+}
+
+message DataPolicy {
+  bool redact_pii    = 1;
+  bool store_inputs  = 2;
+  bool store_outputs = 3;
+  bool allow_logging = 4;
+  // Retention policy hint, e.g., "30d", "7d".
+  string retention    = 5;
+}
+
+message TraceContext {
+  string trace_id       = 1;
+  string span_id        = 2;
+  string parent_span_id = 3;
+  map<string,string> baggage = 4;
+}
+
+message Budget {
+  google.protobuf.Duration wall_clock = 1; // max end-to-end time
+  int64 max_tokens = 2;                    // LLM tokens across plan
+  double max_cost_usd = 3;                 // Cost guardrail
+  int32 max_steps = 4;                     // Hard cap on executed steps
+}
+
+message Timestamps {
+  google.protobuf.Timestamp create_time = 1;
+  google.protobuf.Timestamp update_time = 2;
+  google.protobuf.Timestamp start_time  = 3;
+  google.protobuf.Timestamp end_time    = 4;
+}
+
+// ======================================================================
+// Streaming Events
+// ======================================================================
+
+message PlanEvent {
+  string plan = 1; // resource name "plans/{plan}"
+  EventType type = 2;
+
+  // Step context (when applicable)
+  string step_id = 3;
+  StepStatus step_status = 4;
+
+  // Partial output chunks for streaming steps (optional).
+  StepOutput delta = 5;
+
+  Error error = 6;
+  google.protobuf.Timestamp time = 7;
+  string node = 8; // executor node id
+  map<string,string> attributes = 9;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  PLAN_STARTED   = 1;
+  PLAN_UPDATED   = 2;
+  PLAN_COMPLETED = 3;
+
+  STEP_STARTED   = 10;
+  STEP_PROGRESS  = 11;
+  STEP_COMPLETED = 12;
+  STEP_FAILED    = 13;
+
+  LOG            = 20;
+  HEARTBEAT      = 21;
+}
+
+// ======================================================================
+// API: Planner & Executor
+// ======================================================================
+
+service Planner {
+  rpc CreatePlan(CreatePlanRequest) returns (Plan) {
+    option (google.api.http) = { post: "/v1/plans" body: "plan" };
+  }
+  rpc GetPlan(GetPlanRequest) returns (Plan) {
+    option (google.api.http) = { get: "/v1/{name=plans/*}" };
+  }
+  rpc ListPlans(ListPlansRequest) returns (ListPlansResponse) {
+    option (google.api.http) = { get: "/v1/plans" };
+  }
+  rpc UpdatePlan(UpdatePlanRequest) returns (Plan) {
+    option (google.api.http) = { patch: "/v1/{plan.name=plans/*}" body: "plan" };
+  }
+  rpc DeletePlan(DeletePlanRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { delete: "/v1/{name=plans/*}" };
+  }
+}
+
+service Executor {
+  // Starts execution; server streams events until completion/cancel.
+  rpc ExecutePlan(ExecutePlanRequest) returns (stream PlanEvent) {
+    option (google.api.http) = { post: "/v1/{name=plans/*}:execute" body: "*" };
+  }
+  // Sends a cancel signal (best-effort).
+  rpc CancelPlan(CancelPlanRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = { post: "/v1/{name=plans/*}:cancel" body: "*" };
+  }
+}
+
+// ---------- Requests/Responses ----------
+
+message CreatePlanRequest {
+  Plan plan = 1 [(validate.rules).message.required = true];
+}
+
+message GetPlanRequest {
+  string name = 1 [(validate.rules).string = {pattern: "^plans/[a-zA-Z0-9._\\-]{3,128}$"}];
+}
+
+message ListPlansRequest {
+  int32 page_size = 1 [(validate.rules).int32 = {gte: 0, lte: 1000}];
+  string page_token = 2;
+  string tenant_id = 3;
+  map<string,string> filter_labels = 4;
+}
+
+message ListPlansResponse {
+  repeated Plan plans = 1;
+  string next_page_token = 2;
+}
+
+message UpdatePlanRequest {
+  Plan plan = 1 [(validate.rules).message.required = true];
+  // Optional field mask (if using HTTP/JSON merge-patch, omit).
+  repeated string update_mask = 2;
+}
+
+message DeletePlanRequest {
+  string name = 1 [(validate.rules).string = {pattern: "^plans/[a-zA-Z0-9._\\-]{3,128}$"}];
+  bool force = 2;
+}
+
+message ExecutePlanRequest {
+  string name = 1 [(validate.rules).string = {pattern: "^plans/[a-zA-Z0-9._\\-]{3,128}$"}];
+  // Overrides for single run (do not persist):
+  google.protobuf.Struct override_params = 2;
+  ExecutionPolicy override_execution_policy = 3;
+  Budget override_budget = 4;
+  TraceContext trace = 5;
+}
+
+message CancelPlanRequest {
+  string name = 1 [(validate.rules).string = {pattern: "^plans/[a-zA-Z0-9._\\-]{3,128}$"}];
+  string reason = 2;
+}

@@ -1,0 +1,308 @@
+version: 1.0
+service:
+  name: chronowatch-core
+  domain: neurocity
+  tier: critical
+  description: >
+    ChronoWatch Core — API и фоновые воркеры для трекинга событий/таймсерий, выдачи аналитики и уведомлений.
+  owners:
+    product: "Product Lead <product@neurocity.example>"     # I cannot verify this.
+    sre: "SRE On-Call <sre@neurocity.example>"               # I cannot verify this.
+    tech: "Tech Lead <techlead@neurocity.example>"           # I cannot verify this.
+  repositories:
+    - "https://git.example/neurocity/chronowatch-core"       # I cannot verify this.
+  contact_channels:
+    pagerduty_service: "chronowatch-core"                    # I cannot verify this.
+    slack: "#oncall-chronowatch"                             # I cannot verify this.
+    email: "incidents@neurocity.example"                     # I cannot verify this.
+
+contracts:
+  time_zone: "UTC"
+  reporting_window: "30d"        # окно отчетности SLA
+  publication:
+    cadence: "monthly"
+    audience: ["internal", "customers_enterprise"]
+  penalties:
+    # Примеры; финальные условия — в юридическом SLA.
+    credit_policy:
+      availability_below:
+        "99.9": "10% monthly fee credit"
+        "99.5": "25% monthly fee credit"
+        "99.0": "50% monthly fee credit"
+      rto_rpo_breach: "25% monthly fee credit"
+    # I cannot verify this.
+
+environments:
+  - name: prod
+    namespace: chronowatch-core
+  - name: staging
+    namespace: chronowatch-core-staging
+  - name: dev
+    namespace: chronowatch-core-dev
+
+# ---------- SLI (измеримые показатели качества) ----------
+sli:
+  availability:
+    description: "Доля успешных запросов API (HTTP 2xx/3xx) от общего числа."
+    source:
+      prometheus:
+        expr_success: >
+          sum(rate(http_requests_total{namespace="$NAMESPACE",pod=~"$POD_RX",status=~"2..|3.."}[5m]))
+        expr_total: >
+          sum(rate(http_requests_total{namespace="$NAMESPACE",pod=~"$POD_RX"}[5m]))
+        variables:
+          POD_RX: "$FULLNAME-.*"   # подставляется из Helm. I cannot verify this.
+    unit: "ratio"
+  latency_p95:
+    description: "P95 времени ответа API."
+    source:
+      prometheus:
+        expr: >
+          histogram_quantile(0.95, sum by (le)(
+            rate(http_request_duration_seconds_bucket{namespace="$NAMESPACE",pod=~"$POD_RX"}[5m])
+          ))
+    unit: "seconds"
+  latency_p99:
+    description: "P99 времени ответа API."
+    source:
+      prometheus:
+        expr: >
+          histogram_quantile(0.99, sum by (le)(
+            rate(http_request_duration_seconds_bucket{namespace="$NAMESPACE",pod=~"$POD_RX"}[5m])
+          ))
+    unit: "seconds"
+  worker_success:
+    description: "Доля успешно завершенных фоновых задач."
+    source:
+      prometheus:
+        expr_success: >
+          sum(rate(worker_jobs_total{namespace="$NAMESPACE",pod=~"$POD_RX",result="success"}[5m]))
+        expr_total: >
+          sum(rate(worker_jobs_total{namespace="$NAMESPACE",pod=~"$POD_RX"}[5m]))
+    unit: "ratio"
+  target_up:
+    description: "Доступность экспортера/эндпоинта up()==1."
+    source:
+      prometheus:
+        expr: >
+          sum(up{namespace="$NAMESPACE",job=~".*chronowatch.*"}) / sum(vector(1))
+    unit: "ratio"
+
+# ---------- SLO (целевые значения для SLI) ----------
+slo:
+  window: "28d"  # расчет окна SLO
+  objectives:
+    - id: api-availability
+      sli: availability
+      target: 0.999          # 99.9%
+      min_required_volume: 100   # min req/min для валидности окна
+      error_budget:
+        total: 0.001         # 0.1 за окно
+        burn_alerts:
+          fast:
+            multiple_of_budget_per_hour: 14
+            evaluate_for: "5m"
+          slow:
+            multiple_of_budget_per_day: 6
+            evaluate_for: "2h"
+    - id: api-latency-p95
+      sli: latency_p95
+      target: 0.400          # сек
+      comparison: "less_or_equal"
+      percentiles: 0.95
+    - id: api-latency-p99
+      sli: latency_p99
+      target: 1.000
+      comparison: "less_or_equal"
+      percentiles: 0.99
+    - id: worker-success
+      sli: worker_success
+      target: 0.995
+      error_budget:
+        total: 0.005
+        burn_alerts:
+          fast:
+            multiple_of_budget_per_hour: 14
+            evaluate_for: "10m"
+          slow:
+            multiple_of_budget_per_day: 6
+            evaluate_for: "4h"
+  breach_policy:
+    action_order:
+      - escalate_pager
+      - freeze_changes
+      - initiate_problem_record
+      - postmortem_required
+    postmortem_required: true
+    freeze_changes:
+      threshold_remaining_budget: 0.25  # при остатке бюджета < 25% вводится change freeze
+  review:
+    cadence: "quarterly"
+    approvers: ["SRE Lead", "Product Lead"]  # I cannot verify this.
+
+# ---------- Dependencies (вклад в бюджет и трассируемость) ----------
+dependencies:
+  - name: postgres
+    type: database
+    namespace: data
+    slo_assumption:
+      availability: 0.999
+      latency_p95: "15ms"
+    impact: "hard"
+  - name: redis
+    type: cache
+    namespace: data
+    slo_assumption:
+      availability: 0.9995
+      latency_p95: "5ms"
+    impact: "soft"
+  - name: gateway
+    type: ingress
+    namespace: gateway
+    slo_assumption:
+      availability: 0.999
+    impact: "hard"
+  contribution_model:
+    # простая мультипликативная модель для оценивания достижимости композитного SLO
+    method: "multiplicative"
+    formula: "SLO_total ≈ Π SLO_i (hard) × min(SLO_i) (soft)"
+
+# ---------- Alerting policy ----------
+alerting:
+  ownership:
+    primary_team: "sre-chronowatch"   # I cannot verify this.
+    secondary_team: "backend-core"    # I cannot verify this.
+  routing:
+    critical:
+      pagerduty: true
+      slack_channel: "#oncall-chronowatch"
+      ticketing: "JIRA:INC"           # I cannot verify this.
+    warning:
+      pagerduty: false
+      slack_channel: "#sre-warnings"
+      ticketing: "JIRA:PROBLEM"       # I cannot verify this.
+  rules:
+    - id: burn-fast
+      description: "Быстрый расход error budget"
+      severity: critical
+      expr: >
+        (
+          (
+            sum(rate(http_requests_total{namespace="$NAMESPACE",pod=~"$POD_RX",status=~"5.."}[5m])) /
+            clamp_min(sum(rate(http_requests_total{namespace="$NAMESPACE",pod=~"$POD_RX"}[5m])), 1e-9)
+          )
+        ) > ((1 - {{slo.objectives[0].target}}) * 14)
+      for: "5m"
+    - id: burn-slow
+      description: "Медленный расход error budget"
+      severity: warning
+      expr: >
+        (
+          (
+            sum(rate(http_requests_total{namespace="$NAMESPACE",pod=~"$POD_RX",status=~"5.."}[30m])) /
+            clamp_min(sum(rate(http_requests_total{namespace="$NAMESPACE",pod=~"$POD_RX"}[30m])), 1e-9)
+          )
+        ) > ((1 - {{slo.objectives[0].target}}) * 6)
+      for: "2h"
+    - id: latency-p95-degradation
+      severity: warning
+      expr: >
+        histogram_quantile(0.95, sum by (le)(
+          rate(http_request_duration_seconds_bucket{namespace="$NAMESPACE",pod=~"$POD_RX"}[5m])
+        )) > 0.4
+      for: "10m"
+    - id: latency-p99-degradation
+      severity: critical
+      expr: >
+        histogram_quantile(0.99, sum by (le)(
+          rate(http_request_duration_seconds_bucket{namespace="$NAMESPACE",pod=~"$POD_RX"}[5m])
+        )) > 1
+      for: "10m"
+    - id: pod-restarts
+      severity: warning
+      expr: >
+        increase(kube_pod_container_status_restarts_total{namespace="$NAMESPACE",pod=~"$POD_RX"}[15m]) > 3
+      for: "10m"
+    - id: crashloop
+      severity: critical
+      expr: >
+        max by (pod) (kube_pod_container_status_waiting_reason{
+          namespace="$NAMESPACE",pod=~"$POD_RX",reason="CrashLoopBackOff"}) == 1
+      for: "5m"
+    - id: target-down
+      severity: critical
+      expr: 'sum by (job) (up{namespace="$NAMESPACE",job=~".*chronowatch.*"}) == 0'
+      for: "5m"
+
+# ---------- Maintenance & Change Budget ----------
+maintenance:
+  windows:
+    - name: weekly-low-traffic
+      cron: "0 2 * * 0"      # каждое воскресенье 02:00 UTC
+      duration: "2h"
+      notify_before: "48h"
+  change_budget:
+    allowed_error_budget_consumption: 0.10     # на изменения допускается 10% бюджета ошибок в окне
+    freeze_on:
+      remaining_budget_below: 0.25
+      active_major_incident: true
+    release_policies:
+      require_canary: true
+      require_rollback_plan: true
+      progressive_delivery: true
+
+# ---------- Observability mapping ----------
+observability:
+  prometheus:
+    datasource: "prometheus-main"    # I cannot verify this.
+    scrape_jobs:
+      - chronowatch-core
+      - kube-state-metrics
+  grafana:
+    datasource: "grafana-main"       # I cannot verify this.
+    dashboards:
+      - name: "ChronoWatch RED"
+        uid: "cw-red-001"
+      - name: "ChronoWatch SLO"
+        uid: "cw-slo-001"
+  logging:
+    datasource: "loki-main"          # I cannot verify this.
+    log_label_selector: '{app="chronowatch-core"}'
+  tracing:
+    otlp:
+      endpoint: "http://otel-collector.observability:4317"   # I cannot verify this.
+      service_name: "chronowatch-core"
+
+# ---------- Runbooks ----------
+runbooks:
+  - id: rb-latency
+    name: "Латентность ↑"
+    url: "https://wiki.example/runbooks/latency"              # I cannot verify this.
+    steps:
+      - "Проверить графики p95/p99 и saturation (CPU/memory)."
+      - "Проверить 5xx/бэкенды (DB/Redis) и lock contention."
+      - "Включить sampling профилировщика."
+  - id: rb-errors
+    name: "Рост 5xx"
+    url: "https://wiki.example/runbooks/5xx"                  # I cannot verify this.
+    steps:
+      - "Сравнить релиз-маркеры с началом деградации."
+      - "Провести выборку проблемных эндпоинтов и ответов."
+      - "Откатить последний релиз при подтверждении регрессии."
+  - id: rb-crashloop
+    name: "CrashLoopBackOff"
+    url: "https://wiki.example/runbooks/crashloop"            # I cannot verify this.
+
+# ---------- Exceptions & Reviews ----------
+exceptions:
+  allowed_downtime:
+    planned:
+      monthly_minutes: 30
+      requires_customer_notice: true
+  clock_skew:
+    allowed_ms: 500
+review_process:
+  when:
+    - "Отклонение фактического SLA от целевого более чем на 5% за квартал"
+    - "Изменение критичности или архитектуры"
+  approvers: ["SRE Lead", "CTO"]      # I cannot verify this.

@@ -1,0 +1,299 @@
+syntax = "proto3";
+
+package datafabric.v1.stream;
+
+option go_package = "github.com/aethernova/datafabric-core/schemas/proto/v1/stream;streamv1";
+option java_multiple_files = true;
+option java_package = "io.aethernova.datafabric.v1.stream";
+option java_outer_classname = "EventsProto";
+option csharp_namespace = "Aethernova.Datafabric.V1.Stream";
+option cc_enable_arenas = true;
+option optimize_for = SPEED;
+
+// -----------------------------------------------------------------------------
+// Импорты well-known типов
+// -----------------------------------------------------------------------------
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+import "google/protobuf/any.proto";
+
+// -----------------------------------------------------------------------------
+// Общие перечисления
+// -----------------------------------------------------------------------------
+
+// Класс события (для маршрутизации/политик).
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_BUSINESS    = 1;
+  EVENT_KIND_TECHNICAL   = 2;
+  EVENT_KIND_AUDIT       = 3;
+}
+
+// Уровень важности/серьезности (в духе OpenTelemetry логов).
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_TRACE       = 1;
+  SEVERITY_DEBUG       = 2;
+  SEVERITY_INFO        = 3;
+  SEVERITY_WARN        = 4;
+  SEVERITY_ERROR       = 5;
+  SEVERITY_FATAL       = 6;
+}
+
+// Формат полезной нагрузки.
+enum DataFormat {
+  DATA_FORMAT_UNSPECIFIED = 0;
+  DATA_FORMAT_JSON        = 1;
+  DATA_FORMAT_PROTOBUF    = 2;
+  DATA_FORMAT_AVRO        = 3;
+  DATA_FORMAT_BINARY      = 4;
+}
+
+// Сжатие полезной нагрузки в Envelope.
+enum ContentEncoding {
+  CONTENT_ENCODING_UNSPECIFIED = 0;
+  CONTENT_ENCODING_IDENTITY    = 1; // без сжатия
+  CONTENT_ENCODING_GZIP        = 2;
+  CONTENT_ENCODING_ZSTD        = 3;
+}
+
+// Политика подтверждений для консьюмера/брокера.
+enum AckPolicy {
+  ACK_POLICY_UNSPECIFIED = 0;
+  ACK_POLICY_AT_LEAST_ONCE = 1; // допускается повтор
+  ACK_POLICY_AT_MOST_ONCE  = 2; // без повторов, риск потерь
+  ACK_POLICY_EXACTLY_ONCE  = 3; // требует транзакционности
+}
+
+// Тип отрицательного подтверждения (nack).
+enum NackReason {
+  NACK_REASON_UNSPECIFIED = 0;
+  NACK_REASON_TRANSIENT   = 1;  // временная ошибка, можно ретраить
+  NACK_REASON_PERMANENT   = 2;  // постоянная ошибка, отправить в DLQ
+  NACK_REASON_POLICY      = 3;  // нарушена политика/валидатор
+}
+
+// -----------------------------------------------------------------------------
+// Вспомогательные структуры
+// -----------------------------------------------------------------------------
+
+// Универсальные заголовки транспорта (аналог Kafka headers).
+message Headers {
+  // Ограничение: значения бинарные (bytes); ключи уникальны и регистрозависимы.
+  map<string, bytes> items = 1;
+}
+
+// Атрибуты с типизацией — для контекстов/меток/экспериментальных фич.
+message Attributes {
+  // Строчные attrs для быстрых фильтров.
+  map<string, string> labels = 1;
+  // Произвольные значения (JSON-подобные).
+  map<string, google.protobuf.Value> values = 2;
+}
+
+// Сведения об акторе (пользователь/сервис), инициировавшем событие.
+message Actor {
+  string id = 1;                // обязательный бизнес-идентификатор (может быть субъекта)
+  string type = 2;              // user|service|system|device
+  string display_name = 3;
+  string organization_id = 4;   // арендатор/организация
+  string ip = 5;
+  Device device = 6;
+  Geo geo = 7;
+
+  // Эволюция: резервируем диапазон под будущие поля актора.
+  reserved 100 to 149;
+}
+
+// Устройство (если применимо).
+message Device {
+  string id = 1;
+  string platform = 2;     // ios|android|web|backend|edge
+  string model = 3;
+  string os = 4;
+  string os_version = 5;
+  string app_version = 6;
+
+  reserved 100 to 119;
+}
+
+// Геоданные (если применимо).
+message Geo {
+  string country = 1;  // ISO-3166-1 alpha-2
+  string region = 2;   // административный уровень
+  string city = 3;
+  google.protobuf.DoubleValue lat = 4;
+  google.protobuf.DoubleValue lon = 5;
+
+  reserved 100 to 109;
+}
+
+// Технический контекст генерации события.
+message Context {
+  string app = 1;                 // логическое имя приложения/микросервиса
+  string service_instance_id = 2; // уникальный инстанс
+  string env = 3;                 // dev|staging|prod|...
+  string region = 4;              // облачный регион
+  string version = 5;             // версия сервиса/схемы
+  string feature_revision = 6;    // ревизия фича-флагов
+  Attributes attrs = 7;           // произвольные атрибуты
+
+  // Трассировка (совместимо с W3C Trace Context).
+  string trace_id = 20;
+  string span_id = 21;
+  string parent_span_id = 22;
+
+  reserved 100 to 149;
+}
+
+// Ошибка для nack/аудита.
+message ErrorDetail {
+  string code = 1;                     // машинный код ошибки
+  string message = 2;                  // человекочитаемое описание
+  map<string, string> details = 3;     // доп. детали
+}
+
+// -----------------------------------------------------------------------------
+// Домашняя модель события (CloudEvents-friendly)
+// -----------------------------------------------------------------------------
+
+// Содержимое события. oneof гарантирует один формат данных.
+message Event {
+  // Обязательные поля идемпотентности и источника.
+  string id = 1;                 // UUIDv4/KSUID/ULID — уникальный идентификатор события (idempotency key)
+  string type = 2;               // тип события (e.g., "user.created")
+  string source = 3;             // URI/URN источника (e.g., "service://auth" или "app://mobile")
+  string subject = 4;            // уточнение сущности (e.g., "user:123")
+
+  google.protobuf.Timestamp time = 5; // производственное время генерации
+
+  EventKind kind = 6;            // бизнес/тех/аудит
+  Severity severity = 7;
+
+  // Совместимость с CloudEvents: datacontenttype/dataschema.
+  string datacontenttype = 8;    // e.g., "application/json"
+  string dataschema = 9;         // ссылка на схему (URI)
+
+  DataFormat data_format = 10;
+
+  // Атрибуты приватности/политик
+  bool pii = 11;                 // содержит ли PII
+  string pii_level = 12;         // none|weak|strong (сверяйте с политиками)
+  string classification = 13;    // public|internal|confidential|restricted
+
+  // Доменные теги и атрибуты
+  Attributes attributes = 14;
+
+  // Контекст актора и исполнения
+  Actor actor = 15;
+  Context context = 16;
+
+  // Варианты полезной нагрузки
+  oneof data {
+    // Структурированное JSON-представление (удобно для быстрых потребителей).
+    google.protobuf.Struct json_data = 30;
+
+    // Текстовый формат (JSON/CSV/…); дублирует datacontenttype.
+    string text_data = 31;
+
+    // Любой protobuf-месседж (сохраняем тип через type_url).
+    google.protobuf.Any proto_data = 32;
+
+    // Бинарные данные (Avro/Parquet/др. — при необходимости укажите формат и схему).
+    bytes binary_data = 33;
+  }
+
+  // Эволюционный бюджет (запас номеров).
+  reserved 100 to 199; // под дальнейшие поля в Event
+}
+
+// -----------------------------------------------------------------------------
+// Оболочка для транспорта/брокера
+// -----------------------------------------------------------------------------
+
+message EventEnvelope {
+  // Транспортные идентификаторы (могут отличаться от Event.id).
+  string envelope_id = 1;  // уникальный id конверта (для повторов/маршрутов)
+  string partition_key = 2;
+  string tenant_id = 3;
+  string topic = 4;        // логическая тема/стрим
+
+  // Время публикации в транспорт.
+  google.protobuf.Timestamp published_at = 5;
+
+  // Политика подтверждений/повторов.
+  AckPolicy ack_policy = 6;
+  uint32 delivery_attempt = 7;
+
+  // Кодировка содержимого.
+  ContentEncoding content_encoding = 8;
+
+  // Заголовки транспорта/брокера.
+  Headers headers = 9;
+
+  // Пользовательские метки для маршрутизации/поиска.
+  map<string, string> tags = 10;
+
+  // Само событие.
+  Event event = 20;
+
+  // Резервирование номеров для безопасной эволюции.
+  reserved 100 to 149;
+}
+
+// Батч событий для эффективной передачи/хранения (размер ограничивайте на транспортном уровне).
+message EventBatch {
+  string batch_id = 1;
+  repeated EventEnvelope events = 2;
+  uint32 count = 3;
+  google.protobuf.Timestamp first_event_time = 4;
+  google.protobuf.Timestamp last_event_time = 5;
+
+  reserved 100 to 119;
+}
+
+// Подтверждение доставки.
+message Ack {
+  string envelope_id = 1;
+  string event_id = 2;
+  google.protobuf.Timestamp acked_at = 3;
+
+  reserved 100 to 109;
+}
+
+// Отрицательное подтверждение с причиной.
+message Nack {
+  string envelope_id = 1;
+  string event_id = 2;
+  NackReason reason = 3;
+  ErrorDetail error = 4;
+  google.protobuf.Duration retry_after = 5; // для transient
+
+  reserved 100 to 109;
+}
+
+// -----------------------------------------------------------------------------
+// Контракты на сервисные RPC (опционально для gRPC/gRPC‑Gateway)
+// -----------------------------------------------------------------------------
+
+service StreamIngest {
+  // Одно событие.
+  rpc Publish(EventEnvelope) returns (Ack);
+  // Батч.
+  rpc PublishBatch(EventBatch) returns (Ack);
+}
+
+// -----------------------------------------------------------------------------
+// Руководство по эволюции схемы (важно для долгоживущих стримов)
+// -----------------------------------------------------------------------------
+//
+// 1) Новые поля: только с новыми номерами; делайте их optional по смыслу.
+// 2) Не удаляйте и не переиспользуйте номера — используйте reserved для номеров/имен.
+// 3) Расширяйте oneof, не меняя семантику существующих вариантов.
+// 4) Изменения, ломающие совместимость (типы полей), запрещены.
+// 5) Для PII/классификации следуйте политикам configs/policies/retention.yaml
+//    и OPA‑правилам configs/policies/rego/lineage_guard.rego.
+// 6) Старайтесь сохранять datacontenttype/dataschema в согласии с фактическим форматом.
+// 7) Для идемпотентности используйте Event.id; для транспорта — envelope_id.

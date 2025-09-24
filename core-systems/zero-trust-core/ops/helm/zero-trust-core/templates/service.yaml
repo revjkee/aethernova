@@ -1,0 +1,165 @@
+{{- /*
+Helpers: локально, чтобы файл был самодостаточным.
+*/ -}}
+{{- define "ztc.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ztc.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ztc.labels" -}}
+app.kubernetes.io/name: {{ include "ztc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
+{{- if .Values.commonLabels }}
+{{ toYaml .Values.commonLabels }}
+{{- end }}
+{{- end -}}
+
+{{- define "ztc.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "ztc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- if .Values.selectorExtra }}
+{{ toYaml .Values.selectorExtra }}
+{{- end }}
+{{- end -}}
+
+{{- define "ztc.service.annotations" -}}
+{{- if .Values.service.annotations }}
+{{ toYaml .Values.service.annotations }}
+{{- end }}
+{{- end -}}
+
+{{- /*
+Пример ожидаемых Values (для справки):
+service:
+  type: ClusterIP            # ClusterIP|NodePort|LoadBalancer
+  headless: false            # true => clusterIP: None
+  clusterIP: ""              # фиксированный IP (опционально)
+  annotations: {}            # аннотации Service
+  ipFamilies: []             # ["IPv4"], ["IPv6"], ["IPv4","IPv6"]
+  ipFamilyPolicy: ""         # SingleStack|PreferDualStack|RequireDualStack
+  internalTrafficPolicy: ""  # Cluster|Local
+  externalTrafficPolicy: ""  # Cluster|Local (для LB/NodePort)
+  allocateLoadBalancerNodePorts: true
+  loadBalancerClass: ""      # cloud LB класс
+  loadBalancerIP: ""         # статический LB IP (если поддерживается)
+  loadBalancerSourceRanges: []   # список CIDR
+  externalIPs: []            # список внешних IP
+  publishNotReadyAddresses: false
+  sessionAffinity: "None"    # None|ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800  # 1..86400
+  targetPort: 8080           # дефолт targetPort
+  ports:                     # список портов
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+      appProtocol: http      # http|https|grpc|h2c и т.д.
+      nodePort: null         # для NodePort/LB (опционально)
+*/ -}}
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ztc.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ztc.labels" . | nindent 4 }}
+  {{- if .Values.service.annotations }}
+  annotations:
+    {{- include "ztc.service.annotations" . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ default "ClusterIP" .Values.service.type }}
+  {{- if or .Values.service.headless .Values.service.clusterIP }}
+  {{- if .Values.service.headless }}
+  clusterIP: None
+  {{- else if .Values.service.clusterIP }}
+  clusterIP: {{ .Values.service.clusterIP }}
+  {{- end }}
+  {{- end }}
+
+  {{- if .Values.service.ipFamilies }}
+  ipFamilies:
+    {{- toYaml .Values.service.ipFamilies | nindent 4 }}
+  {{- end }}
+  {{- if .Values.service.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ .Values.service.ipFamilyPolicy }}
+  {{- end }}
+
+  {{- if .Values.service.externalIPs }}
+  externalIPs:
+    {{- toYaml .Values.service.externalIPs | nindent 4 }}
+  {{- end }}
+
+  {{- $stype := (default "ClusterIP" .Values.service.type) -}}
+  {{- if and (or (eq $stype "LoadBalancer") (eq $stype "NodePort")) .Values.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  {{- if and (eq $stype "LoadBalancer") (hasKey .Values.service "allocateLoadBalancerNodePorts") }}
+  allocateLoadBalancerNodePorts: {{ .Values.service.allocateLoadBalancerNodePorts }}
+  {{- end }}
+  {{- if and (eq $stype "LoadBalancer") .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ .Values.service.loadBalancerClass }}
+  {{- end }}
+  {{- if and (eq $stype "LoadBalancer") .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.service.loadBalancerIP }}
+  {{- end }}
+  {{- if and (eq $stype "LoadBalancer") .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml .Values.service.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+
+  {{- if .Values.service.internalTrafficPolicy }}
+  internalTrafficPolicy: {{ .Values.service.internalTrafficPolicy }}
+  {{- end }}
+
+  {{- if .Values.service.publishNotReadyAddresses }}
+  publishNotReadyAddresses: true
+  {{- end }}
+
+  {{- if and (hasKey .Values.service "sessionAffinity") (ne (default "None" .Values.service.sessionAffinity) "") }}
+  sessionAffinity: {{ default "None" .Values.service.sessionAffinity }}
+  {{- if and (ne (default "None" .Values.service.sessionAffinity) "None") .Values.service.sessionAffinityConfig }}
+  sessionAffinityConfig:
+    {{- toYaml .Values.service.sessionAffinityConfig | nindent 4 }}
+  {{- end }}
+  {{- end }}
+
+  ports:
+    {{- $defaultTarget := (default 8080 .Values.service.targetPort) -}}
+    {{- if .Values.service.ports }}
+    {{- range $i, $p := .Values.service.ports }}
+    - name: {{ default (printf "p%d" $i) $p.name | trunc 63 | trimSuffix "-" }}
+      port: {{ required "service.ports[].port is required" $p.port }}
+      targetPort: {{ default $defaultTarget $p.targetPort }}
+      protocol: {{ default "TCP" $p.protocol }}
+      {{- if $p.nodePort }}
+      nodePort: {{ $p.nodePort }}
+      {{- end }}
+      {{- if $p.appProtocol }}
+      appProtocol: {{ $p.appProtocol }}
+      {{- end }}
+    {{- end }}
+    {{- else }}
+    # Дефолтный порт, если список не задан
+    - name: http
+      port: 80
+      targetPort: {{ $defaultTarget }}
+      protocol: TCP
+    {{- end }}
+
+  selector:
+    {{- include "ztc.selectorLabels" . | nindent 4 }}

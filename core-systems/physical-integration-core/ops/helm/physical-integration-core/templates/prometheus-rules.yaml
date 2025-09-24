@@ -1,0 +1,333 @@
+{{- /*
+  Industrial-grade PrometheusRule for physical-integration-core
+  Compatible with Prometheus Operator (monitoring.coreos.com/v1)
+  Features:
+    - Feature flags per rule group
+    - Namespace scoping to Release.Namespace
+    - Tunable thresholds and windows via .Values.alerts.*
+    - Runbook URLs via .Values.global.runbookBaseURL
+    - Optional app HTTP metrics (latency/error ratio) via .Values.metrics.http.*
+    - Extensibility via .Values.alerts.additionalRules
+*/ -}}
+
+{{- /* Naming helpers */ -}}
+{{- define "pic.name" -}}
+{{- default "physical-integration-core" .Chart.Name -}}
+{{- end -}}
+
+{{- define "pic.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride -}}
+{{- else -}}
+{{- printf "%s-%s" (include "pic.name" .) .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Labels and annotations */ -}}
+{{- define "pic.labels" -}}
+app.kubernetes.io/name: {{ include "pic.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+{{- if .Values.global.team }}
+team: {{ .Values.global.team | quote }}
+{{- end }}
+{{- with .Values.alerts.labels }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- define "pic.annotations" -}}
+{{- with .Values.alerts.annotations }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- $ns := .Release.Namespace -}}
+{{- $runbookBase := default "" .Values.global.runbookBaseURL -}}
+
+{{- if default true .Values.alerts.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "pic.fullname" . }}-rules
+  namespace: {{ $ns }}
+  labels:
+{{ include "pic.labels" . | indent 4 }}
+  annotations:
+{{ include "pic.annotations" . | indent 4 }}
+spec:
+  groups:
+
+  {{- /* ============================ Availability group ============================ */ -}}
+  {{- if default true .Values.alerts.groups.appAvailability.enabled }}
+  - name: {{ include "pic.fullname" . }}.app-availability
+    interval: {{ default "30s" .Values.alerts.groups.appAvailability.interval }}
+    rules:
+      - alert: DeploymentReplicasMismatch
+        expr: |
+          max by (namespace, deployment) (
+            kube_deployment_spec_replicas{namespace="{{ $ns }}"}
+          )
+          -
+          max by (namespace, deployment) (
+            kube_deployment_status_replicas_available{namespace="{{ $ns }}"}
+          ) > 0
+        for: {{ default "5m" .Values.alerts.groups.appAvailability.for }}
+        labels:
+          severity: {{ default "warning" .Values.alerts.severities.replicasMismatch }}
+          service: {{ include "pic.name" . }}
+          component: "workloads"
+        annotations:
+          summary: "Deployment не имеет всех доступных реплик"
+          description: "В namespace {{ $ns }} есть Deployment с недоступными репликами более 5 минут."
+          runbook_url: {{ printf "%s/%s" $runbookBase "deployment_replicas_mismatch" | quote }}
+
+      - alert: StatefulSetReplicasMismatch
+        expr: |
+          max by (namespace, statefulset) (
+            kube_statefulset_replicas{namespace="{{ $ns }}"}
+          )
+          -
+          max by (namespace, statefulset) (
+            kube_statefulset_status_replicas_ready{namespace="{{ $ns }}"}
+          ) > 0
+        for: {{ default "10m" .Values.alerts.groups.appAvailability.for }}
+        labels:
+          severity: {{ default "warning" .Values.alerts.severities.replicasMismatch }}
+          service: {{ include "pic.name" . }}
+          component: "workloads"
+        annotations:
+          summary: "StatefulSet не имеет всех готовых реплик"
+          description: "В namespace {{ $ns }} есть StatefulSet с недоготовыми репликами более 10 минут."
+          runbook_url: {{ printf "%s/%s" $runbookBase "statefulset_replicas_mismatch" | quote }}
+
+      - alert: DaemonSetUnavailable
+        expr: |
+          kube_daemonset_status_number_unavailable{namespace="{{ $ns }}"} > 0
+        for: {{ default "10m" .Values.alerts.groups.appAvailability.for }}
+        labels:
+          severity: {{ default "warning" .Values.alerts.severities.unavailable }}
+          service: {{ include "pic.name" . }}
+          component: "workloads"
+        annotations:
+          summary: "В DaemonSet есть недоступные поды"
+          description: "В namespace {{ $ns }} DaemonSet имеет недоступные поды более 10 минут."
+          runbook_url: {{ printf "%s/%s" $runbookBase "daemonset_unavailable" | quote }}
+  {{- end }}
+
+  {{- /* ============================ Pod health group ============================ */ -}}
+  {{- if default true .Values.alerts.groups.podHealth.enabled }}
+  - name: {{ include "pic.fullname" . }}.pod-health
+    interval: {{ default "30s" .Values.alerts.groups.podHealth.interval }}
+    rules:
+      - alert: PodCrashLooping
+        expr: |
+          sum by (namespace, pod) (
+            increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}"}[{{ default "5m" .Values.alerts.windows.podRestarts }}])
+          ) > {{ default 5 .Values.alerts.thresholds.podRestarts }}
+        for: {{ default "5m" .Values.alerts.groups.podHealth.for }}
+        labels:
+          severity: {{ default "critical" .Values.alerts.severities.crashloop }}
+          service: {{ include "pic.name" . }}
+          component: "runtime"
+        annotations:
+          summary: "Под часто рестартует"
+          description: "Под рестартовал более {{ default 5 .Values.alerts.thresholds.podRestarts }} раз за {{ default "5m" .Values.alerts.windows.podRestarts }}."
+          runbook_url: {{ printf "%s/%s" $runbookBase "pod_crashlooping" | quote }}
+
+      - alert: PodImagePullBackOff
+        expr: |
+          max by (namespace, pod) (
+            kube_pod_container_status_waiting_reason{namespace="{{ $ns }}",reason="ImagePullBackOff"}
+          ) == 1
+        for: {{ default "10m" .Values.alerts.groups.podHealth.for }}
+        labels:
+          severity: {{ default "warning" .Values.alerts.severities.imagepull }}
+          service: {{ include "pic.name" . }}
+          component: "supply-chain"
+        annotations:
+          summary: "ImagePullBackOff"
+          description: "Контейнер не может скачать образ более 10 минут."
+          runbook_url: {{ printf "%s/%s" $runbookBase "image_pull_backoff" | quote }}
+
+      - alert: PodOOMKilled
+        expr: |
+          max by (namespace, pod, container) (
+            kube_pod_container_status_last_terminated_reason{namespace="{{ $ns }}",reason="OOMKilled"}
+          ) == 1
+        for: {{ default "2m" .Values.alerts.groups.podHealth.for }}
+        labels:
+          severity: {{ default "critical" .Values.alerts.severities.oom }}
+          service: {{ include "pic.name" . }}
+          component: "resources"
+        annotations:
+          summary: "Контейнер убит OOM"
+          description: "Контейнер завершен по причине OOMKilled."
+          runbook_url: {{ printf "%s/%s" $runbookBase "container_oomkilled" | quote }}
+
+      - alert: PodNotReady
+        expr: |
+          max by (namespace, pod) (
+            kube_pod_status_ready{namespace="{{ $ns }}",condition="true"}
+          ) == 0
+        for: {{ default "10m" .Values.alerts.groups.podHealth.for }}
+        labels:
+          severity: {{ default "warning" .Values.alerts.severities.notready }}
+          service: {{ include "pic.name" . }}
+          component: "runtime"
+        annotations:
+          summary: "Под не в состоянии Ready"
+          description: "Под остается NotReady более 10 минут."
+          runbook_url: {{ printf "%s/%s" $runbookBase "pod_not_ready" | quote }}
+  {{- end }}
+
+  {{- /* ============================ Resource pressure group ============================ */ -}}
+  {{- if default true .Values.alerts.groups.resourcePressure.enabled }}
+  - name: {{ include "pic.fullname" . }}.resource-pressure
+    interval: {{ default "30s" .Values.alerts.groups.resourcePressure.interval }}
+    rules:
+      - alert: ContainerCpuThrottlingHigh
+        expr: |
+          (
+            sum by (namespace, pod, container) (
+              rate(container_cpu_cfs_throttled_seconds_total{namespace="{{ $ns }}"}[{{ default "5m" .Values.alerts.windows.cpu }}])
+            )
+            /
+            sum by (namespace, pod, container) (
+              rate(container_cpu_cfs_periods_total{namespace="{{ $ns }}"}[{{ default "5m" .Values.alerts.windows.cpu }}])
+            )
+          ) > {{ default 0.25 .Values.alerts.thresholds.cpuThrottlingRatio }}
+        for: {{ default "10m" .Values.alerts.groups.resourcePressure.for }}
+        labels:
+          severity: {{ default "warning" .Values.alerts.severities.cpuThrottle }}
+          service: {{ include "pic.name" . }}
+          component: "resources"
+        annotations:
+          summary: "Высокое CPU throttling"
+          description: "Доля throttled periods превышает {{ default 0.25 .Values.alerts.thresholds.cpuThrottlingRatio }} в среднем за окно."
+          runbook_url: {{ printf "%s/%s" $runbookBase "cpu_throttling_high" | quote }}
+
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          (
+            sum by (namespace, pod, container) (
+              container_memory_working_set_bytes{namespace="{{ $ns }}",image!=""}
+            )
+            /
+            sum by (namespace, pod, container) (
+              kube_pod_container_resource_limits{namespace="{{ $ns }}",resource="memory"}
+            )
+          ) > {{ default 0.9 .Values.alerts.thresholds.memNearLimitRatio }}
+        for: {{ default "10m" .Values.alerts.groups.resourcePressure.for }}
+        labels:
+          severity: {{ default "warning" .Values.alerts.severities.memNearLimit }}
+          service: {{ include "pic.name" . }}
+          component: "resources"
+        annotations:
+          summary: "Память близка к лимиту"
+          description: "Рабочий набор > 90% от memory limit в течение окна."
+          runbook_url: {{ printf "%s/%s" $runbookBase "memory_near_limit" | quote }}
+
+      - alert: ContainerCpuSustainedHigh
+        expr: |
+          (
+            sum by (namespace, pod) (
+              rate(container_cpu_usage_seconds_total{namespace="{{ $ns }}",image!=""}[{{ default "5m" .Values.alerts.windows.cpu }}])
+            )
+            /
+            sum by (namespace, pod) (
+              kube_pod_container_resource_limits{namespace="{{ $ns }}",resource="cpu",unit="core"}
+            )
+          ) > {{ default 0.9 .Values.alerts.thresholds.cpuLimitRatio }}
+        for: {{ default "15m" .Values.alerts.groups.resourcePressure.for }}
+        labels:
+          severity: {{ default "warning" .Values.alerts.severities.cpuHigh }}
+          service: {{ include "pic.name" . }}
+          component: "resources"
+        annotations:
+          summary: "Длительная высокая загрузка CPU"
+          description: "Средняя загрузка > 90% от лимита CPU за длительный период."
+          runbook_url: {{ printf "%s/%s" $runbookBase "cpu_sustained_high" | quote }}
+  {{- end }}
+
+  {{- /* ============================ App HTTP metrics (optional) ============================ */ -}}
+  {{- if and (default false .Values.metrics.http.enabled) (default true .Values.alerts.groups.appHttp.enabled) }}
+  - name: {{ include "pic.fullname" . }}.app-http
+    interval: {{ default "30s" .Values.alerts.groups.appHttp.interval }}
+    rules:
+      {{- $reqMetric := default "http_requests_total" .Values.metrics.http.requestsTotalMetric -}}
+      {{- $latMetric := default "http_request_duration_seconds_bucket" .Values.metrics.http.durationHistogramMetric -}}
+      {{- $jobSelector := default (include "pic.name" .) .Values.metrics.http.job -}}
+      - alert: HttpErrorRateHigh
+        expr: |
+          (
+            sum by (namespace) (
+              rate({{ $reqMetric }}{namespace="{{ $ns }}",job="{{ $jobSelector }}",code=~"5.."}[{{ default "5m" .Values.alerts.windows.http }}])
+            )
+            /
+            sum by (namespace) (
+              rate({{ $reqMetric }}{namespace="{{ $ns }}",job="{{ $jobSelector }}"}[{{ default "5m" .Values.alerts.windows.http }}])
+            )
+          ) > {{ default 0.05 .Values.alerts.thresholds.httpErrorRatio }}
+        for: {{ default "10m" .Values.alerts.groups.appHttp.for }}
+        labels:
+          severity: {{ default "critical" .Values.alerts.severities.httpError }}
+          service: {{ include "pic.name" . }}
+          component: "http"
+        annotations:
+          summary: "Высокая доля 5xx"
+          description: "Ошибка 5xx > {{ default 5 .Values.alerts.thresholds.httpErrorRatio | mul 100 | int }}% за окно."
+          runbook_url: {{ printf "%s/%s" $runbookBase "http_error_ratio_high" | quote }}
+
+      - alert: HttpLatencyP99High
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (
+              rate({{ $latMetric }}{namespace="{{ $ns }}",job="{{ $jobSelector }}"}[{{ default "5m" .Values.alerts.windows.http }}])
+            )
+          ) > {{ default 0.5 .Values.alerts.thresholds.httpP99Seconds }}
+        for: {{ default "10m" .Values.alerts.groups.appHttp.for }}
+        labels:
+          severity: {{ default "warning" .Values.alerts.severities.httpLatency }}
+          service: {{ include "pic.name" . }}
+          component: "http"
+        annotations:
+          summary: "Высокая задержка p99"
+          description: "p99 latency превышает {{ default 0.5 .Values.alerts.thresholds.httpP99Seconds }} c за окно."
+          runbook_url: {{ printf "%s/%s" $runbookBase "http_latency_p99_high" | quote }}
+  {{- end }}
+
+  {{- /* ============================ Integration probes (optional) ============================ */ -}}
+  {{- if default true .Values.alerts.groups.integrations.enabled }}
+  - name: {{ include "pic.fullname" . }}.integrations
+    interval: {{ default "30s" .Values.alerts.groups.integrations.interval }}
+    rules:
+      {{- $probeMetric := default "probe_success" .Values.metrics.integration.probeSuccessMetric -}}
+      {{- $jobRegex := default "physical-integration-.*" .Values.metrics.integration.jobRegex -}}
+      - alert: IntegrationProbeDown
+        expr: |
+          min by (namespace, instance, job) (
+            {{ $probeMetric }}{namespace="{{ $ns }}",job=~"{{ $jobRegex }}"}
+          ) == 0
+        for: {{ default "5m" .Values.alerts.groups.integrations.for }}
+        labels:
+          severity: {{ default "critical" .Values.alerts.severities.integrationDown }}
+          service: {{ include "pic.name" . }}
+          component: "integrations"
+        annotations:
+          summary: "Интеграционная точка недоступна"
+          description: "probe_success=0 для одного из интеграционных job."
+          runbook_url: {{ printf "%s/%s" $runbookBase "integration_probe_down" | quote }}
+  {{- end }}
+
+  {{- /* ============================ Additional custom rules ============================ */ -}}
+  {{- with .Values.alerts.additionalRules }}
+  - name: {{ include "pic.fullname" $ }}.custom
+    interval: {{ default "30s" $.Values.alerts.groups.custom.interval }}
+    rules:
+{{ toYaml . | indent 6 }}
+  {{- end }}
+
+{{- end }}

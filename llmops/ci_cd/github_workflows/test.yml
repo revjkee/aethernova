@@ -1,0 +1,113 @@
+name: 🧪 Full Test Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.11'
+  POETRY_VERSION: '1.8.2'
+  CACHE_VERSION: v3
+
+jobs:
+
+  setup-and-test:
+    name: Lint, Test & Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'poetry'
+
+      - name: Install Poetry
+        run: |
+          pip install poetry==${{ env.POETRY_VERSION }}
+          poetry config virtualenvs.create true
+          poetry install --no-interaction --no-ansi
+
+      - name: Lint (ruff + black)
+        run: |
+          poetry run ruff check .
+          poetry run black --check .
+
+      - name: Run Tests (pytest)
+        run: |
+          poetry run pytest --maxfail=5 --disable-warnings --tb=short --cov=llmops --cov-report=xml
+
+      - name: Upload Coverage Report
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          fail_ci_if_error: true
+
+  security-check:
+    name: Security & Secrets Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Python Security Audit (Bandit)
+        uses: tj-actions/bandit@v4
+        with:
+          path: llmops/
+          severity-level: medium
+          confidence-level: medium
+          exclude: "tests"
+
+      - name: Secrets Detection
+        uses: trufflesecurity/trufflehog@v3
+        with:
+          path: .
+          scan-depth: 500
+
+  docker-build-check:
+    name: Docker Build Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (dry-run)
+        run: docker build --no-cache -t teslaai-genesis:test -f Dockerfile .
+
+  notify-status:
+    name: Notify Status
+    needs: [setup-and-test, security-check, docker-build-check]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Telegram Notify
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            ✅ CI Pipeline Completed
+            Repo: ${{ github.repository }}
+            Branch: ${{ github.ref }}
+            Status: ${{ job.status }}
+            Actor: ${{ github.actor }}

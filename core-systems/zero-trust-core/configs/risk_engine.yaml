@@ -1,0 +1,399 @@
+# =============================================================================
+# Zero Trust Core — Risk Engine Configuration (production-grade)
+# Все переменные можно переопределить через окружение: ${NAME:default}
+# Версия схемы
+# =============================================================================
+apiVersion: zero-trust-core/v1
+kind: RiskEngineConfig
+metadata:
+  name: default-risk-pipeline
+  version: ${RISK_CFG_VERSION:1.0.0}
+  environment: ${SERVICE_ENV:prod}
+  region: ${SERVICE_REGION:eu-north-1}
+
+# =============================================================================
+# Конвейер оценки риска
+# =============================================================================
+pipeline:
+  stages:
+    - normalize
+    - enrich
+    - aggregate
+    - scoring
+    - calibrate
+    - decision
+
+  # ---------- Нормализация входных событий ----------
+  normalize:
+    timestamp_tolerance_sec: 120
+    fields:
+      user_id: [user.id, subject, sub, uid]
+      tenant_id: [tenant.id, tenant, org_id]
+      ip: [net.ip, ip, src_ip, client_ip, x_forwarded_for]
+      ua: [http.ua, user_agent, ua]
+      geo: [geo, location]
+      device:
+        id: [device.id, did]
+        posture: [device.posture]
+      action: [action, event, intent]
+      resource: [resource, target]
+      session_id: [session.id, sid]
+    defaults:
+      tenant_id: "default"
+      action: "access"
+      resource: "unknown"
+    drop_if_missing: [user_id, ip]  # минимально необходимый набор
+    truncate:
+      max_str_len: 2048
+
+  # ---------- Обогащение ----------
+  enrich:
+    ip_reputation:
+      enabled: ${RISK_IP_REP_ENABLED:true}
+      providers:
+        - name: "providerA"
+          endpoint: ${IPREP_A_URL:https://iprep-a.example/api/v1/score}
+          api_key: ${IPREP_A_KEY:}
+          weight: 0.6
+          timeout_ms: 600
+        - name: "providerB"
+          endpoint: ${IPREP_B_URL:https://iprep-b.example/score}
+          api_key: ${IPREP_B_KEY:}
+          weight: 0.4
+          timeout_ms: 600
+      cache_ttl_sec: 600
+      tor_exit_check: ${RISK_TOR_CHECK:true}
+      bogon_check: true
+      private_ranges_as_lowrisk: true
+    geoip:
+      enabled: ${RISK_GEOIP_ENABLED:true}
+      db_path: ${GEOIP_DB:/var/lib/geoip/GeoLite2-City.mmdb}
+      offline_only: true
+      cache_ttl_sec: 86400
+    asn:
+      enabled: ${RISK_ASN_ENABLED:true}
+      db_path: ${ASN_DB:/var/lib/geoip/GeoLite2-ASN.mmdb}
+    device_posture_registry:
+      enabled: ${RISK_DEVICE_REG_ENABLED:true}
+      endpoint: ${DEVICE_REG_URL:https://posture.example/api/v1/check}
+      timeout_ms: 800
+      cache_ttl_sec: 300
+    velocity_state:
+      enabled: true
+      store: ${RISK_STATE_BACKEND:redis}  # redis|memory
+      redis_dsn: ${RISK_REDIS_DSN:redis://redis:6379/2}
+      keyspace: ${RISK_STATE_KS:zt:risk:}
+      ttl_sec: 604800  # 7 дней
+
+  # ---------- Агрегация / окна ----------
+  aggregate:
+    windows:
+      short:
+        duration_sec: 300
+        decay: exp
+        half_life_sec: 120
+      medium:
+        duration_sec: 3600
+        decay: exp
+        half_life_sec: 900
+      long:
+        duration_sec: 86400
+        decay: exp
+        half_life_sec: 21600
+    dedup:
+      enabled: true
+      window_sec: 30
+      key_fields: [user_id, action, resource, ip]
+
+  # ---------- Скоуринг (сигналы и веса) ----------
+  scoring:
+    base_score: 10        # базовый уровень
+    cap_total: 100
+    combine: weighted_sum # weighted_sum|max|custom
+    signals:
+
+      # ---- СЕТЬ ----
+      network:
+        ip_reputation:
+          weight: 18
+          mapping:               # нормализация 0..1 в 0..100
+            provider_score_scale: linear
+            provider_score_field: score
+            invert: true         # 1 - хорошее, инвертируем
+        tor_exit:
+          weight: 10
+          when: "${enrich.ip_reputation.is_tor_exit == true}"
+        datacenter_asn:
+          weight: 8
+          when: "${enrich.asn.type == 'hosting' || enrich.asn.name =~ '(cloudflare|aws|gcp|azure)'}"
+        geo_anomaly:
+          weight: 10
+          when: "${enrich.geoip.confidence < 0.5 || enrich.geoip.country in ['-','ZZ']}"
+        ip_velocity:
+          weight: 14
+          rule:
+            window_sec: 3600
+            distinct_countries_threshold: 2
+            distinct_asn_threshold: 2
+        impossible_travel:
+          weight: 30
+          rule:
+            previous_event_source: velocity_state
+            min_distance_km: 500
+            min_time_sec: 1800  # 30 минут
+            require_previous_success: true
+
+      # ---- ДЕВАЙС / ПОЗА ----
+      device:
+        new_device:
+          weight: 12
+          when: "${signals.device_seen_before == false}"
+        posture_non_compliant:
+          weight: 20
+          rule:
+            requirements:
+              secure_boot: true
+              disk_encrypted: true
+              os_patch_age_days_max: 30
+              os_family_allowlist: ["macos","windows","linux"]
+        jailbreak_or_root:
+          weight: 25
+          when: "${device.posture.jailbroken == true || device.posture.rooted == true}"
+        attestation_failed:
+          weight: 28
+          when: "${device.posture.attestation == 'failed'}"
+
+      # ---- ПОВЕДЕНИЕ ----
+      behavior:
+        impossible_sequence:
+          weight: 12
+          when: "${behavior.sequence in ['pwd_reset->api_key_create->exfiltrate']}"
+        new_geo_hour:
+          weight: 8
+          rule:
+            business_hours_tz: ${BUSINESS_TZ:Europe/Stockholm}
+            allowed_hours: [6..22]
+            penalty_if_outside: true
+        brute_like:
+          weight: 15
+          rule:
+            failed_logins_threshold: 5
+            window_sec: 900
+        anomaly_score:
+          weight: 16
+          source: "unsupervised"
+          model_id: ${ANOMALY_MODEL_ID:iso_forest_v1}
+          field: "score"        # уже нормализовано 0..1
+
+      # ---- ИДЕНТИЧНОСТЬ / КОНТЕНТ ----
+      identity:
+        role_escalation:
+          weight: 22
+          when: "${event.action == 'grant_role' && event.target_role in ['admin','owner']}"
+        dormant_account:
+          weight: 14
+          when: "${identity.last_active_days > 30}"
+        password_reset_recent:
+          weight: 6
+          when: "${identity.password_reset_age_minutes < 30}"
+      content:
+        secrets_exposure:
+          weight: 18
+          when: "${content.matches_secret_regex == true}"
+        bulk_download:
+          weight: 15
+          rule:
+            bytes_threshold_mb: 500
+            window_sec: 600
+
+    caps:
+      per_domain:
+        network: 50
+        device: 45
+        behavior: 40
+        identity: 35
+        content: 35
+
+  # ---------- ML / ансамбли ----------
+  models:
+    enabled: ${RISK_MODELS_ENABLED:true}
+    ensemble:
+      strategy: weighted_blend
+      members:
+        - id: ${ANOMALY_MODEL_ID:iso_forest_v1}
+          type: anomaly
+          weight: 0.4
+          endpoint: ${ANOMALY_ENDPOINT:http://models:8080/iso_forest_v1}
+          timeout_ms: 400
+        - id: ${SUPERVISED_MODEL_ID:xgb_v2}
+          type: supervised
+          weight: 0.6
+          endpoint: ${SUPERVISED_ENDPOINT:http://models:8080/xgb_v2}
+          timeout_ms: 500
+    calibration:
+      method: isotonic
+      update_period_sec: 86400
+      min_samples: 10000
+
+  # ---------- Калибровка и пороги ----------
+  calibrate:
+    rescale_to_0_100: true
+    percentile_clip:
+      p_low: 1
+      p_high: 99
+    stability:
+      hysteresis:
+        enabled: true
+        entry_delta: 5     # чтобы входить в класс риска, нужен минимум +5 от границы
+        exit_delta: 8      # чтобы покинуть класс, спад на 8
+      cooldown_sec: 120
+
+  # ---------- Решения / действия ----------
+  decision:
+    thresholds:
+      allow: 0
+      low: 25
+      medium: 40
+      high: 70
+      critical: 90
+    actions:
+      on_allow:
+        - type: "allow"
+      on_low:
+        - type: "allow_with_monitoring"
+      on_medium:
+        - type: "step_up_mfa"
+          aal: "AAL2"
+          reason: "risk_medium"
+      on_high:
+        - type: "step_up_mfa"
+          aal: "AAL2"
+          reason: "risk_high"
+        - type: "restrict_scope"
+          scopes_deny: ["pii.read","secrets.rotate","admin.*"]
+      on_critical:
+        - type: "deny"
+          reason: "risk_critical"
+        - type: "revoke_sessions"
+          window_sec: 86400
+        - type: "alert_siem"
+          severity: "CRITICAL"
+
+    explainability:
+      save_feature_contrib: true
+      top_k: 10
+
+# =============================================================================
+# Политики и исключения
+# =============================================================================
+policies:
+  allowlist:
+    users: ${RISK_ALLOW_USERS:}
+    ips: ${RISK_ALLOW_IPS:}
+    tenants: ${RISK_ALLOW_TENANTS:}
+  denylist:
+    users: ${RISK_DENY_USERS:}
+    ips: ${RISK_DENY_IPS:}
+    asn: ${RISK_DENY_ASN:}
+  per_tenant_overrides:
+    # Пример:
+    # t-123:
+    #   decision.thresholds.high: 75
+    #   scoring.signals.network.impossible_travel.weight: 35
+    {}
+
+# =============================================================================
+# Приватность (GDPR) и минимизация
+# =============================================================================
+privacy:
+  pii_minimization: true
+  store_raw_pii: false
+  retention_days:
+    risk_features: ${RISK_RET_FEATURES_DAYS:30}
+    decisions: ${RISK_RET_DECISIONS_DAYS:365}
+  hashing:
+    user_id_salt_b64: ${RISK_USER_SALT_B64:}
+    hash_user_ids_at_rest: true
+  export:
+    subject_request_enabled: true
+    formats: ["jsonl","csv"]
+
+# =============================================================================
+# Производительность, очереди и отказоустойчивость
+# =============================================================================
+runtime:
+  concurrency: ${RISK_WORKERS:8}
+  queue:
+    backend: ${RISK_QUEUE_BACKEND:memory}  # memory|redis
+    max_inflight: ${RISK_INFLIGHT:20000}
+    batch_size: ${RISK_BATCH:256}
+    flush_interval_ms: 200
+  timeouts:
+    enrich_total_ms: 1500
+    model_total_ms: 800
+    overall_ms: 2500
+  circuit_breakers:
+    iprep:
+      failures: 5
+      reset_timeout_sec: 30
+    models:
+      failures: 5
+      reset_timeout_sec: 30
+  fallbacks:
+    on_enrich_timeout: "assume_neutral"   # assume_neutral|assume_risk
+    on_model_timeout: "assume_neutral"
+
+# =============================================================================
+# Телеметрия и аудит
+# =============================================================================
+telemetry:
+  logging:
+    level: ${RISK_LOG_LEVEL:INFO}
+    json: true
+    pii_redaction: true
+  metrics:
+    prometheus:
+      enabled: ${PROM_ENABLED:true}
+      path: /metrics
+  audit:
+    sinks:
+      siem_webhook:
+        enabled: ${RISK_AUDIT_SIEM:false}
+        url: ${RISK_AUDIT_SIEM_URL:https://siem.example/ingest}
+        hmac_secret_b64: ${RISK_AUDIT_HMAC_B64:}
+    events:
+      include: ["decision","threshold_cross","model_error","policy_override"]
+
+# =============================================================================
+# Тестирование, фиче‑флаги и A/B
+# =============================================================================
+experiments:
+  feature_flags:
+    enable_unsupervised: ${FF_UNSUPERVISED:true}
+    enable_supervised: ${FF_SUPERVISED:true}
+    enable_ip_velocity: ${FF_IP_VELOCITY:true}
+    enable_impossible_travel: ${FF_IMP_TRAVEL:true}
+  ab_tests:
+    active: ${AB_ACTIVE:false}
+    buckets:
+      - id: "A"
+        traffic_pct: 50
+        overrides: {}
+      - id: "B"
+        traffic_pct: 50
+        overrides:
+          decision.thresholds.medium: 45
+          scoring.signals.device.posture_non_compliant.weight: 18
+
+# =============================================================================
+# Валидация конфигурации
+# =============================================================================
+validation:
+  fail_on_unknown_keys: true
+  required:
+    - pipeline.stages
+    - decision.thresholds
+    - scoring
+  guards:
+    - assert: "${decision.thresholds.allow < decision.thresholds.low < decision.thresholds.medium < decision.thresholds.high < decision.thresholds.critical}"
+      message: "Пороги должны возрастать от allow до critical"

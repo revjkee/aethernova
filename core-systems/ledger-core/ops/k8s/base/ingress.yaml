@@ -1,0 +1,148 @@
+# ledger-core/ops/k8s/base/ingress.yaml
+# Kubernetes Ingress (NGINX) для ledger-core: безопасный, ограниченный, с готовыми расширениями.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ledger-core
+  namespace: ledger-core
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/part-of: ledger-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # Класс контроллера
+    kubernetes.io/ingress.class: nginx
+    # HTTPS по умолчанию
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/from-to-www-redirect: "true"
+    # Таймауты прокси
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    # Максимальный размер тела запроса
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    # Ограничение запросов (DoS/abuse guard)
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    # HSTS и TLS‑параметры
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+    # CORS (при необходимости откройте домены)
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://ledger.example.com"
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, PUT, POST, DELETE, PATCH, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization, Content-Type, X-Request-ID"
+    # Безопасные заголовки
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "Referrer-Policy: no-referrer";
+      more_set_headers "X-XSS-Protection: 0";
+      more_set_headers "Content-Security-Policy: default-src 'self'; frame-ancestors 'none'";
+      more_set_headers "Permissions-Policy: geolocation=(), microphone=(), camera=()";
+    # GZip/Brotli (если включено на контроллере; иначе игнорируется)
+    nginx.ingress.kubernetes.io/enable-brotli: "true"
+    nginx.ingress.kubernetes.io/use-gzip: "true"
+    # Sticky‑сессии (отключены; раскомментируйте при надобности)
+    # nginx.ingress.kubernetes.io/affinity: "cookie"
+    # nginx.ingress.kubernetes.io/session-cookie-name: "ledger_affinity"
+    # Канареечный релиз (пример; держите закомментированным в base)
+    # nginx.ingress.kubernetes.io/canary: "true"
+    # nginx.ingress.kubernetes.io/canary-weight: "10"
+    # mTLS к backend (прозрачная TLS‑прокси) — если приложение слушает HTTPS:
+    # nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ledger.example.com
+      secretName: ledger-core-tls # создайте secret типа kubernetes.io/tls
+  rules:
+    - host: ledger.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ledger-core-api
+                port:
+                  number: 8080
+
+---
+# Внутренний Ingress только для метрик/health (ограничение по IP/сети).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ledger-core-internal
+  namespace: ledger-core
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/component: metrics
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Ограничение по источнику трафика (замените на вашу подсеть/адреса)
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16,127.0.0.1/32"
+    # Ужесточённые лимиты
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "5"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ledger-internal.example.com
+      secretName: ledger-core-tls
+  rules:
+    - host: ledger-internal.example.com
+      http:
+        paths:
+          - path: /metrics
+            pathType: Prefix
+            backend:
+              service:
+                name: ledger-core-api
+                port:
+                  number: 9108
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: ledger-core-api
+                port:
+                  number: 8080
+
+---
+# (Опционально) Ingress для строгого mTLS клиента — раскомментируйте при необходимости.
+# Требует секрета с CA‑цепочкой: auth-tls-secret: <ns>/<secret>
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: ledger-core-mtls
+#   namespace: ledger-core
+#   annotations:
+#     kubernetes.io/ingress.class: nginx
+#     nginx.ingress.kubernetes.io/auth-tls-secret: "ledger-core/ledger-clients-ca"
+#     nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+#     nginx.ingress.kubernetes.io/auth-tls-verify-depth: "2"
+#     nginx.ingress.kubernetes.io/auth-tls-error-page: "https://ledger.example.com/403.html"
+# spec:
+#   tls:
+#     - hosts: [ "secure.ledger.example.com" ]
+#       secretName: ledger-core-tls
+#   rules:
+#     - host: secure.ledger.example.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: ledger-core-api
+#                 port:
+#                   number: 8080

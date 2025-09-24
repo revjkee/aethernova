@@ -1,0 +1,373 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: security-core-prometheus-rules
+  namespace: security-core
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/part-of: core-systems
+    observability.neurocity.io/tier: critical
+spec:
+  groups:
+    # ------------------------------------------------------------
+    # 1) Availability & SLO (multi-window burn-rate alerts)
+    # ------------------------------------------------------------
+    - name: security-core.slo
+      interval: 30s
+      rules:
+        # Параметры SLO (целевой уровень безошибочных запросов)
+        - record: slo:availability_target:ratio
+          expr: "0.995"  # 99.5% целевая доступность
+
+        # Ошибочные запросы (5xx) — счётчик
+        - record: job:request_errors_total:rate1m
+          expr: |
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core", status=~"5.."}[1m])
+            )
+
+        # Все запросы — счётчик
+        - record: job:request_total:rate1m
+          expr: |
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core"}[1m])
+            )
+
+        # Ошибочная доля за разные окна
+        - record: job:error_ratio:5m
+          expr: |
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core", status=~"5.."}[5m])
+            )
+            /
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core"}[5m])
+            )
+        - record: job:error_ratio:30m
+          expr: |
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core", status=~"5.."}[30m])
+            )
+            /
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core"}[30m])
+            )
+        - record: job:error_ratio:1h
+          expr: |
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core", status=~"5.."}[1h])
+            )
+            /
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core"}[1h])
+            )
+        - record: job:error_ratio:6h
+          expr: |
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core", status=~"5.."}[6h])
+            )
+            /
+            sum by (namespace, job) (
+              rate(app_http_requests_total{namespace="security-core", job="security-core"}[6h])
+            )
+
+        # Critical burn (быстрая деградация бюджета ошибок)
+        - alert: SLOErrorBudgetBurnHigh
+          expr: |
+            (
+              job:error_ratio:5m > (14.4 * (1 - slo:availability_target:ratio))
+            )
+            and
+            (
+              job:error_ratio:1h > (14.4 * (1 - slo:availability_target:ratio))
+            )
+          for: 2m
+          labels:
+            severity: critical
+            team: sec-core
+            component: api
+          annotations:
+            summary: SLO burn-rate high (5m & 1h)
+            description: >
+              Ошибочная доля превышает 14.4× допустимой нормы в окнах 5m/1h.
+              Необходимо немедленное устранение причины (релиз/зависимость/инфраструктура).
+            runbook: https://runbooks.neurocity.internal/security-core/slo#error-burn
+
+        # Warning burn (медленная, но устойчивая деградация)
+        - alert: SLOErrorBudgetBurnElevated
+          expr: |
+            (
+              job:error_ratio:30m > (6 * (1 - slo:availability_target:ratio))
+            )
+            and
+            (
+              job:error_ratio:6h > (6 * (1 - slo:availability_target:ratio))
+            )
+          for: 10m
+          labels:
+            severity: warning
+            team: sec-core
+            component: api
+          annotations:
+            summary: SLO burn-rate elevated (30m & 6h)
+            description: >
+              Ошибочная доля стабильно превышает 6× допустимой нормы в окнах 30m/6h.
+              Планируйте откат/фиксацию, проверьте зависимые сервисы.
+            runbook: https://runbooks.neurocity.internal/security-core/slo#error-burn
+
+    # ------------------------------------------------------------
+    # 2) Performance & Latency
+    # ------------------------------------------------------------
+    - name: security-core.latency
+      interval: 30s
+      rules:
+        - record: job:request_latency:p95
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(app_request_duration_seconds_bucket{namespace="security-core", job="security-core"}[5m]))
+            )
+        - record: job:request_latency:p99
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le) (rate(app_request_duration_seconds_bucket{namespace="security-core", job="security-core"}[5m]))
+            )
+        - alert: HighRequestLatencyP95
+          expr: job:request_latency:p95 > 0.300
+          for: 5m
+          labels:
+            severity: warning
+            team: sec-core
+            component: api
+          annotations:
+            summary: Высокая латентность p95
+            description: p95 латентность превышает 300ms более 5 минут.
+            runbook: https://runbooks.neurocity.internal/security-core/perf#latency
+        - alert: HighRequestLatencyP99
+          expr: job:request_latency:p99 > 0.800
+          for: 5m
+          labels:
+            severity: critical
+            team: sec-core
+            component: api
+          annotations:
+            summary: Критическая латентность p99
+            description: p99 латентность превышает 800ms более 5 минут.
+            runbook: https://runbooks.neurocity.internal/security-core/perf#latency
+
+    # ------------------------------------------------------------
+    # 3) Error Rates & Health
+    # ------------------------------------------------------------
+    - name: security-core.errors
+      interval: 30s
+      rules:
+        - alert: HighHTTP5xxRate
+          expr: |
+            (
+              sum(rate(app_http_requests_total{namespace="security-core", job="security-core", status=~"5.."}[5m]))
+              /
+              sum(rate(app_http_requests_total{namespace="security-core", job="security-core"}[5m]))
+            ) > 0.02
+          for: 10m
+          labels:
+            severity: critical
+            team: sec-core
+            component: api
+          annotations:
+            summary: Высокая доля 5xx
+            description: Доля 5xx превышает 2% в течение 10 минут.
+            runbook: https://runbooks.neurocity.internal/security-core/errors#5xx
+        - alert: ElevatedHTTP4xxRate
+          expr: |
+            (
+              sum(rate(app_http_requests_total{namespace="security-core", job="security-core", status=~"4.."}[10m]))
+              /
+              sum(rate(app_http_requests_total{namespace="security-core", job="security-core"}[10m]))
+            ) > 0.10
+          for: 15m
+          labels:
+            severity: warning
+            team: sec-core
+            component: api
+          annotations:
+            summary: Повышенная доля 4xx
+            description: 4xx превышают 10% — проверьте валидацию входящих запросов/ACL/аутентификацию.
+            runbook: https://runbooks.neurocity.internal/security-core/errors#4xx
+        - alert: LivenessProbeFailures
+          expr: |
+            rate(kube_pod_container_status_last_terminated_reason{namespace="security-core", reason="ProbeError"}[5m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: sre
+            component: k8s
+          annotations:
+            summary: Ошибки liveness/readiness проб
+            description: Контейнеры регулярно завершаются из-за ошибок probe в течение последних 10 минут.
+            runbook: https://runbooks.neurocity.internal/k8s/pods#probes
+
+    # ------------------------------------------------------------
+    # 4) Container Stability & Resources
+    # ------------------------------------------------------------
+    - name: security-core.runtime
+      interval: 30s
+      rules:
+        - alert: PodRestartRateHigh
+          expr: |
+            sum by (namespace, pod) (
+              rate(kube_pod_container_status_restarts_total{namespace="security-core"}[5m])
+            ) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+            team: sre
+            component: k8s
+          annotations:
+            summary: Частые рестарты Pod
+            description: Частота рестартов превышает 0.1/сек (≈1 рестарт за ~10 мин).
+            runbook: https://runbooks.neurocity.internal/k8s/pods#restarts
+        - alert: OOMKilledDetected
+          expr: |
+            increase(kube_pod_container_status_last_terminated_reason{namespace="security-core", reason="OOMKilled"}[15m]) > 0
+          for: 1m
+          labels:
+            severity: critical
+            team: sre
+            component: k8s
+          annotations:
+            summary: Зафиксирован OOMKilled
+            description: Контейнер завершён по OOMKilled — увеличьте memory limit/оптимизируйте память.
+            runbook: https://runbooks.neurocity.internal/k8s/resources#oom
+        - alert: CPUThrottlingHigh
+          expr: |
+            sum by (namespace, pod) (
+              rate(container_cpu_cfs_throttled_seconds_total{namespace="security-core"}[5m])
+            )
+            /
+            sum by (namespace, pod) (
+              rate(container_cpu_cfs_periods_total{namespace="security-core"}[5m])
+            ) > 0.20
+          for: 10m
+          labels:
+            severity: warning
+            team: sre
+            component: k8s
+          annotations:
+            summary: Высокий CPU throttling
+            description: Более 20% периодов CPU были ограничены throttling'ом 10 минут.
+            runbook: https://runbooks.neurocity.internal/k8s/resources#cpu-throttling
+        - alert: HighContainerCPU
+          expr: |
+            sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{namespace="security-core"}[5m]))
+            >
+            sum by (namespace, pod) (kube_pod_container_resource_limits{namespace="security-core", resource="cpu"}) * 0.9
+          for: 10m
+          labels:
+            severity: warning
+            team: sre
+            component: k8s
+          annotations:
+            summary: Высокая загрузка CPU
+            description: Использование CPU превышает 90% лимита в течение 10 минут.
+            runbook: https://runbooks.neurocity.internal/k8s/resources#cpu
+        - alert: HighContainerMemory
+          expr: |
+            sum by (namespace, pod) (container_memory_working_set_bytes{namespace="security-core"})
+            >
+            sum by (namespace, pod) (kube_pod_container_resource_limits{namespace="security-core", resource="memory"}) * 0.9
+          for: 10m
+          labels:
+            severity: warning
+            team: sre
+            component: k8s
+          annotations:
+            summary: Высокое использование памяти
+            description: Память превышает 90% лимита в течение 10 минут.
+            runbook: https://runbooks.neurocity.internal/k8s/resources#memory
+        - alert: FileDescriptorExhaustion
+          expr: |
+            (process_open_fds{namespace="security-core", job="security-core"} / process_max_fds{namespace="security-core", job="security-core"}) > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            team: sec-core
+            component: api
+          annotations:
+            summary: Исчерпание дескрипторов
+            description: Открытые файловые дескрипторы превышают 90% лимита.
+            runbook: https://runbooks.neurocity.internal/security-core/resources#fds
+
+    # ------------------------------------------------------------
+    # 5) Kubernetes Control-plane / Scheduling / Image pulls
+    # ------------------------------------------------------------
+    - name: security-core.k8s
+      interval: 30s
+      rules:
+        - alert: PodUnschedulable
+          expr: |
+            sum by (namespace, pod) (
+              max_over_time(kube_pod_status_scheduled{namespace="security-core"} == 0[10m])
+            ) > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: sre
+            component: scheduler
+          annotations:
+            summary: Pod не может быть запланирован
+            description: Pod остаётся Unschedulable более 10 минут.
+            runbook: https://runbooks.neurocity.internal/k8s/scheduling#unschedulable
+        - alert: ImagePullBackOff
+          expr: |
+            sum by (namespace, pod) (
+              max_over_time(kube_pod_container_status_waiting_reason{namespace="security-core", reason=~"ImagePullBackOff|ErrImagePull"}[10m])
+            ) > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: sre
+            component: registry
+          annotations:
+            summary: Проблема загрузки образа
+            description: Контейнер не может скачать образ (ImagePullBackOff/ErrImagePull) > 10 минут.
+            runbook: https://runbooks.neurocity.internal/k8s/images#pull-errors
+
+    # ------------------------------------------------------------
+    # 6) Outbound Dependencies (HTTP)
+    # ------------------------------------------------------------
+    - name: security-core.deps
+      interval: 30s
+      rules:
+        - alert: Upstream5xxHigh
+          expr: |
+            (
+              sum(rate(app_outbound_http_requests_total{namespace="security-core", upstream!="", status=~"5.."}[5m]))
+              /
+              sum(rate(app_outbound_http_requests_total{namespace="security-core", upstream!=""}[5m]))
+            ) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            team: sec-core
+            component: deps
+          annotations:
+            summary: Высокая доля 5xx от внешней зависимости
+            description: Ошибки 5xx на upstream > 5% в течение 10 минут. Проверьте доступность зависимых сервисов.
+            runbook: https://runbooks.neurocity.internal/security-core/deps#http-5xx
+
+        - alert: UpstreamLatencyP95High
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(app_outbound_request_duration_seconds_bucket{namespace="security-core", upstream!=""}[5m]))
+            ) > 0.400
+          for: 10m
+          labels:
+            severity: warning
+            team: sec-core
+            component: deps
+          annotations:
+            summary: Повышенная латентность внешней зависимости
+            description: p95 внешних HTTP‑запросов > 400ms в течение 10 минут.
+            runbook: https://runbooks.neurocity.internal/security-core/deps#latency

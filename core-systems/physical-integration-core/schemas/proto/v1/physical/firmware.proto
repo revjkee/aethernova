@@ -1,0 +1,292 @@
+// SPDX-License-Identifier: Apache-2.0
+// physical-integration-core/schemas/proto/v1/physical/firmware.proto
+// Industrial-grade firmware management API for OTA in cyber-physical systems.
+
+syntax = "proto3";
+
+package physical.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+option go_package        = "github.com/neurocity/physical-integration-core/gen/go/physical/v1;physicalv1";
+option java_multiple_files = true;
+option java_package      = "io.neurocity.physical.v1";
+option csharp_namespace  = "NeuroCity.Physical.V1";
+option php_namespace     = "NeuroCity\\Physical\\V1";
+option objc_class_prefix = "NCP";
+
+// Semantic version with optional pre-release/build metadata.
+message SemVer {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+  string prerelease = 4; // e.g. "rc.1"
+  string build      = 5; // e.g. "build.42"
+}
+
+// Hash digest and algorithm.
+message Hash {
+  enum Algorithm {
+    ALGO_UNSPECIFIED = 0;
+    SHA256 = 1;
+    SHA512 = 2;
+    BLAKE3 = 3;
+  }
+  Algorithm algorithm = 1;
+  bytes    digest    = 2; // raw bytes
+  string   hex       = 3; // optional hex (lowercase, no 0x)
+}
+
+// Detached signature of the firmware image or manifest.
+message Signature {
+  enum Algorithm {
+    SIGALG_UNSPECIFIED       = 0;
+    ED25519                  = 1;
+    ECDSA_P256_SHA256        = 2;
+    RSA_PSS_2048_SHA256      = 3;
+  }
+  Algorithm algorithm = 1;
+  bytes     signature = 2; // detached signature bytes
+  string    key_id    = 3; // reference to key in KMS/Keystore
+  string    issuer    = 4; // optional issuer/authority hint
+}
+
+// Hardware/product targeting identity for firmware.
+message FirmwareId {
+  string vendor      = 1; // e.g. "NeuroCity"
+  string product     = 2; // e.g. "PIC-Gateway"
+  string hw_revision = 3; // e.g. "revC"
+  string region      = 4; // optional, e.g. "EU"
+  string channel     = 5; // e.g. "stable", "beta"
+}
+
+// Storage/transfer parameters.
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMP_NONE = 1;
+  COMP_GZIP = 2;
+  COMP_ZSTD = 3;
+}
+
+enum Format {
+  FORMAT_UNSPECIFIED = 0;
+  RAW_BINARY   = 1; // pure bin
+  TAR_ARCHIVE  = 2;
+  ZIP_ARCHIVE  = 3;
+  DFU          = 4;
+  MCU_BOOT     = 5;
+  UEFI_CAPSULE = 6;
+}
+
+enum Encryption {
+  ENCRYPTION_UNSPECIFIED = 0;
+  ENC_NONE     = 1;
+  ENC_AES_256_GCM = 2;
+  ENC_AGE      = 3; // age-encrypted payloads
+}
+
+// Artifact descriptor. Location may be HTTP(S), S3, or OCI reference.
+message FirmwareImage {
+  string            firmware_uid   = 1;  // stable id of this image build
+  FirmwareId        identity       = 2;
+  SemVer            version        = 3;
+  uint64            size_bytes     = 4;
+  Hash              hash           = 5;  // digest of the final payload
+  Signature         signature      = 6;  // detached signature of payload/manifest
+  Compression       compression    = 7;
+  Format            format         = 8;
+  Encryption        encryption     = 9;
+  string            encryption_key_id = 10; // if ENC_* used
+  oneof location {
+    string uri           = 11; // e.g. "https://.../firmware.bin"
+    string oci_reference = 12; // e.g. "oci://registry/repo:tag@sha256:..."
+  }
+  repeated string   mirrors        = 13; // optional fallback URIs
+  google.protobuf.Timestamp created_at = 14;
+  map<string, string> annotations   = 15; // free-form metadata
+
+  // reserved for future: delivery policies, SBOM reference, attestations, etc.
+  reserved 16, 17, 18;
+}
+
+// Selector for targeting devices by ids or labels.
+message DeviceSelector {
+  map<string, string> labels    = 1; // match ALL labels
+  repeated string     device_ids = 2; // explicit devices
+}
+
+// Rollout configuration for safe deployments.
+message RolloutStrategy {
+  uint32 batch_size                    = 1; // devices per batch (if percent unset)
+  uint32 max_parallel                  = 2; // concurrency limit
+  uint32 percent                       = 3; // optional percent per batch (0..100)
+  bool   drain_on_failure              = 4; // stop on first failing batch
+  uint32 pause_seconds_between_batches = 5;
+  uint32 canary_count                  = 6; // first canary set size
+  uint32 canary_duration_seconds       = 7; // observation window for canary
+}
+
+// Exponential backoff retry policy.
+message RetryPolicy {
+  uint32 max_attempts                   = 1;
+  google.protobuf.Duration initial_backoff = 2;
+  google.protobuf.Duration max_backoff     = 3;
+  double multiplier                      = 4; // e.g. 2.0
+}
+
+// Update preconditions to reduce risk in the field.
+message UpdateConstraints {
+  uint32 min_battery_percent      = 1;  // 0..100
+  bool   require_mains_power      = 2;
+  bool   require_network_unmetered= 3;
+  uint64 min_free_storage_bytes   = 4;
+  uint32 min_signal_strength      = 5;  // RSSI or abstract units
+}
+
+// Recurring maintenance windows, local-time based.
+message MaintenanceWindow {
+  string timezone = 1; // IANA tz, e.g. "Europe/Stockholm"
+  repeated DayWindow windows = 2;
+
+  message DayWindow {
+    enum DayOfWeek {
+      DOW_UNSPECIFIED = 0;
+      MON = 1; TUE = 2; WED = 3; THU = 4; FRI = 5; SAT = 6; SUN = 7;
+    }
+    DayOfWeek day    = 1;
+    string    start  = 2; // "HH:MM" local time
+    string    end    = 3; // "HH:MM" local time
+  }
+}
+
+// Complete plan to roll out a specific firmware to a fleet.
+message UpdatePlan {
+  string                plan_id     = 1;
+  FirmwareImage         image       = 2;
+  DeviceSelector        selector    = 3;
+  RolloutStrategy       rollout     = 4;
+  RetryPolicy           retry       = 5;
+  UpdateConstraints     constraints = 6;
+  MaintenanceWindow     maintenance = 7;
+  google.protobuf.Timestamp created_at = 8;
+  string                created_by  = 9;
+
+  // Reserved for approvals, gating SLOs, audit trails, etc.
+  reserved 10, 11;
+}
+
+// Current device state relevant to OTA.
+message DeviceState {
+  string      device_id            = 1;
+  FirmwareId  identity             = 2;
+  SemVer      current_fw_version   = 3;
+  SemVer      bootloader_version   = 4;
+  uint64      storage_total_bytes  = 5;
+  uint64      storage_free_bytes   = 6;
+  uint32      battery_percent      = 7;
+  bool        on_mains_power       = 8;
+  string      ip_address           = 9;
+  map<string, string> labels       = 10;
+  map<string, string> annotations  = 11;
+  google.protobuf.Timestamp reported_at = 12;
+}
+
+// Lifecycle phases of an update on the device.
+enum UpdatePhase {
+  PHASE_UNSPECIFIED = 0;
+  IDLE        = 1;
+  PREPARING   = 2;
+  DOWNLOADING = 3;
+  VERIFYING   = 4;
+  INSTALLING  = 5;
+  REBOOTING   = 6;
+  SUCCESS     = 7;
+  FAILED      = 8;
+  CANCELED    = 9;
+  ROLLED_BACK = 10;
+}
+
+// Normalized failure reasons for analytics and automation.
+enum FailureReason {
+  FAIL_UNSPECIFIED       = 0;
+  DOWNLOAD_ERROR         = 1;
+  HASH_MISMATCH          = 2;
+  SIGNATURE_INVALID      = 3;
+  INSUFFICIENT_STORAGE   = 4;
+  POWER_CONDITION        = 5;
+  NETWORK_UNAVAILABLE    = 6;
+  INCOMPATIBLE_HARDWARE  = 7;
+  INSTALL_SCRIPT_ERROR   = 8;
+  RUNTIME_TIMEOUT        = 9;
+  USER_ABORTED           = 10;
+  ROLLBACK_FAILED        = 11;
+}
+
+// Event emitted by devices during update lifecycle.
+message UpdateStatusEvent {
+  string           device_id     = 1;
+  string           plan_id       = 2;
+  string           firmware_uid  = 3;
+  UpdatePhase      phase         = 4;
+  uint32           progress_percent = 5; // 0..100
+  FailureReason    failure       = 6;    // set when phase==FAILED
+  string           error_message = 7;    // human-readable detail
+  google.protobuf.Timestamp timestamp = 8;
+  Hash             observed_hash = 9;    // optional hash of installed payload
+}
+
+// Chunked content serving over gRPC (optional; for constrained sites).
+message UpdateChunkRequest {
+  string firmware_uid = 1;
+  uint64 offset       = 2; // byte offset
+  uint64 chunk_size   = 3; // desired chunk size
+}
+
+message UpdateChunk {
+  bytes  data    = 1;
+  uint64 offset  = 2;
+  bool   eof     = 3;
+  Hash   chunk_hash = 4;
+}
+
+// Simple ack pattern for write operations.
+message Ack {
+  string message = 1;
+}
+
+// Query for firmware candidates.
+message FirmwareQuery {
+  FirmwareId identity          = 1;
+  SemVer     min_version       = 2;
+  bool       include_prerelease = 3;
+  string     channel_override  = 4; // optional override of channel
+}
+
+message FirmwareList {
+  repeated FirmwareImage items = 1;
+}
+
+// Firmware registry service (read-oriented).
+service FirmwareRegistry {
+  // Return the latest matching firmware for the given identity and policy.
+  rpc GetLatest(FirmwareQuery) returns (FirmwareImage);
+
+  // List all firmware variants for a specific identity.
+  rpc ListByIdentity(FirmwareId) returns (FirmwareList);
+}
+
+// Orchestrator for planning and telemetry (write/stream-oriented).
+service FirmwareOrchestrator {
+  // Create/submit a rollout plan. Idempotent on plan_id.
+  rpc PlanUpdate(UpdatePlan) returns (Ack);
+
+  // Report current device state (periodic heartbeats).
+  rpc ReportDeviceState(DeviceState) returns (Ack);
+
+  // Stream update status events from devices.
+  rpc StreamStatus(stream UpdateStatusEvent) returns (Ack);
+
+  // Optional content streaming (server-side or proxy).
+  rpc GetUpdateChunks(UpdateChunkRequest) returns (stream UpdateChunk);
+}

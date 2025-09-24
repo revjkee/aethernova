@@ -1,0 +1,124 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Базовые ресурсы (Service/Deployment/и т.д.)
+resources:
+  - ../../base
+
+# Пространство имён и суффикс для читаемости
+namespace: dev
+nameSuffix: -dev
+
+# Общие метки/аннотации окружения
+commonLabels:
+  app.kubernetes.io/instance: dev
+  environment: dev
+commonAnnotations:
+  meta.neuroforge.io/owner: "team-neuroforge"
+  meta.neuroforge.io/purpose: "development"
+  # Отключить автоинжект сайдкаров в dev (если используется mesh)
+  sidecar.istio.io/inject: "false"
+
+# Переопределения образа для dev
+images:
+  - name: ghcr.io/yourorg/neuroforge-core
+    newName: ghcr.io/yourorg/neuroforge-core
+    newTag: "dev-local" # переопределяйте CI/kustomize edit set image
+
+# Число реплик в dev
+replicas:
+  - name: neuroforge-core
+    count: 1
+
+# Генерация конфигов для приложения
+generatorOptions:
+  disableNameSuffixHash: false # сохраняем хеш для корректного роллаута
+  annotations:
+    meta.neuroforge.io/generated: "true"
+
+configMapGenerator:
+  - name: neuroforge-core-config
+    behavior: replace
+    literals:
+      - LOG_LEVEL=debug
+      - FEATURE_EXPERIMENTAL=false
+      - HTTP_PORT=8080
+      - GRPC_PORT=9090
+
+# В dev допустимы учебные секреты (не для прод!)
+secretGenerator:
+  - name: neuroforge-core-secrets
+    behavior: replace
+    literals:
+      - DUMMY_API_KEY=dev-placeholder
+    type: Opaque
+
+# Стратегический патч к Deployment:
+# - ресурсы снижены
+# - readiness/liveness/startup пробы заданы
+# - env/envFrom подключают сгенерированные ConfigMap/Secret
+# - политика обновления RollingUpdate
+patches:
+  - target:
+      kind: Deployment
+      name: neuroforge-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: neuroforge-core
+      spec:
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 1
+        template:
+          metadata:
+            annotations:
+              # Сигнал операторам/reloader'ам перезапустить Pod при изменении конфигов
+              configmap.reloader.stakater.com/reload: "neuroforge-core-config"
+              secret.reloader.stakater.com/reload: "neuroforge-core-secrets"
+          spec:
+            containers:
+              - name: neuroforge-core
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: ENVIRONMENT
+                    value: dev
+                  - name: CONFIG_PATH
+                    value: /config/config.env
+                envFrom:
+                  - configMapRef:
+                      name: neuroforge-core-config
+                  - secretRef:
+                      name: neuroforge-core-secrets
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "512Mi"
+                readinessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: http
+                  initialDelaySeconds: 2
+                  periodSeconds: 5
+                  timeoutSeconds: 1
+                  failureThreshold: 6
+                livenessProbe:
+                  httpGet:
+                    path: /livez
+                    port: http
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                  timeoutSeconds: 1
+                  failureThreshold: 3
+                startupProbe:
+                  httpGet:
+                    path: /readyz
+                    port: http
+                  failureThreshold: 30
+                  periodSeconds: 2

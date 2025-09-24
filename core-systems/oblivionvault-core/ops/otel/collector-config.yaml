@@ -1,0 +1,297 @@
+# OpenTelemetry Collector - Industrial Grade Config
+# OblivionVault Core / Observability
+# Версия: v1 (production-hardened)
+# Все endpoint'ы/ключи задаются через переменные окружения.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: ${OTEL_OTLP_GRPC_LISTEN_ENDPOINT:0.0.0.0:4317}
+        max_recv_msg_size_mib: ${OTEL_OTLP_MAX_RECV_MIB:64}
+        include_metadata: true
+      http:
+        endpoint: ${OTEL_OTLP_HTTP_LISTEN_ENDPOINT:0.0.0.0:4318}
+        include_metadata: true
+
+  prometheus:
+    config:
+      global:
+        scrape_interval: ${PROM_SCRAPE_INTERVAL:15s}
+        scrape_timeout: ${PROM_SCRAPE_TIMEOUT:10s}
+      scrape_configs:
+        - job_name: 'otel-collector'
+          static_configs:
+            - targets: ['${PROM_SELF_TARGET:0.0.0.0:8888}']
+        # Пример добавления приложений: задайте через ENV список target'ов
+        - job_name: 'app_targets'
+          static_configs:
+            - targets: ${PROM_APP_TARGETS:['app:9090']}
+        # Нода/к‑адвайзор (если присутствуют экспортеры):
+        - job_name: 'node-exporter'
+          static_configs:
+            - targets: ${PROM_NODE_EXPORTER_TARGETS:['node-exporter:9100']}
+        - job_name: 'cadvisor'
+          static_configs:
+            - targets: ${PROM_CADVISOR_TARGETS:['cadvisor:8080']}
+
+  hostmetrics:
+    collection_interval: ${HOSTMETRICS_INTERVAL:30s}
+    scrapers:
+      cpu: {}
+      load: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      network: {}
+      process: {}
+      paging: {}
+      processes: {}
+
+  filelog:
+    include:
+      - ${FILELOG_PATH_1:/var/log/*.log}
+      - ${FILELOG_PATH_2:/var/log/*/*.log}
+    start_at: beginning
+    include_file_path: true
+    include_file_name: true
+    operators:
+      - type: move
+        from: body
+        to: body.message
+      - type: json_parser
+        parse_from: body.message
+        on_error: drop
+      - type: severity_parser
+        parse_from: attributes["level"]
+        mapping:
+          info:
+            - info
+            - information
+          error:
+            - err
+            - error
+          warn:
+            - warn
+            - warning
+
+  # Для Kubernetes-подстановок используйте готовый receiver k8s_events при необходимости:
+  # k8s_events: {}
+
+processors:
+  memory_limiter:
+    # Ограничение потребления памяти Collector'ом для защиты узла
+    check_interval: 2s
+    limit_percentage: ${OTEL_MEMORY_LIMIT_PERCENT:75}
+    spike_limit_percentage: ${OTEL_MEMORY_SPIKE_PERCENT:25}
+
+  batch:
+    timeout: ${OTEL_BATCH_TIMEOUT:5s}
+    send_batch_size: ${OTEL_BATCH_SIZE:8192}
+    send_batch_max_size: ${OTEL_BATCH_MAX_SIZE:16384}
+    metadata_keys:
+      - service.name
+      - service.namespace
+      - service.instance.id
+
+  resourcedetection:
+    detectors: [env, system, host, gcp, ec2, azure, k8s]
+    timeout: 5s
+    override: false
+
+  k8sattributes:
+    auth_type: ${K8S_AUTH_TYPE:serviceAccount}
+    passthrough: false
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - k8s.node.name
+        - k8s.container.name
+        - k8s.cluster.name
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.uid
+          - from: resource_attribute
+            name: k8s.pod.name
+          - from: connection
+
+  attributes/normalize-service:
+    actions:
+      - key: service.name
+        action: upsert
+        from_attribute: service
+      - key: service.namespace
+        action: insert
+        value: ${SERVICE_NAMESPACE:oblivionvault}
+
+  transform/metrics:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - convert_sum_to_gauge()
+
+  filter/traces:
+    error_mode: ignore
+    spans:
+      # Отфильтровать шум (пример: healthcheck/metrics пробы)
+      - 'attributes["http.target"] == "/health"'
+      - 'attributes["rpc.system"] == "grpc" && attributes["rpc.method"] == "Check" && attributes["rpc.service"] == "grpc.health.v1.Health"'
+
+  tailsampling:
+    decision_wait: ${TAIL_SAMPLING_DECISION_WAIT:5s}
+    num_traces: ${TAIL_SAMPLING_NUM_TRACES:50000}
+    expected_new_traces_per_sec: ${TAIL_SAMPLING_EXPECTED_TPS:2000}
+    policies:
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+          # Все ошибки — 100%
+          sampling_percentage: 100
+      - name: latency
+        type: latency
+        latency:
+          # Трейсы с длительностью > LATENCY_THRESHOLD — 100%
+          threshold_ms: ${TAIL_SAMPLING_LATENCY_MS:1000}
+          sampling_percentage: 100
+      - name: important-services
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values: ${TAIL_SAMPLING_IMPORTANT_SERVICES:['oblivionvault-api','oblivionvault-core','payment-gateway']}
+          enabled_regex_matching: false
+          sampling_percentage: 50
+      - name: probabilistic-default
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: ${TAIL_SAMPLING_DEFAULT_PERCENT:10}
+
+  groupbyattrs:
+    keys:
+      - service.name
+      - k8s.namespace.name
+
+exporters:
+  # Универсальный OTLP (все сигналы) — в централизованный бекенд: Tempo/Jaeger/OTel Collector/Мультитенант-шину
+  otlp:
+    endpoint: ${OTLP_EXPORT_ENDPOINT:otel-gateway:4317}
+    tls:
+      insecure: ${OTLP_EXPORT_INSECURE:true}
+      insecure_skip_verify: ${OTLP_EXPORT_SKIP_VERIFY:true}
+    headers:
+      Authorization: ${OTLP_EXPORT_AUTH_HEADER:}
+    sending_queue:
+      enabled: true
+      num_consumers: ${OTLP_QUEUE_CONSUMERS:8}
+      queue_size: ${OTLP_QUEUE_SIZE:262144}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 5m
+    compression: ${OTLP_EXPORT_COMPRESSION:gzip}
+    timeout: 30s
+
+  # Prometheus Remote Write для метрик
+  prometheusremotewrite:
+    endpoint: ${PRW_ENDPOINT:http://prometheus-remote-write:1234/api/v1/write}
+    tls:
+      insecure: ${PRW_INSECURE:true}
+      insecure_skip_verify: ${PRW_SKIP_VERIFY:true}
+    headers:
+      Authorization: ${PRW_AUTH_HEADER:}
+    resource_to_telemetry_conversion:
+      enabled: true
+    external_labels:
+      cluster: ${CLUSTER_NAME:dev}
+      project: ${PROJECT_NAME:oblivionvault}
+    sending_queue:
+      enabled: true
+      num_consumers: ${PRW_QUEUE_CONSUMERS:4}
+      queue_size: ${PRW_QUEUE_SIZE:131072}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 20s
+      max_elapsed_time: 3m
+    timeout: 30s
+
+  # Loki для логов
+  loki:
+    endpoint: ${LOKI_ENDPOINT:http://loki:3100/loki/api/v1/push}
+    tls:
+      insecure: ${LOKI_INSECURE:true}
+      insecure_skip_verify: ${LOKI_SKIP_VERIFY:true}
+    headers:
+      Authorization: ${LOKI_AUTH_HEADER:}
+    labels:
+      resource:
+        service_name: service.name
+        namespace: k8s.namespace.name
+        pod: k8s.pod.name
+        container: k8s.container.name
+        cluster: k8s.cluster.name
+      attributes:
+        level: level
+        http_status: http.status_code
+    default_labels_enabled:
+      exporter: false
+      job: true
+      instance: true
+    sending_queue:
+      enabled: true
+      num_consumers: ${LOKI_QUEUE_CONSUMERS:4}
+      queue_size: ${LOKI_QUEUE_SIZE:131072}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 20s
+      max_elapsed_time: 3m
+    timeout: 30s
+
+  # Встроенный Prometheus экспортер для метрик самого коллектора (scrape на :8888)
+  prometheus:
+    endpoint: ${OTEL_PROM_EXPORT_LISTEN:0.0.0.0:8888}
+
+  # Отладка (опционально)
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: ${OTEL_HEALTH_ENDPOINT:0.0.0.0:13133}
+  pprof:
+    endpoint: ${OTEL_PPROF_ENDPOINT:0.0.0.0:1777}
+  zpages:
+    endpoint: ${OTEL_ZPAGES_ENDPOINT:0.0.0.0:55679}
+
+service:
+  telemetry:
+    logs:
+      level: ${OTEL_LOG_LEVEL:info}
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, attributes/normalize-service, filter/traces, tailsampling, batch]
+      exporters: [otlp, debug]
+
+    metrics:
+      receivers: [otlp, prometheus, hostmetrics]
+      processors: [memory_limiter, resourcedetection, attributes/normalize-service, transform/metrics, batch]
+      exporters: [prometheusremotewrite, prometheus, otlp]
+
+    logs:
+      receivers: [otlp, filelog]
+      processors: [memory_limiter, k8sattributes, resourcedetection, attributes/normalize-service, groupbyattrs, batch]
+      exporters: [loki, otlp, debug]

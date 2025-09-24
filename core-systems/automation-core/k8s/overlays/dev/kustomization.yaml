@@ -1,0 +1,127 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Изоляция dev-окружения
+namespace: automation-core-dev
+nameSuffix: -dev
+
+# База (директория с собственным kustomization.yaml)
+resources:
+  - ../../base
+
+# Единые метки и аннотации
+commonLabels:
+  app.kubernetes.io/name: automation-core
+  app.kubernetes.io/instance: automation-core-dev
+  app.kubernetes.io/part-of: automation-core
+  app.kubernetes.io/environment: dev
+commonAnnotations:
+  app.kubernetes.io/managed-by: kustomize
+  stake.owner: platform-team
+  purpose: development
+
+# Переопределение образов без патчей
+images:
+  - name: ghcr.io/yourorg/automation-core
+    newName: ghcr.io/yourorg/automation-core
+    newTag: dev
+  # пример вторичного образа-утилиты
+  - name: busybox
+    newTag: "1.36"
+
+# Генераторы конфигураций и секретов для dev
+generatorOptions:
+  # метаданные применяются ко всем сгенерированным ресурсам
+  labels:
+    generated.by: kustomize
+  annotations:
+    rotation.policy: "manual"
+  # для dev допускаем фиксированное имя без хеш-субфикса
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: automation-core-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=debug
+      - FEATURE_FLAG_EXPERIMENTAL=true
+      - HTTP_REQUEST_TIMEOUT=5s
+    options:
+      labels:
+        app.kubernetes.io/component: api
+
+secretGenerator:
+  - name: automation-core-secrets
+    behavior: merge
+    literals:
+      # dev-заглушки. В проде использовать внешний менеджер секретов.
+      - DUMMY_API_KEY=dev-placeholder
+    type: Opaque
+    options:
+      labels:
+        app.kubernetes.io/component: api
+
+# Масштабирование рабочих нагрузок в dev
+replicas:
+  - name: automation-core-api
+    count: 1
+  - name: automation-core-worker
+    count: 1
+
+# Точечные изменения через JSON 6902 патчи
+patches:
+  # Добавить/переопределить переменные окружения и политику pull
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: automation-core-api
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: ENVIRONMENT
+          value: dev
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: FEATURE_FLAG_EXPERIMENTAL
+          valueFrom:
+            configMapKeyRef:
+              name: automation-core-config
+              key: FEATURE_FLAG_EXPERIMENTAL
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+
+  # Установить dev-ресурсы контейнера
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: automation-core-api
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+
+  # Пример добавления tolerations для dev-ноды (если нужно)
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: automation-core-api
+    patch: |-
+      - op: add
+        path: /spec/template/spec/tolerations/-
+        value:
+          key: "workload"
+          operator: "Equal"
+          value: "dev"
+          effect: "NoSchedule"

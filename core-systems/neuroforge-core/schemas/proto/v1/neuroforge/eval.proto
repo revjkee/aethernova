@@ -1,0 +1,575 @@
+syntax = "proto3";
+
+package neuroforge.v1;
+
+option optimize_for = SPEED;
+option cc_enable_arenas = true;
+
+option go_package = "github.com/yourorg/neuroforge-core/schemas/gen/go/neuroforge/v1;neuroforgev1";
+option java_multiple_files = true;
+option java_package = "com.yourorg.neuroforge.v1";
+option java_outer_classname = "EvalProto";
+option csharp_namespace = "YourOrg.Neuroforge.V1";
+option php_namespace = "YourOrg\\Neuroforge\\V1";
+option ruby_package = "YourOrg::Neuroforge::V1";
+option objc_class_prefix = "NF";
+
+// Well-known types
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+import "google/rpc/status.proto";
+
+// ============================== ENUMS =========================================
+
+enum TaskType {
+  TASK_TYPE_UNSPECIFIED = 0;
+  TASK_CLASSIFICATION = 1;
+  TASK_REGRESSION = 2;
+  TASK_RANKING = 3;
+  TASK_SEQ2SEQ = 4;            // генерация/перевод/суммаризация
+  TASK_LANGUAGE_MODELING = 5;  // перплексия и пр.
+  TASK_QA = 6;                 // вопрос-ответ
+  TASK_RECOMMENDATION = 7;
+  TASK_CLUSTERING = 8;
+  TASK_ANOMALY_DETECTION = 9;
+  TASK_IMAGE_CLASSIFICATION = 10;
+  TASK_OBJECT_DETECTION = 11;
+  TASK_SPEECH_RECOGNITION = 12;
+  TASK_TRANSLATION = 13;
+  TASK_SUMMARIZATION = 14;
+}
+
+enum MetricType {
+  METRIC_TYPE_UNSPECIFIED = 0;
+  // Классификация
+  METRIC_ACCURACY = 1;
+  METRIC_PRECISION = 2;
+  METRIC_RECALL = 3;
+  METRIC_F1 = 4;
+  METRIC_ROC_AUC = 5;
+  METRIC_PR_AUC = 6;
+  METRIC_LOG_LOSS = 7;
+
+  // Регрессия
+  METRIC_MSE = 20;
+  METRIC_RMSE = 21;
+  METRIC_MAE = 22;
+  METRIC_R2 = 23;
+
+  // Ранжирование/рекомендации
+  METRIC_NDCG = 40;
+  METRIC_MRR = 41;
+  METRIC_MAP = 42; // mean average precision
+
+  // Генерация/Seq2Seq
+  METRIC_BLEU = 60;
+  METRIC_ROUGE_L = 61;
+  METRIC_CHRF = 62;
+  METRIC_BERTSCORE = 63;
+  METRIC_EXACT_MATCH = 64;
+  METRIC_TOKEN_F1 = 65;
+  METRIC_PERPLEXITY = 66;
+
+  // Распознавание речи
+  METRIC_WER = 80; // word error rate
+}
+
+enum GoalDirection {
+  GOAL_DIRECTION_UNSPECIFIED = 0;
+  GOAL_HIGHER_IS_BETTER = 1;
+  GOAL_LOWER_IS_BETTER = 2;
+}
+
+enum EvalStatus {
+  EVAL_STATUS_UNSPECIFIED = 0;
+  EVAL_QUEUED = 1;
+  EVAL_RUNNING = 2;
+  EVAL_SUCCEEDED = 3;
+  EVAL_FAILED = 4;
+  EVAL_CANCELED = 5;
+  EVAL_TIMEOUT = 6;
+}
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_NORMAL = 2;
+  PRIORITY_HIGH = 3;
+  PRIORITY_URGENT = 4;
+}
+
+enum FileFormat {
+  FILE_FORMAT_UNSPECIFIED = 0;
+  FILE_FORMAT_JSONL = 1;
+  FILE_FORMAT_CSV = 2;
+  FILE_FORMAT_PARQUET = 3;
+  FILE_FORMAT_ARROW = 4;
+  FILE_FORMAT_TFRECORD = 5;
+}
+
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_NONE = 1;
+  COMPRESSION_GZIP = 2;
+  COMPRESSION_ZSTD = 3;
+}
+
+enum Transport {
+  TRANSPORT_UNSPECIFIED = 0;
+  TRANSPORT_HTTP = 1;
+  TRANSPORT_GRPC = 2;
+  TRANSPORT_LOCAL = 3;
+}
+
+// ============================== CORE SPECS ====================================
+
+message EvaluationSpec {
+  // Идентификация/метки
+  string eval_name = 1;
+  TaskType task = 2;
+  map<string, string> labels = 3;     // произвольные бизнес-метки
+  google.protobuf.Struct metadata = 4; // задаёт произвольный JSON
+
+  DatasetSpec dataset = 10;
+  ModelRef model = 11;
+
+  // Какие метрики считать
+  repeated MetricSpec metrics = 20;
+
+  SamplingSpec sampling = 30;
+  ConstraintsSpec constraints = 31;
+
+  // Общие параметры
+  uint64 random_seed = 40;
+  uint64 max_examples = 41;         // 0 — без ограничений
+  uint32 parallelism = 42;          // max concurrency
+  bool warm_start = 43;             // разрешить переиспользовать промежуточные результаты
+
+  // Резерв для будущих несовместимых добавлений
+  reserved 44 to 49;
+}
+
+message DatasetSpec {
+  string name = 1;
+  string version = 2;
+
+  FileFormat format = 3;
+  Compression compression = 4;
+
+  // Сопоставление столбцов для типовых задач
+  ColumnMapping mapping = 5;
+
+  SplitSpec split = 6;
+
+  oneof source {
+    S3Source s3 = 10;
+    GcsSource gcs = 11;
+    HttpSource http = 12;
+    LocalSource local = 13;
+    BigQuerySource bigquery = 14;
+    RegistryRef registry = 15; // ссылка на внутренний реестр датасетов
+  }
+
+  // Пользовательская схема (если нужна строгая валидация)
+  google.protobuf.Struct schema = 20;
+
+  // Резерв
+  reserved 21 to 29;
+}
+
+message ColumnMapping {
+  // Общие поля
+  string id_col = 1;
+  string input_col = 2;       // prompt/текст/фичи (JSON при необходимости)
+  string target_col = 3;      // эталон/лейбл
+  string prediction_col = 4;  // если уже есть предсказания (off-line eval)
+  string weight_col = 5;      // веса примеров
+  // Для многоклассовой/мульти-метки
+  string classes_col = 10;    // список классов
+  string probs_col = 11;      // вероятности/логиты
+  // Для генерации
+  string context_col = 20;    // контекст/источник
+  string references_col = 21; // список эталонов
+  // Резерв
+  reserved 22 to 29;
+}
+
+message SplitSpec {
+  // Либо процентные доли, либо выражение фильтра (например SQL/DSL)
+  double eval_ratio = 1;        // 0..1; если 0 — не делить, используем всё
+  string filter = 2;            // опциональный фильтр
+  bool stratify = 3;
+  string stratify_by = 4;
+}
+
+message S3Source {
+  string bucket = 1;
+  string prefix = 2;
+  string region = 3;
+  string role_arn = 4;      // опциональная роль для доступа
+}
+
+message GcsSource {
+  string bucket = 1;
+  string prefix = 2;
+  string project_id = 3;
+}
+
+message HttpSource {
+  string url = 1;
+  map<string, string> headers = 2;
+}
+
+message LocalSource {
+  string path = 1; // путь на узле рантайма
+}
+
+message BigQuerySource {
+  string project_id = 1;
+  string dataset = 2;
+  string table = 3;
+  string query = 4; // если задано — имеет приоритет над dataset/table
+}
+
+message RegistryRef {
+  string workspace = 1;
+  string dataset = 2;
+  string version = 3;
+}
+
+message ModelRef {
+  string name = 1;         // человекочитаемое имя/идентификатор
+  string version = 2;
+
+  oneof endpoint {
+    HttpEndpoint http = 10;
+    GrpcEndpoint grpc = 11;
+    LocalCommand local = 12;
+    HuggingFaceRef hf = 13;
+  }
+
+  // Общие лимиты для инференса
+  uint32 max_input_tokens = 20;
+  uint32 max_output_tokens = 21;
+
+  // Доп. параметры как непрозрачная структура
+  google.protobuf.Struct params = 30;
+
+  reserved 31 to 39;
+}
+
+message HttpEndpoint {
+  string url = 1;
+  string method = 2; // GET/POST
+  map<string, string> headers = 3;
+  bool use_tls = 4;
+}
+
+message GrpcEndpoint {
+  string target = 1; // host:port
+  bool use_tls = 2;
+  map<string, string> metadata = 3;
+}
+
+message LocalCommand {
+  string command = 1;
+  repeated string args = 2;
+  map<string, string> env = 3;
+}
+
+message HuggingFaceRef {
+  string repo_id = 1;   // e.g. "bert-base-uncased"
+  string revision = 2;  // commit/tag
+  string task = 3;      // pipe task id, e.g. "text-classification"
+}
+
+message MetricSpec {
+  MetricType type = 1;
+  GoalDirection goal = 2;
+  // Параметры конкретной метрики (например beta для F-beta, n для NDCG@k)
+  map<string, google.protobuf.Value> params = 3;
+  // Необязательный порог (например accuracy >= 0.9)
+  google.protobuf.StringValue threshold = 4;
+}
+
+message SamplingSpec {
+  // Либо фиксированное количество, либо доля; если оба = 0 → берём всё
+  uint64 sample_size = 1;
+  double sample_ratio = 2; // 0..1
+  bool shuffle = 3;
+}
+
+message ConstraintsSpec {
+  google.protobuf.Duration per_example_timeout = 1;
+  google.protobuf.Duration total_timeout = 2;
+  double max_qps = 3;               // rate-limit
+  uint64 memory_mb = 4;
+  bool allow_network = 5;
+  // Дедупликация и защита от штормов
+  bool deduplicate_inputs = 6;
+}
+
+// ============================== REQUESTS ======================================
+
+message EvaluationRequest {
+  EvaluationSpec spec = 1;
+  Priority priority = 2;
+  string tenant_id = 3;
+  string request_id = 4;     // идемпотентность
+}
+
+message GetEvaluationRequest {
+  string eval_id = 1;
+}
+
+message ListEvaluationsRequest {
+  string tenant_id = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+  // Фильтры
+  repeated EvalStatus status_in = 4;
+  google.protobuf.Timestamp created_after = 5;
+  google.protobuf.Timestamp created_before = 6;
+  map<string, string> label_equals = 7;
+}
+
+message ListEvaluationsResponse {
+  repeated Evaluation evaluations = 1;
+  string next_page_token = 2;
+}
+
+message CancelEvaluationRequest {
+  string eval_id = 1;
+  string reason = 2;
+}
+
+message StreamEvaluationRequest {
+  string eval_id = 1;
+}
+
+// Планирование (оценка стоимости/времени до запуска)
+message EvaluationPlan {
+  uint64 expected_examples = 1;
+  double estimated_cost = 2; // условные единицы/валюта вашей платформы
+  google.protobuf.Duration estimated_walltime = 3;
+  map<string, string> notes = 4;
+}
+
+// ============================== ENTITIES ======================================
+
+message Evaluation {
+  string id = 1;
+  EvalStatus status = 2;
+
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp updated_at = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp finished_at = 6;
+
+  double progress = 7; // 0..1
+
+  EvaluationSpec spec = 8;
+
+  // Итоговые результаты (доступны при SUCCEEDED)
+  EvaluationResult result = 9;
+
+  // Подробности ошибки (FAILED/CANCELED/TIMEOUT)
+  google.rpc.Status error = 10;
+}
+
+message EvaluationResult {
+  Counts counts = 1;
+
+  // Агрегированные метрики по всему датасету
+  repeated MetricAggregate metrics = 2;
+
+  // Могут присутствовать дополнительные формы
+  ConfusionMatrix confusion_matrix = 10;
+  RocCurve roc_curve = 11;
+  PrCurve pr_curve = 12;
+  RegressionStats regression = 13;
+  GenerationStats generation = 14;
+
+  // Квантили и распределение латентности
+  LatencyStats latency = 20;
+
+  // Пер-класс/пер-группа агрегации
+  map<string, PerGroupMetrics> by_label = 30; // напр., класс "spam" → метрики
+  map<string, PerGroupMetrics> by_slice = 31; // напр., слайс "lang=en" → метрики
+
+  // Подвыборка пер-примерных результатов (для UI/отладки)
+  repeated ExampleResult sample_examples = 40;
+}
+
+message Counts {
+  uint64 total = 1;
+  uint64 succeeded = 2;
+  uint64 failed = 3;
+  uint64 skipped = 4;
+}
+
+message MetricAggregate {
+  MetricType type = 1;
+  double value = 2;
+  GoalDirection goal = 3;
+  // Доверительный интервал (если оценен бутстрэпом)
+  google.protobuf.DoubleValue ci_lower = 4;
+  google.protobuf.DoubleValue ci_upper = 5;
+  // Доп. сведения (например "k": 10 для NDCG@10)
+  map<string, google.protobuf.Value> details = 6;
+}
+
+message PerGroupMetrics {
+  Counts counts = 1;
+  repeated MetricAggregate metrics = 2;
+}
+
+message ConfusionMatrix {
+  repeated string labels = 1;         // порядок меток
+  // row-major, размер = len(labels) * len(labels)
+  repeated uint64 matrix = 2;
+}
+
+message RocCurve {
+  repeated double fpr = 1; // false positive rate
+  repeated double tpr = 2; // true positive rate
+  google.protobuf.DoubleValue auc = 3;
+}
+
+message PrCurve {
+  repeated double precision = 1;
+  repeated double recall = 2;
+  google.protobuf.DoubleValue auc = 3;
+}
+
+message RegressionStats {
+  double mse = 1;
+  double rmse = 2;
+  double mae = 3;
+  double r2 = 4;
+}
+
+message GenerationStats {
+  google.protobuf.DoubleValue bleu = 1;
+  google.protobuf.DoubleValue rouge_l = 2;
+  google.protobuf.DoubleValue chrf = 3;
+  google.protobuf.DoubleValue bertscore = 4;
+  google.protobuf.DoubleValue exact_match = 5;
+  google.protobuf.DoubleValue token_f1 = 6;
+  google.protobuf.DoubleValue perplexity = 7;
+}
+
+message LatencyStats {
+  double p50_ms = 1;
+  double p90_ms = 2;
+  double p95_ms = 3;
+  double p99_ms = 4;
+  double mean_ms = 5;
+  double stddev_ms = 6;
+}
+
+message ExampleResult {
+  // Идентификатор/ключ примера
+  string example_id = 1;
+
+  // Входные данные и эталон
+  google.protobuf.Struct input = 2;           // произвольная форма
+  repeated google.protobuf.Value references = 3;
+
+  // Предсказание в унифицированном виде
+  oneof prediction {
+    google.protobuf.Value predicted_value = 10; // регрессия/произвольное
+    string predicted_text = 11;                  // генерация
+    ClassProbs predicted_class = 12;             // классификация
+  }
+
+  // Пер-примерные метрики (подмножество)
+  map<string, double> metrics = 20;
+
+  // Технические атрибуты
+  uint32 tokens_input = 30;
+  uint32 tokens_output = 31;
+  double latency_ms = 32;
+
+  // Ошибка инференса/вычисления на примере, если была
+  google.rpc.Status error = 40;
+}
+
+message ClassProbs {
+  // параллельные массивы одинаковой длины
+  repeated string labels = 1;
+  repeated double probs = 2;
+}
+
+// ============================== STREAMING =====================================
+
+message StreamEvent {
+  google.protobuf.Timestamp ts = 1;
+  string eval_id = 2;
+
+  oneof event {
+    ProgressEvent progress = 10;
+    LogEvent log = 11;
+    PartialMetricEvent partial = 12;
+    HeartbeatEvent heartbeat = 13;
+  }
+}
+
+message ProgressEvent {
+  double progress = 1; // 0..1
+  Counts counts = 2;
+}
+
+message LogEvent {
+  string level = 1;   // INFO/WARN/ERROR/DEBUG
+  string message = 2;
+  map<string, string> fields = 3;
+}
+
+message PartialMetricEvent {
+  // Временная агрегация на подвыборке
+  repeated MetricAggregate metrics = 1;
+  string slice_key = 2; // напр., "lang=en" или "class=spam"
+}
+
+message HeartbeatEvent {
+  string node_id = 1;
+  google.protobuf.Duration interval = 2;
+}
+
+// ============================== SERVICE =======================================
+
+service EvalService {
+  // Предварительная оценка размера работы/стоимости
+  rpc PlanEvaluation(EvaluationSpec) returns (EvaluationPlan);
+
+  // Создать/запустить оценку
+  rpc SubmitEvaluation(EvaluationRequest) returns (Evaluation);
+
+  // Получить текущее состояние
+  rpc GetEvaluation(GetEvaluationRequest) returns (Evaluation);
+
+  // Список оценок
+  rpc ListEvaluations(ListEvaluationsRequest) returns (ListEvaluationsResponse);
+
+  // Подписка на события и прогресс
+  rpc StreamEvaluation(StreamEvaluationRequest) returns (stream StreamEvent);
+
+  // Отмена выполнения
+  rpc CancelEvaluation(CancelEvaluationRequest) returns (OperationResult);
+}
+
+message OperationResult {
+  bool ok = 1;
+  google.rpc.Status error = 2;
+}
+
+// ============================== COMPATIBILITY NOTES ===========================
+// - Поля НЕ удалять и НЕ переиспользовать их номера; вместо этого: mark 'reserved'.
+// - Новые поля добавлять в хвост сообщений, делать их опциональными.
+// - Для переносимости входных/выходных структур использовать google.protobuf.Struct/Value.
+// - Для сложных расширений — вложить в google.protobuf.Any.
+// - Нумерация оставляет зазоры для будущих расширений.

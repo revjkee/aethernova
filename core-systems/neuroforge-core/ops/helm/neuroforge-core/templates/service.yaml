@@ -1,0 +1,210 @@
+{{- /*
+neuroforge-core/templates/service.yaml
+
+Ожидаемые значения (фрагмент values.yaml):
+
+service:
+  enabled: true
+  type: ClusterIP            # ClusterIP | NodePort | LoadBalancer
+  annotations: {}            # произвольные аннотации
+  labels: {}                 # доп. метки
+  externalTrafficPolicy: Cluster  # для LB/NodePort: Cluster | Local
+  loadBalancerIP: ""         # опционально
+  loadBalancerClass: ""      # опционально (k8s>=1.24)
+  allocateLoadBalancerNodePorts: true  # для LB
+  sessionAffinity: None      # None | ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800  # если sessionAffinity=ClientIP
+  ipFamilyPolicy: ""         # SingleStack | PreferDualStack | RequireDualStack
+  ipFamilies: []             # ["IPv4","IPv6"]
+  publishNotReadyAddresses: false
+  selector: {}               # переопределение селектора (иначе стандартные метки)
+  ports:                     # список портов сервиса
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+      appProtocol: http
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+      appProtocol: grpc
+
+headless:
+  enabled: false
+  annotations: {}
+  labels: {}
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+      appProtocol: http
+
+metrics:
+  service:
+    enabled: false
+    annotations: {}
+    labels: {}
+    port: 9091
+    targetPort: 9091
+    appProtocol: http
+*/ -}}
+
+{{- if .Values.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "neuroforge-core.fullname" . }}
+  labels:
+    {{- include "neuroforge-core.labels" . | nindent 4 }}
+    {{- with .Values.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ default "ClusterIP" .Values.service.type }}
+  {{- if eq (default "ClusterIP" .Values.service.type) "LoadBalancer" }}
+  {{- with .Values.service.allocateLoadBalancerNodePorts }}
+  allocateLoadBalancerNodePorts: {{ . }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if or (eq (default "ClusterIP" .Values.service.type) "LoadBalancer") (eq (default "ClusterIP" .Values.service.type) "NodePort") }}
+  {{- with .Values.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.service.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with .Values.service.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.sessionAffinity }}
+  sessionAffinity: {{ . }}
+  {{- end }}
+  {{- if and (eq (default "None" .Values.service.sessionAffinity) "ClientIP") .Values.service.sessionAffinityConfig }}
+  sessionAffinityConfig:
+    {{- toYaml .Values.service.sessionAffinityConfig | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.publishNotReadyAddresses }}
+  publishNotReadyAddresses: {{ . }}
+  {{- end }}
+  selector:
+    {{- if .Values.service.selector }}
+    {{- /* Пользовательский селектор полностью переопределяет стандартный */ -}}
+    {{- toYaml .Values.service.selector | nindent 4 }}
+    {{- else }}
+    {{- /* Стабильные метки из helpers.tpl */ -}}
+    {{- include "neuroforge-core.selectorLabels" . | nindent 4 }}
+    {{- end }}
+  ports:
+    {{- $ports := .Values.service.ports | default list -}}
+    {{- if not (hasKey .Values.service "ports") }}
+    {{- /* безопасное значение по умолчанию */ -}}
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+      appProtocol: http
+    {{- else }}
+    {{- range $i, $p := $ports }}
+    - name: {{ $p.name | quote }}
+      port: {{ $p.port }}
+      targetPort: {{ $p.targetPort | default $p.port }}
+      protocol: {{ default "TCP" $p.protocol }}
+      {{- with $p.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
+      {{- with $p.appProtocol }}
+      appProtocol: {{ . | quote }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+---
+{{- end }}
+
+{{- if and .Values.headless.enabled .Values.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-headless" (include "neuroforge-core.fullname" .) }}
+  labels:
+    {{- include "neuroforge-core.labels" . | nindent 4 }}
+    {{- with .Values.headless.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.headless.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  {{- with .Values.headless.publishNotReadyAddresses }}
+  publishNotReadyAddresses: {{ . }}
+  {{- end }}
+  selector:
+    {{- include "neuroforge-core.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- $hports := .Values.headless.ports | default list -}}
+    {{- if not (hasKey .Values.headless "ports") }}
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+      appProtocol: http
+    {{- else }}
+    {{- range $i, $p := $hports }}
+    - name: {{ $p.name | quote }}
+      port: {{ $p.port }}
+      targetPort: {{ $p.targetPort | default $p.port }}
+      protocol: {{ default "TCP" $p.protocol }}
+      {{- with $p.appProtocol }}
+      appProtocol: {{ . | quote }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+---
+{{- end }}
+
+{{- if and .Values.metrics.service.enabled .Values.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-metrics" (include "neuroforge-core.fullname" .) }}
+  labels:
+    {{- include "neuroforge-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+    {{- with .Values.metrics.service.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "neuroforge-core.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.service.port | default 9091 }}
+      targetPort: {{ .Values.metrics.service.targetPort | default 9091 }}
+      protocol: TCP
+      {{- with .Values.metrics.service.appProtocol }}
+      appProtocol: {{ . | quote }}
+      {{- end }}
+{{- end }}

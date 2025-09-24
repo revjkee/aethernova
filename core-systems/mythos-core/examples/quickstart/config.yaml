@@ -1,0 +1,508 @@
+# mythos-core/examples/quickstart/config.yaml
+# Industrial-grade configuration for Mythos Core
+# Schema-first, profile-driven, 12-factor compliant
+
+apiVersion: mythos.aethernova.io/v1
+kind: MythosConfig
+
+metadata:
+  name: mythos-core
+  description: "Core runtime config for Mythos (policy/orchestration/LLM governance) with profiles."
+  owner: "platform-security-core"
+  environment: ${MYTHOS_ENV:-dev}
+  revision: ${MYTHOS_REVISION:-local}
+  generatedAt: ${MYTHOS_GENERATED_AT:-2025-08-28T00:00:00Z}
+  # Optional checksum of this file to detect drift (supply externally if needed)
+  checksum: ${MYTHOS_CONFIG_SHA256:-}
+
+schema:
+  version: 1.0.0
+  # Internal JSON Schema location for validation inside Mythos loader
+  ref: "internal://schemas/mythos-config-1.0.0.json"
+  validateOnBoot: true
+  failFast: true
+
+# -------------------------
+# Anchors: defaults & snippets
+# -------------------------
+defaults: &defaults
+  runtime:
+    mode: ${MYTHOS_MODE:-service}            # service | job | cli
+    tz: ${MYTHOS_TZ:-UTC}
+    locale: ${MYTHOS_LOCALE:-en_US}
+    gracefulShutdownSec: 30
+    maxConcurrentWorkers: ${MYTHOS_WORKERS:-8}
+    # Secrets resolution order: env -> vault -> file
+    secrets:
+      strategy: [env, vault, file]
+      vault:
+        enabled: ${VAULT_ENABLED:-false}
+        addr: ${VAULT_ADDR:-http://127.0.0.1:8200}
+        role: ${VAULT_ROLE:-mythos-core}
+        tokenEnv: VAULT_TOKEN
+        kvMount: ${VAULT_KV:-secret}
+      file:
+        path: ${MYTHOS_SECRETS_FILE:-}
+        requiredKeys: []
+    include:
+      # Optional includes of extra config fragments (mounted by Ops)
+      paths: ${MYTHOS_INCLUDE_PATHS:-}
+      required: false
+
+  http:
+    enabled: true
+    host: ${MYTHOS_HTTP_HOST:-0.0.0.0}
+    port: ${MYTHOS_HTTP_PORT:-8080}
+    basePath: /api
+    requestBodyLimitMB: 8
+    cors:
+      enabled: true
+      allowOrigins: ${MYTHOS_CORS_ORIGINS:-*}
+      allowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+      allowHeaders: "Authorization,Content-Type,Idempotency-Key,Request-Id"
+      allowCredentials: false
+      maxAgeSec: 600
+    compression:
+      enabled: true
+      minBytes: 1024
+    timeouts:
+      readMs: 10000
+      writeMs: 15000
+      idleMs: 60000
+    rateLimit:
+      enabled: true
+      strategy: token_bucket
+      capacity: 200
+      refillPerSec: 50
+      # Per-key segmentation to avoid global throttling
+      key: ${MYTHOS_RL_KEY:-ip}              # ip | user | api_key
+
+  security:
+    zeroTrust: true
+    csrf:
+      enabled: false
+    rbac:
+      enabled: true
+      # Roles mapped to policy bundles
+      roles:
+        - id: superadmin
+          description: "Full access for break-glass only"
+          policies: [sys.all, data.all, ai.admin, governance.all]
+        - id: operator
+          description: "Operate runtime, no data exfil"
+          policies: [sys.read, sys.operate, data.read_meta, ai.operate, governance.read]
+        - id: analyst
+          description: "Read-only data & dashboards"
+          policies: [data.read, observability.read, governance.read]
+        - id: service
+          description: "Service account for internal calls"
+          policies: [sys.call, data.read, data.write_scoped, ai.infer]
+    authn:
+      # One of: none | api_key | oidc | mTLS
+      default: ${MYTHOS_AUTHN_MODE:-api_key}
+      apiKey:
+        header: "X-API-Key"
+        allowedKeys:
+          - ${MYTHOS_API_KEY_1:-}
+          - ${MYTHOS_API_KEY_2:-}
+        allowFromIPs: ${MYTHOS_APIKEY_ALLOW_IPS:-}
+      oidc:
+        enabled: ${MYTHOS_OIDC_ENABLED:-false}
+        issuer: ${MYTHOS_OIDC_ISSUER:-}
+        audience: ${MYTHOS_OIDC_AUDIENCE:-mythos-core}
+        jwksUri: ${MYTHOS_OIDC_JWKS_URI:-}
+        requiredScopes: ["mythos.read"]
+      mTLS:
+        enabled: ${MYTHOS_MTLS_ENABLED:-false}
+        caBundlePath: ${MYTHOS_MTLS_CA:-}
+        requireSAN: true
+    authz:
+      engine: abac_rbac_merge
+      defaultDeny: true
+    contentSafety:
+      enabled: true
+      mode: "enforce"  # enforce | audit
+      # Policy bundle names resolved from governance.policyStore
+      policies: ["ethics.base", "safety.llm", "privacy.pii"]
+    privacy:
+      piiRedaction:
+        enabled: true
+        strategy: deterministic
+        saltEnv: MYTHOS_PII_SALT
+      dataMinimization: true
+      differentialPrivacy:
+        enabled: false
+
+  governance:
+    policyStore:
+      # Inline bundle names; resolved by loader from storage
+      bundles:
+        ethics:
+          - name: ethics.base
+            version: 1.0.0
+          - name: ethics.restricted_content
+            version: 1.0.0
+        safety:
+          - name: safety.llm
+            version: 1.1.0
+        privacy:
+          - name: privacy.pii
+            version: 1.0.0
+    provenance:
+      enabled: true
+      # W3C DID/VC optional
+      signedStatements: false
+    audit:
+      enabled: true
+      redactSensitive: true
+      sink: "stream"
+
+  observability:
+    log:
+      level: ${MYTHOS_LOG_LEVEL:-INFO}       # TRACE/DEBUG/INFO/WARN/ERROR
+      format: json                           # json | text
+      include:
+        requestId: true
+        spanId: true
+        userId: true
+        caller: false
+      sinks:
+        - type: stdout
+        - type: file
+          path: ${MYTHOS_LOG_FILE:-}
+          rolling:
+            enabled: true
+            maxSizeMB: 100
+            maxBackups: 7
+        - type: loki
+          enabled: ${MYTHOS_LOKI_ENABLED:-false}
+          url: ${MYTHOS_LOKI_URL:-}
+          tenant: ${MYTHOS_LOKI_TENANT:-}
+    tracing:
+      enabled: ${MYTHOS_OTEL_ENABLED:-true}
+      provider: otlp
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://127.0.0.1:4317}
+      sampleRatio: ${MYTHOS_TRACE_SAMPLE:-0.1}
+      serviceName: mythos-core
+    metrics:
+      provider: prometheus
+      endpoint: ${MYTHOS_METRICS_BIND:-0.0.0.0:9090}
+      defaultBuckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5]
+    health:
+      livenessPath: /healthz
+      readinessPath: /readyz
+
+  storage:
+    postgres:
+      enabled: true
+      dsn: ${MYTHOS_PG_DSN:-postgresql://mythos:mythos@127.0.0.1:5432/mythos}
+      pool:
+        maxOpen: 40
+        maxIdle: 8
+        connMaxLifetimeSec: 1800
+      migrations:
+        runOnBoot: true
+        dir: ${MYTHOS_MIGRATIONS_DIR:-/app/migrations}
+    redis:
+      enabled: true
+      url: ${MYTHOS_REDIS_URL:-redis://127.0.0.1:6379/0}
+      tls: ${MYTHOS_REDIS_TLS:-false}
+      poolSize: 64
+    objectStore:
+      enabled: true
+      provider: s3
+      endpoint: ${MYTHOS_S3_ENDPOINT:-http://127.0.0.1:9000}
+      region: ${MYTHOS_S3_REGION:-us-east-1}
+      bucket: ${MYTHOS_S3_BUCKET:-mythos}
+      accessKeyId: ${MYTHOS_S3_KEY:-}
+      secretAccessKey: ${MYTHOS_S3_SECRET:-}
+      forcePathStyle: true
+      encryption:
+        atRest: true
+        sse: "AES256"
+    cache:
+      defaultTTLsec: 300
+      maxEntries: 100000
+
+  broker:
+    type: ${MYTHOS_BROKER:-rabbitmq}         # rabbitmq | kafka | nats
+    rabbitmq:
+      url: ${MYTHOS_RMQ_URL:-amqp://guest:guest@127.0.0.1:5672/}
+      prefetch: 64
+    kafka:
+      brokers: ${MYTHOS_KAFKA_BROKERS:-127.0.0.1:9092}
+      acks: all
+      compression: snappy
+    nats:
+      url: ${MYTHOS_NATS_URL:-nats://127.0.0.1:4222}
+    topics:
+      policyEvents: mythos.policy.events
+      auditEvents: mythos.audit.events
+      inferenceJobs: mythos.ai.infer
+      backgroundTasks: mythos.tasks.background
+    dlq:
+      enabled: true
+      name: mythos.dlq
+      retentionHours: 168
+
+  ai:
+    # Providers and models are referenced by logical name; adapters resolve credentials via secrets.strategy
+    providers:
+      openai:
+        enabled: ${MYTHOS_OPENAI_ENABLED:-false}
+        apiKeyEnv: OPENAI_API_KEY
+        organization: ${OPENAI_ORG:-}
+      local:
+        enabled: true
+        runtime: vllm
+        endpoint: ${MYTHOS_LOCAL_LLM_ENDPOINT:-http://127.0.0.1:8000}
+      huggingface:
+        enabled: ${MYTHOS_HF_ENABLED:-false}
+        tokenEnv: HUGGING_FACE_HUB_TOKEN
+    models:
+      policy_llm:
+        provider: local
+        model: ${MYTHOS_POLICY_MODEL:-Meta-Llama-3.1-8B-Instruct}
+        maxTokens: 2048
+        temperature: 0.2
+        stop: []
+        safetyGuardrails: true
+      nlp_general:
+        provider: openai
+        model: ${MYTHOS_NLP_MODEL:-gpt-4o-mini}
+        maxTokens: 4096
+        temperature: 0.4
+        safetyGuardrails: true
+        enabled: ${MYTHOS_NLP_ENABLED:-false}
+      embedding:
+        provider: huggingface
+        model: ${MYTHOS_EMB_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+        dim: 384
+        enabled: ${MYTHOS_EMB_ENABLED:-true}
+    quotas:
+      maxRequestsPerMin: 120
+      perUserOverrides: {}
+    safety:
+      jailbreakDetection: true
+      toxicityThreshold: 0.4
+      piiDetection: true
+
+  featureFlags:
+    policy_explanations: true       # Return rationale for policy decisions
+    strict_schema_validation: true
+    deferred_audit_flush: true
+    cache_embeddings: true
+    enable_ab_testing: false
+
+  validation:
+    inputs:
+      maxPromptChars: 10000
+      maxMetadataBytes: 16384
+      rejectEmpty: true
+    outputs:
+      maxTokens: 8192
+      sanitizeHTML: true
+      redactPII: true
+
+  retention:
+    policies:
+      logsDays: 14
+      auditsDays: 90
+      metricsDays: 7
+      tracesDays: 7
+      objectsDays: 365
+      piiEraseOnRequest: true
+
+  tasks:
+    scheduler:
+      enabled: true
+      # Cron-like tasks
+      jobs:
+        - id: audits-rollup
+          schedule: "0 * * * *"         # hourly
+          action: governance.audit.rollup
+          timeoutSec: 120
+          retries: 3
+        - id: dlq-drain
+          schedule: "*/15 * * * *"      # every 15 min
+          action: broker.dlq.drain
+          timeoutSec: 60
+          retries: 5
+        - id: cache-warmup
+          schedule: "30 3 * * *"        # daily off-peak
+          action: ai.embedding.cacheWarm
+          timeoutSec: 600
+          retries: 1
+
+  storageSchemas:
+    # Declarative tables/indices (optional, for bootstrap/migration guard)
+    postgres:
+      tables:
+        - name: policy_decisions
+          columns:
+            - {name: id, type: uuid, pk: true}
+            - {name: ts, type: timestamptz, notNull: true}
+            - {name: subject, type: text, notNull: true}
+            - {name: action, type: text, notNull: true}
+            - {name: resource, type: text, notNull: true}
+            - {name: decision, type: text, notNull: true}
+            - {name: rationale, type: jsonb, notNull: true}
+          indices:
+            - {name: idx_policy_ts, on: [ts]}
+            - {name: idx_policy_subject, on: [subject]}
+        - name: audit_events
+          columns:
+            - {name: id, type: uuid, pk: true}
+            - {name: ts, type: timestamptz, notNull: true}
+            - {name: actor, type: text, notNull: true}
+            - {name: event, type: text, notNull: true}
+            - {name: payload, type: jsonb, notNull: true}
+          indices:
+            - {name: idx_audit_ts, on: [ts]}
+
+# -------------------------
+# Profiles
+# -------------------------
+profiles:
+  dev: &dev
+    <<: *defaults
+    metadata:
+      <<: *{metadata}  # No-op placeholder to stress profile structure
+    runtime:
+      <<: *defaults.runtime
+      mode: service
+      gracefulShutdownSec: 5
+      maxConcurrentWorkers: 4
+    http:
+      <<: *defaults.http
+      port: ${MYTHOS_HTTP_PORT:-8081}
+      cors:
+        <<: *defaults.http.cors
+        allowOrigins: ${MYTHOS_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,*}
+    observability:
+      <<: *defaults.observability
+      log:
+        <<: *defaults.observability.log
+        level: DEBUG
+        format: text
+      tracing:
+        <<: *defaults.observability.tracing
+        sampleRatio: 1.0
+    storage:
+      <<: *defaults.storage
+      postgres:
+        <<: *defaults.storage.postgres
+        dsn: ${MYTHOS_PG_DSN:-postgresql://mythos:mythos@127.0.0.1:5432/mythos_dev}
+      objectStore:
+        <<: *defaults.storage.objectStore
+        bucket: ${MYTHOS_S3_BUCKET:-mythos-dev}
+    ai:
+      <<: *defaults.ai
+      models:
+        <<: *defaults.ai.models
+        policy_llm:
+          <<: *defaults.ai.models.policy_llm
+          temperature: 0.3
+    featureFlags:
+      <<: *defaults.featureFlags
+      enable_ab_testing: true
+
+  prod: &prod
+    <<: *defaults
+    runtime:
+      <<: *defaults.runtime
+      gracefulShutdownSec: 30
+      maxConcurrentWorkers: ${MYTHOS_WORKERS:-32}
+    http:
+      <<: *defaults.http
+      port: ${MYTHOS_HTTP_PORT:-8080}
+      cors:
+        <<: *defaults.http.cors
+        allowOrigins: ${MYTHOS_CORS_ORIGINS:-https://app.mythos.aethernova.io}
+    security:
+      <<: *defaults.security
+      authn:
+        <<: *defaults.security.authn
+        default: ${MYTHOS_AUTHN_MODE:-oidc}
+        apiKey:
+          <<: *defaults.security.authn.apiKey
+          allowedKeys: []   # Disallow API keys in prod by default
+        oidc:
+          enabled: true
+          issuer: ${MYTHOS_OIDC_ISSUER:?set OIDC issuer}
+          audience: ${MYTHOS_OIDC_AUDIENCE:-mythos-core}
+          jwksUri: ${MYTHOS_OIDC_JWKS_URI:?set JWKS URI}
+      contentSafety:
+        <<: *defaults.security.contentSafety
+        mode: enforce
+    observability:
+      <<: *defaults.observability
+      log:
+        <<: *defaults.observability.log
+        level: INFO
+        format: json
+        sinks:
+          - type: stdout
+          - type: loki
+            enabled: true
+            url: ${MYTHOS_LOKI_URL:?set Loki URL}
+            tenant: ${MYTHOS_LOKI_TENANT:-mythos}
+      tracing:
+        <<: *defaults.observability.tracing
+        sampleRatio: ${MYTHOS_TRACE_SAMPLE:-0.05}
+    storage:
+      <<: *defaults.storage
+      postgres:
+        <<: *defaults.storage.postgres
+        dsn: ${MYTHOS_PG_DSN:?set Postgres DSN}
+      objectStore:
+        <<: *defaults.storage.objectStore
+        bucket: ${MYTHOS_S3_BUCKET:?set S3 bucket}
+    broker:
+      <<: *defaults.broker
+      type: ${MYTHOS_BROKER:-kafka}
+      kafka:
+        <<: *defaults.broker.kafka
+        brokers: ${MYTHOS_KAFKA_BROKERS:?set Kafka brokers}
+    ai:
+      <<: *defaults.ai
+      providers:
+        <<: *defaults.ai.providers
+        local:
+          enabled: ${MYTHOS_LOCAL_LLM_ENABLED:-false}
+        openai:
+          enabled: ${MYTHOS_OPENAI_ENABLED:-true}
+      quotas:
+        <<: *defaults.ai.quotas
+        maxRequestsPerMin: ${MYTHOS_AI_QPM:-600}
+    retention:
+      <<: *defaults.retention
+      policies:
+        <<: *defaults.retention.policies
+        logsDays: 30
+        metricsDays: 30
+        tracesDays: 14
+
+# -------------------------
+# Active profile selector
+# -------------------------
+activeProfile: ${MYTHOS_ENV:-dev}
+
+# -------------------------
+# Sanity checks on boot (guardrails)
+# -------------------------
+bootChecks:
+  require:
+    - storage.postgres.enabled
+    - observability.metrics.provider
+    - security.authz.defaultDeny
+  forbidInProd:
+    - observability.log.format=text
+    - security.authn.apiKey.allowedKeys[0]  # any api keys present
+  warnIfMissing:
+    - ai.providers.openai.enabled=true AND env(OPENAI_API_KEY)
+    - observability.tracing.enabled=true AND env(OTEL_EXPORTER_OTLP_ENDPOINT)
+
+# -------------------------
+# End of file
+# -------------------------

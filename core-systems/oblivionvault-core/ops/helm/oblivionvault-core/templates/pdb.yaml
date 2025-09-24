@@ -1,0 +1,171 @@
+{{- /*
+Industrial-grade PodDisruptionBudget template for oblivionvault-core
+Features:
+- policy/v1 or policy/v1beta1 auto-detection
+- Global enable switch: .Values.pdb.enabled
+- Safety: skip creation when replicaCount <= 1 unless createWhenSingleReplica=true
+- Mutually exclusive validation: minAvailable vs maxUnavailable
+- Multiple PDBs via .Values.pdb.targets (list)
+- Strict Kubernetes recommended labels, extra labels/annotations supported
+- Extra selectors via matchLabels/matchExpressions
+
+Minimal values.yaml example:
+
+pdb:
+  enabled: true
+  # One of the two (never both):
+  # minAvailable: 1           # or "50%" (strings allowed by Kubernetes)
+  # maxUnavailable: 1
+  # createWhenSingleReplica: false
+  # extraLabels: { "security.oblivionvault.io/tier": "critical" }
+  # annotations: { "policy.oblivionvault.io/owner": "platform" }
+  # matchLabels: { "app.kubernetes.io/component": "api" }
+  # matchExpressions:
+  #   - key: "app.kubernetes.io/part-of"
+  #     operator: In
+  #     values: ["oblivionvault"]
+  #
+  # Or define multiple PDBs for different sub-workloads:
+  # targets:
+  #   - nameSuffix: "api"
+  #     minAvailable: 1
+  #     matchLabels: { "app.kubernetes.io/component": "api" }
+  #   - nameSuffix: "worker"
+  #     maxUnavailable: 1
+  #     matchLabels: { "app.kubernetes.io/component": "worker" }
+replicaCount: 3
+*/ -}}
+
+{{- $root := . -}}
+{{- $pdb := (default dict .Values.pdb) -}}
+{{- $enabled := (default false $pdb.enabled) -}}
+{{- $replicas := (default 1 .Values.replicaCount) | int -}}
+{{- $createWhenSingle := (default false $pdb.createWhenSingleReplica) -}}
+
+{{- /* Validate mutually exclusive knobs on the global block (fallback) */ -}}
+{{- if and (hasKey $pdb "minAvailable") (hasKey $pdb "maxUnavailable") -}}
+  {{- fail "pdb.minAvailable and pdb.maxUnavailable are mutually exclusive. Set only one." -}}
+{{- end -}}
+
+{{- /* Helper to compute effective API version */ -}}
+{{- define "oblivionvault.pdb.apiversion" -}}
+  {{- if .Capabilities.APIVersions.Has "policy/v1/PodDisruptionBudget" -}}
+policy/v1
+  {{- else if .Capabilities.APIVersions.Has "policy/v1beta1/PodDisruptionBudget" -}}
+policy/v1beta1
+  {{- else -}}
+    {{- fail "No supported PodDisruptionBudget API version found on this cluster." -}}
+  {{- end -}}
+{{- end -}}
+
+{{- /* Render a single PDB resource */ -}}
+{{- define "oblivionvault.pdb.render" -}}
+{{- $ctx := index . "ctx" -}}
+{{- $nameSuffix := (default "" (index . "nameSuffix")) -}}
+{{- $block := (default dict (index . "block")) -}}
+
+{{- $minAvail := (index $block "minAvailable") | default (index $ctx.Values.pdb "minAvailable") -}}
+{{- $maxUnavail := (index $block "maxUnavailable") | default (index $ctx.Values.pdb "maxUnavailable") -}}
+{{- if and $minAvail $maxUnavail -}}
+  {{- fail (printf "Both minAvailable and maxUnavailable set for PDB %s; choose one." $nameSuffix) -}}
+{{- end -}}
+
+{{- $extraLabels := (index $ctx.Values.pdb "extraLabels") | default dict -}}
+{{- $annotations := (index $ctx.Values.pdb "annotations") | default dict -}}
+
+{{- $userMatchLabels := (index $ctx.Values.pdb "matchLabels") | default dict -}}
+{{- $blockMatchLabels := (index $block "matchLabels") | default dict -}}
+{{- $finalMatchLabels := merge (dict)
+      (fromYaml (include "oblivionvault.selectorLabels" $ctx))
+      $userMatchLabels
+      $blockMatchLabels -}}
+
+{{- $matchExpr := (index $ctx.Values.pdb "matchExpressions") | default list -}}
+{{- $blockMatchExpr := (index $block "matchExpressions") | default list -}}
+{{- $finalMatchExpr := concat $matchExpr $blockMatchExpr -}}
+
+apiVersion: {{ include "oblivionvault.pdb.apiversion" $ctx | trim }}
+kind: PodDisruptionBudget
+metadata:
+  name: {{- if $nameSuffix -}}
+    {{ include "oblivionvault.fullname" $ctx }}-{{ $nameSuffix }}-pdb
+  {{- else -}}
+    {{ include "oblivionvault.fullname" $ctx }}-pdb
+  {{- end }}
+  labels:
+    {{- include "oblivionvault.labels" $ctx | nindent 4 }}
+    {{- if $extraLabels }}
+    {{- toYaml $extraLabels | nindent 4 }}
+    {{- end }}
+  {{- if $annotations }}
+  annotations:
+    {{- toYaml $annotations | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if $minAvail }}
+  minAvailable: {{ $minAvail }}
+  {{- else if $maxUnavail }}
+  maxUnavailable: {{ $maxUnavail }}
+  {{- else }}
+  minAvailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- toYaml $finalMatchLabels | nindent 6 }}
+    {{- if $finalMatchExpr }}
+    matchExpressions:
+      {{- toYaml $finalMatchExpr | nindent 6 }}
+    {{- end }}
+{{- end -}}
+
+{{- /* Gate creation: must be enabled and either replicas>1 or override enabled */ -}}
+{{- if and $enabled (or (gt $replicas 1) $createWhenSingle) -}}
+
+  {{- $targets := (default list $pdb.targets) -}}
+  {{- if $targets }}
+    {{- range $i, $t := $targets }}
+---
+{{ include "oblivionvault.pdb.render" (dict "ctx" $root "block" $t "nameSuffix" ($t.nameSuffix | default (printf "t%d" $i))) }}
+    {{- end }}
+  {{- else }}
+{{ include "oblivionvault.pdb.render" (dict "ctx" $root "block" dict) }}
+  {{- end }}
+
+{{- else -}}
+  {{- /* Not enabled or unsafe to create for single replica without override. No manifest produced. */ -}}
+{{- end -}}
+
+{{- /* ===== Helpers: naming and labels (self-contained) ===== */ -}}
+{{- define "oblivionvault.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "oblivionvault.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := include "oblivionvault.name" . -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "oblivionvault.chart" -}}
+{{- printf "%s-%s" .Chart.Name (.Chart.Version | replace "+" "_") -}}
+{{- end -}}
+
+{{- define "oblivionvault.labels" -}}
+app.kubernetes.io/name: {{ include "oblivionvault.name" . }}
+helm.sh/chart: {{ include "oblivionvault.chart" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: oblivionvault-core
+{{- end -}}
+
+{{- define "oblivionvault.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "oblivionvault.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}

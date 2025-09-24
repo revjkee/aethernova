@@ -1,0 +1,197 @@
+# path: zero-trust-core/ops/k8s/base/networkpolicy.yaml
+# -----------------------------------------------------------------------------
+# 00) Default deny: запрещает весь входящий и исходящий трафик для Pod'ов
+#    zero-trust-core. Для работы разрешений ниже требуется, чтобы Pod'ы
+#    имели метку: app.kubernetes.io/part-of=zero-trust-core
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ztc-default-deny
+  labels:
+    app.kubernetes.io/part-of: zero-trust-core
+    app.kubernetes.io/component: network-policy
+    app.kubernetes.io/name: default-deny
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: zero-trust-core
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress: []
+
+---
+# -----------------------------------------------------------------------------
+# 10) Разрешить DNS egress (TCP/UDP 53) к kube-dns/coredns в kube-system.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ztc-allow-dns-egress
+  labels:
+    app.kubernetes.io/part-of: zero-trust-core
+    app.kubernetes.io/component: network-policy
+    app.kubernetes.io/name: allow-dns-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: zero-trust-core
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchExpressions:
+              - key: k8s-app
+                operator: In
+                values: ["kube-dns", "coredns"]
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# -----------------------------------------------------------------------------
+# 20) Разрешить Ingress к API-подам приложения от Ingress-контроллера
+#     и от внутренних сервисов того же приложения.
+#     Ожидаемые метки у Pod'ов приложения:
+#       app.kubernetes.io/part-of=zero-trust-core
+#       app.kubernetes.io/component=api
+#     Порты сервиса: 8080 (HTTP), 8443 (mTLS/HTTPS) — при необходимости скорректируйте.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ztc-allow-app-ingress
+  labels:
+    app.kubernetes.io/part-of: zero-trust-core
+    app.kubernetes.io/component: network-policy
+    app.kubernetes.io/name: allow-app-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: zero-trust-core
+      app.kubernetes.io/component: api
+  policyTypes: [Ingress]
+  ingress:
+    # Источник 1: Ingress-NGINX (namespace ingress-nginx)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+    # Источник 2: внутренние pod'ы того же приложения (внутренний east-west)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: zero-trust-core
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+
+---
+# -----------------------------------------------------------------------------
+# 30) Разрешить Prometheus scrape метрик (ingress) из namespace `monitoring`.
+#     Целевые Pod'ы должны публиковать метрики на порту 9090 (либо измените ниже).
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ztc-allow-metrics-ingress
+  labels:
+    app.kubernetes.io/part-of: zero-trust-core
+    app.kubernetes.io/component: network-policy
+    app.kubernetes.io/name: allow-metrics-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: zero-trust-core
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["prometheus", "kube-prometheus-stack-prometheus"]
+      ports:
+        - port: 9090
+          protocol: TCP
+
+---
+# -----------------------------------------------------------------------------
+# 40) Разрешить egress в OpenTelemetry Collector (otel-collector) для логов/трейсов.
+#     Namespace предполагается `observability`, можно заменить в overlays.
+#     Порты: 4317 (gRPC OTLP), 4318 (HTTP OTLP).
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ztc-allow-egress-otel
+  labels:
+    app.kubernetes.io/part-of: zero-trust-core
+    app.kubernetes.io/component: network-policy
+    app.kubernetes.io/name: allow-egress-otel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: zero-trust-core
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+
+---
+# -----------------------------------------------------------------------------
+# 50) (Опционально) Разрешить контролируемый egress "в интернет" только через
+#     специализированный egress-шлюз (pod с меткой egress=internet), порт 443.
+#     При отсутствии шлюза этот манифест можно исключить в overlay.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ztc-allow-egress-via-gateway
+  labels:
+    app.kubernetes.io/part-of: zero-trust-core
+    app.kubernetes.io/component: network-policy
+    app.kubernetes.io/name: allow-egress-via-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: zero-trust-core
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              egress: internet
+      ports:
+        - port: 443
+          protocol: TCP

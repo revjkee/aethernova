@@ -1,0 +1,184 @@
+# path: omnimind-core/ops/ansible/roles/omnimind-core/handlers/main.yml
+---
+# ============================================================
+# Handlers for omnimind-core role (industrial-grade)
+# Supports: systemd, Docker Compose v2, single container,
+#           safe reload (SIGHUP), daemon-reload, logrotate, nginx reload.
+# All handlers are guarded by role variables to avoid side effects.
+#
+# Recommended role variables (defaults in vars/defaults):
+#   omnimind_core_service_manage_systemd: true|false
+#   omnimind_core_service_unit: "omnimind-core.service"
+#   omnimind_core_service_name: "omnimind-core"
+#   omnimind_core_service_state_on_restart: "restarted"  # or "reloaded"
+#   omnimind_core_send_hup_signal: true|false
+#   omnimind_core_compose_enabled: true|false
+#   omnimind_core_compose_project_dir: "/opt/omnimind-core"
+#   omnimind_core_compose_project_name: "omnimind-core"
+#   omnimind_core_container_enabled: true|false
+#   omnimind_core_container_name: "omnimind-core"
+#   omnimind_core_proxy_nginx_enabled: true|false
+#   omnimind_core_nginx_service_unit: "nginx.service"
+#   omnimind_core_logrotate_reload_enabled: true|false
+#   omnimind_core_systemd_scope: "system"  # or "user"
+# ============================================================
+
+# ---------- SYSTEMD ----------
+
+- name: Systemd | reload daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: "{{ omnimind_core_systemd_scope | default('system') }}"
+  listen: "daemon-reload"
+  when:
+    - omnimind_core_service_manage_systemd | default(true) | bool
+  tags: [omnimind, systemd, reload]
+
+- name: Systemd | safe reload service (SIGHUP or native reload)
+  ansible.builtin.systemd:
+    name: "{{ omnimind_core_service_unit | default('omnimind-core.service') }}"
+    state: reloaded
+    scope: "{{ omnimind_core_systemd_scope | default('system') }}"
+  listen: "reload omnimind-core"
+  when:
+    - omnimind_core_service_manage_systemd | default(true) | bool
+  tags: [omnimind, systemd, reload]
+
+- name: Systemd | restart service
+  ansible.builtin.systemd:
+    name: "{{ omnimind_core_service_unit | default('omnimind-core.service') }}"
+    state: restarted
+    scope: "{{ omnimind_core_systemd_scope | default('system') }}"
+  listen: "restart omnimind-core"
+  when:
+    - omnimind_core_service_manage_systemd | default(true) | bool
+  tags: [omnimind, systemd, restart]
+
+- name: Systemd | show service status (for diagnostics)
+  ansible.builtin.command:
+    cmd: >
+      systemctl --{{ omnimind_core_systemd_scope | default('system') }} status
+      {{ omnimind_core_service_unit | default('omnimind-core.service') }} --no-pager
+  register: omnimind_core_systemd_status
+  changed_when: false
+  failed_when: false
+  listen: ["reload omnimind-core", "restart omnimind-core"]
+  when:
+    - omnimind_core_service_manage_systemd | default(true) | bool
+  tags: [omnimind, systemd, debug]
+
+# Optional: send explicit SIGHUP if application supports it and native reload is absent
+- name: Systemd | send SIGHUP to main PID (fallback)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    unit="{{ omnimind_core_service_unit | default('omnimind-core.service') }}"
+    pid="$(systemctl show -p MainPID --value "$unit")"
+    if [ -n "$pid" ] && [ "$pid" -gt 1 ]; then kill -HUP "$pid"; fi
+  args:
+    executable: /bin/bash
+  changed_when: true
+  listen: "hup omnimind-core"
+  when:
+    - omnimind_core_service_manage_systemd | default(true) | bool
+    - omnimind_core_send_hup_signal | default(false) | bool
+  tags: [omnimind, systemd, reload]
+
+# ---------- DOCKER COMPOSE v2 ----------
+
+- name: Docker Compose | pull & up (recreate changed)
+  community.docker.docker_compose_v2:
+    project_src: "{{ omnimind_core_compose_project_dir }}"
+    project_name: "{{ omnimind_core_compose_project_name | default('omnimind-core') }}"
+    pull: always
+    state: present
+    recreate: auto
+    remove_orphans: true
+    quiet: true
+  listen: "restart compose omnimind-core"
+  when:
+    - omnimind_core_compose_enabled | default(false) | bool
+    - omnimind_core_compose_project_dir is defined
+  tags: [omnimind, docker, compose, restart]
+
+- name: Docker Compose | graceful restart (down/up minimal)
+  community.docker.docker_compose_v2:
+    project_src: "{{ omnimind_core_compose_project_dir }}"
+    project_name: "{{ omnimind_core_compose_project_name | default('omnimind-core') }}"
+    state: restarted
+    quiet: true
+  listen: "reload compose omnimind-core"
+  when:
+    - omnimind_core_compose_enabled | default(false) | bool
+    - omnimind_core_compose_project_dir is defined
+  tags: [omnimind, docker, compose, reload]
+
+# ---------- SINGLE CONTAINER ----------
+
+- name: Docker | restart container
+  community.docker.docker_container:
+    name: "{{ omnimind_core_container_name | default('omnimind-core') }}"
+    restart: true
+    state: started
+    detach: true
+    env_file: null
+  listen: "restart container omnimind-core"
+  when:
+    - omnimind_core_container_enabled | default(false) | bool
+  tags: [omnimind, docker, container, restart]
+
+- name: Docker | send SIGHUP to container process (if supported)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cid="$(docker inspect --format '{{"{{.Id}}"}}' {{ omnimind_core_container_name | default('omnimind-core') }} 2>/dev/null || true)"
+    if [ -n "$cid" ]; then docker kill --signal=HUP "$cid"; fi
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+  listen: "hup container omnimind-core"
+  when:
+    - omnimind_core_container_enabled | default(false) | bool
+  tags: [omnimind, docker, container, reload]
+
+# ---------- LOGGING / ROTATION ----------
+
+- name: Logrotate | force rotate and reload
+  ansible.builtin.command: logrotate -f /etc/logrotate.conf
+  changed_when: true
+  failed_when: false
+  listen: "rotate logs omnimind-core"
+  when:
+    - omnimind_core_logrotate_reload_enabled | default(true) | bool
+  tags: [omnimind, logging, logrotate]
+
+# ---------- NGINX (OPTIONAL REVERSE PROXY) ----------
+
+- name: NGINX | reload
+  ansible.builtin.systemd:
+    name: "{{ omnimind_core_nginx_service_unit | default('nginx.service') }}"
+    state: reloaded
+    scope: system
+  listen: "reload nginx"
+  when:
+    - omnimind_core_proxy_nginx_enabled | default(false) | bool
+  tags: [omnimind, nginx, reload]
+
+- name: NGINX | test config before reload (safer)
+  ansible.builtin.command: nginx -t
+  register: nginx_test
+  changed_when: false
+  failed_when: "nginx_test.rc != 0"
+  listen: "validate nginx"
+  when:
+    - omnimind_core_proxy_nginx_enabled | default(false) | bool
+  tags: [omnimind, nginx, validate]
+
+# ---------- DEBUG OUTPUT (OPTIONAL) ----------
+
+- name: Debug | print last systemd status
+  ansible.builtin.debug:
+    msg: "{{ omnimind_core_systemd_status.stdout | default('systemd status not captured') }}"
+  listen: ["reload omnimind-core", "restart omnimind-core"]
+  when:
+    - omnimind_core_service_manage_systemd | default(true) | bool
+  tags: [omnimind, debug]

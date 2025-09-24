@@ -1,0 +1,384 @@
+apiVersion: policies.oblivionvault.io/v1
+kind: ErasurePlaybook
+metadata:
+  name: erasure-master-playbook
+  labels:
+    app.kubernetes.io/part-of: oblivionvault-core
+    policy.tier: critical
+  annotations:
+    description: "Стандартизированный плейбук безопасного удаления данных (GDPR Art.17, CCPA, ISO/IEC 27040)."
+    managedBy: "gitops/argocd"
+    reviewSchedule: "P30D"
+
+spec:
+  schema:
+    version: "1.0.0"
+    $schema: "https://schemas.oblivionvault.io/policies/erasure/v1.json"
+    validation:
+      strictTypes: true
+      forbidUnknownKeys: true
+
+  tenant:
+    id: "ov-tenant-prod"
+    environment: "prod"   # dev|staging|prod
+    jurisdictions: ["EU","US","UK"]
+    dataResidency:
+      requiredRegions: ["eu-central-1","eu-west-1"]
+      denyRegions: ["ap-east-1"]
+
+  kms:
+    envelope:
+      provider: "aws-kms"
+      dataKeySpec: "AES_256"
+    signing:
+      provider: "aws-kms"
+      keyArn: "arn:aws:kms:eu-central-1:123456789012:key/ffffffff-1111-2222-3333-444444444444"
+      algorithm: "RSA_PSS_SHA_256"
+    keyShred:
+      # Для CRYPTO_SHRED: какие KMS-ключи/оболочки подлежат утилизации
+      policy: "revoke-then-schedule-delete"
+      minGracePeriod: "P7D"
+
+  governance:
+    legalHoldCheck:
+      enabled: true
+      breakGlass:
+        enabled: false
+        quorum:
+          roles: ["LEGAL_ADMIN","SECURITY_OFFICER","DPO"]
+          minApprovals: 3
+    retentionCheck:
+      enabled: true
+      denyIfMinNotMet: true
+    approvals:
+      required: 2
+      matrix:
+        - anyOfRoles: ["LEGAL_ADMIN","DPO"]
+        - anyOfRoles: ["SECURITY_OFFICER","ENGINEERING_MANAGER"]
+    requireDryRunBeforeLive: true
+    changeTicket:
+      system: "jira"
+      regex: "^OV-[0-9]+$"
+
+  controls:
+    blastRadius:
+      maxObjects: 100000        # верхняя планка на удаление за один запуск
+      maxTotalBytes: "500Gi"
+      canary:
+        enabled: true
+        sample: 0.01            # 1% сначала, затем полное выполнение
+        haltOnAnyError: true
+    rateLimit:
+      objectsPerSecond: 500
+      bytesPerSecond: "64Mi"
+    concurrency:
+      maxWorkers: 16
+      perTargetMax: 4
+    retries:
+      maxAttempts: 5
+      backoff:
+        base: "PT2S"
+        max: "PT2M"
+        factor: 2.0
+    windows:
+      allowCron: ["0 1 * * *"]  # ночное окно 01:00
+      blackoutCron: ["0 8-20 * * 1-5"]  # запрет в рабочие часы
+    consistencyGuards:
+      quiesceWrites: true
+      fsyncAfterQuiesce: true
+      snapshotBeforeErase:
+        enabled: true
+        ttl: "P7D"
+
+  observability:
+    metrics:
+      enabled: true
+      namespace: "observability"
+      slos:
+        - name: "erasure-success-rate"
+          objective: ">=99.9%"
+        - name: "verification-latency-p95"
+          objective: "<=5m"
+    tracing:
+      enabled: true
+      otlpEndpoint: "http://otel-collector.observability.svc:4317"
+    logging:
+      level: "INFO"
+      sinks:
+        - type: "loki"
+          url: "http://loki-gateway.observability.svc:80"
+          labels: { stream: "erasure", severity: "info" }
+        - type: "kafka"
+          brokers: ["kafka-1:9092","kafka-2:9092"]
+          topic: "ov.erasure.audit.v1"
+
+  dlp:
+    piiClasses:
+      - id: "PII_EMAIL"
+        detectors: ["regex://[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"]
+        action: "mask"
+      - id: "PII_PAN"
+        detectors: ["regex://\\b\\d{16}\\b"]
+        action: "mask"
+    enforceBeforeErase: true
+
+  outputs:
+    reports:
+      bucket: "ov-prod-erasure"
+      prefix: "reports/"
+      format: "jsonl"
+      compression: "zstd"
+    certificates:
+      enabled: true
+      signingKeyRef: "kms://signing"
+      include:
+        - inventoryDigest
+        - steps
+        - successStats
+        - failures
+        - hash: "SHA3-512"
+
+  connectors:
+    objectStores:
+      - id: "s3-prod"
+        type: "s3"
+        region: "eu-central-1"
+        bucket: "ov-prod-data"
+        prefix: ""
+        sse: "aws:kms"
+      - id: "minio-arch"
+        type: "minio"
+        endpoint: "https://minio.prod.internal"
+        bucket: "archives"
+        prefix: "legacy/"
+    databases:
+      - id: "pg-main"
+        type: "postgres"
+        dsnRef: "secret://db/pg-main-dsn"
+      - id: "mysql-billing"
+        type: "mysql"
+        dsnRef: "secret://db/mysql-billing-dsn"
+      - id: "clickhouse-logs"
+        type: "clickhouse"
+        dsnRef: "secret://db/ch-logs-dsn"
+      - id: "elasticsearch"
+        type: "elasticsearch"
+        endpoint: "https://es.prod.internal:9200"
+        authRef: "secret://es/creds"
+    streams:
+      - id: "kafka-mail"
+        type: "kafka"
+        brokers: ["kafka-1:9092","kafka-2:9092"]
+    filesystems:
+      - id: "nfs-backup"
+        type: "nfs"
+        mount: "/mnt/backups"
+
+  modes:
+    # Режимы локально к целям
+    HARD_DELETE:
+      verify:
+        existenceCheck: "404-or-empty"
+        storageLens: true
+    SOFT_DELETE:
+      tombstoneField: "_deleted"
+      ttlField: "_ttl"
+      minTtl: "P30D"
+    CRYPTO_SHRED:
+      keyScopes:
+        - "kms://project/keywrap/*"
+      revokeWindow: "P7D"
+    ANONYMIZE:
+      strategies:
+        - type: "pseudonymize"
+          fields: ["email","phone","name"]
+          method: "deterministic-token"
+          saltRef: "secret://pii/tokenization-salt"
+        - type: "hash"
+          fields: ["user_id"]
+          algorithm: "SHA256"
+          encode: "hex"
+
+  verification:
+    # Доверяй-но-проверяй
+    readAfterWrite: true
+    samplePercent: 5
+    bytesSampleMax: "256Mi"
+    secondPass:
+      enabled: true
+      delay: "PT15M"
+    indexConsistence:
+      elasticsearch:
+        checkBeforeAfterDocs: true
+      clickhouse:
+        optimizeFinal: true
+
+  rollback:
+    # Возможен только для SOFT_DELETE/ANONYMIZE
+    enabled: true
+    window: "P7D"
+    denyForModes: ["HARD_DELETE","CRYPTO_SHRED"]
+
+  notifications:
+    channels:
+      - id: "slack-erasure"
+        type: "slack"
+        webhookRef: "secret://notifications/slack-erasure"
+      - id: "email-erasure"
+        type: "email"
+        smtpProfile: "smtp-prod"
+    rules:
+      - onEvents: ["PLAN_READY","DRY_RUN_DONE","LIVE_DONE","VERIFICATION_FAILED","ABORTED"]
+        to: ["slack-erasure","email-erasure"]
+        template: "default"
+
+  plan:
+    # 1) Инвентаризация
+    - id: "inventory"
+      action: "inventory.collect"
+      inputs:
+        selectors:
+          - connector: "s3-prod"
+            include: ["user-data/**","exports/**"]
+            exclude: ["**/*.tmp","**/~$*"]
+          - connector: "pg-main"
+            tables:
+              - name: "users"
+                where: "deleted_at IS NOT NULL OR gdpr_erasure_request = true"
+              - name: "audit_events"
+                where: "pii = true AND created_at < now() - interval '365 days'"
+          - connector: "elasticsearch"
+            indices: ["logs-*","app-*"]
+            query: 'fields.pii:true AND @timestamp < now()-365d'
+      outputs:
+        inventoryRef: "mem://inventory.current"
+      guards:
+        dlpScan: true
+
+    # 2) Предпроверки: Legal Hold, ретеншен, канарейка
+    - id: "preflight"
+      action: "governance.preflight"
+      inputs:
+        inventoryRef: "mem://inventory.current"
+      guards:
+        legalHold: "deny-if-any"
+        retention: "deny-if-min-not-met"
+        canary: "1%"
+
+    # 3) Подготовка: квиес и снапшоты
+    - id: "prepare"
+      action: "consistency.quiesce"
+      inputs:
+        connectors: ["pg-main","mysql-billing","elasticsearch","s3-prod"]
+      options:
+        snapshot: true
+
+    # 4) Удаление в БД
+    - id: "db-erasure"
+      action: "erase.database"
+      mode: "ANONYMIZE"
+      steps:
+        - connector: "pg-main"
+          operations:
+            - table: "users"
+              set:
+                - column: "email"
+                  value: "{{ token('email') }}"
+                - column: "phone"
+                  value: "{{ mask('phone') }}"
+                - column: "name"
+                  value: "{{ token('name') }}"
+              where: "gdpr_erasure_request = true"
+            - table: "user_profiles"
+              set:
+                - column: "address"
+                  value: "{{ redact('ADDRESS') }}"
+              where: "user_id IN (SELECT id FROM users WHERE gdpr_erasure_request = true)"
+        - connector: "mysql-billing"
+          operations:
+            - table: "billing_events"
+              mode: "SOFT_DELETE"
+              set:
+                - column: "_deleted"
+                  value: "true"
+                - column: "_ttl"
+                  value: "{{ now() + duration('P90D') }}"
+              where: "user_id IN (SELECT id FROM map_ids)"
+
+    # 5) Объектное хранилище
+    - id: "objstore-erasure"
+      action: "erase.objectstore"
+      mode: "HARD_DELETE"
+      steps:
+        - connector: "s3-prod"
+          delete:
+            include: ["exports/**","user-data/**"]
+            versioned: true
+            multiPartParallel: 16
+            abortMultipartUploadsOlderThan: "P7D"
+        - connector: "minio-arch"
+          mode: "CRYPTO_SHRED"
+          keyScopes: ["kms://project/keywrap/archives/*"]
+          delete:
+            include: ["legacy/**"]
+
+    # 6) Поисковые индексы/логи
+    - id: "indexes-logs"
+      action: "erase.search-and-logs"
+      steps:
+        - connector: "elasticsearch"
+          deleteByQuery:
+            indices: ["app-*","logs-*"]
+            query: 'user_id IN {{ map_ids }} OR fields.pii:true'
+            refresh: true
+        - connector: "clickhouse-logs"
+          hardDelete:
+            database: "logs"
+            tables:
+              - name: "events"
+                where: "user_id IN {{ map_ids }} AND event_time < now()-interval 365 day"
+            optimizeFinal: true
+        - connector: "kafka-mail"
+          compactAndPurge:
+            topics: ["prod.mail.ingest"]
+            keys: "{{ map_ids }}"
+            retentionOverride: "P1D"
+
+    # 7) Верификация
+    - id: "verify"
+      action: "verify.post"
+      inputs:
+        inventoryRef: "mem://inventory.current"
+      checks:
+        - type: "existence"
+          expect: "absent"
+        - type: "index-consistency"
+        - type: "second-pass"
+      haltOnFailure: true
+
+    # 8) Сертификат и публикация результатов
+    - id: "certificate"
+      action: "report.certificate"
+      signWith: "kms://signing"
+      publish:
+        to:
+          - "s3://ov-prod-erasure/reports/"
+        notify: ["slack-erasure","email-erasure"]
+
+  safety:
+    denyIf:
+      - condition: "governance.legalHoldCheck.breakGlass.enabled == true"
+        reason: "Break-glass запрещён в prod."
+      - condition: "controls.blastRadius.maxTotalBytes > '2Ti'"
+        reason: "Превышение blast radius."
+    require:
+      - "governance.approvals.required >= 2"
+      - "governance.requireDryRunBeforeLive == true"
+
+  execution:
+    dryRun: true          # по умолчанию только симуляция
+    stopOnFirstError: true
+    continueOnNonCritical: ["SOFT_DELETE_rollback"]
+    timeouts:
+      perStep: "PT20M"
+      total: "PT6H"

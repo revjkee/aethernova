@@ -1,0 +1,328 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Наследуемся от базовых манифестов
+resources:
+  - ../../base
+
+# Пространство имен и единые метки/аннотации для продакшн
+namespace: neuroforge-prod
+namePrefix: nf-
+commonLabels:
+  app.kubernetes.io/part-of: neuroforge
+  app.kubernetes.io/environment: prod
+  ops.neuroforge.io/managed-by: kustomize
+commonAnnotations:
+  ops.neuroforge.io/change-cause: "prod rollout via kustomize"
+  # Жесткие Pod Security аннотации для namespace-scoped контроллеров, если требуется
+  # pod-security.kubernetes.io/enforce: "restricted"
+  # pod-security.kubernetes.io/enforce-version: "latest"
+
+# Образы пинутся по digest для детерминированности сборок
+images:
+  - name: ghcr.io/neuroforge/neuroforge-api
+    newName: ghcr.io/neuroforge/neuroforge-api
+    newTag: "1.0.0"
+    digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  - name: ghcr.io/neuroforge/neuroforge-workers
+    newName: ghcr.io/neuroforge/neuroforge-workers
+    newTag: "1.0.0"
+    digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+# Реплики по умолчанию для ключевых контроллеров
+replicas:
+  - name: neuroforge-api
+    count: 6
+  - name: neuroforge-workers
+    count: 5
+
+# Генераторы конфигов/секретов (prod overrides). behavior: merge — чтобы не ломать ключи из base.
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/environment: prod
+
+configMapGenerator:
+  - name: neuroforge-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=INFO
+      - FEATURE_FLAGS=stable
+      - METRICS_ENABLED=true
+      - TRACING_ENABLED=true
+      - TRACING_ENDPOINT=http://otel-collector.observability.svc:4318
+      - HTTP_READ_TIMEOUT=10s
+      - HTTP_WRITE_TIMEOUT=15s
+      - WORKER_CONCURRENCY=8
+  - name: neuroforge-api-nginx
+    behavior: merge
+    files:
+      - nginx.conf=files/nginx.prod.conf
+
+secretGenerator:
+  - name: neuroforge-secrets
+    behavior: merge
+    literals:
+      - JWT_AUDIENCE=neuroforge
+      - JWT_ISSUER=https://auth.neuroforge.local
+    envs:
+      - secrets/prod.env.enc.placeholder  # замените CI-дешифровкой перед сборкой
+  - name: neuroforge-db
+    behavior: merge
+    literals:
+      - DB_USER=neuroforge
+      - DB_NAME=neuroforge
+    envs:
+      - secrets/db.prod.env.enc.placeholder
+
+# Патчи production-уровня: ресурсы, пробки, security context, топология, логирование
+patches:
+  # 1) API Deployment: ресурсы, пробки, безопасность, topology spread
+  - target:
+      kind: Deployment
+      name: neuroforge-api
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: neuroforge-api
+        labels:
+          app.kubernetes.io/tier: web
+      spec:
+        revisionHistoryLimit: 10
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 1
+            maxSurge: 2
+        template:
+          metadata:
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "9090"
+              prometheus.io/path: "/metrics"
+              logging.neuroforge.io/format: "json"
+          spec:
+            automountServiceAccountToken: false
+            securityContext:
+              runAsNonRoot: true
+              fsGroup: 2000
+            containers:
+              - name: api
+                # image заменяется через images:
+                resources:
+                  requests:
+                    cpu: "500m"
+                    memory: "512Mi"
+                  limits:
+                    cpu: "2000m"
+                    memory: "1024Mi"
+                ports:
+                  - containerPort: 8080
+                    name: http
+                  - containerPort: 9090
+                    name: metrics
+                readinessProbe:
+                  httpGet: { path: /health/ready, port: http }
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  failureThreshold: 6
+                livenessProbe:
+                  httpGet: { path: /health/live, port: http }
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  runAsUser: 1001
+                  runAsGroup: 1001
+                  capabilities:
+                    drop: ["ALL"]
+                env:
+                  - name: ENV
+                    value: prod
+            nodeSelector:
+              node-pool: workload
+            tolerations:
+              - key: "workload"
+                operator: "Equal"
+                value: "high"
+                effect: "NoSchedule"
+            affinity:
+              podAntiAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 100
+                    podAffinityTerm:
+                      topologyKey: kubernetes.io/hostname
+                      labelSelector:
+                        matchLabels:
+                          app.kubernetes.io/name: neuroforge-core
+                          app.kubernetes.io/component: api
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: topology.kubernetes.io/zone
+                whenUnsatisfiable: ScheduleAnyway
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: neuroforge-core
+                    app.kubernetes.io/component: api
+
+  # 2) Workers StatefulSet: ресурсы, пробки, безопасность, persistent storage policy
+  - target:
+      kind: StatefulSet
+      name: neuroforge-workers
+    patch: |
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: neuroforge-workers
+        labels:
+          app.kubernetes.io/tier: backend
+      spec:
+        podManagementPolicy: Parallel
+        updateStrategy:
+          type: RollingUpdate
+        template:
+          metadata:
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "9100"
+              prometheus.io/path: "/metrics"
+              logging.neuroforge.io/format: "json"
+          spec:
+            serviceAccountName: neuroforge-workers
+            securityContext:
+              runAsNonRoot: true
+              fsGroup: 2001
+            containers:
+              - name: worker
+                resources:
+                  requests:
+                    cpu: "400m"
+                    memory: "512Mi"
+                  limits:
+                    cpu: "1500m"
+                    memory: "1536Mi"
+                ports:
+                  - containerPort: 9100
+                    name: metrics
+                readinessProbe:
+                  exec:
+                    command: ["sh","-c","/app/healthcheck ready"]
+                  initialDelaySeconds: 15
+                  periodSeconds: 10
+                livenessProbe:
+                  exec:
+                    command: ["sh","-c","/app/healthcheck live"]
+                  initialDelaySeconds: 45
+                  periodSeconds: 15
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  runAsUser: 1002
+                  runAsGroup: 1002
+                  capabilities:
+                    drop: ["ALL"]
+            nodeSelector:
+              node-pool: workload
+            tolerations:
+              - key: "batch"
+                operator: "Equal"
+                value: "yes"
+                effect: "NoSchedule"
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: neuroforge-core
+                        app.kubernetes.io/component: workers
+
+  # 3) Сервис API: жесткие таймауты и аннотации для ingress/балансировщика (если используется).
+  - target:
+      kind: Service
+      name: neuroforge-api
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: neuroforge-api
+        annotations:
+          service.kubernetes.io/topology-mode: "auto"
+          cloud.google.com/neg: '{"ingress": true}'
+          service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+      spec:
+        sessionAffinity: None
+
+  # 4) HPA (если в base есть HPA, можно подтюнить цели)
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: neuroforge-api
+    patch: |
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: neuroforge-api
+      spec:
+        minReplicas: 6
+        maxReplicas: 18
+        metrics:
+          - type: Resource
+            resource:
+              name: cpu
+              target:
+                type: Utilization
+                averageUtilization: 60
+          - type: Resource
+            resource:
+              name: memory
+              target:
+                type: Utilization
+                averageUtilization: 70
+
+  # 5) NetworkPolicy (если есть в base — ужесточить egress/ingress)
+  - target:
+      kind: NetworkPolicy
+      name: neuroforge-restrictive
+    patch: |
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: neuroforge-restrictive
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/part-of: neuroforge
+            app.kubernetes.io/environment: prod
+        policyTypes: ["Ingress","Egress"]
+        ingress:
+          - from:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: observability
+              - podSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: neuroforge-core
+        egress:
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: observability
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: database
+            ports:
+              - protocol: TCP
+                port: 5432
+              - protocol: TCP
+                port: 4318
+
+# Примечание:
+# - Значения digest следует обновлять при релизах.
+# - Параметры HPA/replicas согласуйте с SLO и емкостью кластера.
+# - Секреты *.enc.placeholder предполагают дешифровку/замену на этапе CI перед билдом kustomize.

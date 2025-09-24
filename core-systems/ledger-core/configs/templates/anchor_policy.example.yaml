@@ -1,0 +1,441 @@
+# ledger-core/ops/templates/anchor_policy.example.yaml
+# Набор "якорных" Kyverno ClusterPolicy/Policy для безопасности и выпусков ledger-core.
+# Требования: Kyverno >= 1.9 (validate.verifyImages, attestors, generate).
+# Замените плейсхолдеры вида <...> под ваш стек (реестры, ключи, домены, каналы).
+
+# -----------------------------------------------------------------------------
+# 0) Базовые метки и селекторы окружения
+#   Принято: namespace с меткой env=prod считается продом. Измените при необходимости.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# 1) Supply-chain: проверка подписи контейнерных образов cosign по публичному ключу (base64 / k8s secret)
+#   Применяется ко всем Deployment/StatefulSet/Job/CronJob в namespace с label app=ledger-core-*
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify signed images
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  webhooks:
+    - timeoutSeconds: 10
+  rules:
+    - name: check-cosign-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - DaemonSet
+                - Job
+                - CronJob
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/part-of
+                    operator: In
+                    values: ["ledger-core"]
+      verifyImages:
+        - imageReferences:
+            - "<REGISTRY>/<ORG>/ledger-core*"
+            - "<REGISTRY>/<ORG>/aux/*"
+          attestors:
+            - entries:
+                - keys:
+                    # Публичный ключ cosign (PEM). Альтернатива — k8s секрет.
+                    publicKeys: |
+                      -----BEGIN PUBLIC KEY-----
+                      <COSIGN_PUBLIC_KEY_PEM>
+                      -----END PUBLIC KEY-----
+          required: true
+          mutateDigest: false
+
+# -----------------------------------------------------------------------------
+# 2) Supply-chain: запрет тегов :latest и требование семвер‑тегов (semver) вне prod допускается digest или теги‑префиксы
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-and-enforce-tags
+  annotations:
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-latest
+      match:
+        any:
+          - resources:
+              kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/part-of
+                    operator: In
+                    values: ["ledger-core"]
+      validate:
+        message: "Запрещено использовать тег :latest. Укажите конкретную версию или digest."
+        pattern:
+          spec:
+            containers:
+              - image: "!*/latest"
+            =(initContainers):
+              - image: "!*/latest"
+    - name: enforce-semver-tags-nonprod
+      preconditions:
+        any:
+          - key: "{{ request.namespace | to_string(@) | namespace_labels('env') }}"
+            operator: AnyIn
+            value: ["dev","staging","test"]
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector:
+                matchLabels:
+                  app.kubernetes.io/part-of: "ledger-core"
+      validate:
+        message: "Теги образов должны соответствовать семвер (x.y.z[-suffix]) или быть digest (@sha256:...)."
+        foreach:
+          - list: "request.object.spec.template.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: AnyNotIn
+                    value:
+                      - "@*"
+                      - "*/v*.*.*"
+                      - "*/[0-9]*.[0-9]*.[0-9]*"
+
+# -----------------------------------------------------------------------------
+# 3) Supply-chain: allowlist реестров
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: allowed-image-registries
+  annotations:
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: only-allowed-registries
+      match:
+        any:
+          - resources:
+              kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+      validate:
+        message: "Разрешены только реестры: <REGISTRY>, ghcr.io/<ORG>, public.ecr.aws/<ALIAS>"
+        foreach:
+          - list: "request.object.spec.template.spec.containers[].image"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ elements }}"
+                    operator: AllNotIn
+                    value:
+                      - "<REGISTRY>/"
+                      - "ghcr.io/<ORG>/"
+                      - "public.ecr.aws/<ALIAS>/"
+
+# -----------------------------------------------------------------------------
+# 4) Эксплуатация: probes обязательны для контейнеров ledger-core*
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-probes
+  annotations:
+    policies.kyverno.io/category: Operations
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: containers-must-have-probes
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment","StatefulSet"]
+              selector:
+                matchLabels:
+                  app.kubernetes.io/name: "ledger-core"
+      validate:
+        message: "livenessProbe и readinessProbe обязательны."
+        pattern:
+          spec:
+            template:
+              spec:
+                containers:
+                  - livenessProbe: {}
+                    readinessProbe: {}
+
+# -----------------------------------------------------------------------------
+# 5) Эксплуатация: обязательные requests/limits CPU/Memory
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-requests-limits
+  annotations:
+    policies.kyverno.io/category: Operations
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: req-limits
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/part-of
+                    operator: In
+                    values: ["ledger-core"]
+      validate:
+        message: "Укажите resources.requests/limits для CPU и memory."
+        foreach:
+          - list: "request.object.spec.template.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.resources.requests.cpu || '' }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.requests.memory || '' }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.limits.cpu || '' }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ element.resources.limits.memory || '' }}"
+                    operator: Equals
+                    value: ""
+
+# -----------------------------------------------------------------------------
+# 6) Безопасность: запрет привилегий, hostPID/IPC/Network, hostPath; строгий securityContext
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: hardened-security-context
+  annotations:
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: disallow-privilege-escalation-and-host
+      match:
+        any:
+          - resources:
+              kinds: ["Pod","Deployment","StatefulSet","Job","CronJob","DaemonSet"]
+      validate:
+        message: "Запрещены привилегии, hostPID/IPC/Network, hostPath; требуется runAsNonRoot, seccompProfile=RuntimeDefault."
+        pattern:
+          spec:
+            =(hostPID): "false"
+            =(hostIPC): "false"
+            =(hostNetwork): "false"
+            =(volumes):
+              - X(hostPath): "null"
+            securityContext:
+              seccompProfile:
+                type: "RuntimeDefault"
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
+                  runAsUser: "> 0"
+                  capabilities:
+                    drop:
+                      - "ALL"
+                  readOnlyRootFilesystem: true
+            =(initContainers):
+              - securityContext:
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
+                  capabilities:
+                    drop:
+                      - "ALL"
+
+# -----------------------------------------------------------------------------
+# 7) Сеть: автогенерация default‑deny NetworkPolicy для каждого namespace ledger-core (если нет)
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ensure-default-deny-netpol
+  annotations:
+    policies.kyverno.io/category: Network
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Audit
+  generateExistingOnPolicyUpdate: true
+  rules:
+    - name: generate-default-deny
+      match:
+        any:
+          - resources:
+              kinds: ["Namespace"]
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/part-of
+                    operator: In
+                    values: ["ledger-core"]
+      generate:
+        kind: NetworkPolicy
+        name: default-deny
+        namespace: "{{ request.object.metadata.name }}"
+        synchronize: true
+        data:
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: default-deny
+            labels:
+              app.kubernetes.io/part-of: ledger-core
+          spec:
+            podSelector: {}
+            policyTypes: ["Ingress","Egress"]
+
+# -----------------------------------------------------------------------------
+# 8) Prod‑усиления: в prod требуем запуск образов ТОЛЬКО по digest (@sha256:...), запрещаем Service: LoadBalancer
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: prod-pin-digest-and-disallow-lb
+  annotations:
+    policies.kyverno.io/category: Production Guardrails
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: prod-images-must-be-digest
+      preconditions:
+        all:
+          - key: "{{ request.namespace | to_string(@) | namespace_labels('env') }}"
+            operator: Equals
+            value: "prod"
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment","StatefulSet","Job","CronJob"]
+      validate:
+        message: "В prod разрешены только образы, зафиксированные по digest (@sha256:...)."
+        foreach:
+          - list: "request.object.spec.template.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: ".*@sha256:[a-f0-9]{64}$"
+    - name: disallow-lb-in-prod
+      preconditions:
+        all:
+          - key: "{{ request.namespace | to_string(@) | namespace_labels('env') }}"
+            operator: Equals
+            value: "prod"
+      match:
+        any:
+          - resources:
+              kinds: ["Service"]
+      validate:
+        message: "В prod запрещён Service type=LoadBalancer (используйте Ingress/ServiceMesh)."
+        pattern:
+          spec:
+            type: "!LoadBalancer"
+
+# -----------------------------------------------------------------------------
+# 9) Prod‑усиления: ConfigMap должен быть immutable=true (для критичных конфигов)
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: prod-immutable-configmap
+  annotations:
+    policies.kyverno.io/category: Production Guardrails
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: cm-immutable
+      preconditions:
+        all:
+          - key: "{{ request.namespace | to_string(@) | namespace_labels('env') }}"
+            operator: Equals
+            value: "prod"
+      match:
+        any:
+          - resources:
+              kinds: ["ConfigMap"]
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/part-of
+                    operator: In
+                    values: ["ledger-core"]
+      validate:
+        message: "ConfigMap для prod должен быть immutable=true."
+        pattern:
+          immutable: true
+
+# -----------------------------------------------------------------------------
+# 10) Prod‑усиления: обязательные PodDisruptionBudget и PDB‑minAvailable >= 1 для приложений
+# -----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-pdb-in-prod
+  annotations:
+    policies.kyverno.io/category: Reliability
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: ensure-pdb
+      preconditions:
+        all:
+          - key: "{{ request.namespace | to_string(@) | namespace_labels('env') }}"
+            operator: Equals
+            value: "prod"
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment","StatefulSet"]
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/part-of
+                    operator: In
+                    values: ["ledger-core"]
+      generate:
+        kind: PodDisruptionBudget
+        name: "{{ request.object.metadata.name }}-pdb"
+        namespace: "{{ request.namespace }}"
+        synchronize: false
+        data:
+          apiVersion: policy/v1
+          kind: PodDisruptionBudget
+          metadata:
+            name: "{{ request.object.metadata.name }}-pdb"
+            labels:
+              app.kubernetes.io/part-of: ledger-core
+          spec:
+            minAvailable: 1
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: "{{ request.object.metadata.labels['app.kubernetes.io/name'] || request.object.metadata.name }}"

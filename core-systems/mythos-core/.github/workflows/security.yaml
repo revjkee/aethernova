@@ -1,0 +1,251 @@
+# mythos-core/.github/workflows/security.yaml
+name: Security CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 2 * * *"  # Ежедневный ночной прогон
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  RUFF_OUTPUT_FORMAT: github
+  PYTHON_DEFAULT: "3.11"
+
+jobs:
+  codeql:
+    name: CodeQL (python)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: +security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: CodeQL Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Semgrep Scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          publishToken: ${{ secrets.SEMGREP_APP_TOKEN }}
+          generateSarif: "1"
+          config: >
+            p/ci
+            p/python
+            p/security-audit
+          sarifFile: semgrep.sarif
+        env:
+          SEMGREP_TIMEOUT: "600"
+
+      - name: Upload SARIF to Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+  secrets:
+    name: gitleaks (secrets)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_SARIF: "true"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+
+  deps_audit:
+    name: Dependencies audit (pip-audit + SBOM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: "pip"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit cyclonedx-bom
+
+      - name: Resolve dependencies (no install fail)
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt || true; fi
+
+      - name: pip-audit (SARIF)
+        run: |
+          pip-audit -r requirements.txt -f sarif -o pip-audit.sarif || true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pip-audit.sarif
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          cyclonedx-bom -e -o sbom.json || true
+        continue-on-error: true
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.json
+          retention-days: 7
+
+  ruff_bandit:
+    name: Ruff + Bandit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [ "3.10", "3.11", "3.12" ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff bandit sarif-tools
+
+      - name: Ruff Lint (SARIF)
+        run: |
+          ruff check --output-format sarif --output ruff.sarif .
+        continue-on-error: true
+
+      - name: Upload Ruff SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ruff.sarif
+
+      - name: Bandit (SARIF)
+        run: |
+          bandit -r . -f sarif -o bandit.sarif || true
+
+      - name: Upload Bandit SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+
+  trivy:
+    name: Trivy FS + SBOM vuln
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy FS scan (SARIF)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: true
+
+      - name: Upload Trivy FS SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+      - name: Trivy SBOM vuln (if SBOM exists)
+        if: ${{ always() }}
+        run: |
+          if [ -f sbom.json ]; then
+            trivy sbom --format sarif --output trivy-sbom.sarif sbom.json || true
+          fi
+        shell: bash
+
+      - name: Upload Trivy SBOM SARIF
+        if: ${{ hashFiles('trivy-sbom.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-sbom.sarif
+
+  summary:
+    name: Summary Gate
+    runs-on: ubuntu-24.04
+    needs: [ codeql, semgrep, secrets, deps_audit, ruff_bandit, trivy ]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Conclude
+        run: |
+          echo "Security workflow completed. Review Security tab for SARIF findings."

@@ -1,0 +1,113 @@
+{{- /*
+datafabric-core / ops / helm / datafabric-core / templates / pdb.yaml
+
+Значения (пример):
+
+pdb:
+  enabled: true
+  default:
+    policy: minAvailable         # или "maxUnavailable"
+    value: "60%"                 # строка (процент) или число
+    labels: {}                   # доп. метки по умолчанию
+    annotations: {}              # доп. аннотации по умолчанию
+  components:
+    app:
+      enabled: true
+      policy: minAvailable
+      value: "60%"
+      labels:
+        app.kubernetes.io/component: api
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: datafabric-core
+          app.kubernetes.io/component: api
+    postgres:
+      enabled: true
+      value: 1
+      labels:
+        app.kubernetes.io/component: postgres
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/component: db
+    redis:
+      enabled: true
+      value: 1
+      labels:
+        app.kubernetes.io/component: redis
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: redis
+          app.kubernetes.io/component: cache
+*/ -}}
+{{- if and .Values.pdb .Values.pdb.enabled .Values.pdb.components }}
+
+{{- $release := .Release.Name -}}
+{{- $chartName := .Chart.Name | default "chart" -}}
+
+{{- range $name, $cfg := .Values.pdb.components }}
+{{- if and $cfg $cfg.enabled }}
+
+{{- /* Вытаскиваем политику и значение с учётом pdb.default */ -}}
+{{- $policy := (default (default "minAvailable" $.Values.pdb.default.policy) $cfg.policy) -}}
+{{- $value  := (default (default "1" $.Values.pdb.default.value)  $cfg.value) -}}
+
+{{- /* Формируем метки: рекомендованные + per-component + пользовательские */ -}}
+{{- $baseLabels := dict
+      "app.kubernetes.io/name" $chartName
+      "app.kubernetes.io/instance" $release
+      "app.kubernetes.io/managed-by" "Helm"
+      "app.kubernetes.io/part-of" "datafabric"
+      "app.kubernetes.io/component" $name -}}
+{{- $userDefaultLabels := (default dict $.Values.pdb.default.labels) -}}
+{{- $userLabels := (default dict $cfg.labels) -}}
+{{- $labels := merge (dict) $baseLabels $userDefaultLabels $userLabels -}}
+
+{{- /* Аннотации: по умолчанию + пользовательские */ -}}
+{{- $userDefaultAnn := (default dict $.Values.pdb.default.annotations) -}}
+{{- $userAnn := (default dict $cfg.annotations) -}}
+{{- $annotations := merge (dict) $userDefaultAnn $userAnn -}}
+
+{{- /* Селектор обязателен */ -}}
+{{- $selector := (default dict $cfg.selector) -}}
+{{- if not $selector }}
+  {{- fail (printf "pdb.components.%s.selector is required" $name) -}}
+{{- end }}
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ printf "%s-%s-pdb" $release $name | trunc 63 | trimSuffix "-" }}
+  labels:
+{{- range $k, $v := $labels }}
+    {{ $k }}: {{ $v | quote }}
+{{- end }}
+{{- if $annotations }}
+  annotations:
+{{- range $k, $v := $annotations }}
+    {{ $k }}: {{ $v | quote }}
+{{- end }}
+{{- end }}
+spec:
+{{- /* Выбор между minAvailable и maxUnavailable + правильная типизация числа/строки */}}
+  {{- if eq $policy "maxUnavailable" }}
+  {{- if kindIs "int" $value }}
+  maxUnavailable: {{ $value }}
+  {{- else }}
+  maxUnavailable: {{ $value | quote }}
+  {{- end }}
+  {{- else }}
+  {{- if kindIs "int" $value }}
+  minAvailable: {{ $value }}
+  {{- else }}
+  minAvailable: {{ $value | quote }}
+  {{- end }}
+  {{- end }}
+  selector:
+{{- toYaml $selector | nindent 4 }}
+
+{{- end }} {{/* component enabled */}}
+{{- end }} {{/* range components */}}
+
+{{- end }} {{/* global enabled */}}

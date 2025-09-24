@@ -1,0 +1,127 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Наследуем базовые манифесты сервиса
+resources:
+  - ../../base
+
+# Продакшен‑контекст
+namespace: veilmind-prod
+namePrefix: prod-
+
+commonLabels:
+  app.kubernetes.io/part-of: veilmind-core
+  app.kubernetes.io/environment: production
+  app.kubernetes.io/instance: veilmind-api-prod
+
+commonAnnotations:
+  veilmind.io/change-log: "prod overlay: hardened securityContext, replicas=5, HPA tuned, image pinned by digest"
+  veilmind.io/owner: "platform-team"
+  veilmind.io/tier: "backend"
+
+buildMetadata:
+  - managedByLabel
+
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+
+# Реплики на уровне оверлея (дубль безопасности к патчу)
+replicas:
+  - name: veilmind-api
+    count: 5
+
+# Переопределение образа: детерминированный digest (рекомендуется вместо тега)
+images:
+  - name: ghcr.io/your-org/veilmind-api
+    newName: ghcr.io/your-org/veilmind-api
+    # Используйте только digest для SLSA/Provenance-пиннинга. newTag можно не задавать.
+    digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+# Дополнительные метки к объектам и селекторам (более точный контроль)
+labels:
+  - includeSelectors: true
+    includeTemplates: true
+    pairs:
+      workload.veilmind.io/profile: hardened
+
+# Inline‑патчи JSON6902: ужесточение Deployment, настройка HPA и PDB
+patches:
+  # 1) Ужесточаем Deployment: безопасность, ресурсы, spread, envFrom
+  - target:
+      version: v1
+      kind: Deployment
+      name: veilmind-api
+    patch: |-
+      - op: add
+        path: /spec/replicas
+        value: 5
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          fsGroupChangePolicy: "OnRootMismatch"
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: veilmind-api
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+      - op: add
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: veilmind-api-config
+          # Секреты должны приходить из внешнего секрет‑менеджера (ExternalSecret/SealedSecret)
+          # - secretRef:
+          #     name: veilmind-api-secrets
+
+  # 2) Тюнинг HPA из базы: min/max и стабилизация scaleDown
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: veilmind-api-hpa
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 5
+      - op: replace
+        path: /spec/maxReplicas
+        value: 100
+      - op: replace
+        path: /spec/behavior/scaleDown/stabilizationWindowSeconds
+        value: 600  # 10 минут сглаживания на снижение
+
+  # 3) PDB: гарантируем наличие как минимум 2 Pod при эвакуациях
+  - target:
+      group: policy
+      version: v1
+      kind: PodDisruptionBudget
+      name: veilmind-api-pdb
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 2

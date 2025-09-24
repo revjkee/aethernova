@@ -1,0 +1,103 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ns-enforce-owner-tenant-labels
+  labels:
+    app.kubernetes.io/part-of: aethernova-chain-core
+    app.kubernetes.io/component: kyverno-policy
+    app.kubernetes.io/name: enforce-namespace-owner-labels
+    policy.aethernova.io/tier: multitenancy
+    policy.aethernova.io/domain: namespaces
+  annotations:
+    policies.kyverno.io/title: Enforce Namespace Owner/Tenant Labels
+    policies.kyverno.io/category: Multitenancy, Governance
+    policies.kyverno.io/subject: Namespace,Label
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >
+      Require and lock down owner/tenant labels on Namespaces. Enforces presence
+      and Kubernetes-compliant format for label values; prevents later changes/removal.
+spec:
+  validationFailureAction: Enforce     # block violating requests
+  failurePolicy: Fail                  # fail-closed on webhook errors
+  background: false                    # uses AdmissionReview-only variables (request.*, oldObject)
+
+  rules:
+    # 1) Требуем обязательные метки и корректный формат (соответствие правилам K8s label value)
+    - name: require-owner-tenant-labels
+      match:
+        any:
+          - resources:
+              kinds: ["Namespace"]
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - kyverno
+                - gatekeeper-system
+                - cert-manager
+                - istio-system
+                - linkerd
+                - monitoring
+                - logging
+                - flux-system
+                - velero
+                - metallb-system
+                - karpenter
+      validate:
+        message: >
+          Namespace must define labels 'owner', 'tenant', and 'cost-center'
+          with Kubernetes-compliant values (1..63 chars, start/end alphanumeric; '-', '_' and '.' allowed).
+        deny:
+          conditions:
+            any:
+              # Отсутствует owner | tenant | cost-center
+              - key: "{{ request.object.metadata.labels.owner || '' }}"
+                operator: Equals
+                value: ""
+              - key: "{{ request.object.metadata.labels.tenant || '' }}"
+                operator: Equals
+                value: ""
+              - key: "{{ request.object.metadata.labels.\"cost-center\" || '' }}"
+                operator: Equals
+                value: ""
+              # Неверный формат значения по regex K8s label value (1..63, допустимые символы)
+              - key: "{{ regex_match('^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$', '{{request.object.metadata.labels.owner || \"\"}}') }}"
+                operator: Equals
+                value: false
+              - key: "{{ regex_match('^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$', '{{request.object.metadata.labels.tenant || \"\"}}') }}"
+                operator: Equals
+                value: false
+              - key: "{{ regex_match('^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$', '{{request.object.metadata.labels.\"cost-center\" || \"\"}}') }}"
+                operator: Equals
+                value: false
+
+    # 2) Делаем ключевые метки неизменяемыми после создания: запрещаем изменение/удаление owner/tenant/cost-center
+    - name: immutable-owner-tenant-labels
+      match:
+        any:
+          - resources:
+              kinds: ["Namespace"]
+      validate:
+        message: >
+          Labels 'owner', 'tenant', and 'cost-center' are immutable for Namespaces.
+        deny:
+          conditions:
+            all:
+              # Применяется только на UPDATE
+              - key: "{{ request.operation }}"
+                operator: Equals
+                value: UPDATE
+              # Изменение или удаление любой из меток
+              - any:
+                  - key: "{{ (request.oldObject.metadata.labels.owner || '') != (request.object.metadata.labels.owner || '') }}"
+                    operator: Equals
+                    value: true
+                  - key: "{{ (request.oldObject.metadata.labels.tenant || '') != (request.object.metadata.labels.tenant || '') }}"
+                    operator: Equals
+                    value: true
+                  - key: "{{ (request.oldObject.metadata.labels.\"cost-center\" || '') != (request.object.metadata.labels.\"cost-center\" || '') }}"
+                    operator: Equals
+                    value: true

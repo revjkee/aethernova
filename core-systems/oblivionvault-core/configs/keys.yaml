@@ -1,0 +1,299 @@
+apiVersion: oblivionvault.io/v1
+kind: KeyManifest
+metadata:
+  name: keys
+  env: prod
+  cluster: oblivionvault-prod
+  labels:
+    app.kubernetes.io/managed-by: gitops
+    app.kubernetes.io/part-of: oblivionvault-core
+    env: prod
+    security.tier: critical
+
+x-rotation-defaults: &rotation_defaults
+  interval_days: 90
+  jitter_percent: 10
+  window_utc:
+    day_of_week: "Sun"
+    start: "02:00"
+    duration: "PT60M"
+
+x-access-defaults: &access_defaults
+  allowed_callers:
+    - ns/oblivionvault/auth:sa/jwt-signer
+    - ns/oblivionvault/api:sa/api-gateway
+    - ns/oblivionvault/jobs:sa/crypto-rotator
+  deny_raw_export: true
+  approval:
+    dual_control: true
+    m_out_of_n: "2/3"
+    custodians:
+      - user: security-lead@oblivionvault.io
+      - user: ciso@oblivionvault.io
+      - user: sre-lead@oblivionvault.io
+
+spec:
+  storage:
+    strategy: sops+sealed-secrets
+    providers:
+      - name: primary-kms
+        type: aws-kms
+        region: eu-north-1
+        key_arn: "arn:aws:kms:eu-north-1:000000000000:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        grants:
+          - role: arn:aws:iam::000000000000:role/ov-auth-jwt-signer
+          - role: arn:aws:iam::000000000000:role/ov-crypto-rotator
+      - name: hsm-signing
+        type: pkcs11-hsm
+        vendor: generic
+        module_path: "/usr/local/lib/softhsm/libsofthsm2.so"
+        slot_label: "OV-HSM-SLOT-1"
+      - name: vault-transit
+        type: hashicorp-vault
+        address: "https://vault.security.svc.cluster.local:8200"
+        mount: "transit"
+        role: "ov-transit"
+
+  observability:
+    audit_spans_otlp:
+      endpoint: "otel-gateway.observability.svc.cluster.local:4317"
+      protocol: grpc
+    emit_metrics: true
+    labels:
+      env: prod
+      cluster: oblivionvault-prod
+
+  compliance:
+    standards:
+      - iso27001
+      - soc2
+      - cis-k8s
+    key_usage_logging: required
+    retention_days:
+      audit_logs: 365
+      key_versions: 180
+    export_controls:
+      raw_private_material: prohibited
+
+  breakglass:
+    conditions:
+      - type: outage
+      - type: incident-p1
+    timeout: "PT15M"
+    approvers_required: 2
+    notify:
+      pagerduty_service: "oblivionvault-security"
+      email: "security-incident@oblivionvault.io"
+
+  rotation_policies:
+    default: *rotation_defaults
+    overrides:
+      jwt-access:
+        interval_days: 60
+        <<: *rotation_defaults
+      mtls-ca-root:
+        interval_days: 3650
+        jitter_percent: 0
+        window_utc:
+          day_of_week: "Sun"
+          start: "03:30"
+          duration: "PT120M"
+
+  keysets:
+    - name: jwt-access
+      purpose: signing
+      description: "Подпись access JWT (EdDSA)"
+      algorithms:
+        allowed: ["Ed25519"]
+        current: "Ed25519"
+      provider_ref: hsm-signing
+      access: *access_defaults
+      publish:
+        jwks:
+          enabled: true
+          jwks_uri: "https://auth.oblivionvault.io/.well-known/jwks.json"
+          cache_control: "public, max-age=300"
+          audiences: ["webapp", "mobile", "service"]
+      lifecycle:
+        current:
+          kid: "ed25519-2025-08-01"
+          created_at: "2025-08-01T00:00:00Z"
+          not_after: "2025-11-01T00:00:00Z"
+        next:
+          scheduled_at: "2025-10-15T00:00:00Z"
+        previous:
+          retain_until: "2025-12-01T00:00:00Z"
+      audit:
+        sign_context_required:
+          - "sub"
+          - "aud"
+          - "exp"
+
+    - name: jwt-refresh
+      purpose: signing
+      description: "Подпись refresh JWT (RS256 для широкой совместимости)"
+      algorithms:
+        allowed: ["RS256", "PS256"]
+        current: "RS256"
+        parameters:
+          modulus_bits_min: 3072
+      provider_ref: primary-kms
+      access: *access_defaults
+      publish:
+        jwks:
+          enabled: true
+          jwks_uri: "https://auth.oblivionvault.io/.well-known/jwks.json"
+          cache_control: "public, max-age=300"
+      lifecycle:
+        current:
+          kid: "rsa-3072-2025-07-01"
+          created_at: "2025-07-01T00:00:00Z"
+          not_after: "2026-01-01T00:00:00Z"
+
+    - name: data-envelope
+      purpose: encryption
+      description: "Конвертное шифрование данных (AES-256-GCM, DEK через KMS)"
+      algorithms:
+        allowed: ["AES-256-GCM"]
+        current: "AES-256-GCM"
+      provider_ref: primary-kms
+      envelope:
+        dek_cache_ttl: "10m"
+        aad:
+          - "env=prod"
+          - "cluster=oblivionvault-prod"
+      access:
+        <<: *access_defaults
+        allowed_callers:
+          - ns/oblivionvault/api:sa/storage
+          - ns/oblivionvault/batch:sa/etl
+      lifecycle:
+        current:
+          kid: "kek-2025-06-01"
+          created_at: "2025-06-01T00:00:00Z"
+          not_after: "2025-09-01T00:00:00Z"
+
+    - name: mtls-ca-root
+      purpose: x509-ca
+      description: "Корневой CA для mTLS"
+      provider_ref: hsm-signing
+      x509:
+        path_refs:
+          root_cert: "secrets://security/mtls/ca-root.pem"
+          root_key: "hsm://slot/OV-HSM-SLOT-1/key/ca-root"
+        profiles:
+          server:
+            expiry: "2160h"
+            usages: ["digital signature", "key encipherment", "server auth"]
+          client:
+            expiry: "2160h"
+            usages: ["digital signature", "client auth"]
+      lifecycle:
+        current:
+          kid: "ca-root-2025-01-10"
+          created_at: "2025-01-10T00:00:00Z"
+          not_after: "2035-01-10T00:00:00Z"
+
+    - name: db-tde
+      purpose: encryption
+      description: "Ключи TDE для БД (PostgreSQL/ClickHouse), управление через Vault Transit"
+      algorithms:
+        allowed: ["AES-256-GCM"]
+        current: "AES-256-GCM"
+      provider_ref: vault-transit
+      access:
+        <<: *access_defaults
+        allowed_callers:
+          - ns/oblivionvault/db:sa/postgres
+          - ns/oblivionvault/analytics:sa/clickhouse
+      lifecycle:
+        current:
+          kid: "tde-2025-05-20"
+          created_at: "2025-05-20T00:00:00Z"
+          not_after: "2025-11-20T00:00:00Z"
+
+    - name: pii-tokenization
+      purpose: tokenization
+      description: "Псевдонимизация/токенизация PII (FPE FF3-1)"
+      algorithms:
+        allowed: ["FF3-1-AES-256"]
+        current: "FF3-1-AES-256"
+      provider_ref: primary-kms
+      policy:
+        format_preserving:
+          radix: 10
+          tweak_source: "ns/oblivionvault/jobs:sa/tokenizer"
+      access: *access_defaults
+      lifecycle:
+        current:
+          kid: "fpe-2025-07-15"
+          created_at: "2025-07-15T00:00:00Z"
+          not_after: "2025-10-15T00:00:00Z"
+
+    - name: backup-velero
+      purpose: encryption
+      description: "Шифрование артефактов Velero в S3"
+      algorithms:
+        allowed: ["AES-256-GCM"]
+        current: "AES-256-GCM"
+      provider_ref: primary-kms
+      access:
+        <<: *access_defaults
+        allowed_callers:
+          - ns/backup:sa/velero
+      lifecycle:
+        current:
+          kid: "velero-2025-06-30"
+          created_at: "2025-06-30T00:00:00Z"
+          not_after: "2025-12-30T00:00:00Z"
+
+  hashing:
+    password:
+      algorithm: argon2id
+      params:
+        time_cost: 3
+        memory_kib: 65536
+        parallelism: 1
+        salt_len: 16
+        hash_len: 32
+
+  jwks_publish:
+    source_keysets: ["jwt-access", "jwt-refresh"]
+    push:
+      enabled: true
+      endpoint: "https://auth.oblivionvault.io/.well-known/jwks.json"
+      method: PUT
+      auth: workload-identity
+      cache_ttl: "300s"
+
+  validation:
+    required_fields:
+      - spec.storage.providers[*].name
+      - spec.keysets[*].algorithms.current
+      - spec.keysets[*].provider_ref
+    deny:
+      - raw_private_material
+    lint:
+      algorithms:
+        - Ed25519
+        - RS256
+        - PS256
+        - AES-256-GCM
+        - FF3-1-AES-256
+
+checksums:
+  manifest_sha256: "AUTO"
+  last_validated_at: "AUTO"
+
+# ВНИМАНИЕ:
+# 1) Этот файл — декларация и политики. Приватные ключи не размещаются здесь.
+# 2) Используйте SOPS/Sealed-Secrets/Vault для секций, где требуются секретные значения.
+# 3) Пример SOPS-заголовка (скелет), замените RECIPIENTS и интеграции на реальные.
+sops:
+  kms: []
+  gcp_kms: []
+  azure_kv: []
+  age:
+    - recipient: "age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  lastmodified: "2025-08-25T00:00:00Z"
+  mac: "ENC[AES256_GCM,data:REDACTED,iv:REDACTED,tag:REDACTED,type:str]"

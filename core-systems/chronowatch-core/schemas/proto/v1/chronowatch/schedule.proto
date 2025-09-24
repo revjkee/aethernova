@@ -1,0 +1,422 @@
+syntax = "proto3";
+
+package chronowatch.v1;
+
+option csharp_namespace = "Chronowatch.V1";
+option go_package = "github.com/aethernova/chronowatch-core/gen/go/chronowatch/v1;chronowatchv1";
+option java_multiple_files = true;
+option java_package = "com.aethernova.chronowatch.v1";
+option java_outer_classname = "ScheduleProto";
+option php_namespace = "Chronowatch\\V1";
+option ruby_package = "Chronowatch::V1";
+
+// Well-known types
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+// Тип расписания (дискриминатор oneof-a)
+enum ScheduleType {
+  SCHEDULE_TYPE_UNSPECIFIED = 0;
+  SCHEDULE_TYPE_CRON = 1;
+  SCHEDULE_TYPE_INTERVAL = 2;
+  SCHEDULE_TYPE_ONE_OFF = 3;
+  SCHEDULE_TYPE_CALENDAR = 4;
+}
+
+// Политика конкуренции при одновременных запусках.
+enum ConcurrencyPolicy {
+  CONCURRENCY_POLICY_UNSPECIFIED = 0;
+  CONCURRENCY_FORBID = 1;   // новый запуск отклоняется, если пред. ещё идёт
+  CONCURRENCY_REPLACE = 2;   // текущий прерывается, новый стартует
+  CONCURRENCY_ALLOW = 3;     // разрешить параллельные инстансы
+}
+
+// Политика обработки пропущенных запусков (misfire).
+enum MisfirePolicy {
+  MISFIRE_POLICY_UNSPECIFIED = 0;
+  MISFIRE_FIRE_NOW = 1;        // немедленно выполнить один догоняющий запуск
+  MISFIRE_SKIP = 2;            // пропустить
+  MISFIRE_CATCH_UP_ALL = 3;    // догнать все пропуски (осторожно с нагрузкой)
+}
+
+// Приоритет задания (может влиять на планировщик/очереди).
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_NORMAL = 2;
+  PRIORITY_HIGH = 3;
+  PRIORITY_CRITICAL = 4;
+}
+
+// Текущий статус расписания.
+enum ScheduleStatus {
+  SCHEDULE_STATUS_UNSPECIFIED = 0;
+  SCHEDULE_ACTIVE = 1;
+  SCHEDULE_PAUSED = 2;
+  SCHEDULE_COMPLETED = 3;  // истекло окно/one-off выполнен
+  SCHEDULE_DISABLED = 4;   // отключено администратором/kill-switch
+}
+
+// -----------------------------------------------------------------------------
+// CORE MESSAGES
+// -----------------------------------------------------------------------------
+
+// Основной ресурс расписания.
+message Schedule {
+  // Идентификатор ресурса в стиле REST:
+  // "schedules/{schedule_id}" или "tenants/{tenant_id}/schedules/{schedule_id}"
+  string name = 1;
+
+  // Короткий человекочитаемый идентификатор/алиас (уникален в рамках tenant).
+  string uid = 2;
+
+  // Метка ревизии для опт. блокировок (If-Match/If-None-Match).
+  string etag = 3;
+
+  // Метаданные и метки.
+  map<string, string> labels = 4;
+  map<string, string> annotations = 5;
+
+  // Тип расписания и конкретное определение.
+  ScheduleType type = 6;
+
+  oneof definition {
+    CronSchedule cron = 7;
+    IntervalSchedule interval = 8;
+    OneOffSchedule one_off = 9;
+    CalendarSchedule calendar = 10;
+  }
+
+  // Ограничения и политики.
+  ConcurrencyPolicy concurrency_policy = 11;
+  MisfirePolicy misfire_policy = 12;
+  Priority priority = 13;
+
+  // Политика таймзон.
+  TimezonePolicy timezone = 14;
+
+  // Политика ретраев при неуспехе запуска.
+  RetryPolicy retry_policy = 15;
+
+  // Доп. параметры задания (передаются исполнителю).
+  google.protobuf.Struct payload = 16;
+
+  // Временные окна валидности расписания.
+  repeated Window active_windows = 17;
+
+  // Джиттер (случайное смещение для сглаживания пиков).
+  JitterPolicy jitter = 18;
+
+  // Статус и служебные поля.
+  ScheduleStatus status = 19;
+  bool kill_switch = 20; // аварийное отключение
+
+  // Аудит.
+  google.protobuf.Timestamp create_time = 21;
+  google.protobuf.Timestamp update_time = 22;
+  string created_by = 23;
+  string updated_by = 24;
+
+  // Теневая конфигурация (для canary/AB, хранение альтернативной версии).
+  Shadow shadow = 25;
+
+  // Резерв под будущие поля (не использовать номера).
+  reserved 26, 27;
+}
+
+// Cron-расписание.
+message CronSchedule {
+  // Строка cron в формате "sec min hour dom mon dow", поддержка стандартной 5-/6-полейной нотации.
+  string expression = 1;
+
+  // Явная таймзона для вычисления cron, если не задано — берётся из Schedule.timezone.
+  string tz = 2;
+
+  // Ограничение максимального дрейфа между запусками (для компенсаций).
+  google.protobuf.Duration max_drift = 3;
+}
+
+// Интервальное расписание.
+message IntervalSchedule {
+  google.protobuf.Duration every = 1;     // интервал между запусками
+  google.protobuf.Duration offset = 2;     // сдвиг относительно create_time/anchor_time
+  google.protobuf.Timestamp anchor_time = 3; // опорное время для расчёта
+}
+
+// Одноразовый запуск.
+message OneOffSchedule {
+  google.protobuf.Timestamp run_at = 1;
+}
+
+// Календарное расписание: сложные окна.
+message CalendarSchedule {
+  // Примеры:
+  // - "0 7 * * MON-FRI @eu/stockholm"
+  // - "every last-friday-of-month at 18:00"
+  // Оставлено строковым DSL, чтобы не усложнять схемой — парсится ядром.
+  string expression = 1;
+}
+
+// Политика таймзон.
+message TimezonePolicy {
+  // Основная таймзона, например "UTC", "Europe/Stockholm".
+  string primary = 1;
+
+  // Разрешён ли авто-детект TZ по контексту (тенант/запрос/место выполнения).
+  bool allow_auto_detect = 2;
+
+  // Таймзоны-исключения (запретить).
+  repeated string deny = 3;
+}
+
+// Ретраи при неуспехе исполнения.
+message RetryPolicy {
+  // Общее количество попыток (не включая первый запуск).
+  uint32 max_retries = 1;
+
+  // Бэк-офф между попытками.
+  Backoff backoff = 2;
+
+  // Максимальное абсолютное время на все попытки.
+  google.protobuf.Duration max_retry_duration = 3;
+
+  // Идempotency ключ для согласованности повторных запусков.
+  string idempotency_key = 4;
+}
+
+// Бэк-офф.
+message Backoff {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    FIXED = 1;
+    EXPONENTIAL = 2;
+    EXPONENTIAL_JITTER = 3;
+  }
+  Kind kind = 1;
+
+  // Базовая задержка.
+  google.protobuf.Duration base = 2;
+
+  // Максимальная задержка (для экспоненты).
+  google.protobuf.Duration max = 3;
+
+  // Множитель экспоненты (например, 2.0).
+  double multiplier = 4;
+}
+
+// Джиттер.
+message JitterPolicy {
+  // Максимальное случайное смещение (+/-) вокруг расчётного времени.
+  google.protobuf.Duration max = 1;
+
+  // Фиксировать ли джиттер на ключ (стабильный хэш: job.id/tenant.id).
+  string sticky_hash_by = 2;
+}
+
+// Окно валидности расписания.
+message Window {
+  // Либо [start,end], либо cron-окно через dsl с tz.
+  oneof window {
+    AbsoluteWindow absolute = 1;
+    WindowDsl dsl = 2;
+  }
+}
+
+message AbsoluteWindow {
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2; // включительно по контракту ядра
+}
+
+message WindowDsl {
+  string expression = 1; // "mon-fri 07:00-19:00 @UTC"
+}
+
+// Теневая конфигурация (canary/AB).
+message Shadow {
+  // Альтернативная версия расписания (например, изменённый cron/interval).
+  Schedule shadow_schedule = 1;
+
+  // Тип эксперимента.
+  enum ShadowMode {
+    SHADOW_MODE_UNSPECIFIED = 0;
+    CANARY = 1;
+    A_B = 2;
+  }
+  ShadowMode mode = 2;
+
+  // Хэш-ключ и веса вариантов.
+  string hash_by = 3;
+
+  // Для A/B: веса контроль/тритмент в [0..1], суммарно 1.0.
+  double control_weight = 4;
+  double treatment_weight = 5;
+
+  // Для canary: процент трафика на тень.
+  double canary_percent = 6;
+}
+
+// -----------------------------------------------------------------------------
+— REQUEST/RESPONSE DTOs
+// -----------------------------------------------------------------------------
+
+message CreateScheduleRequest {
+  // Родитель ресурса: пусто (глобально) или "tenants/{tenant_id}".
+  string parent = 1;
+  Schedule schedule = 2;
+  // Клиентский idempotency ключ.
+  string request_id = 3;
+}
+
+message CreateScheduleResponse {
+  Schedule schedule = 1;
+}
+
+message GetScheduleRequest {
+  string name = 1; // "schedules/{id}" | "tenants/{tenant}/schedules/{id}"
+}
+
+message GetScheduleResponse {
+  Schedule schedule = 1;
+}
+
+message UpdateScheduleRequest {
+  Schedule schedule = 1;
+  // Поля для частичного обновления (JSON-путь, совместим с google.api.field_mask не объявляем здесь).
+  repeated string update_mask = 2;
+  // Требуемая etag для оптимистичной блокировки.
+  string etag = 3;
+}
+
+message UpdateScheduleResponse {
+  Schedule schedule = 1;
+}
+
+message DeleteScheduleRequest {
+  string name = 1;
+  string etag = 2;
+}
+
+message DeleteScheduleResponse {}
+
+message PauseScheduleRequest {
+  string name = 1;
+  string etag = 2;
+  string reason = 3;
+}
+
+message PauseScheduleResponse {
+  Schedule schedule = 1;
+}
+
+message ResumeScheduleRequest {
+  string name = 1;
+  string etag = 2;
+}
+
+message ResumeScheduleResponse {
+  Schedule schedule = 1;
+}
+
+message TriggerNowRequest {
+  string name = 1;
+  // Опциональный payload для единичного триггера (не меняет сохранённый payload).
+  google.protobuf.Struct payload_override = 2;
+  // Для согласованности повторов.
+  string idempotency_key = 3;
+}
+
+message TriggerNowResponse {
+  // Время фактической постановки запуска.
+  google.protobuf.Timestamp scheduled_at = 1;
+}
+
+message EvaluateNextRunsRequest {
+  // Можно передать name существующего расписания или инлайн-определение.
+  string name = 1;
+  Schedule inline = 2;
+  // С какого времени считать след. запуски.
+  google.protobuf.Timestamp from_time = 3;
+  // Сколько запусков вернуть.
+  uint32 limit = 4;
+}
+
+message EvaluateNextRunsResponse {
+  repeated google.protobuf.Timestamp next_runs = 1;
+}
+
+message ListSchedulesRequest {
+  string parent = 1;         // фильтр по родителю, например "tenants/{tenant_id}"
+  uint32 page_size = 2;      // до 1000
+  string page_token = 3;
+  // Простой фильтр по меткам/статусу, например: "status=ACTIVE labels.env=prod"
+  string filter = 4;
+  // Поля сортировки: "create_time desc", "priority desc, name asc"
+  string order_by = 5;
+}
+
+message ListSchedulesResponse {
+  repeated Schedule schedules = 1;
+  string next_page_token = 2;
+  // Общее кол-во (может быть оценочным).
+  int64 total_size = 3;
+}
+
+message DryRunRequest {
+  // Проверка валидности конфигурации расписания без сохранения.
+  Schedule schedule = 1;
+}
+
+message DryRunResponse {
+  bool valid = 1;
+  repeated ValidationError errors = 2;
+  repeated ValidationWarning warnings = 3;
+}
+
+message ValidationError {
+  string path = 1;     // путь к полю (например, "cron.expression")
+  string message = 2;  // описание
+  string code = 3;     // программный код ошибки
+}
+
+message ValidationWarning {
+  string path = 1;
+  string message = 2;
+  string code = 3;
+}
+
+message TestCronRequest {
+  string expression = 1;
+  string tz = 2;
+  google.protobuf.Timestamp from_time = 3;
+  uint32 limit = 4;
+}
+
+message TestCronResponse {
+  repeated google.protobuf.Timestamp next_runs = 1;
+}
+
+// -----------------------------------------------------------------------------
+// SERVICE
+// -----------------------------------------------------------------------------
+
+service SchedulerService {
+  rpc CreateSchedule(CreateScheduleRequest) returns (CreateScheduleResponse);
+  rpc GetSchedule(GetScheduleRequest) returns (GetScheduleResponse);
+  rpc UpdateSchedule(UpdateScheduleRequest) returns (UpdateScheduleResponse);
+  rpc DeleteSchedule(DeleteScheduleRequest) returns (DeleteScheduleResponse);
+
+  rpc PauseSchedule(PauseScheduleRequest) returns (PauseScheduleResponse);
+  rpc ResumeSchedule(ResumeScheduleRequest) returns (ResumeScheduleResponse);
+  rpc TriggerNow(TriggerNowRequest) returns (TriggerNowResponse);
+
+  rpc EvaluateNextRuns(EvaluateNextRunsRequest) returns (EvaluateNextRunsResponse);
+  rpc ListSchedules(ListSchedulesRequest) returns (ListSchedulesResponse);
+
+  rpc DryRun(DryRunRequest) returns (DryRunResponse);
+  rpc TestCron(TestCronRequest) returns (TestCronResponse);
+}

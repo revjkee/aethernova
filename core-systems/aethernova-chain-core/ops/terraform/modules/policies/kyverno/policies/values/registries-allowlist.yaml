@@ -1,0 +1,151 @@
+# Path: aethernova-chain-core/ops/terraform/modules/policies/kyverno/policies/values/registries-allowlist.yaml
+# Purpose: Параметры для темплейтов Kyverno-политики, ограничивающей использование образов
+#          только разрешёнными реестрами/репозиториями. Основано на практике Kyverno
+#          "Restrict Image Registries" и типичных values-чартах kyverno-policies. Источники: kyverno.io, BigBang kyverno-policies. 
+#          (policy skeleton в чарте/ytt должен опираться на эти значения). 
+#
+# ВНИМАНИЕ:
+# - validationFailureAction по умолчанию Audit (как в референсах). Для жёсткого режима используйте Enforce.
+# - Шаблон должен проверять containers, initContainers, ephemeralContainers.
+# - Поддерживаются allow/deny списки, namespace-исключения, исключения по ServiceAccount/NamespaceSelector,
+#   а также автогенерация для контроллеров (Deploy/STS/DS/Job/CronJob).
+#
+# Рекомендуемые ссылки для сверки логики политики:
+# - Kyverno policy "Restrict Image Registries": https://kyverno.io/policies/best-practices/restrict-image-registries/restrict-image-registries/ 
+# - Пример параметров в продакшн-чартах (BigBang kyverno-policies): https://docs-bigbang.dso.mil/latest/packages/kyverno-policies/values/
+#
+# ---------------------------------------------------------------------------
+
+policy:
+  enabled: true
+  name: restrict-image-registries
+  namespace: policies                # неймспейс для Policy/PolicySet/Placement (если применяется ACM), для ClusterPolicy игнорируется
+  kind: ClusterPolicy                # Policy | ClusterPolicy. Для реестров обычно ClusterPolicy
+  validationFailureAction: Audit     # Audit | Enforce
+  background: true                   # проверять существующие ресурсы
+  severity: medium                   # аннотация severity
+  category: "Best Practices"         # аннотация category
+  subject: "Pod"                     # аннотация subject
+  autogenControllers: true           # включить kyverno autogen для контроллеров
+  failureActionOverrides: []         # список override-ов по namespaceSelector (если нужно смягчать действие)
+
+parameters:
+  # Список РАЗРЕШЁННЫХ реестров. Строки могут быть:
+  # - точным реестром: "registry.example.com/"
+  # - реестром с портом: "registry.example.com:5000/"
+  # - поддоменом: "ghcr.io/"
+  # - при необходимости допускаются шаблоны в самом policy-шаблоне (regex/CEL) — значения здесь буквальные.
+  allowRegistries:
+    - ghcr.io/
+    - registry.k8s.gcr.io/
+    - docker.io/library/
+    - quay.io/
+    - eu.gcr.io/org-project/
+    # пример внутреннего зеркала
+    - registry.internal.example.com/
+
+  # Дополнительная фильтрация по репозиториям (опционально).
+  # Если список не пустой, политика должна проверять, что image начинается с одного из allowRepos.
+  allowRepos: []
+    # - ghcr.io/org/app-
+    # - quay.io/company/base-images/
+
+  # Список ЯВНО ЗАПРЕЩЁННЫХ реестров (имеет приоритет над allowRegistries).
+  denyRegistries:
+    - gcr.io/knative-releases/
+    - k8s.gcr.io/ingress-nginx/
+
+  # Разрешённые теги (опционально). Если непусто — ограничить пул по тегам.
+  allowedTags: []
+    # - latest
+    # - v1.*
+    # - ^[0-9]+\\.[0-9]+\\.[0-9]+(-rc\\.[0-9]+)?$
+
+  # Политика версионирования (опционально) — запрет "latest", если требуется.
+  forbidTagLatest: true
+
+  # Исключения по пространствам имён и аккаунтам (не проверять или ослабить действие).
+  exemptions:
+    namespacesAllowlist:             # эти namespaces исключаются из проверки
+      - kube-system
+      - kyverno
+      - gatekeeper-system
+    serviceAccountsAllowlist:        # исключения по ServiceAccount
+      - default/helm
+      - policies/policy-controller
+    namespaceSelector: {}            # произвольный selector для исключений, если реализуете через failureActionOverrides
+
+  # Управление сообщениями и ссылками.
+  message:
+    deny: "Images must originate from approved registries."
+    link: "https://kyverno.io/policies/best-practices/restrict-image-registries/restrict-image-registries/"
+
+  # Настройки соответствия ресурсам.
+  match:
+    kinds:
+      - Pod
+    apiVersions:
+      - v1
+    excludeKinds: []                 # опционально исключить отдельные kinds
+    namespaceSelector: {}            # match по namespace (если нужно сузить область действия)
+    objectSelector: {}               # match по меткам объекта
+
+  # Дополнительные опции обработки.
+  options:
+    failOnEmptyImage: true           # если в контейнере отсутствует image — считать это нарушением
+    checkInitContainers: true
+    checkEphemeralContainers: true
+    caseInsensitive: true            # сравнение реестров без учёта регистра
+    allowInsecureRegistries: false   # НЕЛЬЗЯ использовать в проде (см. kyverno customization). Для тестов — с пониманием риска.
+    # см. kyverno customization: https://kyverno.io/docs/installation/customization/  (allowInsecureRegistry) 
+    # В продакшене оставляйте false. 
+
+  # Стратегия логирования/отчётности (PolicyReport/PolicyReporter и др.).
+  reporting:
+    enablePolicyReport: true
+    addResultAnnotations: true
+    sourceLabel: "Kyverno"           # Чтобы отчёты группировались вместе с основными событиями Kyverno
+
+# ---------------------------------------------------------------------------
+# Ниже — рекомендуемые значения по умолчанию для разных сред.
+# В PROD целевой режим — Enforce, но включать его следует после этапа наблюдения в Audit.
+profiles:
+  dev:
+    validationFailureAction: Audit
+    forbidTagLatest: false
+  staging:
+    validationFailureAction: Audit
+    forbidTagLatest: true
+  prod:
+    validationFailureAction: Enforce
+    forbidTagLatest: true
+
+# ---------------------------------------------------------------------------
+# Тестовые фикстуры (для kyverno CLI / CI), чтобы проверить корректность значений.
+tests:
+  validImages:
+    - ghcr.io/org/app:1.2.3
+    - quay.io/company/tooling:v0.9.0
+    - registry.k8s.gcr.io/pause:3.9
+    - registry.internal.example.com/secure/app:2.4.1
+  invalidImages:
+    - docker.io/randomuser/unknown:latest
+    - gcr.io/knative-releases/serving@sha256:deadbeef
+    - k8s.gcr.io/ingress-nginx/controller:v1.9.0
+    - example.com/any/app:latest
+
+# ---------------------------------------------------------------------------
+# Аннотации/метки для единого аудита.
+metadata:
+  labels:
+    app.kubernetes.io/name: kyverno-registries
+    app.kubernetes.io/component: policy-values
+    app.kubernetes.io/part-of: aethernova-chain-core
+    policy.aethernova.io/type: best-practices
+    policy.aethernova.io/policy: restrict-image-registries
+  annotations:
+    org.aethernova.repo: "aethernova-chain-core"
+    org.aethernova.path: "ops/terraform/modules/policies/kyverno/policies/values"
+    org.aethernova.change-control: "gitops"
+    policies.kyverno.io/description: "Limit images to approved registries; see Kyverno reference policy."
+    policies.kyverno.io/severity: "medium"

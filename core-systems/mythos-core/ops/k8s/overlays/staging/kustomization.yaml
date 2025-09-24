@@ -1,0 +1,109 @@
+# mythos-core/ops/k8s/overlays/staging/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 1) Базовые ресурсы
+resources:
+  - ../../base
+
+# 2) Идентичность среды
+namespace: mythos-staging
+namePrefix: staging-
+
+commonLabels:
+  app.kubernetes.io/part-of: mythos
+  app.kubernetes.io/name: mythos-core
+  app.kubernetes.io/component: api
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/environment: staging
+  environment: staging
+
+commonAnnotations:
+  owner: platform-team
+  runbook: https://runbooks.example.internal/mythos-core
+  rollout.strategy: progressive
+
+# 3) Стабильные генераторы (runtime-config)
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: mythos-core-config
+    literals:
+      - LOG_LEVEL=INFO
+      - FEATURE_FLAGS=stable
+      - METRICS_ENABLED=true
+      - GRACEFUL_TIMEOUT_SECONDS=25
+
+# 4) Образы и масштабирование
+images:
+  - name: mythos-core
+    newName: ghcr.io/yourorg/mythos-core
+    newTag: v0.1.0-staging
+
+replicas:
+  - name: mythos-core
+    count: 3
+
+# 5) Патчи
+patches:
+  # 5.1) JSON6902: добавить метку среды на Service (совместимо со стратегическим мерджем)
+  - target:
+      version: v1
+      kind: Service
+      name: mythos-core
+    patch: |-
+      - op: add
+        path: /metadata/labels/environment
+        value: staging
+      - op: add
+        path: /metadata/labels/app.kubernetes.io~1environment
+        value: staging
+
+  # 5.2) Стратегический мердж: при наличии Deployment — задать ресурсы/пробы (безопасные дефолты)
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: mythos-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mythos-core
+      spec:
+        template:
+          metadata:
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "9090"
+              prometheus.io/path: "/metrics"
+          spec:
+            containers:
+              - name: mythos-core
+                envFrom:
+                  - configMapRef:
+                      name: mythos-core-config
+                resources:
+                  requests:
+                    cpu: "200m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "1"
+                    memory: "1Gi"
+                readinessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  failureThreshold: 6
+                livenessProbe:
+                  httpGet:
+                    path: /livez
+                    port: 8080
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3

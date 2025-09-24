@@ -1,0 +1,269 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: mythos-core-rules
+  namespace: monitoring
+  labels:
+    prometheus: k8s
+    role: alert-rules
+    app.kubernetes.io/name: mythos-core
+    app.kubernetes.io/part-of: mythos
+spec:
+  groups:
+
+  # =========================
+  # Availability & scraping
+  # =========================
+  - name: mythos-app-availability
+    rules:
+      - alert: MythosTargetDown
+        expr: up{job=~"mythos-.*"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          domain: availability
+        annotations:
+          summary: Target down for {{ $labels.job }} in {{ $labels.namespace }}
+          description: Endpoint {{ $labels.job }} on {{ $labels.instance }} is down for 5m.
+          action: Check Pod/Service/Ingress and container logs.
+
+      - alert: MythosMetricsMissing
+        expr: |
+          absent(up{job=~"mythos-.*"})
+        for: 10m
+        labels:
+          severity: warning
+          domain: observability
+        annotations:
+          summary: No 'up' metric for mythos targets
+          description: Prometheus has not scraped any mythos-* targets for 10m. Possible ServiceMonitor/Endpoint issue.
+          action: Verify ServiceMonitor/Endpoints and Prometheus target relabeling.
+
+  # =========================
+  # Serve Local (cli/tools/serve_local.py)
+  # =========================
+  - name: mythos-serve-local
+    rules:
+      # Recording rules (per namespace+job) for error ratio and traffic
+      - record: mythos:serve_local:http_errors_5m
+        expr: sum by (namespace, job) (increase(serve_local_http_errors_total[5m]))
+      - record: mythos:serve_local:http_reqs_5m
+        expr: sum by (namespace, job) (increase(serve_local_http_requests_total[5m]))
+      - record: mythos:serve_local:error_ratio_5m
+        expr: mythos:serve_local:http_errors_5m / clamp_min(mythos:serve_local:http_reqs_5m, 1)
+
+      - record: mythos:serve_local:http_errors_30m
+        expr: sum by (namespace, job) (increase(serve_local_http_errors_total[30m]))
+      - record: mythos:serve_local:http_reqs_30m
+        expr: sum by (namespace, job) (increase(serve_local_http_requests_total[30m]))
+      - record: mythos:serve_local:error_ratio_30m
+        expr: mythos:serve_local:http_errors_30m / clamp_min(mythos:serve_local:http_reqs_30m, 1)
+
+      - alert: ServeLocalHighErrorRateShort
+        expr: mythos:serve_local:error_ratio_5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: serve-local
+          slo: availability
+        annotations:
+          summary: Serve Local error ratio > 5 percent (5m)
+          description: |
+            Error ratio over 5m = {{ $value | humanizePercentage }} for {{ $labels.job }} (ns={{ $labels.namespace }}).
+          action: Inspect recent releases, configuration changes, and server logs.
+
+      - alert: ServeLocalHighErrorRateSustained
+        expr: mythos:serve_local:error_ratio_30m > 0.2
+        for: 10m
+        labels:
+          severity: critical
+          service: serve-local
+          slo: availability
+        annotations:
+          summary: Serve Local error ratio > 20 percent (30m)
+          description: Sustained high error ratio over 30m for {{ $labels.job }} in {{ $labels.namespace }}.
+          action: Roll back recent changes or scale out; check dependency health.
+
+      - alert: ServeLocalOpenConnectionsSpike
+        expr: max by (namespace, job) (serve_local_open_connections) > 1000
+        for: 10m
+        labels:
+          severity: warning
+          service: serve-local
+          domain: capacity
+        annotations:
+          summary: Serve Local too many open connections
+          description: Open connections > 1000 for 10m ({{ $labels.job }}).
+          action: Check clients throttling, reverse-proxy limits, and long-lived tails/SSE.
+
+      - alert: ServeLocalMetricsAbsent
+        expr: |
+          absent(serve_local_http_requests_total) or
+          absent(serve_local_http_errors_total) or
+          absent(serve_local_open_connections)
+        for: 10m
+        labels:
+          severity: warning
+          service: serve-local
+          domain: observability
+        annotations:
+          summary: Serve Local metrics absent
+          description: One or more serve_local_* metrics are missing for 10m.
+          action: Verify scraping and application /metrics endpoint.
+
+  # =========================
+  # LLM Chat Demo (examples/llm_chat_demo/app.py)
+  # =========================
+  - name: mythos-llm-chat
+    rules:
+      - record: mythos:llm:http_errors_5m
+        expr: sum by (namespace, job) (increase(llm_demo_http_errors_total[5m]))
+      - record: mythos:llm:http_reqs_5m
+        expr: sum by (namespace, job) (increase(llm_demo_http_requests_total[5m]))
+      - record: mythos:llm:error_ratio_5m
+        expr: mythos:llm:http_errors_5m / clamp_min(mythos:llm:http_reqs_5m, 1)
+
+      - record: mythos:llm:http_errors_30m
+        expr: sum by (namespace, job) (increase(llm_demo_http_errors_total[30m]))
+      - record: mythos:llm:http_reqs_30m
+        expr: sum by (namespace, job) (increase(llm_demo_http_requests_total[30m]))
+      - record: mythos:llm:error_ratio_30m
+        expr: mythos:llm:http_errors_30m / clamp_min(mythos:llm:http_reqs_30m, 1)
+
+      - alert: LLMChatHighErrorRateShort
+        expr: mythos:llm:error_ratio_5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: llm-chat
+          slo: availability
+        annotations:
+          summary: LLM Chat error ratio > 5 percent (5m)
+          description: Short-window error ratio exceeded for {{ $labels.job }}.
+          action: Inspect upstream LLM provider connectivity and API responses.
+
+      - alert: LLMChatHighErrorRateSustained
+        expr: mythos:llm:error_ratio_30m > 0.2
+        for: 10m
+        labels:
+          severity: critical
+          service: llm-chat
+          slo: availability
+        annotations:
+          summary: LLM Chat error ratio > 20 percent (30m)
+          description: Sustained high error ratio for {{ $labels.job }} in {{ $labels.namespace }}.
+          action: Fallback to mock provider or reduce traffic; check keys/limits.
+
+      - alert: LLMChatMetricsAbsent
+        expr: |
+          absent(llm_demo_http_requests_total) or
+          absent(llm_demo_http_errors_total) or
+          absent(llm_demo_open_connections)
+        for: 10m
+        labels:
+          severity: warning
+          service: llm-chat
+          domain: observability
+        annotations:
+          summary: LLM Chat metrics absent
+          description: One or more llm_demo_* metrics are missing for 10m.
+          action: Verify /metrics endpoint and ServiceMonitor.
+
+  # =========================
+  # Training Worker (neuroforge/workers/training_worker.py)
+  # =========================
+  - name: mythos-training-worker
+    rules:
+      - record: mythos:worker:jobs_total_10m
+        expr: sum by () (increase(neuroforge_jobs_total[10m]))
+      - record: mythos:worker:jobs_failed_10m
+        expr: sum by () (increase(neuroforge_jobs_failed_total[10m]))
+      - record: mythos:worker:jobs_succeeded_10m
+        expr: sum by () (increase(neuroforge_jobs_succeeded_total[10m]))
+      - record: mythos:worker:fail_ratio_10m
+        expr: mythos:worker:jobs_failed_10m / clamp_min(mythos:worker:jobs_total_10m, 1)
+
+      - alert: TrainingWorkerAllJobsFailing
+        expr: mythos:worker:fail_ratio_10m > 0.5 and mythos:worker:jobs_total_10m > 10
+        for: 10m
+        labels:
+          severity: critical
+          service: training-worker
+          slo: reliability
+        annotations:
+          summary: Training worker failing > 50 percent jobs (10m)
+          description: |
+            Over the last 10m failures/total = {{ $value | humanizePercentage }} with
+            total jobs={{ $labels.mythos_worker_jobs_total_10m }} (see recording series).
+          action: Inspect trainer entrypoints, data sources, and checkpoint directory.
+
+      - alert: TrainingWorkerNoProgressWhileJobsArrive
+        expr: (mythos:worker:jobs_total_10m > 0)
+              and on() (avg_over_time(neuroforge_jobs_running[5m]) < 0.5)
+        for: 15m
+        labels:
+          severity: warning
+          service: training-worker
+          slo: throughput
+        annotations:
+          summary: Training worker not processing while jobs are incoming
+          description: Jobs arrived in last 10m, but running gauge ~0 for 15m.
+          action: Check file queue permissions, stale reclaim, and worker concurrency.
+
+      - alert: TrainingWorkerLoopLatencyHigh
+        expr: avg_over_time(neuroforge_loop_iteration_seconds[5m]) > 2
+        for: 10m
+        labels:
+          severity: warning
+          service: training-worker
+          domain: performance
+        annotations:
+          summary: Training worker loop latency > 2s
+          description: Event loop iteration time is elevated; may indicate I/O stalls or locking.
+          action: Inspect disk I/O, network FS, and Python GIL hotspots.
+
+      - alert: TrainingWorkerMetricsAbsent
+        expr: |
+          absent(neuroforge_jobs_total) or
+          absent(neuroforge_jobs_succeeded_total) or
+          absent(neuroforge_jobs_failed_total) or
+          absent(neuroforge_jobs_running) or
+          absent(neuroforge_loop_iteration_seconds)
+        for: 10m
+        labels:
+          severity: warning
+          service: training-worker
+          domain: observability
+        annotations:
+          summary: Training worker metrics absent
+          description: One or more neuroforge_* metrics are missing for 10m.
+          action: Verify worker /metrics endpoint and ServiceMonitor.
+
+  # =========================
+  # Platform hygiene (optional)
+  # =========================
+  - name: mythos-platform
+    rules:
+      - alert: PodCrashLoopBackOff
+        expr: |
+          increase(kube_pod_container_status_restarts_total{job="kube-state-metrics"}[10m]) > 3
+        for: 10m
+        labels:
+          severity: warning
+          domain: platform
+        annotations:
+          summary: Pod restarting frequently
+          description: Pod {{ $labels.namespace }}/{{ $labels.pod }} restarts > 3 per 10m.
+          action: Inspect container logs and readiness/liveness probes.
+
+      - alert: NodeDiskPressure
+        expr: kube_node_status_condition{condition="DiskPressure",status="true"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          domain: platform
+        annotations:
+          summary: Node under DiskPressure
+          description: Node {{ $labels.node }} reports DiskPressure.
+          action: Free up disk space or move workloads.
+

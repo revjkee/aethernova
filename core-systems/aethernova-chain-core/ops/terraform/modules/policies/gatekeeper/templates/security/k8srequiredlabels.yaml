@@ -1,0 +1,187 @@
+# aethernova-chain-core/ops/terraform/modules/policies/gatekeeper/templates/security/k8srequiredlabels.yaml
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+  annotations:
+    metadata.gatekeeper.sh/title: "Required Labels"
+    metadata.gatekeeper.sh/version: "1.1.0-aethernova"
+    description: >
+      Требует наличия указанных меток на ресурсах Kubernetes. Значения могут
+      проверяться по регулярным выражениям. Поддерживаются исключения namespaces.
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        # Используем современную схему валидации параметров
+        # (описание параметров задаётся в OpenAPI v3).
+        # См. оф. док.: схема parameters определяется в ConstraintTemplate.
+        # enforcementAction задаётся уже в Constraint, не здесь.
+        legacySchema: false
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              description: Список обязательных меток и (опционально) ограничений значений.
+              items:
+                type: object
+                properties:
+                  key:
+                    type: string
+                    minLength: 1
+                    description: Имя обязательной метки.
+                  allowedRegex:
+                    type: string
+                    description: Регулярное выражение для проверки значения метки.
+                  message:
+                    type: string
+                    description: Пользовательское сообщение об ошибке для данной метки.
+                required: ["key"]
+              minItems: 1
+            excludedNamespaces:
+              type: array
+              description: Набор namespace, для которых проверка выключена.
+              items:
+                type: string
+            excludedNamespaceRegex:
+              type: string
+              description: Регулярное выражение для исключения namespace.
+          required: ["labels"]
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+
+        # Возвращает истину, если ресурс попадает под исключение по namespace.
+        is_ns_excluded {
+          ns := object_namespace(input.review.object)
+          ns != ""
+          some ex
+          ex := input.parameters.excludedNamespaces[_]
+          ns == ex
+        }
+
+        is_ns_excluded {
+          ns := object_namespace(input.review.object)
+          ns != ""
+          input.parameters.excludedNamespaceRegex != ""
+          re_match(input.parameters.excludedNamespaceRegex, ns)
+        }
+
+        # Вычисляет namespace объекта с учётом кластерных ресурсов.
+        object_namespace(obj) = ns {
+          ns := obj.metadata.namespace
+        } else = ns {
+          # У кластерных объектов (например, Namespace, ClusterRole) поле namespace отсутствует.
+          ns := ""
+        }
+
+        # Достаёт значение метки (пустая строка, если нет).
+        get_label(obj, k) = v {
+          v := obj.metadata.labels[k]
+        } else = "" {
+          true
+        }
+
+        # Есть ли метка у объекта.
+        has_label(obj, k) {
+          obj.metadata.labels[k]
+        }
+
+        # Формирование текста сообщения по спискам нарушений.
+        build_msg(missing, invalid) = msg {
+          base := "Required label(s) are missing or invalid"
+          msg := sprintf("%s. missing=%v invalid=%v", [base, missing, invalid])
+        }
+
+        # Главная проверка: формируем одно или несколько нарушений.
+        violation[{
+          "msg": out_msg,
+          "details": {
+            "missingLabels": missing_arr,
+            "invalidLabels": invalid_arr
+          }
+        }] {
+          not is_ns_excluded
+
+          obj := input.review.object
+          params := input.parameters
+
+          # Собираем множества пропущенных и некорректных меток
+          missing := { l.key |
+            some i
+            l := params.labels[i]
+            not has_label(obj, l.key)
+          }
+          invalid := { l.key |
+            some i
+            l := params.labels[i]
+            has_label(obj, l.key)
+            l.allowedRegex != ""
+            v := get_label(obj, l.key)
+            not re_match(l.allowedRegex, v)
+          }
+
+          count(missing) > 0 or count(invalid) > 0
+
+          # Преобразуем в массивы для удобства логов/инструментов
+          missing_arr := sort(missing)
+          invalid_arr := sort(invalid)
+
+          # Индивидуальные сообщения приоритетнее общего
+          custom_msgs := { l.message |
+            some i
+            l := params.labels[i]
+            l.message != ""
+          }
+
+          base_msg := build_msg(missing_arr, invalid_arr)
+          out_msg := base_msg
+          count(custom_msgs) > 0
+        }
+
+        violation[{
+          "msg": out_msg,
+          "details": {
+            "missingLabels": missing_arr,
+            "invalidLabels": invalid_arr
+          }
+        }] {
+          not is_ns_excluded
+
+          obj := input.review.object
+          params := input.parameters
+
+          missing := { l.key |
+            some i
+            l := params.labels[i]
+            not has_label(obj, l.key)
+          }
+          invalid := { l.key |
+            some i
+            l := params.labels[i]
+            has_label(obj, l.key)
+            l.allowedRegex != ""
+            v := get_label(obj, l.key)
+            not re_match(l.allowedRegex, v)
+          }
+
+          count(missing) > 0 or count(invalid) > 0
+
+          missing_arr := sort(missing)
+          invalid_arr := sort(invalid)
+
+          # Если есть пользовательские сообщения — добавляем их в общий текст
+          msgs := [m |
+            some i
+            l := params.labels[i]
+            l.message != ""
+            m := sprintf("%s: %s", [l.key, l.message])
+          ]
+
+          base_msg := build_msg(missing_arr, invalid_arr)
+          out_msg := sprintf("%s. %v", [base_msg, msgs])
+        }

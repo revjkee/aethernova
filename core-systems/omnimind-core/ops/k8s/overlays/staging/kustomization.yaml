@@ -1,0 +1,166 @@
+# omnimind-core/ops/k8s/overlays/staging/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# База
+resources:
+  - ../../base
+
+# Изоляция и трассируемость
+namespace: omnimind-staging
+nameSuffix: -stg
+
+commonLabels:
+  app.kubernetes.io/name: omnimind-core
+  app.kubernetes.io/instance: omnimind-core
+  app.kubernetes.io/part-of: omnimind
+  app.kubernetes.io/environment: staging
+  app.kubernetes.io/managed-by: kustomize
+
+commonAnnotations:
+  omnimind.io/owner: "platform-team"
+  omnimind.io/env: "staging"
+  omnimind.io/change-request: "REPLACE_WITH_TICKET_ID"
+  # Хеш конфига для принудительного перезапуска (патч в Deployment ниже)
+  omnimind.io/config-hash: "REPLACE_WITH_CONFIG_HASH"
+
+# Воспроизводимость образов
+images:
+  - name: ghcr.io/your-org/omnimind-core
+    newName: ghcr.io/your-org/omnimind-core
+    newTag: "0.6.0-stg"
+    digest: "sha256:REPLACE_WITH_DIGEST"
+
+# Генераторы конфигов/секретов (файлы положите рядом с этим kustomization)
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/component: api
+  annotations:
+    omnimind.io/generated: "true"
+
+configMapGenerator:
+  - name: omnimind-core-config
+    behavior: replace
+    envs:
+      - staging.env                  # KEY=VALUE пары
+    files:
+      - configs/staging.yaml         # при наличии структурного конфига
+
+secretGenerator:
+  - name: omnimind-core-secrets
+    behavior: replace
+    envs:
+      - staging.secrets.env          # Секреты в формате KEY=VALUE
+    type: Opaque
+
+# Патчи для конкретных ресурсов base (без привязки к имени с суффиксом — матч по лейблам)
+patches:
+
+  # 1) Deployment: реплики, ресурсы, env, аннотации, пробы
+  - target:
+      kind: Deployment
+      labelSelector: "app.kubernetes.io/name=omnimind-core,app.kubernetes.io/component=api"
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        annotations:
+          omnimind.io/config-hash: "REPLACE_WITH_CONFIG_HASH"
+      spec:
+        replicas: 4
+        strategy:
+          rollingUpdate:
+            maxSurge: 25%
+            maxUnavailable: 25%
+        template:
+          metadata:
+            annotations:
+              prometheus.io/scrape: "true"
+              prometheus.io/port: "8080"
+              prometheus.io/path: "/metrics"
+          spec:
+            automountServiceAccountToken: false
+            containers:
+              - name: omnimind-core
+                env:
+                  - name: APP_ENV
+                    value: "staging"
+                  - name: LOG_LEVEL
+                    value: "INFO"
+                  - name: FEATURE_FLAGS
+                    value: "safe-defaults"
+                resources:
+                  requests:
+                    cpu: "300m"
+                    memory: "640Mi"
+                    ephemeral-storage: "1Gi"
+                  limits:
+                    cpu: "1500m"
+                    memory: "1536Mi"
+                    ephemeral-storage: "2Gi"
+                readinessProbe:
+                  httpGet:
+                    path: /healthz/ready
+                    port: 8080
+                  initialDelaySeconds: 3
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 5
+                startupProbe:
+                  httpGet:
+                    path: /healthz/ready
+                    port: 8080
+                  failureThreshold: 45
+                  periodSeconds: 2
+                  timeoutSeconds: 2
+
+  # 2) Service: гарантируем ClusterIP и портовую схему для staging
+  - target:
+      kind: Service
+      labelSelector: "app.kubernetes.io/name=omnimind-core,app.kubernetes.io/component=api"
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        annotations:
+          omnimind.io/traffic-policy: "internal"
+      spec:
+        type: ClusterIP
+        ports:
+          - name: http
+            port: 80
+            targetPort: 8080
+
+  # 3) Ingress: домен и TLS для staging
+  - target:
+      kind: Ingress
+      labelSelector: "app.kubernetes.io/name=omnimind-core,app.kubernetes.io/component=api"
+    patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        annotations:
+          kubernetes.io/ingress.class: "nginx"
+          nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+          nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      spec:
+        tls:
+          - hosts:
+              - omnimind-stg.example.com
+            secretName: omnimind-stg-tls
+        rules:
+          - host: omnimind-stg.example.com
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: omnimind-core-stg    # будет резолвиться с nameSuffix
+                      port:
+                        number: 80
+
+# Мета-данные сборки (удобно для трассировки)
+buildMetadata:
+  - managedByLabel

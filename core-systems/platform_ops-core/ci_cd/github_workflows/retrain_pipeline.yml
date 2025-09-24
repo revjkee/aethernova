@@ -1,0 +1,92 @@
+name: Retrain LLM Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_version:
+        description: 'Dataset version for retraining'
+        required: true
+      run_full_pipeline:
+        description: 'Run full retraining pipeline (true/false)'
+        required: false
+        default: 'true'
+
+  schedule:
+    - cron: '0 3 * * 0'  # Автоматическая еженедельная перетренировка по воскресеньям
+
+env:
+  PROJECT_NAME: llmops
+  MODEL_NAME: retrained-llm
+  PYTHON_VERSION: '3.10'
+  POETRY_VERSION: '1.8.2'
+
+jobs:
+  retrain-llm:
+    name: Run Retraining Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          poetry install --no-root
+
+      - name: Authenticate with cloud provider
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIP }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Pull training dataset
+        run: |
+          poetry run python scripts/data/pull_dataset.py --version "${{ github.event.inputs.dataset_version }}"
+
+      - name: Preprocess data
+        run: |
+          poetry run python scripts/data/preprocess.py
+
+      - name: Run model training
+        run: |
+          poetry run python scripts/training/train.py \
+            --config configs/retrain.yaml \
+            --full_pipeline ${{ github.event.inputs.run_full_pipeline }}
+
+      - name: Evaluate model
+        run: |
+          poetry run python scripts/training/evaluate.py
+
+      - name: Save model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MODEL_NAME }}
+          path: models/${{ env.MODEL_NAME }}.pt
+
+      - name: Upload to model registry
+        run: |
+          poetry run python scripts/registry/upload_model.py \
+            --model-path models/${{ env.MODEL_NAME }}.pt
+
+      - name: Notify via Telegram
+        if: always()
+        run: |
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+            -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -d text="✅ Retraining pipeline completed: ${{ github.workflow }}"
+

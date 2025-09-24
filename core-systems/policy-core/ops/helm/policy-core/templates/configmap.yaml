@@ -1,0 +1,150 @@
+{{- /*
+  Policy Core — ConfigMap template (industrial-grade)
+  Inputs (values.yaml):
+    config: map (основная конфигурация приложения)
+    extraConfigs: map[string]string (доп. файлы ConfigMap, значения — многострочные тексты)
+    extraConfigFiles: []string (пути к файлам внутри чарта, будут добавлены как отдельные ключи)
+    binaryData: map[string]string (base64-строки для binaryData)
+    reloader:
+      enabled: bool (если true — включить аннотации reloader.stakater.com)
+    commonLabels: map[string]string
+    commonAnnotations: map[string]string
+*/ -}}
+
+{{- /* ===== Helpers: имена, метки, аннотации, checksum ===== */ -}}
+{{- define "policy-core.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "policy-core.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name (include "policy-core.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "policy-core.labels" -}}
+app.kubernetes.io/name: {{ include "policy-core.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | default .Chart.Version | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: neurocity
+app.kubernetes.io/component: policy
+{{- if .Values.commonLabels }}
+{{- toYaml .Values.commonLabels | nindent 0 }}
+{{- end }}
+{{- end -}}
+
+{{- define "policy-core.annotations" -}}
+{{- if .Values.commonAnnotations -}}
+{{- toYaml .Values.commonAnnotations -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+  Собираем «сырой» текст конфигурации для application.yaml:
+  - .Values.config сериализуем в YAML
+  - применяем tpl для подстановки {{ .Values.* }} если встречаются в строковых значениях
+*/ -}}
+{{- define "policy-core.config.content" -}}
+{{- $cfg := (default (dict) .Values.config) -}}
+{{- tpl (toYaml $cfg) . | trimSuffix "\n" -}}
+{{- end -}}
+
+{{- /*
+  Собираем строку для checksum: основная конфигурация + extraConfigs + содержимое extraConfigFiles + binaryData (ключи и длина)
+*/ -}}
+{{- define "policy-core.config.checksum" -}}
+{{- $parts := list -}}
+{{- $parts = append $parts (include "policy-core.config.content" .) -}}
+{{- if .Values.extraConfigs -}}
+  {{- range $k, $v := .Values.extraConfigs -}}
+    {{- $parts = append $parts (printf "%s:%s" $k (tpl $v $)) -}}
+  {{- end -}}
+{{- end -}}
+{{- if .Values.extraConfigFiles -}}
+  {{- range $p := .Values.extraConfigFiles -}}
+    {{- $content := .Files.Get $p | default "" -}}
+    {{- $parts = append $parts (printf "%s:%s" $p $content) -}}
+  {{- end -}}
+{{- end -}}
+{{- if .Values.binaryData -}}
+  {{- range $bk, $bv := .Values.binaryData -}}
+    {{- $parts = append $parts (printf "bin:%s:%d" $bk (len $bv)) -}}
+  {{- end -}}
+{{- end -}}
+{{- $joined := join "\n---\n" $parts -}}
+{{- sha256sum $joined -}}
+{{- end -}}
+
+{{- /*
+  Генерация пар ключ:значение для extraConfigs (tpl-подстановка поддерживается)
+*/ -}}
+{{- define "policy-core.extraConfigs.data" -}}
+{{- if .Values.extraConfigs -}}
+  {{- range $k, $v := .Values.extraConfigs }}
+{{ $k }}: |-
+{{ tpl $v $ | nindent 2 }}
+  {{- end }}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+  Генерация пар ключ:значение из файлов чарта (extraConfigFiles)
+*/ -}}
+{{- define "policy-core.extraConfigFiles.data" -}}
+{{- if .Values.extraConfigFiles -}}
+  {{- range $p := .Values.extraConfigFiles }}
+{{ base $p }}: |-
+{{- /* .Files.Get вернет содержимое файла; если файла нет — пусто */ -}}
+{{ .Files.Get $p | default "" | nindent 2 }}
+  {{- end }}
+{{- end -}}
+{{- end -}}
+
+{{- /* ====== Главный ConfigMap ====== */ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "policy-core.fullname" . }}-config
+  labels:
+    {{- include "policy-core.labels" . | nindent 4 }}
+  annotations:
+    checksum/config: {{ include "policy-core.config.checksum" . | quote }}
+    {{- if and .Values.reloader .Values.reloader.enabled }}
+    reloader.stakater.com/search: "true"
+    {{- end }}
+    {{- with (include "policy-core.annotations" .) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+data:
+  # Основной конфигурационный файл приложения
+  application.yaml: |-
+{{ include "policy-core.config.content" . | nindent 4 }}
+{{- /* Добавочные текстовые ключи из Values (tpl поддержан) */ -}}
+{{ include "policy-core.extraConfigs.data" . | nindent 2 }}
+{{- /* Подмешиваем файлы чарта (если заданы) */ -}}
+{{ include "policy-core.extraConfigFiles.data" . | nindent 2 }}
+{{- /* binaryData выводим отдельным документом, если задано */ -}}
+{{- if .Values.binaryData }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "policy-core.fullname" . }}-config-binary
+  labels:
+    {{- include "policy-core.labels" . | nindent 4 }}
+  annotations:
+    checksum/config: {{ include "policy-core.config.checksum" . | quote }}
+    {{- if and .Values.reloader .Values.reloader.enabled }}
+    reloader.stakater.com/search: "true"
+    {{- end }}
+    {{- with (include "policy-core.annotations" .) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+binaryData:
+  {{- range $k, $v := .Values.binaryData }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+{{- end }}

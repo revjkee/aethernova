@@ -1,0 +1,361 @@
+# omnimind-core/ops/ansible/roles/omnimind-core/tasks/healthcheck.yml
+---
+# Требования: Ansible >= 2.14, собранные факты (setup).
+# Запуск: ansible-playbook ... -t health
+# Все параметры настраиваются через vars/inventory.
+
+# -------------------- Переменные по умолчанию --------------------
+- name: "Set default health variables"
+  ansible.builtin.set_fact:
+    omnimind_service_name: "{{ omnimind_service_name | default('omnimind-core') }}"
+    omnimind_service_user: "{{ omnimind_service_user | default('omni') }}"
+    omnimind_http_host: "{{ omnimind_http_host | default('127.0.0.1') }}"
+    omnimind_http_port: "{{ omnimind_http_port | default(8000) }}"
+    omnimind_health_path: "{{ omnimind_health_path | default('/healthz') }}"
+    omnimind_ready_path: "{{ omnimind_ready_path | default('/ready') }}"
+    omnimind_version_path: "{{ omnimind_version_path | default('/version') }}"
+    omnimind_expected_version_regex: "{{ omnimind_expected_version_regex | default('^[0-9]+\\.[0-9]+\\.[0-9]+') }}"
+    omnimind_tls_enabled: "{{ omnimind_tls_enabled | default(false) }}"
+    omnimind_tls_sni: "{{ omnimind_tls_sni | default('') }}"
+    omnimind_tls_min_days_left: "{{ omnimind_tls_min_days_left | default(14) }}"
+    omnimind_monitored_mounts: "{{ omnimind_monitored_mounts | default(['/', '/var', '/opt']) }}"
+    omnimind_min_disk_free_bytes: "{{ omnimind_min_disk_free_bytes | default(5368709120) }}"  # 5 GiB
+    omnimind_max_load1: "{{ omnimind_max_load1 | default(4.0) }}"
+    omnimind_min_mem_free_mb: "{{ omnimind_min_mem_free_mb | default(256) }}"
+    omnimind_check_postgres: "{{ omnimind_check_postgres | default(false) }}"
+    omnimind_database_url: "{{ omnimind_database_url | default('') }}"
+    omnimind_check_redis: "{{ omnimind_check_redis | default(false) }}"
+    omnimind_redis_url: "{{ omnimind_redis_url | default('') }}"
+    omnimind_check_docker: "{{ omnimind_check_docker | default(false) }}"
+    omnimind_docker_container_name: "{{ omnimind_docker_container_name | default('omnimind-core') }}"
+    omnimind_max_recent_errors: "{{ omnimind_max_recent_errors | default(0) }}"
+    omnimind_log_since: "{{ omnimind_log_since | default('10m') }}"
+    omnimind_check_ulimit: "{{ omnimind_check_ulimit | default(false) }}"
+    omnimind_min_nofile: "{{ omnimind_min_nofile | default(65535) }}"
+    omnimind_health_report_path: "{{ omnimind_health_report_path | default('/var/log/omnimind/health_report.json') }}"
+    _health_failures: []
+  tags: [health, verify]
+
+# -------------------- Состояние systemd-сервиса --------------------
+- name: "Collect service facts"
+  ansible.builtin.service_facts:
+  tags: [health, service]
+
+- name: "Record systemd service state"
+  ansible.builtin.set_fact:
+    _svc_info: "{{ ansible_facts.services[omnimind_service_name + '.service'] | default({}) }}"
+  tags: [health, service]
+
+- name: "Check service is enabled and running"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'service:not_running_or_disabled' ] }}"
+  when: not (_svc_info.state is defined and _svc_info.state == 'running' and _svc_info.status is defined and _svc_info.status == 'enabled')
+  tags: [health, service]
+
+# -------------------- Порт и TCP-доступность --------------------
+- name: "Verify TCP port is accepting connections"
+  ansible.builtin.wait_for:
+    host: "{{ omnimind_http_host }}"
+    port: "{{ omnimind_http_port }}"
+    state: started
+    connect_timeout: 1
+    timeout: 1
+  register: _port_check
+  failed_when: false
+  changed_when: false
+  tags: [health, network]
+
+- name: "Record port failure if unreachable"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'tcp:port_unreachable' ] }}"
+  when: _port_check.failed | default(false)
+  tags: [health, network]
+
+# -------------------- HTTP /healthz и /ready --------------------
+- name: "HTTP GET /healthz"
+  ansible.builtin.uri:
+    url: "http://{{ omnimind_http_host }}:{{ omnimind_http_port }}{{ omnimind_health_path }}"
+    method: GET
+    return_content: true
+    status_code: 200
+    timeout: 3
+  register: _healthz
+  retries: 5
+  delay: 2
+  until: _healthz is succeeded
+  failed_when: false
+  tags: [health, http]
+
+- name: "Record /healthz failure"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'http:healthz_failed' ] }}"
+  when: _healthz.status | default(0) != 200
+  tags: [health, http]
+
+- name: "HTTP GET /ready"
+  ansible.builtin.uri:
+    url: "http://{{ omnimind_http_host }}:{{ omnimind_http_port }}{{ omnimind_ready_path }}"
+    method: GET
+    status_code: 200
+    timeout: 3
+  register: _ready
+  failed_when: false
+  tags: [health, http]
+
+- name: "Record /ready failure"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'http:ready_failed' ] }}"
+  when: _ready.status | default(0) != 200
+  tags: [health, http]
+
+# -------------------- Версия сервиса --------------------
+- name: "HTTP GET /version"
+  ansible.builtin.uri:
+    url: "http://{{ omnimind_http_host }}:{{ omnimind_http_port }}{{ omnimind_version_path }}"
+    method: GET
+    return_content: true
+    status_code: 200
+    timeout: 3
+  register: _version
+  failed_when: false
+  tags: [health, http]
+
+- name: "Validate version format"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'version:unexpected' ] }}"
+  when: not (_version.content is defined and (_version.content | regex_search(omnimind_expected_version_regex)))
+  tags: [health, http]
+
+# -------------------- TLS-сертификат (опционально) --------------------
+- name: "TLS: fetch cert enddate (optional)"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    host="{{ omnimind_http_host }}"
+    port="{{ omnimind_http_port }}"
+    sni="{{ omnimind_tls_sni }}"
+    if [ -n "$sni" ]; then SNI_OPT="-servername $sni"; else SNI_OPT=""; fi
+    echo | openssl s_client -connect "${host}:${port}" $SNI_OPT -brief -showcerts 2>/dev/null \
+      | openssl x509 -noout -enddate | cut -d'=' -f2
+  args:
+    executable: /bin/bash
+  register: _tls_enddate
+  changed_when: false
+  failed_when: false
+  when: omnimind_tls_enabled | bool
+  tags: [health, tls]
+
+- name: "TLS: compute days to expire"
+  ansible.builtin.set_fact:
+    _tls_days_left: >-
+      {{
+        (
+          ( (_tls_enddate.stdout | default('')) | length > 0 )
+          | ternary(
+              ( ( _tls_enddate.stdout | to_datetime('%b %d %H:%M:%S %Y %Z') ) - (ansible_date_time.iso8601 | to_datetime) ).days,
+              -1
+            )
+        )
+      }}
+  when: omnimind_tls_enabled | bool
+  tags: [health, tls]
+
+- name: "TLS: record expiry failure"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'tls:expiring_soon' ] }}"
+  when:
+    - omnimind_tls_enabled | bool
+    - _tls_days_left | default(-1) >= 0
+    - _tls_days_left < omnimind_tls_min_days_left | int
+  tags: [health, tls]
+
+# -------------------- Диски/ресурсы --------------------
+- name: "Validate free space on monitored mounts"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'disk:low_free:' ~ item.mount ] }}"
+  loop: "{{ ansible_facts.mounts | selectattr('mount', 'in', omnimind_monitored_mounts) | list }}"
+  when: (item.size_available | default(0)) | int < (omnimind_min_disk_free_bytes | int)
+  tags: [health, disk]
+
+- name: "Validate CPU 1-minute load average"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'cpu:high_load1:' ~ (ansible_facts.loadavg[0] | string) ] }}"
+  when: (ansible_facts.loadavg[0] | float) > (omnimind_max_load1 | float)
+  tags: [health, cpu]
+
+- name: "Validate free memory"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'mem:low_free_mb' ] }}"
+  when: (ansible_facts.memfree_mb | int) < (omnimind_min_mem_free_mb | int)
+  tags: [health, memory]
+
+# -------------------- sysctl/ulimit (опционально) --------------------
+- name: "Check fs.file-max sysctl"
+  ansible.builtin.command: sysctl -n fs.file-max
+  register: _filemax
+  changed_when: false
+  failed_when: false
+  tags: [health, sysctl]
+
+- name: "Record sysctl file-max too low"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'sysctl:file-max_low' ] }}"
+  when: (_filemax.stdout | default('0') | int) < 1048576
+  tags: [health, sysctl]
+
+- name: "Check ulimit -n for service user (optional)"
+  ansible.builtin.shell: "su -s /bin/bash -c 'ulimit -n' {{ omnimind_service_user }}"
+  register: _ulimit_n
+  changed_when: false
+  failed_when: false
+  when: omnimind_check_ulimit | bool
+  tags: [health, limits]
+
+- name: "Record ulimit too low"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'limits:nofile_low' ] }}"
+  when:
+    - omnimind_check_ulimit | bool
+    - (_ulimit_n.stdout | default('0') | int) < (omnimind_min_nofile | int)
+  tags: [health, limits]
+
+# -------------------- Синхронизация времени --------------------
+- name: "Check time sync via timedatectl"
+  ansible.builtin.command: timedatectl show -p NTPSynchronized --value
+  register: _ntp_sync
+  changed_when: false
+  failed_when: false
+  tags: [health, time]
+
+- name: "Record unsynchronized time"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'time:ntp_unsynchronized' ] }}"
+  when: _ntp_sync.stdout | default('no') not in ['yes', 'true', '1']
+  tags: [health, time]
+
+# -------------------- Интеграции: Postgres/Redis (опционально) --------------------
+- name: "Postgres ping (optional)"
+  ansible.builtin.shell: "psql '{{ omnimind_database_url }}' -c 'select 1' -t -A"
+  register: _pg_ping
+  changed_when: false
+  failed_when: false
+  when:
+    - omnimind_check_postgres | bool
+    - omnimind_database_url | length > 0
+  tags: [health, db]
+
+- name: "Record Postgres failure"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'db:postgres_unreachable' ] }}"
+  when:
+    - omnimind_check_postgres | bool
+    - omnimind_database_url | length > 0
+    - (_pg_ping.stdout | default('') | trim) != '1'
+  tags: [health, db]
+
+- name: "Redis ping (optional)"
+  ansible.builtin.shell: "redis-cli -u '{{ omnimind_redis_url }}' PING"
+  register: _redis_ping
+  changed_when: false
+  failed_when: false
+  when:
+    - omnimind_check_redis | bool
+    - omnimind_redis_url | length > 0
+  tags: [health, cache]
+
+- name: "Record Redis failure"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'cache:redis_unreachable' ] }}"
+  when:
+    - omnimind_check_redis | bool
+    - omnimind_redis_url | length > 0
+    - (_redis_ping.stdout | default('') | trim) != 'PONG'
+  tags: [health, cache]
+
+# -------------------- Docker контейнер (опционально) --------------------
+- name: "Check container exists and healthy (optional)"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    name="{{ omnimind_docker_container_name }}"
+    docker inspect --format '{{"{{"}}.State.Running{{"}}"}} {{ "{{" }}index .State.Health.Status{{ "}}" }}' "$name" 2>/dev/null || echo "notfound notfound"
+  register: _docker_state
+  changed_when: false
+  failed_when: false
+  when: omnimind_check_docker | bool
+  tags: [health, docker]
+
+- name: "Record Docker health failure"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'docker:container_unhealthy' ] }}"
+  when:
+    - omnimind_check_docker | bool
+    - (_docker_state.stdout | default('notfound notfound')) is regex('^(true|false) (healthy|starting|unhealthy|notfound)$')
+    - _docker_state.stdout.split()|length == 2
+    - (_docker_state.stdout.split()[0] != 'true') or (_docker_state.stdout.split()[1] != 'healthy')
+  tags: [health, docker]
+
+# -------------------- Логи: ошибки за период --------------------
+- name: "Scan recent journal errors"
+  ansible.builtin.shell: |
+    journalctl -u {{ omnimind_service_name }} --since {{ omnimind_log_since }} -o cat \
+      | egrep -i 'error|exception|traceback' | wc -l
+  register: _err_count
+  changed_when: false
+  failed_when: false
+  tags: [health, logs]
+
+- name: "Record excessive recent errors"
+  ansible.builtin.set_fact:
+    _health_failures: "{{ _health_failures + [ 'logs:excessive_errors:' ~ (_err_count.stdout | default('0')) ] }}"
+  when: (_err_count.stdout | default('0') | int) > (omnimind_max_recent_errors | int)
+  tags: [health, logs]
+
+# -------------------- Отчёт и финальная валидация --------------------
+- name: "Assemble health report"
+  ansible.builtin.set_fact:
+    _health_report:
+      timestamp: "{{ ansible_date_time.iso8601 }}"
+      host: "{{ inventory_hostname }}"
+      service:
+        name: "{{ omnimind_service_name }}"
+        running: "{{ _svc_info.state | default('unknown') }}"
+        enabled: "{{ _svc_info.status | default('unknown') }}"
+      http:
+        healthz: "{{ _healthz.status | default(0) }}"
+        ready: "{{ _ready.status | default(0) }}"
+        version: "{{ (_version.content | default('') ) | trim }}"
+      tls:
+        enabled: "{{ omnimind_tls_enabled | bool }}"
+        days_left: "{{ _tls_days_left | default(omit) }}"
+      resources:
+        load1: "{{ ansible_facts.loadavg[0] | default(omit) }}"
+        memfree_mb: "{{ ansible_facts.memfree_mb | default(omit) }}"
+        disks: >-
+          {{ (ansible_facts.mounts | selectattr('mount','in',omnimind_monitored_mounts) | map(attribute='mount') | list) }}
+      integrations:
+        postgres_ok: "{{ (_pg_ping.stdout | default('') | trim) == '1' if omnimind_check_postgres | bool else omit }}"
+        redis_ok: "{{ (_redis_ping.stdout | default('') | trim) == 'PONG' if omnimind_check_redis | bool else omit }}"
+        docker_state: "{{ _docker_state.stdout | default(omit) if omnimind_check_docker | bool else omit }}"
+      limits:
+        file_max: "{{ _filemax.stdout | default(omit) }}"
+        nofile_user: "{{ _ulimit_n.stdout | default(omit) if omnimind_check_ulimit | bool else omit }}"
+      time_sync:
+        ntp_synced: "{{ _ntp_sync.stdout | default('no') }}"
+      failures: "{{ _health_failures }}"
+  tags: [health, report]
+
+- name: "Write health report to file"
+  ansible.builtin.copy:
+    dest: "{{ omnimind_health_report_path }}"
+    content: "{{ _health_report | to_nice_json }}"
+    owner: "{{ omnimind_service_user }}"
+    group: "{{ omnimind_service_user }}"
+    mode: "0640"
+  tags: [health, report]
+
+- name: "Fail if any health checks failed"
+  ansible.builtin.assert:
+    that:
+      - _health_failures | length == 0
+    fail_msg: "Healthcheck failed: {{ _health_failures | to_nice_json }}"
+    success_msg: "Healthcheck passed"
+  tags: [health, verify]

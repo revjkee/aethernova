@@ -1,0 +1,386 @@
+syntax = "proto3";
+
+package datafabric.v1.stream.quality;
+
+option go_package = "github.com/aethernova/datafabric-core/schemas/proto/v1/stream/quality;qualityv1";
+option java_multiple_files = true;
+option java_package = "io.aethernova.datafabric.v1.stream.quality";
+option java_outer_classname = "ChecksProto";
+option csharp_namespace = "Aethernova.Datafabric.V1.Stream.Quality";
+option cc_enable_arenas = true;
+option optimize_for = SPEED;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+import "google/protobuf/any.proto";
+
+/* ===========================
+   Перечисления (строгая типизация)
+   =========================== */
+
+enum CheckKind {
+  CHECK_KIND_UNSPECIFIED = 0;
+  CHECK_KIND_SCHEMA      = 1; // соответствие ожидаемой схеме/типам
+  CHECK_KIND_CONSTRAINT  = 2; // детерминированные ограничения (NOT NULL, UNIQUE, диапазоны)
+  CHECK_KIND_STATISTICAL = 3; // статистические ожидания (квантили, дрейф)
+  CHECK_KIND_FRESHNESS   = 4; // своевременность данных
+  CHECK_KIND_COMPLETENESS= 5; // полнота (coverage)
+  CHECK_KIND_CONSISTENCY = 6; // согласованность (межполевая логика)
+  CHECK_KIND_PIISAFETY   = 7; // политики PII/маскирование
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO        = 1;
+  SEVERITY_WARN        = 2;
+  SEVERITY_ERROR       = 3;
+  SEVERITY_CRITICAL    = 4;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_PASS        = 1;
+  STATUS_WARN        = 2;
+  STATUS_FAIL        = 3;
+  STATUS_ERROR       = 4; // ошибка выполнения проверки
+}
+
+enum Comparator {
+  CMP_UNSPECIFIED = 0;
+  CMP_EQ          = 1;
+  CMP_NE          = 2;
+  CMP_LT          = 3;
+  CMP_LE          = 4;
+  CMP_GT          = 5;
+  CMP_GE          = 6;
+  CMP_IN_SET      = 7;
+  CMP_NOT_IN_SET  = 8;
+  CMP_MATCHES     = 9;  // regex
+  CMP_NOT_MATCHES = 10;
+  CMP_BETWEEN     = 11; // включительно
+}
+
+enum Aggregation {
+  AGG_UNSPECIFIED = 0;
+  AGG_NONE        = 1;  // record-level
+  AGG_COUNT       = 2;
+  AGG_COUNT_DISTINCT = 3;
+  AGG_MIN         = 4;
+  AGG_MAX         = 5;
+  AGG_MEAN        = 6;
+  AGG_MEDIAN      = 7;
+  AGG_STDDEV      = 8;
+  AGG_PERCENTILE  = 9;
+  AGG_SUM         = 10;
+  AGG_RATE        = 11; // событий/сек на окне
+}
+
+enum WindowKind {
+  WINDOW_KIND_UNSPECIFIED = 0;
+  WINDOW_TUMBLING         = 1;
+  WINDOW_SLIDING          = 2;
+  WINDOW_SESSION          = 3;
+}
+
+enum EnforcementAction {
+  ENF_ACTION_UNSPECIFIED = 0;
+  ENF_ALERT              = 1;  // отправить алерт
+  ENF_FLAG_ROLLOUT_PAUSE = 2;  // приостановить раскатку фич
+  ENF_EGRESS_PAUSE       = 3;  // приостановить выгрузку
+  ENF_ROUTE_TO_DLQ       = 4;  // отправить записи в DLQ
+  ENF_REJECT_NEW         = 5;  // начать отбрасывать новые записи
+  ENF_SCALE_UP_HINT      = 6;  // рекомендовать скейлап
+}
+
+enum DataType {
+  DT_UNSPECIFIED = 0;
+  DT_BOOL        = 1;
+  DT_INT64       = 2;
+  DT_DOUBLE      = 3;
+  DT_STRING      = 4;
+  DT_BYTES       = 5;
+  DT_TIMESTAMP   = 6;
+  DT_DECIMAL     = 7;
+}
+
+enum MissingPolicy {
+  MISSING_UNSPECIFIED = 0;
+  MISSING_FORBID      = 1; // поле обязательно
+  MISSING_ALLOW       = 2; // допускается
+  MISSING_DEFAULT     = 3; // замена значением по умолчанию
+}
+
+/* ===========================
+   Базовые структуры
+   =========================== */
+
+message Identity {
+  string id = 1;             // стабильный идентификатор проверки/набора
+  string name = 2;           // человекочитаемое имя
+  string owner = 3;          // команда-владелец
+  repeated string tags = 4;  // метки поиска/категоризации
+}
+
+message DatasetRef {
+  string system = 1;         // e.g., "kafka" | "s3" | "postgres"
+  string name = 2;           // топик/таблица/префикс
+  string namespace = 3;      // логическое пространство/арендатор
+  string schema_ref = 4;     // ссылка на схему/версии (URI)
+  string classification = 5; // public|internal|confidential|restricted
+  bool pii = 6;              // содержит PII
+  string pii_level = 7;      // none|weak|strong
+  map<string, string> labels = 8; // произвольные лейблы (версия пайплайна и т.п.)
+}
+
+message Window {
+  WindowKind kind = 1;
+  google.protobuf.Duration size = 2;       // длина окна (tumbling/sliding)
+  google.protobuf.Duration slide = 3;      // шаг (для sliding)
+  google.protobuf.Duration session_gap = 4;// разрыв (для session)
+  google.protobuf.Duration allowed_lateness = 5; // watermarks/запаздывание
+}
+
+message Sampling {
+  double ratio = 1; // 0..1
+  uint32 max_records = 2;
+}
+
+message Threshold {
+  Comparator comparator = 1;
+  // значение порога (любой тип). Для BETWEEN используйте range_min/range_max.
+  google.protobuf.Value value = 2;
+  google.protobuf.Value range_min = 3;
+  google.protobuf.Value range_max = 4;
+  // Для percentiles и т.п.
+  google.protobuf.DoubleValue percentile = 10; // 0..100
+}
+
+message FieldRef {
+  string path = 1;       // JSONPath/колонка: e.g. "payload.amount"
+  DataType type = 2;
+  MissingPolicy missing = 3;
+  google.protobuf.Value default_value = 4; // при MISSING_DEFAULT
+}
+
+/* ===========================
+   Ожидания (expectations)
+   =========================== */
+
+message Expectation {
+  string id = 1;
+  CheckKind kind = 2;
+  Severity severity = 3;
+  Aggregation aggregation = 4; // AGG_NONE для record-level
+  FieldRef field = 5;          // целевое поле (может быть опционально для агрегатов)
+  repeated FieldRef group_by = 6; // группировки на окне (опционально)
+  Threshold threshold = 7;        // основной порог
+  // Специфика отдельных проверок:
+  // - для SCHEMA/CONSTRAINT можно указать ожидаемый regex/сет значений/формат.
+  repeated string allowed_set = 20;
+  string regex = 21;
+  // Межполевая логика: выражение (например CEL, SQL-подобный синтаксис)
+  string expression = 22;
+  // Сравнение с базовой линией (drift): относительное отклонение в %
+  google.protobuf.DoubleValue drift_percent_max = 23;
+  // Минимальная полнота/покрытие (Completeness)
+  google.protobuf.DoubleValue completeness_min = 24; // 0..1
+  // Свежесть: максимальная задержка против текущего времени
+  google.protobuf.Duration freshness_max = 25;
+
+  // Резервируем диапазоны для совместимости
+  reserved 100 to 149;
+}
+
+/* ===========================
+   Спецификация набора проверок
+   =========================== */
+
+message CheckSpec {
+  Identity identity = 1;
+  DatasetRef dataset = 2;
+  Window window = 3;
+  Sampling sampling = 4;
+  repeated Expectation expectations = 5;
+
+  // Политика эскалации/действий при нарушениях
+  message Policy {
+    // Порог глобального статуса по числу/доле фейлов
+    google.protobuf.DoubleValue fail_ratio_threshold = 1; // 0..1
+    google.protobuf.UInt64Value fail_count_threshold = 2;
+    repeated EnforcementAction actions_on_fail = 3;
+    repeated EnforcementAction actions_on_critical = 4;
+    // Холодный старт/обучение базовой линии
+    google.protobuf.Duration warmup = 10;
+  }
+  Policy policy = 6;
+
+  // Связь с lineage/retention/OPA (URI/ключи)
+  string lineage_policy_ref = 10;
+  string retention_policy_ref = 11;
+  map<string, string> extern_refs = 12;
+
+  // Версионирование/эволюция
+  string revision = 20; // e.g., git SHA/semver
+  google.protobuf.Timestamp updated_at = 21;
+
+  reserved 100 to 149;
+}
+
+/* ===========================
+   Результаты проверки
+   =========================== */
+
+message Metric {
+  string name = 1;                    // e.g., "count", "p95_payload_size"
+  google.protobuf.Value value = 2;
+  Aggregation aggregation = 3;
+  Window window = 4;
+  map<string, string> attributes = 5; // group keys и т.п.
+}
+
+message ViolationSample {
+  // минимальный образец, без утечки PII: ключи/хэши, не payload целиком
+  repeated string keys = 1;           // ключи записей/хэши
+  map<string, google.protobuf.Value> fields = 2; // наблюдаемые значения по полям
+}
+
+message Violation {
+  string expectation_id = 1;
+  CheckKind kind = 2;
+  Severity severity = 3;
+  Status status = 4; // обычно FAIL
+  string message = 5; // человекочитаемое объяснение
+  Threshold observed = 6; // фактические метрики vs порог
+  uint64 affected_count = 7;
+  double affected_ratio = 8; // 0..1
+  repeated ViolationSample samples = 9; // ограничить объемом на уровне сервиса
+  map<string, string> attributes = 10;  // группировки/метки
+
+  reserved 100 to 129;
+}
+
+message EnforcementHint {
+  EnforcementAction action = 1;
+  Severity severity = 2;
+  string reason = 3;
+  map<string, string> attributes = 4; // например, id фичи/синка/маршрута
+}
+
+message CheckResult {
+  Identity identity = 1;
+  DatasetRef dataset = 2;
+  Window window = 3;
+
+  Status status = 4;
+  Severity max_severity = 5;
+
+  uint64 total_records = 10;
+  uint64 checked_records = 11;
+  double fail_ratio = 12; // 0..1
+
+  repeated Metric metrics = 20;
+  repeated Violation violations = 21;
+  repeated EnforcementHint enforcement = 22;
+
+  google.protobuf.Timestamp started_at = 30;
+  google.protobuf.Timestamp finished_at = 31;
+  string executor = 32; // имя раннера/версии
+
+  map<string, string> labels = 40; // произвольные метки отчета
+  google.protobuf.Any debug_info = 41;
+
+  reserved 100 to 149;
+}
+
+/* ===========================
+   Профайлинг и базовые линии
+   =========================== */
+
+message ProfileStat {
+  string field = 1;
+  DataType type = 2;
+  uint64 count = 3;
+  uint64 nulls = 4;
+  uint64 distinct = 5;
+  google.protobuf.Value min = 6;
+  google.protobuf.Value max = 7;
+  double mean = 8;
+  double stddev = 9;
+  map<string, double> quantiles = 10; // "p50": 123.0, "p95": ...
+  map<string, string> attributes = 11; // по группам
+}
+
+message DatasetProfile {
+  Identity identity = 1;
+  DatasetRef dataset = 2;
+  Window window = 3;
+  repeated ProfileStat stats = 4;
+  google.protobuf.Timestamp generated_at = 5;
+  string revision = 6;
+
+  reserved 100 to 119;
+}
+
+/* ===========================
+   Запросы/ответы сервисов
+   =========================== */
+
+message ValidateRecordRequest {
+  CheckSpec spec = 1;
+  // Одна запись для record-level проверок. Поле не должно содержать PII в открытом виде.
+  google.protobuf.Struct record = 2;
+  google.protobuf.Timestamp received_at = 3;
+}
+
+message ValidateBatchRequest {
+  CheckSpec spec = 1;
+  // Батч записей (семплинг управляется spec.sampling)
+  repeated google.protobuf.Struct records = 2;
+  google.protobuf.Timestamp received_at = 3;
+}
+
+message ValidateResponse {
+  CheckResult result = 1;
+}
+
+message ProfileRequest {
+  Identity identity = 1;
+  DatasetRef dataset = 2;
+  Window window = 3;
+  repeated FieldRef fields = 4; // если пусто — профайлим все обнаруженные
+}
+
+message ProfileResponse {
+  DatasetProfile profile = 1;
+}
+
+/* ===========================
+   Сервисы (gRPC)
+   =========================== */
+
+service QualityValidator {
+  // Быстрая проверка одной записи (низкая задержка)
+  rpc ValidateRecord(ValidateRecordRequest) returns (ValidateResponse);
+
+  // Проверка батча/окна
+  rpc ValidateBatch(ValidateBatchRequest) returns (ValidateResponse);
+}
+
+service QualityProfiler {
+  // Профайлинг на окне/батче для построения базовой линии
+  rpc BuildProfile(ProfileRequest) returns (ProfileResponse);
+}
+
+/* ===========================
+   Рекомендации по эволюции (важно для долговременных потоков)
+   ===========================
+   1) Не переиспользуйте номера полей; удаляемые номера помечайте reserved.
+   2) Новые поля добавляйте с новыми номерами и безопасными default.
+   3) Расширяйте enum’ы только добавлением значений в конец.
+   4) Не передавайте сырой PII в samples; используйте хэши/ключи.
+   5) Согласуйте классификацию/retention с конфигами:
+      - configs/policies/retention.yaml
+      - configs/policies/rego/lineage_guard.rego
+*/

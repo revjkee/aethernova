@@ -1,0 +1,271 @@
+# VeilMind Core — Redaction Configuration
+# Версия схемы конфигурации
+version: 1.2.0
+
+meta:
+  owner: "VeilMind Security"
+  description: "Централизованное редактирование PII/секретов для логов, метрик и трассировок"
+  updated_at: "2025-08-21"
+  compliance:
+    - "GDPR"
+    - "CCPA"
+    - "ISO/IEC 27001"
+  notes:
+    - "Все правила применяются до записи в sink"
+    - "Детерминированный хеш позволяет коррелировать события без раскрытия исходного значения"
+
+defaults:
+  strategy: "mask"           # mask | hash | remove | tokenize
+  mask_char: "*"
+  mask_keep_head: 2          # первые символы оставить при маскировании
+  mask_keep_tail: 2          # последние символы оставить при маскировании
+  hash:
+    algo: "sha256"
+    salt_env: "VEILMIND_PII_SALT"  # если отсутствует — берется из static_salt
+    static_salt: ""                 # задайте в окружениях non-prod
+  tokenize:
+    namespace: "vmc"         # префикс псевдонима
+  max_value_len: 4096        # отсечка длинных значений перед обработкой
+  sampling:
+    enabled: true
+    rate: 1.0                # 0.0..1.0; <1.0 уменьшает нагрузку редактора
+  cardinality:
+    limit_labels: 20         # ограничение кол-ва меток после редактирования
+    limit_values: 128        # лимит длины значения после редактирования
+  precedence:
+    # Порядок применения категорий правил (выше — раньше)
+    - "denylist"   # remove жесткие секреты всегда первыми
+    - "pii"
+    - "sensitive"
+    - "weak"
+    - "allowlist" # перезаписывает поведение: поля, которые можно не редактировать
+  sinks:
+    logs:
+      enabled: true
+      strategy_override: ""  # можно задать "hash" для логов
+    traces:
+      enabled: true
+      strategy_override: "hash"
+    metrics:
+      enabled: true
+      strategy_override: "hash"
+
+sources:
+  # Определения источников событий и путей полей
+  http:
+    enabled: true
+    fields:
+      # JSONPath/Pointer для структурированных полей
+      - path: "$.request.headers"         # map<string,string|list>
+      - path: "$.request.query"
+      - path: "$.request.cookies"
+      - path: "$.request.body"            # объект/строка
+      - path: "$.response.headers"
+      - path: "$.response.body"
+    text_fields:
+      - "$.raw"                            # неструктурированный дамп
+  grpc:
+    enabled: true
+    fields:
+      - "$.request.metadata"
+      - "$.request.message"
+      - "$.response.message"
+  db:
+    enabled: true
+    fields:
+      - "$.sql.query"
+      - "$.sql.params"
+  process:
+    enabled: true
+    fields:
+      - "$.env"                            # переменные окружения
+      - "$.args"
+  files:
+    enabled: true
+    fields:
+      - "$.path"
+      - "$.content"
+
+strategies:
+  # Можно переопределить поведение для конкретных категорий
+  denylist: { strategy: "remove" }
+  pii:      { strategy: "hash" }
+  sensitive:{ strategy: "mask" }
+  weak:     { strategy: "mask" }
+  allowlist:{ strategy: "none" }   # никаких изменений
+
+detectors:
+  # Регулярные выражения и нормализация. regex должны быть безопасны (RE2‑совместимые).
+  # Каждая запись — именованный детектор. category задает класс риска.
+  - name: "auth_bearer"
+    category: "denylist"
+    targets: ["headers","cookies","text","json","query","env"]
+    regex: "(?i)\\bBearer\\s+([A-Za-z0-9\\-_.~+/]+=*)\\b"
+    group: 1
+  - name: "jwt"
+    category: "denylist"
+    targets: ["text","json","headers","cookies"]
+    regex: "\\beyJ[A-Za-z0-9_\\-]+=*\\.[A-Za-z0-9_\\-]+=*\\.[A-Za-z0-9_\\-]+=*\\b"
+  - name: "aws_access_key_id"
+    category: "denylist"
+    targets: ["text","json","env"]
+    regex: "\\bAKIA[0-9A-Z]{16}\\b"
+  - name: "aws_secret_access_key"
+    category: "denylist"
+    targets: ["text","json","env"]
+    regex: "(?i)aws(?:_|-)secret(?:_|-)access(?:_|-)key\\s*[:=]\\s*([A-Za-z0-9/+=]{40})"
+    group: 1
+  - name: "private_key_pem"
+    category: "denylist"
+    targets: ["text","files","json"]
+    regex: "-----BEGIN (?:RSA|EC|PRIVATE) KEY-----[\\s\\S]+?-----END (?:RSA|EC|PRIVATE) KEY-----"
+    multiline: true
+  - name: "password_kv"
+    category: "denylist"
+    targets: ["json","env","headers","cookies","query","text"]
+    regex: "(?i)(pass(word)?|pwd|secret|token|apikey|api_key|access_token)\\s*[:=]\\s*([^\\s,;\"']+)"
+    group: 3
+
+  - name: "email"
+    category: "pii"
+    targets: ["text","json","headers","query"]
+    regex: "\\b[a-zA-Z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b"
+  - name: "phone_e164"
+    category: "pii"
+    targets: ["text","json"]
+    regex: "\\+\\d{8,15}\\b"
+  - name: "ipv4"
+    category: "pii"
+    targets: ["text","json","headers","query"]
+    regex: "\\b((25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\.){3}(25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\b"
+  - name: "ipv6"
+    category: "pii"
+    targets: ["text","json","headers","query"]
+    regex: "\\b([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\\b"
+  - name: "credit_card"
+    category: "pii"
+    targets: ["text","json"]
+    regex: "\\b(?:4\\d{12}(?:\\d{3})?|5[1-5]\\d{14}|3[47]\\d{13}|6(?:011|5\\d{2})\\d{12})\\b"
+    luhn: true
+  - name: "iban"
+    category: "pii"
+    targets: ["text","json"]
+    regex: "\\b[A-Z]{2}\\d{2}[A-Z0-9]{1,30}\\b"
+
+  - name: "session_id"
+    category: "sensitive"
+    targets: ["cookies","headers","json","text"]
+    regex: "(?i)\\b(sid|session(?:id)?|sess)\\b\\s*[=:]\\s*([A-Za-z0-9\\-_.]{8,128})"
+    group: 2
+  - name: "device_id"
+    category: "sensitive"
+    targets: ["json","headers","text"]
+    regex: "\\b(device[_-]?id)\\b\\s*[:=]\\s*([A-Za-z0-9\\-_.]{6,128})"
+    group: 2
+
+  - name: "name_like"
+    category: "weak"
+    targets: ["json","text"]
+    regex: "(?i)\\b(fullname|firstname|lastname|fio)\\b\\s*[:=]\\s*([\\p{L} .'\\-]{1,128})"
+    group: 2
+  - name: "address_like"
+    category: "weak"
+    targets: ["json","text"]
+    regex: "(?i)\\b(address|street|city|zip|postal)\\b\\s*[:=]\\s*([^,\\n]{3,256})"
+    group: 2
+
+json_rules:
+  # Строго структурированные правила по ключам (до/вместо regex).
+  # Ключи нормализуются: нижний регистр, пробелы/дефисы -> подчеркивание.
+  denylist:
+    - keys: ["authorization","proxy-authorization","x-api-key","x-auth-token","set-cookie"]
+      where: ["headers"]
+    - keys: ["password","secret","token","client_secret","private_key","refresh_token"]
+      where: ["json","env","query","cookies"]
+  pii:
+    - keys: ["email","e-mail","user_email","customer_email"]
+      where: ["json","query"]
+    - keys: ["phone","msisdn","contact_phone"]
+      where: ["json","query"]
+    - keys: ["ip","client_ip","remote_addr","x-forwarded-for"]
+      where: ["headers","json","query"]
+  sensitive:
+    - keys: ["session","session_id","device_id","fingerprint","cookie","sid"]
+      where: ["json","cookies","headers"]
+  allowlist:
+    - keys: ["request_id","trace_id","span_id","tenant_id","component","service","version"]
+      where: ["headers","json","query"]
+      # Для этих ключей применяется только обрезка длины и санитизация
+      sanitize_only: true
+
+policies:
+  # Политики на основе контекста события (route/service/level/sink)
+  - name: "http_response_body_large"
+    when:
+      source: "http"
+      phase: "response"
+      conditions:
+        content_type_regex: "(?i)^(text|application)/(html|xml)$"
+        body_length_gt: 65536
+    action:
+      strategy: "remove"     # большие текстовые ответы не логируем
+  - name: "error_only_headers"
+    when:
+      source: "http"
+      phase: "response"
+      conditions:
+        status_gte: 500
+    action:
+      keep_fields: ["$.request.method","$.request.path","$.request.headers","$.response.status"]
+      drop_others: true
+  - name: "metrics_low_cardinality"
+    when:
+      sink: "metrics"
+    action:
+      cardinality:
+        limit_labels: 10
+        limit_values: 64
+      strategy: "hash"
+
+postprocessors:
+  # Общая санитизация после правил
+  - name: "trim_whitespace"
+    type: "normalize"
+  - name: "truncate_long_values"
+    type: "truncate"
+    max_len: 2048
+  - name: "collapse_unicode"
+    type: "normalize_unicode"
+    form: "NFKC"
+
+tests:
+  # Встроенные примеры для само‑проверки пайплайна редактирования
+  - name: "jwt_in_header_removed"
+    input:
+      headers: { Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.zz.zz" }
+    expect:
+      headers:
+        Authorization: "[REDACTED]"
+  - name: "email_hashed"
+    input:
+      json: { email: "user@example.com" }
+    expect:
+      json:
+        email: "sha256:..."   # детерминированный хеш; точное значение зависит от соли
+  - name: "session_masked"
+    input:
+      cookies: { sid: "S1234567890abcdef" }
+    expect:
+      cookies:
+        sid: "S1**************ef"
+
+telemetry:
+  # Самонаблюдение самого редактора
+  counters:
+    redacted_total: true
+    dropped_total: true
+    errors_total: true
+  labels:
+    env_from: "VEILMIND_ENV"
+    region_from: "VEILMIND_REGION"
+  sample_rate: 1.0

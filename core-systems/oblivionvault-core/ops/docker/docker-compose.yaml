@@ -1,0 +1,313 @@
+# ops/docker/docker-compose.yaml
+version: "3.9"
+
+x-health-retries: &health_retries 5
+x-health-start-period: &health_start_period 20s
+x-common-env: &common_env
+  TZ: ${TZ:-UTC}
+
+x-security-restrictions: &security_restrictions
+  read_only: true
+  cap_drop: ["ALL"]
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+
+x-deploy-defaults: &deploy_defaults
+  restart: unless-stopped
+
+networks:
+  public:
+    name: oblivion_public
+    driver: bridge
+  internal:
+    name: oblivion_internal
+    driver: bridge
+    internal: true
+  observability:
+    name: oblivion_observability
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres-data:
+  redis-data:
+  app-static:
+  app-media:
+  traefik-acme:
+  grafana-data:
+  prometheus-data:
+  loki-data:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+  app_jwt_secret:
+    file: ./secrets/app_jwt_secret.txt
+
+services:
+
+  # =========================
+  # Core application
+  # =========================
+  app:
+    <<: *deploy_defaults
+    profiles: ["core"]
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${APP_IMAGE:-oblivionvault-core:local}
+    env_file:
+      - ./env/app.env
+    environment:
+      <<: *common_env
+      DATABASE_URL: ${DATABASE_URL:-postgresql://app:${DB_PASSWORD}@db:5432/oblivion}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      APP_JWT_SECRET_FILE: /run/secrets/app_jwt_secret
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8000"
+      # Для Traefik‑маршрутизации:
+      APP_DOMAIN: ${APP_DOMAIN:-app.localhost}
+    secrets:
+      - app_jwt_secret
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: *health_retries
+      start_period: *health_start_period
+    ports:
+      - "${APP_PORT_BIND:-127.0.0.1:8000}:8000"
+    volumes:
+      - app-static:/app/static
+      - app-media:/app/media
+    labels:
+      # Traefik (включайте вместе с профилем edge)
+      traefik.enable: "true"
+      traefik.http.routers.app.rule: "Host(`${APP_DOMAIN:-app.localhost}`)"
+      traefik.http.routers.app.entrypoints: "websecure"
+      traefik.http.routers.app.tls.certresolver: "le"
+      traefik.http.services.app.loadbalancer.server.port: "8000"
+    networks:
+      - internal
+      - public
+    # Безопасность
+    user: ${APP_UID:-1000}:${APP_GID:-1000}
+    <<: *security_restrictions
+    # Ресурсы (compose игнорирует deploy в non-swarm, но оставим для стандартизации)
+    deploy:
+      resources:
+        limits:
+          cpus: "${APP_CPU_LIMIT:-1.0}"
+          memory: "${APP_MEM_LIMIT:-512M}"
+        reservations:
+          cpus: "${APP_CPU_RESERVATION:-0.25}"
+          memory: "${APP_MEM_RESERVATION:-256M}"
+
+  db:
+    <<: *deploy_defaults
+    profiles: ["core"]
+    image: postgres:16-alpine
+    environment:
+      <<: *common_env
+      POSTGRES_DB: ${POSTGRES_DB:-oblivion}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-oblivion} -h 127.0.0.1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: *health_retries
+      start_period: *health_start_period
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - internal
+    user: "999:999"
+    read_only: false
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPU_LIMIT:-1.0}"
+          memory: "${DB_MEM_LIMIT:-1G}"
+
+  redis:
+    <<: *deploy_defaults
+    profiles: ["core"]
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: *health_retries
+      start_period: *health_start_period
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal
+    user: "999:999"
+    <<: *security_restrictions
+
+  # =========================
+  # Edge: reverse proxy with TLS/ACME
+  # =========================
+  traefik:
+    <<: *deploy_defaults
+    profiles: ["edge"]
+    image: traefik:v3.0
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.email=${TRAEFIK_ACME_EMAIL:-admin@example.com}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --api=false
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - traefik-acme:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD-SHELL", "traefik healthcheck || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: *health_retries
+      start_period: *health_start_period
+    networks:
+      - public
+      - internal
+    user: "0:0"
+    read_only: false
+
+  # =========================
+  # MQ: Kafka-compatible broker (Redpanda)
+  # =========================
+  redpanda:
+    <<: *deploy_defaults
+    profiles: ["mq"]
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.10
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 1024M
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - 0.0.0.0:9092
+      - --advertise-kafka-addr
+      - redpanda:9092
+    ports:
+      - "${KAFKA_PORT_BIND:-127.0.0.1:9092}:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9644/v1/status/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: *health_retries
+      start_period: *health_start_period
+    networks:
+      - internal
+    <<: *security_restrictions
+    read_only: false
+
+  # =========================
+  # Observability stack
+  # =========================
+  prometheus:
+    <<: *deploy_defaults
+    profiles: ["observability"]
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=${PROM_RETENTION:-15d}
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: *health_retries
+      start_period: *health_start_period
+    ports:
+      - "${PROM_PORT_BIND:-127.0.0.1:9090}:9090"
+    networks:
+      - observability
+      - internal
+    <<: *security_restrictions
+    read_only: false
+
+  loki:
+    <<: *deploy_defaults
+    profiles: ["observability"]
+    image: grafana/loki:2.9.8
+    command: ["-config.file=/etc/loki/config.yml"]
+    volumes:
+      - ./observability/loki/config.yml:/etc/loki/config.yml:ro
+      - loki-data:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: *health_retries
+      start_period: *health_start_period
+    ports:
+      - "${LOKI_PORT_BIND:-127.0.0.1:3100}:3100"
+    networks:
+      - observability
+    <<: *security_restrictions
+    read_only: false
+
+  promtail:
+    <<: *deploy_defaults
+    profiles: ["observability"]
+    image: grafana/promtail:2.9.8
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - /var/log:/var/log:ro
+      - ./observability/promtail/config.yml:/etc/promtail/config.yml:ro
+    networks:
+      - observability
+    <<: *security_restrictions
+
+  grafana:
+    <<: *deploy_defaults
+    profiles: ["observability"]
+    image: grafana/grafana:11.1.4
+    environment:
+      <<: *common_env
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: *health_retries
+      start_period: *health_start_period
+    ports:
+      - "${GRAFANA_PORT_BIND:-127.0.0.1:3000}:3000"
+    networks:
+      - observability
+    <<: *security_restrictions
+    read_only: false

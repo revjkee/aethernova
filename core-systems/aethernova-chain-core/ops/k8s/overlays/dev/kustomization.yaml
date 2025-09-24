@@ -1,0 +1,112 @@
+apiVersion: kustomize.config.k8s.io/v1beta1  # kubernetes.io Kustomize task page
+kind: Kustomization
+
+# Базовые манифесты
+resources:
+  - ../../base  # структура "base/overlays" соответствует практике overlays из официальных руководств
+
+# Пространство имён для dev
+namespace: aethernova-dev
+
+# Единые метки и аннотации
+commonLabels:
+  app.kubernetes.io/name: chain-core
+  app.kubernetes.io/instance: chain-core-dev
+  app.kubernetes.io/component: backend
+  app.kubernetes.io/part-of: aethernova
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/environment: dev
+
+commonAnnotations:
+  observability.aethernova.io/scrape: "true"
+  owner.aethernova.io/team: "core"
+  release.aethernova.io/channel: "dev"
+
+# Суффикс имён для отделения dev-объектов
+nameSuffix: -dev
+
+# Генераторы конфигов и секретов для dev
+generatorOptions:
+  disableNameSuffixHash: true  # стабильные имена для dev
+
+configMapGenerator:
+  - name: chain-core-config
+    behavior: merge        # разрешаем оверлейно дополнять/переопределять
+    literals:
+      - APP_ENV=dev
+      - LOG_LEVEL=debug
+      - HTTP_DETAILED_ERRORS=true
+    files:
+      - ../../../configs/env/dev.toml
+
+secretGenerator:
+  - name: chain-core-secrets
+    behavior: merge
+    literals:
+      - JWT_SECRET=change-me-dev
+      - DB_PASSWORD=postgres
+      - REDIS_PASSWORD=
+    # В dev допускаем незашифрованные секреты; в prod — через внешние секрет-менеджеры
+
+# Обновление образов для dev
+images:
+  - name: ghcr.io/aethernova/chain-core
+    newName: ghcr.io/aethernova/chain-core
+    newTag: dev-2025-09-08  # пример тега; в CI можно подставлять SHA
+
+# Реплики для dev (официальное поле kustomize "replicas")
+replicas:
+  - name: chain-core
+    kind: Deployment
+    count: 2
+
+# Патчи: стратегический merge и JSON6902 (точечные изменения)
+patches:
+  # 1) Стратегический merge-патч для ресурсов/лимитов/проб
+  - path: patches/deployment-resources.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: chain-core
+
+  # 2) JSON6902-патч для добавления dev-переменных окружения
+  - patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: FEATURE_FLAG_EXPERIMENTAL
+          value: "true"
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: APP_ENV
+          valueFrom:
+            configMapKeyRef:
+              name: chain-core-config
+              key: APP_ENV
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: chain-core
+
+# Replacements — современная альтернатива устаревающим vars
+# Пример: перенос значения APP_ENV из ConfigMap в метку Pod
+replacements:
+  - source:
+      kind: ConfigMap
+      name: chain-core-config
+      fieldPath: data.APP_ENV
+    targets:
+      - select:
+          group: apps
+          version: v1
+          kind: Deployment
+          name: chain-core
+        fieldPaths:
+          - spec.template.metadata.labels.app-env
+        options:
+          create: true
+
+# Ограничения RBAC/NetworkPolicy/Ingress можно добавлять патчами в этом же оверлее

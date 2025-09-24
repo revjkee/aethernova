@@ -1,0 +1,422 @@
+name: Security CI/CD Guardrail
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: security-ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+  id-token: write
+  attestations: write
+  packages: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  GO_VERSION: "1.22.x"
+  RUST_TOOLCHAIN: "stable"
+
+jobs:
+  actionlint:
+    name: Lint GitHub Workflows (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        uses: reviewdog/action-actionlint@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-check
+          level: error
+
+  dependency-review:
+    name: Dependency Review (PR only)
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          allow-licenses: MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0, MPL-2.0, ISC
+          deny-licenses: AGPL-3.0, GPL-3.0, GPL-2.0
+          comment-summary-in-pr: true
+
+  scorecard:
+    name: OSSF Scorecard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+
+  codeql:
+    name: CodeQL (SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ["cpp", "csharp", "go", "java", "javascript", "python", "ruby", "rust"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: +security-and-quality
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  semgrep:
+    name: Semgrep (p/ci + p/security-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep Scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/ci
+            p/security-audit
+          generateSarif: "1"
+          uploadSarif: "1"
+        env:
+          SEMGREP_ENABLE_VERSION_CHECK: "0"
+
+  secrets-scan:
+    name: Secrets Scan (Gitleaks + TruffleHog)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_VERBOSE: "true"
+          GITLEAKS_EXIT_CODE: "1"
+      - name: TruffleHog
+        uses: trufflesecurity/trufflehog@v3
+        with:
+          path: .
+          base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+          head: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+          extra_args: --only-verified --fail
+
+  python-security:
+    name: Python Security (ruff, bandit, pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        if: ${{ hashFiles('**/requirements.txt', '**/pyproject.toml') != '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install deps (requirements.txt)
+        if: ${{ hashFiles('**/requirements.txt') != '' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pip-audit bandit ruff
+      - name: Install deps (pyproject)
+        if: ${{ hashFiles('**/pyproject.toml') != '' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit bandit ruff
+          if [ -f poetry.lock ]; then pip install poetry && poetry install --no-root; fi
+          if [ -f uv.lock ] || [ -f uv.toml ]; then pip install uv && uv sync; fi
+      - name: Ruff Lint
+        if: ${{ hashFiles('**/*.py') != '' }}
+        run: ruff check --output-format=github .
+      - name: Bandit (SAST)
+        if: ${{ hashFiles('**/*.py') != '' }}
+        run: bandit -r . -x tests -lll -ii
+      - name: pip-audit (Vulns)
+        if: ${{ hashFiles('**/requirements.txt', '**/pyproject.toml') != '' }}
+        run: |
+          if [ -f requirements.txt ]; then pip-audit -r requirements.txt; else pip-audit; fi
+
+  node-security:
+    name: Node.js Security (audit + lockfile-lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        if: ${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/package.json') != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install
+        if: ${{ hashFiles('**/package.json') != '' }}
+        run: |
+          if [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i --frozen-lockfile; \
+          elif [ -f yarn.lock ]; then npm i -g yarn && yarn install --frozen-lockfile; \
+          else npm ci; fi
+      - name: Audit
+        if: ${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock') != '' }}
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pnpm audit --prod --audit-level=high || true; \
+          elif [ -f yarn.lock ]; then yarn audit --level high || true; \
+          else npm audit --omit=dev --audit-level=high || true; fi
+      - name: lockfile-lint
+        if: ${{ hashFiles('**/package-lock.json') != '' }}
+        run: npx --yes lockfile-lint --path package-lock.json --type npm --validate-https --allowed-hosts npm
+
+  rust-security:
+    name: Rust Security (cargo-audit, cargo-deny, clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        if: ${{ hashFiles('**/Cargo.toml') != '' }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install tools
+        if: ${{ hashFiles('**/Cargo.toml') != '' }}
+        run: |
+          cargo install cargo-audit || true
+          cargo install cargo-deny || true
+      - name: Cargo Audit
+        if: ${{ hashFiles('**/Cargo.lock') != '' }}
+        run: cargo audit -D warnings
+      - name: Cargo Deny (licenses + bans)
+        if: ${{ hashFiles('**/Cargo.toml') != '' }}
+        run: cargo deny check
+      - name: Clippy
+        if: ${{ hashFiles('**/Cargo.toml') != '' }}
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  go-security:
+    name: Go Security (govulncheck, vet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
+        if: ${{ hashFiles('**/go.mod') != '' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: govulncheck
+        if: ${{ hashFiles('**/go.mod') != '' }}
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: go vet
+        if: ${{ hashFiles('**/go.mod') != '' }}
+        run: go vet ./...
+
+  java-security:
+    name: Java Security (OWASP DepCheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency-Check
+        if: ${{ hashFiles('**/pom.xml', '**/build.gradle*') != '' }}
+        uses: dependency-check/Dependency-Check_Action@v4.1.0
+        with:
+          format: 'SARIF'
+          out: 'reports'
+      - name: Upload SARIF
+        if: ${{ hashFiles('**/pom.xml', '**/build.gradle*') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/dependency-check-report.sarif
+
+  terraform-security:
+    name: Terraform Security (tfsec)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: tfsec
+        if: ${{ hashFiles('**/*.tf') != '' }}
+        uses: aquasecurity/tfsec-action@v1.0.3
+
+  k8s-policy:
+    name: Kubernetes Manifests (kubeconform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: kubeconform
+        if: ${{ hashFiles('**/*k8s*.y*ml', '**/kubernetes/*.y*ml', '**/manifests/*.y*ml') != '' }}
+        uses: yannh/kubeconform-action@v1.0.0
+        with:
+          kubeconform_args: "-strict -ignore-missing-schemas -summary"
+
+  container-lint:
+    name: Dockerfile Lint (Hadolint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hadolint
+        if: ${{ hashFiles('**/Dockerfile') != '' }}
+        uses: hadolint/hadolint-action@v3.1.0
+
+  container-scan:
+    name: Container Build + Scan (Grype)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (if Dockerfile exists)
+        id: build
+        if: ${{ hashFiles('**/Dockerfile') != '' }}
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}/security-ci:${GITHUB_SHA::12}
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          docker build -t "$IMAGE" .
+      - name: Grype Scan
+        if: ${{ hashFiles('**/Dockerfile') != '' }}
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ env.IMAGE }}
+          severity-cutoff: high
+          fail-build: true
+          acs-report-enable: true
+      - name: Upload scan SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+        continue-on-error: true
+
+  sbom:
+    name: SBOM (Syft SPDX) + Attestation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      sbom: ${{ steps.sbom.outputs.file }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SBOM (Syft SPDX JSON)
+        id: sbom
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: sbom.spdx.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Attest SBOM (SLSA provenance)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "sbom.spdx.json"
+
+  pre-commit:
+    name: Pre-commit (security hooks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install pre-commit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pre-commit
+      - name: Run pre-commit
+        run: |
+          if [ -f .pre-commit-config.yaml ]; then
+            pre-commit run --all-files --show-diff-on-failure
+          else
+            echo ".pre-commit-config.yaml not found, skipping."
+          fi
+
+  summarize:
+    name: Summarize Results
+    needs:
+      - actionlint
+      - dependency-review
+      - scorecard
+      - codeql
+      - semgrep
+      - secrets-scan
+      - python-security
+      - node-security
+      - rust-security
+      - go-security
+      - java-security
+      - terraform-security
+      - k8s-policy
+      - container-lint
+      - container-scan
+      - sbom
+      - pre-commit
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report status
+        run: |
+          echo "actionlint:         ${{ needs.actionlint.result }}"
+          echo "dependency-review:  ${{ needs.dependency-review.result }}"
+          echo "ossf-scorecard:     ${{ needs.scorecard.result }}"
+          echo "codeql:             ${{ needs.codeql.result }}"
+          echo "semgrep:            ${{ needs.semgrep.result }}"
+          echo "secrets-scan:       ${{ needs.secrets-scan.result }}"
+          echo "python-security:    ${{ needs.python-security.result }}"
+          echo "node-security:      ${{ needs.node-security.result }}"
+          echo "rust-security:      ${{ needs.rust-security.result }}"
+          echo "go-security:        ${{ needs.go-security.result }}"
+          echo "java-security:      ${{ needs.java-security.result }}"
+          echo "terraform-security: ${{ needs.terraform-security.result }}"
+          echo "k8s-policy:         ${{ needs.k8s-policy.result }}"
+          echo "container-lint:     ${{ needs.container-lint.result }}"
+          echo "container-scan:     ${{ needs.container-scan.result }}"
+          echo "sbom:               ${{ needs.sbom.result }}"
+          echo "pre-commit:         ${{ needs.pre-commit.result }}"
+      - name: Fail if critical checks failed
+        if: |
+          needs.codeql.result == 'failure' ||
+          needs.secrets-scan.result == 'failure' ||
+          needs.semgrep.result == 'failure' ||
+          needs.container-scan.result == 'failure'
+        run: |
+          echo "One or more critical security checks failed."
+          exit 1

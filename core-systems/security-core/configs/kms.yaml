@@ -1,0 +1,438 @@
+apiVersion: security.aethernova.io/v1
+kind: KMSConfig
+metadata:
+  name: security-core-kms
+  description: >
+    Централизованная конфигурация управления ключами для компонентов security-core.
+    Поддерживает AWS KMS, GCP KMS, Azure Key Vault и HashiCorp Vault Transit.
+  owners:
+    - platform-security
+    - infra-ops
+  environmentTiers:
+    - dev
+    - staging
+    - prod
+  compliance:
+    - owasp-asvs-2.6.1
+    - cis-benchmark-kms
+    - iso-27001-a.10
+    - soc2-security
+
+spec:
+  defaults:
+    protectionLevel: HSM            # HSM или SOFTWARE (dev)
+    rotation:
+      enabled: true
+      period: 90d                   # период ротации master-ключа
+      schedule: "0 3 * * SUN"       # окно ротации
+      strategy: create-new-and-rewrap
+      maxCryptoMaterialAge: 365d
+    deletionProtection: true
+    keyUsage:
+      allowEncrypt: true
+      allowDecrypt: true
+      allowSign: true
+      allowVerify: true
+      allowWrap: true
+      allowUnwrap: true
+    envelope:
+      dataKeyAlgorithm: AES-256-GCM
+      aad:
+        include:
+          - k8s.namespace
+          - k8s.pod
+          - app.component
+          - env
+      dataKeyCache:
+        enabled: true
+        ttl: 10m
+        maxKeys: 1024
+    networkConstraints:
+      requirePrivateEndpoint: true
+      allowedCIDRs:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+    contextRequirements:
+      requireEncryptionContext: true
+      requiredContextKeys:
+        - app
+        - env
+        - data.class
+    audit:
+      enabled: true
+      redactSensitiveValues: true
+      sinks:
+        - type: otlp
+          endpoint: "${OTLP_EXPORTER_ENDPOINT}"
+          insecure: false
+        - type: file
+          path: "/var/log/security-core/kms-audit.log"
+      fields:
+        include:
+          - timestamp
+          - provider
+          - location
+          - key.id
+          - key.alias
+          - action
+          - principal
+          - auth.mfa
+          - net.src
+          - context.hash
+          - result
+
+  providers:
+    aws:
+      enabled: true
+      locations:
+        - name: primary
+          region: "${AWS_REGION_PRIMARY}"
+          accountId: "${AWS_ACCOUNT_ID}"
+          vpcEndpointRequired: true
+        - name: dr
+          region: "${AWS_REGION_DR}"
+          accountId: "${AWS_ACCOUNT_ID}"
+          vpcEndpointRequired: true
+      auth:
+        roleArn: "${AWS_KMS_ROLE_ARN}"
+        externalId: "${AWS_EXTERNAL_ID}"
+      options:
+        enforceMfaDelete: true
+        keyPolicyTemplate: strict
+    gcp:
+      enabled: true
+      locations:
+        - name: primary
+          project: "${GCP_PROJECT_ID}"
+          location: "${GCP_KMS_LOCATION}"
+        - name: dr
+          project: "${GCP_PROJECT_ID}"
+          location: "${GCP_KMS_LOCATION_DR}"
+      auth:
+        workloadIdentityPool: "${GCP_WI_POOL}"
+        serviceAccount: "${GCP_SA_EMAIL}"
+      options:
+        protectionLevelDefault: HSM
+    azure:
+      enabled: true
+      locations:
+        - name: primary
+          subscriptionId: "${AZ_SUBSCRIPTION_ID}"
+          tenantId: "${AZ_TENANT_ID}"
+          resourceGroup: "${AZ_RG}"
+          vaultName: "${AZ_KV_NAME}"
+          region: "${AZ_REGION}"
+      auth:
+        managedIdentityClientId: "${AZ_MI_CLIENT_ID}"
+      options:
+        purgeProtection: true
+        softDeleteRetentionDays: 90
+    vault:
+      enabled: true
+      transitMount: "transit/"
+      address: "${VAULT_ADDR}"
+      namespace: "${VAULT_NAMESPACE}"
+      auth:
+        method: kubernetes
+        role: "security-core"
+      options:
+        enforceKeyDerivation: true
+
+  principals:
+    # Логические субъекты и их идентификаторы в облаках
+    api:
+      description: "API pods security-core"
+      aws: ["arn:aws:iam::${AWS_ACCOUNT_ID}:role/security-core-api"]
+      gcp: ["principal://iam.gserviceaccount.com/${GCP_SA_API}"]
+      azure: ["principal://msi/${AZ_MI_API_CLIENT_ID}"]
+      vault: ["k8s:serviceaccount:security-core:api"]
+    worker:
+      description: "Worker pods security-core"
+      aws: ["arn:aws:iam::${AWS_ACCOUNT_ID}:role/security-core-worker"]
+      gcp: ["principal://iam.gserviceaccount.com/${GCP_SA_WORKER}"]
+      azure: ["principal://msi/${AZ_MI_WORKER_CLIENT_ID}"]
+      vault: ["k8s:serviceaccount:security-core:worker"]
+    ci:
+      description: "CI pipeline"
+      aws: ["arn:aws:iam::${AWS_ACCOUNT_ID}:role/ci-deploy"]
+      gcp: ["principal://iam.gserviceaccount.com/${GCP_SA_CI}"]
+      azure: ["principal://msi/${AZ_MI_CI_CLIENT_ID}"]
+      vault: ["k8s:serviceaccount:ci:runner"]
+    secops:
+      description: "Security operations and forensics"
+      aws: ["arn:aws:iam::${AWS_ACCOUNT_ID}:role/secops"]
+      gcp: ["principal://iam.gserviceaccount.com/${GCP_SA_SECOPS}"]
+      azure: ["principal://aad/${AZ_AAD_SECOPS_GROUP_ID}"]
+      vault: ["user:secops"]
+
+  keys:
+    # Ключ для шифрования данных в покое и envelope data keys
+    - id: data-master
+      alias: "security-core/data"
+      purpose: encrypt-decrypt
+      algorithms: [AES-256]
+      providers:
+        aws:
+          keySpec: SYMMETRIC_DEFAULT
+          regions: [primary, dr]
+          multiRegion: true
+        gcp:
+          keyRing: "security-core"
+          cryptoKey: "data-master"
+          protectionLevel: HSM
+        azure:
+          keyName: "data-master"
+          keyType: "oct-HSM"
+        vault:
+          name: "data-master"
+          type: "aes256-gcm96"
+          convergentEncryption: false
+      rotation:
+        enabled: true
+        period: 90d
+        schedule: "0 2 * * SUN"
+      contextPolicy:
+        required:
+          - app
+          - env
+          - data.class
+        constraints:
+          - key: env
+            allowed: ["dev", "staging", "prod"]
+          - key: data.class
+            allowed: ["internal", "confidential", "restricted"]
+      access:
+        allow:
+          - principal: api
+            actions: [encrypt, decrypt, generateDataKey, reencrypt]
+            conditions:
+              network: private
+              auth:
+                mfa: false
+          - principal: worker
+            actions: [encrypt, decrypt, generateDataKey]
+            conditions:
+              network: private
+              auth:
+                mfa: false
+          - principal: ci
+            actions: [encrypt, decrypt]
+            conditions:
+              network: private
+              timeWindow: "00:00-06:00Z"
+          - principal: secops
+            actions: [describe, list, audit, reencrypt]
+            conditions:
+              auth:
+                mfa: true
+        deny:
+          - reason: "Запрет расшифрования без контекста"
+            when:
+              missingContextKeys: ["app", "env", "data.class"]
+
+    # Ключ для подписи артефактов и JWT
+    - id: signing-master
+      alias: "security-core/signing"
+      purpose: sign-verify
+      algorithms: [RSA-4096-PSS-SHA256, ECDSA-P256-SHA256]
+      providers:
+        aws:
+          keySpec: RSA_4096
+          keyUsage: SIGN_VERIFY
+          regions: [primary]
+        gcp:
+          keyRing: "security-core"
+          cryptoKey: "signing-master"
+          protectionLevel: HSM
+        azure:
+          keyName: "signing-master"
+          keyType: "RSA-HSM"
+          keySize: 4096
+        vault:
+          name: "signing-master"
+          type: "rsa-4096"
+      rotation:
+        enabled: true
+        period: 180d
+        schedule: "0 4 * * SUN"
+        keepOldPublicKeysDays: 365
+      contextPolicy:
+        required:
+          - app
+          - env
+          - signing.purpose
+        constraints:
+          - key: signing.purpose
+            allowed: ["jwt", "artifact", "supply-chain"]
+      access:
+        allow:
+          - principal: api
+            actions: [sign, getPublicKey]
+            conditions:
+              network: private
+          - principal: ci
+            actions: [sign, getPublicKey]
+            conditions:
+              network: private
+          - principal: secops
+            actions: [verify, getPublicKey, audit]
+            conditions:
+              auth:
+                mfa: true
+
+    # Ключ для защиты секретов конфигурации
+    - id: config-secrets
+      alias: "security-core/config"
+      purpose: encrypt-decrypt
+      algorithms: [AES-256]
+      providers:
+        aws:
+          keySpec: SYMMETRIC_DEFAULT
+          regions: [primary]
+        gcp:
+          keyRing: "security-core"
+          cryptoKey: "config-secrets"
+          protectionLevel: HSM
+        azure:
+          keyName: "config-secrets"
+          keyType: "oct-HSM"
+        vault:
+          name: "config-secrets"
+          type: "aes256-gcm96"
+      rotation:
+        enabled: true
+        period: 120d
+      sops:
+        enabled: true
+        pgp: []           # опционально, если используется гибридный режим
+        age: []           # список публичных ключей age, если требуется
+      access:
+        allow:
+          - principal: ci
+            actions: [encrypt, decrypt]
+          - principal: api
+            actions: [decrypt]
+        deny:
+          - reason: "worker не должен расшифровывать конфиги"
+            when:
+              principal: worker
+
+  policies:
+    # Глобальные правила
+    global:
+      denyIf:
+        - description: "Запрет доступа из публичных сетей"
+          condition:
+            network: public
+        - description: "Запрет операций без контекста"
+          condition:
+            missingContextKeys: ["app", "env"]
+      require:
+        - description: "Включенный аудит"
+          condition:
+            auditEnabled: true
+
+  operations:
+    # Критерии соответствия для действия
+    encrypt:
+      maxPlaintextSize: 1MiB
+      enforceContext: true
+    decrypt:
+      enforceContext: true
+    sign:
+      digestAlgorithms: ["SHA256"]
+      enforceContext: true
+    verify:
+      enforceContext: false
+    generateDataKey:
+      lengthBits: 256
+    reencrypt:
+      allowedDowngrade: false
+
+  dr:
+    multiRegionReplication:
+      enabled: true
+      keys: ["data-master"]
+      rpoTarget: "5m"
+      rtoTarget: "30m"
+    backups:
+      enabled: true
+      schedule: "0 */6 * * *"
+      store:
+        type: object
+        provider: s3
+        bucket: "${KMS_BACKUP_BUCKET}"
+        prefix: "kms/backups/"
+        kmsKeyAlias: "security-core/data"
+      artifacts:
+        include:
+          - keyMetadata
+          - publicKeys
+          - wrappedDEK
+        encryption:
+          method: envelope
+          wrappingKey: "security-core/data"
+
+  monitoring:
+    metrics:
+      exporter: otlp
+      endpoint: "${OTLP_EXPORTER_ENDPOINT}"
+      include:
+        - kms.requests.total
+        - kms.errors.total
+        - kms.latency.p50
+        - kms.latency.p95
+        - kms.key.rotation.count
+    alerts:
+      - name: "kms-errors-spike"
+        expr: 'rate(kms_errors_total[5m]) > 0.05'
+        for: 10m
+        severity: high
+      - name: "kms-latency-p95"
+        expr: 'histogram_quantile(0.95, sum(rate(kms_latency_bucket[5m])) by (le)) > 300'
+        for: 10m
+        severity: medium
+
+  environments:
+    dev:
+      overrides:
+        defaults:
+          protectionLevel: SOFTWARE
+          rotation:
+            period: 365d
+        policies:
+          global:
+            denyIf: []     # упрощаем для dev
+        providers:
+          aws:
+            enabled: false
+          gcp:
+            enabled: false
+          azure:
+            enabled: false
+          vault:
+            enabled: true
+    staging:
+      overrides:
+        defaults:
+          rotation:
+            period: 120d
+        providers:
+          vault:
+            enabled: true
+    prod:
+      overrides:
+        defaults:
+          protectionLevel: HSM
+          rotation:
+            period: 90d
+        providers:
+          aws:
+            enabled: true
+          gcp:
+            enabled: true
+          azure:
+            enabled: true
+          vault:
+            enabled: false

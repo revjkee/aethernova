@@ -1,0 +1,169 @@
+{{- /*
+  Industrial-grade Helm template for Kubernetes Service (policy-core)
+  Supports: ClusterIP, Headless, NodePort, LoadBalancer, ExternalName
+  Includes local helpers to avoid dependency on _helpers.tpl
+*/ -}}
+
+{{- /* =========================
+      Helpers
+     ========================= */ -}}
+{{- define "policy-core.fullname" -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- $fullname := printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $fullname -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "policy-core.selectorLabels" -}}
+app.kubernetes.io/name: {{ default .Chart.Name .Values.nameOverride | quote }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
+app.kubernetes.io/part-of: "policy-core"
+{{- if .Values.selectorExtra }}
+{{- toYaml .Values.selectorExtra }}
+{{- end }}
+{{- end -}}
+
+{{- define "policy-core.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name (.Chart.Version | replace "+" "_") | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- include "policy-core.selectorLabels" . | nindent 0 }}
+{{- if .Values.labels }}
+{{- toYaml .Values.labels }}
+{{- end }}
+{{- end -}}
+
+{{- /* =========================
+      Main Service
+     ========================= */ -}}
+{{- if (default true .Values.service.enabled) }}
+
+{{- $fullname := include "policy-core.fullname" . -}}
+{{- $svcName := default $fullname .Values.service.nameOverride -}}
+{{- $type := default "ClusterIP" .Values.service.type | title -}}
+{{- $headless := or (eq (default false .Values.service.headless) true) (eq (default "" .Values.service.clusterIP) "None") -}}
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svcName }}
+  labels:
+    {{- include "policy-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: "service"
+  {{- with .Values.service.labels }}
+  {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* ExternalName special case */}}
+  {{- if eq $type "Externalname" }}
+  type: ExternalName
+  externalName: {{ required ".Values.service.externalName is required for type=ExternalName" .Values.service.externalName | quote }}
+  {{- else }}
+  type: {{ if $headless }}ClusterIP{{ else }}{{ $type }}{{ end }}
+  {{- if $headless }}
+  clusterIP: None
+  {{- else if .Values.service.clusterIP }}
+  clusterIP: {{ .Values.service.clusterIP | quote }}
+  {{- end }}
+
+  {{- with .Values.service.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . | quote }}
+  {{- end }}
+
+  {{- with .Values.service.internalTrafficPolicy }}
+  internalTrafficPolicy: {{ . | quote }}
+  {{- end }}
+
+  {{- if and (eq $type "Loadbalancer") (hasKey .Values.service "allocateLoadBalancerNodePorts") }}
+  allocateLoadBalancerNodePorts: {{ .Values.service.allocateLoadBalancerNodePorts }}
+  {{- end }}
+
+  {{- with .Values.service.sessionAffinity }}
+  sessionAffinity: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.sessionAffinityConfig }}
+  sessionAffinityConfig:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  {{- if or .Values.service.publishNotReadyAddresses $headless }}
+  publishNotReadyAddresses: {{ default true .Values.service.publishNotReadyAddresses }}
+  {{- end }}
+
+  {{- with .Values.service.externalIPs }}
+  externalIPs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  {{- if eq $type "Loadbalancer" }}
+  {{- with .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . | quote }} # Cluster | Local
+  {{- end }}
+  {{- if and (eq (default "Cluster" .Values.service.externalTrafficPolicy) "Local") .Values.service.healthCheckNodePort }}
+  healthCheckNodePort: {{ .Values.service.healthCheckNodePort }}
+  {{- end }}
+  {{- end }}
+
+  selector:
+    {{- include "policy-core.selectorLabels" . | nindent 4 }}
+
+  ports:
+    {{- $ports := (default (list (dict "name" "http" "port" 80 "targetPort" "http" "protocol" "TCP" "appProtocol" "http")) .Values.service.ports) -}}
+    {{- range $i, $p := $ports }}
+    - name: {{ required "service.ports[].name is required" $p.name | quote }}
+      port: {{ required "service.ports[].port is required" $p.port }}
+      {{- if $p.targetPort }}
+      targetPort: {{ $p.targetPort }}
+      {{- end }}
+      {{- with $p.protocol }}
+      protocol: {{ . | quote }}
+      {{- end }}
+      {{- with $p.appProtocol }}
+      appProtocol: {{ . | quote }}
+      {{- end }}
+      {{- if and (or (eq $type "Nodeport") (eq $type "Loadbalancer")) $p.nodePort }}
+      nodePort: {{ $p.nodePort }}
+      {{- end }}
+    {{- end }}
+    {{- with .Values.service.additionalPorts }}
+    {{- range $i, $p := . }}
+    - name: {{ required "service.additionalPorts[].name is required" $p.name | quote }}
+      port: {{ required "service.additionalPorts[].port is required" $p.port }}
+      {{- if $p.targetPort }}
+      targetPort: {{ $p.targetPort }}
+      {{- end }}
+      {{- with $p.protocol }}
+      protocol: {{ . | quote }}
+      {{- end }}
+      {{- with $p.appProtocol }}
+      appProtocol: {{ . | quote }}
+      {{- end }}
+      {{- if and (or (eq $type "Nodeport") (eq $type "Loadbalancer")) $p.nodePort }}
+      nodePort: {{ $p.nodePort }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
+  {{- end }} # ExternalName else
+{{- end }}   # service.enabled

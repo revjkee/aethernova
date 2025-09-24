@@ -1,0 +1,159 @@
+version: "3.9"
+
+# ---------- Anchors (общие политики) ----------
+x-security: &security
+  read_only: true
+  cap_drop: ["ALL"]
+  security_opt:
+    - no-new-privileges:true
+    - label=disable
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  pids_limit: 256
+  ulimits:
+    nproc: 256
+    nofile: 4096
+  stop_grace_period: 15s
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+      compress: "true"
+      tag: "{{.ImageName}}|{{.Name}}|{{.ID}}"
+
+x-common-env: &common-env
+  ENV: "docker"
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_NO_CACHE_DIR: "1"
+
+# ---------- Networks / Volumes / Secrets ----------
+networks:
+  secnet:
+    driver: bridge
+    attachable: false
+    internal: true
+
+volumes:
+  sec_core_cache:
+    labels:
+      com.neurocity.purpose: "pip/poetry-cache"
+
+secrets:
+  security_core_config:
+    # Замените путь на реальный. Файл не попадёт в образ.
+    file: ./secrets/security_core_config.toml
+    labels:
+      com.neurocity.purpose: "app-config"
+
+# ---------- Services ----------
+services:
+  # Базовый сервис (используется в prod/dev/test/audit)
+  app:
+    build:
+      context: ../../..
+      dockerfile: core-systems/security-core/ops/docker/Dockerfile
+      target: runtime
+      args:
+        POETRY_VERSION: "1.8.3"
+        PYTHON_VERSION: "3.11"
+    image: security-core:latest
+    environment:
+      <<: *common-env
+    user: "10001:10001"         # Некорневой пользователь (создайте в Dockerfile)
+    secrets:
+      - security_core_config
+    volumes:
+      - type: volume
+        source: sec_core_cache
+        target: /app/.cache
+        read_only: false
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import importlib,sys; sys.exit(0 if importlib.util.find_spec(\"security_core\") else 1)'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: "on-failure:3"
+    networks: ["secnet"]
+    <<: *security
+    <<: *logging
+    profiles: ["prod","dev","test","audit"]
+    # По умолчанию ничего не запускаем, чтобы профили управляли командой
+    command: ["bash","-lc","sleep infinity"]
+
+  # ------ Профиль PROD ------
+  prod:
+    extends:
+      service: app
+    container_name: security-core-prod
+    # Предполагается продовый entrypoint вашего пакета (смените на реальный)
+    command: ["bash","-lc","python -m security_core.cli run"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    profiles: ["prod"]
+
+  # ------ Профиль DEV ------
+  dev:
+    extends:
+      service: app
+    container_name: security-core-dev
+    # В DEV включаем монтирование исходников, отключаем read_only
+    read_only: false
+    volumes:
+      - type: bind
+        source: ../../..
+        target: /app
+        read_only: false
+      - type: volume
+        source: sec_core_cache
+        target: /app/.cache
+        read_only: false
+    command: >
+      bash -lc "
+      poetry install --with dev,test,audit &&
+      exec bash -i
+      "
+    # В DEV разумно ослабить лимиты процессов при отладке
+    pids_limit: 4096
+    ulimits:
+      nproc: 2048
+      nofile: 65536
+    profiles: ["dev"]
+
+  # ------ Профиль TEST ------
+  test:
+    extends:
+      service: app
+    container_name: security-core-test
+    environment:
+      <<: *common-env
+      PYTHONHASHSEED: "0"
+    command: >
+      bash -lc "
+      poetry install --with test &&
+      pytest -q --maxfail=1 --disable-warnings --strict-markers
+      "
+    profiles: ["test"]
+
+  # ------ Профиль AUDIT (SAST/Deps) ------
+  audit:
+    extends:
+      service: app
+    container_name: security-core-audit
+    command: >
+      bash -lc "
+      poetry install --with audit &&
+      bandit -r src -q -ll &&
+      pip-audit -P
+      "
+    profiles: ["audit"]

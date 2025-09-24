@@ -1,0 +1,339 @@
+# cybersecurity-core/cybersecurity/adversary_emulation/scenarios/templates/crypto_mining.yaml
+schema_version: "2025-09-01"
+template_id: "AET-CRYPTO-MINING-001"
+name: "Crypto Mining (benign emulation)"
+version: "1.2.0"
+status: "stable"
+description: >
+  Безопасная эмуляция сценария криптодобычи (Resource Hijacking) без подключения к пулам и без загрузки майнеров.
+  Нагрузка создается легитимными инструментами (stress-ng, yes, openssl speed) в изолированной среде, чтобы
+  сымитировать поведенческие и телеметрические признаки майнинга для проверки обнаружения и отклика Blue Team.
+
+references:
+  mitre_attack:
+    - id: "T1496"
+      name: "Resource Hijacking"
+      url: "https://attack.mitre.org/techniques/T1496/"
+    - id: "T1610"
+      name: "Deploy Container"
+      url: "https://attack.mitre.org/techniques/T1610/"
+    - id: "T1543"
+      name: "Create or Modify System Process"
+      url: "https://attack.mitre.org/techniques/T1543/"
+    - id: "T1053"
+      name: "Scheduled Task/Job"
+      url: "https://attack.mitre.org/techniques/T1053/"
+    - id: "T1562"
+      name: "Impair Defenses"
+      url: "https://attack.mitre.org/techniques/T1562/"
+    - id: "T1526"
+      name: "Cloud Service Discovery"
+      url: "https://attack.mitre.org/techniques/T1526/"
+  cisa:
+    - id: "T1496.001"
+      name: "Compute Hijacking (CISA Eviction Strategies)"
+      url: "https://www.cisa.gov/eviction-strategies-tool/info-attack/T1496.001"
+
+guardrails:
+  safety_mode: "simulate"            # simulate|record|detonate; simulate исключает подключение к внешним пулам
+  network_egress_block: true         # блокировать исходящие соединения
+  network_dns_block: true
+  forbid_real_miners: true           # запрещает xmrig/nbminer/trex и т.п.
+  require_lab_only: true             # запуск только в изолированной тестовой среде
+  cpu_cap_pct: 70                    # верхний порог нагрузки CPU на узел
+  mem_cap_pct: 60
+  max_duration_minutes: 20
+  container_isolation: "runtime"     # runtime|k8s-namespace|vm
+  privileged_operations: false
+  requires_approval: true
+
+scope:
+  platforms:
+    - linux
+    - windows
+    - container
+    - kubernetes
+    - cloud
+  tactics:
+    - Impact          # T1496
+    - Execution
+    - Persistence
+    - Defense Evasion
+    - Discovery
+  objectives:
+    - "Сымитировать устойчивую high-CPU активность одного процесса"
+    - "Сгенерировать артефакты телеметрии для систем EDR/SIEM"
+    - "Проверить срабатывание правил детектирования и алертов"
+    - "Проверить процессы реагирования и авто-ремедиацию"
+
+telemetry_requirements:
+  linux:
+    - "auditd: SYSCALL execve, fork, setuid"
+    - "syslog: cron/systemd timers start/stop"
+    - "procfs: /proc/<pid>/stat, cgroup cpuacct"
+    - "eBPF/EBPF exporters (optional)"
+    - "osquery: processes, cpu_time, system_info"
+  windows:
+    - "Sysmon: Event ID 1 (Process Create), 3 (Network), 6 (Driver), 13 (Registry)"
+    - "Security Log: 4697 (Service Installed), 4698 (Scheduled Task Created)"
+    - "PerfMon/WMI: CPU utilization per process"
+  container_k8s:
+    - "Container runtime events (containerd/docker): Create/Start/Stop"
+    - "Kubernetes Audit: pods/deployments/daemonsets/jobs"
+    - "cAdvisor/metrics-server: container_cpu_usage_seconds_total"
+  cloud:
+    - "CloudWatch/Monitor/Stackdriver: CPUUtilization, NetworkOut"
+    - "IAM/Audit log: policy changes, new roles (if emulated)"
+
+kpis:
+  - key: "process_cpu_pct_peak"
+    target: ">=50"
+    description: "Пиковая утилизация CPU одиночным процессом"
+  - key: "container_cpu_quota_hit"
+    target: ">=1"
+    description: "Срабатывание квоты/лимита CPU в контейнере"
+  - key: "alert_triggered"
+    target: ">=1"
+    description: "Количество ожидаемых детектов/алертов"
+  - key: "ttx_minutes"
+    target: "<=15"
+    description: "Время обнаружения до алерта"
+
+variables:
+  DURATION_SEC: 600
+  LINUX_CMD_PRIMARY: "stress-ng --cpu 2 --cpu-load 95 --timeout ${DURATION_SEC}"
+  LINUX_CMD_FALLBACK: "sh -c 'yes > /dev/null & sleep ${DURATION_SEC}; kill %1'"
+  WIN_CMD_PRIMARY: "PowerShell -NoProfile -Command \"$t=Get-Date; while((Get-Date)-$t).TotalSeconds -lt ${DURATION_SEC}) { ([System.Numerics.BigInteger]::Parse('9'*2000) * 3 ) > $null }\""
+  WIN_CMD_FALLBACK: "PowerShell -NoProfile -Command \"Measure-Command {Get-FileHash -Algorithm SHA256 C:\\Windows\\System32\\kernel32.dll} | Out-Null; Start-Sleep -Seconds ${DURATION_SEC}\""
+  CONTAINER_IMAGE: "ghcr.io/aethernova/benign-load:stable"   # имидж без майнера; содержит stress-ng и sleep
+  K8S_NAMESPACE: "emulation-lab"
+  CPU_LIMIT: "500m"
+  MEM_LIMIT: "256Mi"
+
+preconditions:
+  - id: "PRE-001"
+    text: "Изолированная тестовая среда; сетевые политики запрещают внешний egress."
+  - id: "PRE-002"
+    text: "Наличие прав на запуск контейнеров/задач в указанном namespace или на хосте."
+  - id: "PRE-003"
+    text: "Средства наблюдения включены и собирают указанную телеметрию."
+  - id: "PRE-004"
+    text: "Отсутствуют реальные клиенто-пулы, кошельки, майнеры и загрузчики."
+
+techniques:
+  - id: "T1496"
+    tactic: "Impact"
+    description: "Эмуляция потребления ресурсов системой/контейнером."
+  - id: "T1610"
+    tactic: "Execution"
+    description: "Развертывание контейнера/работы в оркестраторе."
+  - id: "T1543"
+    tactic: "Persistence"
+    description: "Создание службы/демона (эмуляция устойчивости)."
+  - id: "T1053"
+    tactic: "Persistence"
+    description: "Планировщик заданий для периодической нагрузки."
+  - id: "T1562"
+    tactic: "Defense Evasion"
+    description: "Имитация попытки обхода защиты (только лог-события)."
+  - id: "T1526"
+    tactic: "Discovery"
+    description: "Безопасная проверка облачных метрик без раскрытия секретов."
+
+execution_plan:
+  steps:
+    - id: "STP-100"
+      title: "Linux host: запуск безопасной CPU-нагрузки"
+      technique: "T1496"
+      platforms: ["linux"]
+      executor:
+        name: "sh"
+        command: "${LINUX_CMD_PRIMARY}"
+        fallback: "${LINUX_CMD_FALLBACK}"
+      validations:
+        - type: "process_exists"
+          query: "name in ['stress-ng','yes']"
+        - type: "cpu_spike"
+          threshold_pct: 50
+          window_sec: 60
+      rollback:
+        - "pkill -f stress-ng || true"
+        - "pkill -f '^yes$' || true"
+
+    - id: "STP-110"
+      title: "Windows host: безопасная нагрузка через PowerShell"
+      technique: "T1496"
+      platforms: ["windows"]
+      executor:
+        name: "cmd"
+        command: "${WIN_CMD_PRIMARY}"
+        fallback: "${WIN_CMD_FALLBACK}"
+      validations:
+        - type: "process_exists"
+          query: "Image endswith 'powershell.exe'"
+        - type: "cpu_spike"
+          threshold_pct: 50
+          window_sec: 60
+      rollback:
+        - "Stop-Process -Name powershell -Force -ErrorAction SilentlyContinue"
+
+    - id: "STP-200"
+      title: "Container: запуск benign-image с лимитами"
+      technique: "T1610"
+      platforms: ["container","kubernetes"]
+      executor:
+        name: "k8s"
+        manifest:
+          apiVersion: "batch/v1"
+          kind: "Job"
+          metadata:
+            name: "benign-cpu-load"
+            namespace: "${K8S_NAMESPACE}"
+            labels: { app: "crypto-mining-sim" }
+          spec:
+            backoffLimit: 0
+            template:
+              metadata: { labels: { app: "crypto-mining-sim" } }
+              spec:
+                restartPolicy: "Never"
+                containers:
+                  - name: "load"
+                    image: "${CONTAINER_IMAGE}"
+                    args: ["--cpu-load","95","--timeout","${DURATION_SEC}"]
+                    resources:
+                      limits: { cpu: "${CPU_LIMIT}", memory: "${MEM_LIMIT}" }
+                      requests: { cpu: "200m", memory: "128Mi" }
+      validations:
+        - type: "k8s_job_succeeded"
+          name: "benign-cpu-load"
+        - type: "container_cpu_quota_hit"
+          threshold_pct: 90
+      rollback:
+        - "kubectl -n ${K8S_NAMESPACE} delete job benign-cpu-load --ignore-not-found=true"
+
+    - id: "STP-300"
+      title: "Persistence: системная служба (эмуляция)"
+      technique: "T1543"
+      platforms: ["linux"]
+      executor:
+        name: "sh"
+        command: |
+          cat >/etc/systemd/system/benign-load.service <<'UNIT'
+          [Unit]
+          Description=Benign CPU load (emulation)
+          After=network.target
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/stress-ng --cpu 1 --cpu-load 80 --timeout 300
+          User=nobody
+          NoNewPrivileges=true
+          CapabilityBoundingSet=
+          PrivateTmp=true
+          ProtectSystem=strict
+          ProtectHome=true
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now benign-load.service
+      validations:
+        - type: "service_active"
+          name: "benign-load.service"
+      rollback:
+        - "systemctl disable --now benign-load.service || true"
+        - "rm -f /etc/systemd/system/benign-load.service || true"
+        - "systemctl daemon-reload || true"
+
+    - id: "STP-310"
+      title: "Persistence: планировщик"
+      technique: "T1053"
+      platforms: ["linux","windows"]
+      executor:
+        linux:
+          name: "sh"
+          command: |
+            echo "*/15 * * * * nobody /usr/bin/timeout 120 ${LINUX_CMD_PRIMARY}" > /etc/cron.d/benign-load
+        windows:
+          name: "powershell"
+          command: |
+            $A=New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -Command ${WIN_CMD_FALLBACK}"
+            $T=New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+            Register-ScheduledTask -TaskName "BenignLoad" -Action $A -Trigger $T -User "SYSTEM" -RunLevel Highest -Force
+      validations:
+        - type: "scheduled_job_exists"
+          name: "BenignLoad or /etc/cron.d/benign-load"
+      rollback:
+        - "crontab -l | sed '/benign-load/d' | crontab - || true; rm -f /etc/cron.d/benign-load || true"
+        - "Unregister-ScheduledTask -TaskName BenignLoad -Confirm:$false -ErrorAction SilentlyContinue"
+
+    - id: "STP-400"
+      title: "Defense Evasion: имитация отключения логирования (только артефакты)"
+      technique: "T1562"
+      platforms: ["linux","windows"]
+      executor:
+        linux:
+          name: "sh"
+          command: |
+            logger -p authpriv.notice "SIMULATE: attempt to modify auditd rules blocked"
+        windows:
+          name: "powershell"
+          command: |
+            Write-EventLog -LogName Application -Source "BenignEmu" -EventId 1001 -EntryType Information -Message "SIMULATE: Tamper attempt logged"
+      validations:
+        - type: "log_event_present"
+          source: "syslog or Windows Application"
+      rollback: []
+
+    - id: "STP-500"
+      title: "Cloud Discovery: безопасная метрика без секретов"
+      technique: "T1526"
+      platforms: ["cloud"]
+      executor:
+        note: "Используйте только учетку с read-only; без вывода секретов/ключей."
+        pseudo:
+          - "Запросить метрику CPUUtilization выбранного инстанса за последние 10 минут"
+      validations:
+        - type: "metric_read_success"
+          provider: "CloudWatch/Monitor"
+      rollback: []
+
+detections:
+  linux_sigma_like:
+    - name: "High CPU single process"
+      logic: "process_name in ['stress-ng','yes'] and cpu_pct >= 50 for 60s"
+    - name: "Cron benign-load"
+      logic: "file:/etc/cron.d/benign-load created or modified"
+    - name: "Systemd benign-load"
+      logic: "systemd unit benign-load.service created/enabled"
+  windows_sigma_like:
+    - name: "ScheduledTask BenignLoad"
+      eid: 4698
+      logic: "TaskName = 'BenignLoad'"
+    - name: "PowerShell long-running loop"
+      sysmon_eid: 1
+      logic: "Image endswith powershell.exe and ParentImage endswith cmd.exe and Duration >= 60s"
+  container_k8s:
+    - name: "Job benign-cpu-load"
+      logic: "k8s.audit verb=create kind=Job namespace=${K8S_NAMESPACE} labels.app=crypto-mining-sim"
+    - name: "CPU quota throttling"
+      logic: "container_cpu_cfs_throttled_seconds_total increases during job"
+
+success_criteria:
+  - "Нагрузка CPU зафиксирована и превышает 50% в течение не менее 60 секунд"
+  - "Минимум один детект/алерт сработал в SIEM/EDR"
+  - "Все артефакты успешно откатились по завершении"
+
+cleanup:
+  - "Остановить и удалить все запущенные процессы benign-нагрузки"
+  - "Удалить systemd unit/cron и выполнить daemon-reload"
+  - "Удалить k8s Job benign-cpu-load и проверить отсутствие активных pod"
+  - "Подтвердить восстановление нормальных метрик CPU"
+
+notes:
+  limitations:
+    - "Шаблон не подключается к пулам и не использует майнеры; нагрузка сугубо синтетическая."
+    - "Сетевые индикаторы майнинга не формируются по умолчанию из-за egress-блокировок."
+  extensions:
+    - "Для теста сетевых детектов используйте локальный sink-сервер внутри лаб-сегмента без выхода в интернет."
+  compliance_mapping:
+    - "ATT&CK T1496, T1610, T1543, T1053, T1562, T1526 (см. references)"

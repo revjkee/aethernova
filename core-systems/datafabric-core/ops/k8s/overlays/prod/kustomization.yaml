@@ -1,0 +1,179 @@
+# datafabric-core/ops/k8s/overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Продовый namespace
+namespace: datafabric-prod
+
+# Общие метки и аннотации для прод-среды
+commonLabels:
+  app.kubernetes.io/part-of: datafabric
+  app.kubernetes.io/environment: prod
+  env: prod
+commonAnnotations:
+  reloader.stakater.com/auto: "true"
+
+# Подключаем базовые манифесты (Deployment, NetworkPolicy, ServiceMonitor и др., лежащие в base/)
+resources:
+  - ../../base
+
+# Обновляем образ и тег для прода
+images:
+  - name: PLACEHOLDER_REGISTRY/datafabric-core
+    newName: registry.example.com/datafabric/datafabric-core
+    newTag: v1.2.3
+
+# Генерация конфигов (ConfigMap) с хэшированием имени для автоматического рестарта подов
+configMapGenerator:
+  - name: datafabric-config
+    behavior: merge
+    literals:
+      - ENGINE_LOG_LEVEL=INFO
+      - ENGINE_LOG_FORMAT=json
+      - DF_SQL_ENDPOINT=https://df-sql.datafabric.svc.cluster.local
+      - LEDGER_ENDPOINT=https://ledger-api.datafabric.svc.cluster.local
+    files:
+      # при наличии, подтянет overrides
+      - application.yaml=application-prod.yaml
+
+# Генерация секретов (merge/replace регулирует при существовании)
+secretGenerator:
+  - name: datafabric-secrets
+    behavior: merge
+    envs:
+      - secrets-prod.env   # DF_AUTH_TOKEN=..., LEDGER_API_KEY=..., CACHE_REDIS_URL=redis://...
+    type: Opaque
+
+generatorOptions:
+  disableNameSuffixHash: false   # держим хэш, чтобы поды перезапускались на изменение config/secret
+
+# Управление количеством реплик в проде
+replicas:
+  - name: datafabric-core
+    count: 4
+
+# Патчи (Deployment/ServiceMonitor/NetworkPolicy) — точечные изменения под прод
+patches:
+  # 1) Deployment: ресурсы, приоритет, imagePullSecrets, env overrides
+  - target:
+      version: v1
+      kind: Deployment
+      name: datafabric-core
+    patch: |
+      - op: replace
+        path: /spec/template/spec/priorityClassName
+        value: high-priority
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value:
+          - name: regcred-prod
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          nodepool: workloads
+          kubernetes.io/os: linux
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - key: "workloads"
+            operator: "Equal"
+            value: "true"
+            effect: "NoSchedule"
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: ENGINE_PROFILE_DIR
+          value: /var/lib/datafabric/profiles
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: ENGINE_LOG_LEVEL
+          value: INFO
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: ENGINE_LOG_FORMAT
+          value: json
+
+  # 2) ServiceMonitor: таргет на prod‑namespace Prometheus и релиз-лейбл
+  - target:
+      group: monitoring.coreos.com
+      version: v1
+      kind: ServiceMonitor
+      name: datafabric-core
+    patch: |
+      - op: replace
+        path: /spec/namespaceSelector/matchNames
+        value:
+          - datafabric-prod
+      - op: add
+        path: /metadata/labels/release
+        value: prom-operator
+      - op: replace
+        path: /spec/endpoints/0/interval
+        value: 15s
+      - op: replace
+        path: /spec/endpoints/0/scrapeTimeout
+        value: 10s
+
+  # 3) NetworkPolicy: подстановка реальных namespaces и ingress‑ns
+  - target:
+      version: v1
+      kind: NetworkPolicy
+      name: datafabric-core-ingress-same-namespace
+    patch: |
+      - op: replace
+        path: /spec/ingress/0/from/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: datafabric-prod
+  - target:
+      version: v1
+      kind: NetworkPolicy
+      name: datafabric-core-egress-redis
+    patch: |
+      - op: replace
+        path: /spec/egress/0/to/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: cache
+  - target:
+      version: v1
+      kind: NetworkPolicy
+      name: datafabric-core-egress-event-bus
+    patch: |
+      # Kafka
+      - op: replace
+        path: /spec/egress/0/to/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: kafka
+      # NATS
+      - op: replace
+        path: /spec/egress/1/to/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: nats
+      # RabbitMQ
+      - op: replace
+        path: /spec/egress/2/to/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: rabbitmq
+  - target:
+      version: v1
+      kind: NetworkPolicy
+      name: datafabric-core-egress-sql-endpoint
+    patch: |
+      - op: replace
+        path: /spec/egress/0/to/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: datafabric
+  - target:
+      version: v1
+      kind: NetworkPolicy
+      name: datafabric-core-egress-ledger
+    patch: |
+      - op: replace
+        path: /spec/egress/0/to/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: datafabric
+
+# Примечание: json6902 patch использует ~1 для кодирования '/' в ключе 'kubernetes.io/metadata.name'

@@ -1,0 +1,364 @@
+# datafabric-core/configs/connectors.yaml
+# Единый реестр коннекторов для DataFabric Core.
+# Поддержка ENV-переменных: ${VAR} или с дефолтом ${VAR:-value}.
+# Секреты рекомендуются через переменные окружения/secret mounts.
+
+version: 1
+
+defaults:
+  # Общие значения по умолчанию (могут переопределяться на уровне коннектора)
+  timeouts:
+    connectMs: 3000
+    readMs: 5000
+    writeMs: 5000
+    requestMs: 10000
+  pool:
+    enabled: true
+    maxSize: 32
+    minIdle: 2
+    maxIdleTimeMs: 60000
+    maxLifetimeMs: 1800000
+  retry:
+    enabled: true
+    maxAttempts: 6
+    baseDelayMs: 100      # экспоненциальная задержка
+    maxDelayMs: 5000
+    jitter: true
+    retryOn: [ "timeout", "connection_reset", "deadlock", "429", "5xx" ]
+  circuitBreaker:
+    enabled: true
+    failureRateThresholdPct: 50
+    slowCallRateThresholdPct: 50
+    slowCallDurationMs: 2000
+    slidingWindowSize: 50
+    permittedCallsInHalfOpen: 5
+    waitDurationInOpenStateMs: 30000
+  tls:
+    # По умолчанию TLS включён, но без кастомных ключей/CA; задавайте в коннекторах
+    enabled: true
+    insecureSkipVerify: false
+    # caFile/keyFile/certFile могут монтироваться в /etc/datafabric/certs/*
+    caFile: "${TLS_CA_FILE:-}"
+    certFile: "${TLS_CERT_FILE:-}"
+    keyFile: "${TLS_KEY_FILE:-}"
+    sni: "${TLS_SNI:-}"
+  auth:
+    # Базовые поля; используйте конкретные для каждого коннектора
+    username: "${DF_USERNAME:-}"
+    password: "${DF_PASSWORD:-}"
+    token:    "${DF_TOKEN:-}"
+  observability:
+    metrics:
+      enabled: true
+      labels:
+        app: datafabric-core
+    tracing:
+      enabled: true
+      # переподключение к OTLP коллектору на уровне приложения
+  healthcheck:
+    enabled: true
+    intervalMs: 10000
+    timeoutMs: 2000
+    initialDelayMs: 3000
+  serialization:
+    # Для сообщений: по умолчанию JSON
+    format: "json"
+    avro:
+      schemaRegistryUrl: "${SCHEMA_REGISTRY_URL:-}"
+      basicAuth:
+        username: "${SCHEMA_REGISTRY_USER:-}"
+        password: "${SCHEMA_REGISTRY_PASS:-}"
+
+# Список коннекторов. Ключ — уникальный идентификатор (используйте в коде/политиках доступа)
+connectors:
+
+  # ---------------------------
+  # Реляционные базы
+  # ---------------------------
+
+  pg_main:
+    type: postgres
+    enabled: true
+    dsn: "postgresql://${PG_USER:-app}:${PG_PASSWORD:-change_me}@${PG_HOST:-postgres}.${PG_NS:-datafabric}.svc:${PG_PORT:-5432}/${PG_DB:-app}?sslmode=${PG_SSLMODE:-require}"
+    pool:
+      maxSize: ${PG_POOL_MAX:-32}
+      minIdle: ${PG_POOL_MIN:-2}
+    tls:
+      enabled: true
+      caFile: "${PG_SSL_CA_FILE:-}"
+      certFile: "${PG_SSL_CERT_FILE:-}"
+      keyFile: "${PG_SSL_KEY_FILE:-}"
+    healthcheck:
+      sql: "SELECT 1"
+    audit:
+      sqlLog: false                # включайте только в отладке
+      ddlGuard: true               # запрет DDL в проде (enforced на уровне приложения)
+    migration:
+      tool: "alembic"              # либо flyway/liquibase, если применяется вне приложения
+
+  mysql_analytics:
+    type: mysql
+    enabled: false
+    dsn: "mysql://${MYSQL_USER:-app}:${MYSQL_PASSWORD:-change_me}@tcp(${MYSQL_HOST:-mysql}.${MYSQL_NS:-analytics}.svc:${MYSQL_PORT:-3306})/${MYSQL_DB:-analytics}?tls=${MYSQL_TLS:-true}&parseTime=true&collation=utf8mb4_unicode_ci"
+    pool:
+      maxSize: ${MYSQL_POOL_MAX:-16}
+    tls:
+      enabled: true
+      caFile: "${MYSQL_SSL_CA_FILE:-}"
+
+  clickhouse_dw:
+    type: clickhouse
+    enabled: false
+    url: "https://${CH_HOST:-clickhouse}.${CH_NS:-dw}.svc:${CH_PORT:-8443}"
+    auth:
+      username: "${CH_USER:-app}"
+      password: "${CH_PASSWORD:-}"
+    params:
+      database: "${CH_DB:-stage}"
+      compress: true
+    tls:
+      enabled: true
+      insecureSkipVerify: false
+    healthcheck:
+      sql: "SELECT 1"
+
+  snowflake_raw:
+    type: snowflake
+    enabled: false
+    account: "${SNOWFLAKE_ACCOUNT:-}"
+    user: "${SNOWFLAKE_USER:-}"
+    password: "${SNOWFLAKE_PASSWORD:-}"
+    role: "${SNOWFLAKE_ROLE:-SYSADMIN}"
+    warehouse: "${SNOWFLAKE_WH:-LOADER}"
+    database: "${SNOWFLAKE_DB:-RAW}"
+    schema: "${SNOWFLAKE_SCHEMA:-PUBLIC}"
+    tls:
+      enabled: true
+
+  # ---------------------------
+  # Шины/сообщения
+  # ---------------------------
+
+  kafka_bus:
+    type: kafka
+    enabled: true
+    brokers: "${KAFKA_BROKERS:-kafka-0.kafka:9093,kafka-1.kafka:9093}"
+    security:
+      protocol: "${KAFKA_SECURITY_PROTOCOL:-SASL_SSL}"  # PLAINTEXT|SSL|SASL_SSL
+      sasl:
+        mechanism: "${KAFKA_SASL_MECH:-SCRAM-SHA-512}"  # OAUTHBEARER|PLAIN|SCRAM-SHA-*
+        username: "${KAFKA_SASL_USER:-}"
+        password: "${KAFKA_SASL_PASS:-}"
+      tls:
+        enabled: true
+        caFile: "${KAFKA_CA_FILE:-}"
+        certFile: "${KAFKA_CERT_FILE:-}"
+        keyFile: "${KAFKA_KEY_FILE:-}"
+    topics:
+      events: "${KAFKA_TOPIC_EVENTS:-df.events}"
+      metrics: "${KAFKA_TOPIC_METRICS:-df.metrics}"
+      dlq:    "${KAFKA_TOPIC_DLQ:-df.dlq}"
+    producer:
+      acks: "all"
+      compression: "lz4"           # lz4|snappy|zstd
+      lingerMs: 5
+      batchBytes: 1048576
+      idempotent: true
+      transactionalId: "${KAFKA_TX_ID:-}"
+    consumer:
+      groupId: "${KAFKA_GROUP_ID:-df-core}"
+      sessionTimeoutMs: 10000
+      autoOffsetReset: "latest"    # earliest|latest
+      maxPollRecords: 500
+      maxPollIntervalMs: 300000
+    schemaRegistry:
+      url: "${SCHEMA_REGISTRY_URL:-}"
+      auth:
+        username: "${SCHEMA_REGISTRY_USER:-}"
+        password: "${SCHEMA_REGISTRY_PASS:-}"
+
+  nats_ctrl:
+    type: nats
+    enabled: false
+    urls: "${NATS_URLS:-nats://nats.nats.svc:4222}"
+    tls:
+      enabled: true
+      caFile: "${NATS_CA_FILE:-}"
+    auth:
+      token: "${NATS_TOKEN:-}"
+    streams:
+      control: "df.control"
+      telemetry: "df.telemetry"
+
+  rabbitmq_jobs:
+    type: rabbitmq
+    enabled: false
+    url: "amqps://${RMQ_USER:-app}:${RMQ_PASSWORD:-}@${RMQ_HOST:-rabbitmq.rabbit}.svc:${RMQ_PORT:-5671}/${RMQ_VHOST:-%2F}"
+    qos:
+      prefetch: 200
+    exchanges:
+      jobs: "jobs.direct"
+    queues:
+      jobs_main:
+        name: "jobs.main"
+        durable: true
+        routingKey: "jobs.run"
+      jobs_dlq:
+        name: "jobs.dlq"
+        durable: true
+
+  redis_cache:
+    type: redis
+    enabled: true
+    mode: "standalone"             # standalone|cluster|sentinel
+    url: "${CACHE_REDIS_URL:-redis://redis.cache.svc:6379/0}"
+    tls:
+      enabled: ${CACHE_REDIS_TLS_ENABLED:-false}
+      caFile: "${CACHE_REDIS_CA_FILE:-}"
+    pool:
+      maxSize: ${CACHE_POOL_MAX:-64}
+    healthcheck:
+      command: "PING"
+
+  # ---------------------------
+  # Хранилища/облака
+  # ---------------------------
+
+  s3_storage:
+    type: s3
+    enabled: true
+    endpoint: "${S3_ENDPOINT:-}"   # оставьте пустым для AWS
+    bucket:   "${S3_BUCKET:-datafabric}"
+    region:   "${AWS_REGION:-eu-central-1}"
+    pathStyle: ${S3_PATH_STYLE:-false}
+    tls:
+      enabled: true
+    auth:
+      accessKeyId:     "${AWS_ACCESS_KEY_ID:-}"
+      secretAccessKey: "${AWS_SECRET_ACCESS_KEY:-}"
+      sessionToken:    "${AWS_SESSION_TOKEN:-}"
+    upload:
+      acl: "private"
+      sse: "${S3_SSE:-AES256}"     # AES256|aws:kms
+      kmsKeyId: "${S3_KMS_KEY_ID:-}"
+      multipart:
+        enabled: true
+        partSizeMb: 16
+
+  gcs_storage:
+    type: gcs
+    enabled: false
+    bucket: "${GCS_BUCKET:-}"
+    project: "${GCP_PROJECT:-}"
+    credentialsFile: "${GOOGLE_APPLICATION_CREDENTIALS:-}"
+    upload:
+      storageClass: "STANDARD"
+      kmsKeyName: "${GCS_KMS_KEY:-}"
+
+  azure_blob:
+    type: azureblob
+    enabled: false
+    accountName: "${AZURE_BLOB_ACCOUNT:-}"
+    container:   "${AZURE_BLOB_CONTAINER:-}"
+    endpoint:    "${AZURE_BLOB_ENDPOINT:-}"
+    sasToken:    "${AZURE_BLOB_SAS_TOKEN:-}"
+    tls:
+      enabled: true
+
+  opensearch_logs:
+    type: opensearch
+    enabled: false
+    endpoints: "${OS_ENDPOINTS:-https://opensearch.logging.svc:9200}"
+    index: "${OS_INDEX:-datafabric-logs-%{+yyyy.MM.dd}}"
+    auth:
+      username: "${OS_USER:-}"
+      password: "${OS_PASSWORD:-}"
+    tls:
+      enabled: true
+      insecureSkipVerify: false
+    timeouts:
+      requestMs: 15000
+
+  # ---------------------------
+  # Внешние API / webhooks
+  # ---------------------------
+
+  http_webhook_audit:
+    type: http
+    enabled: true
+    baseUrl: "${AUDIT_ENDPOINT:-https://audit.example.com/api}"
+    headers:
+      Authorization: "Bearer ${AUDIT_TOKEN:-}"
+      Content-Type: "application/json"
+    timeouts:
+      connectMs: 1500
+      requestMs: 4000
+    retry:
+      enabled: true
+      maxAttempts: 5
+      baseDelayMs: 200
+      retryOn: [ "timeout", "5xx", "429" ]
+
+  grpc_inference:
+    type: grpc
+    enabled: false
+    endpoint: "${GRPC_ENDPOINT:-ml-infer.ml.svc:50051}"
+    tls:
+      enabled: true
+      caFile: "${GRPC_CA_FILE:-}"
+    deadlinesMs:
+      unary: 2000
+      stream: 10000
+
+  # ---------------------------
+  # Каталоги/реестры схем/прав
+  # ---------------------------
+
+  vault_secrets:
+    type: vault
+    enabled: false
+    address: "${VAULT_ADDR:-https://vault.hashicorp.svc:8200}"
+    auth:
+      method: "kubernetes"         # kubernetes|token|approle
+      role:   "${VAULT_ROLE:-datafabric-core}"
+      token:  "${VAULT_TOKEN:-}"
+    tls:
+      enabled: true
+      caFile: "${VAULT_CA_FILE:-}"
+
+# Маппинг политик доступа (ACL) на коннекторы (пример; реальную матрицу храните отдельно)
+acl:
+  roles:
+    reader:
+      allow: [ "pg_main:read", "s3_storage:get", "kafka_bus:consume" ]
+    writer:
+      allow: [ "pg_main:write", "s3_storage:put", "kafka_bus:produce" ]
+    admin:
+      allow: [ "*" ]
+
+# Источники секретов: позволяет подтянуть ENV из внешних провайдеров (используется приложением)
+secretsFrom:
+  - type: "env"
+    prefix: ""
+  - type: "file"
+    path: "/etc/datafabric/secrets.env"
+    optional: true
+  # - type: "vault"
+  #   mount: "kv/data/datafabric-core"
+  #   optional: true
+
+# Валидационные правила (проверяются на старте приложения)
+validation:
+  requiredConnectors:
+    - "pg_main"
+    - "kafka_bus"
+    - "redis_cache"
+  rules:
+    - name: "TLS-required-for-prod"
+      whenEnv: "${ENVIRONMENT:-prod}"
+      check:
+        anyOf:
+          - connector: "pg_main"
+            expect: { "tls.enabled": true, "tls.insecureSkipVerify": false }
+          - connector: "kafka_bus"
+            expect: { "security.protocol": "SASL_SSL" }

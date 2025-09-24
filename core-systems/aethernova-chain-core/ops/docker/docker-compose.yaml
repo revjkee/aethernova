@@ -1,0 +1,348 @@
+version: "3.9"
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+    mode: "non-blocking"
+    tag: "{{.ImageName}}|{{.Name}}|{{.ID}}"
+
+x-healthcheck-curl: &hc-curl
+  test: ["CMD-SHELL", "apk add --no-cache curl >/dev/null 2>&1 || true; curl -fsS localhost:${HEALTH_PORT:-80}/health || exit 1"]
+  interval: 10s
+  timeout: 3s
+  retries: 10
+  start_period: 20s
+
+x-env-common: &env-common
+  TZ: ${TZ:-UTC}
+  RUST_LOG: ${RUST_LOG:-info}
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+
+networks:
+  core:
+    driver: bridge
+  observability:
+    driver: bridge
+  edge:
+    driver: bridge
+
+volumes:
+  chain_node_data:
+  chain_indexer_data:
+  chain_api_cache:
+  pg_data:
+  redis_data:
+  loki_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  chain-node:
+    image: ${CHAIN_NODE_IMAGE:-ghcr.io/aethernova/chain-node:latest}
+    container_name: chain-node
+    command: >
+      ${CHAIN_NODE_CMD:-/usr/local/bin/chain-node}
+      --base-path /var/lib/chain
+      --rpc-external
+      --ws-external
+      --prometheus-external
+      --telemetry-url ${CHAIN_TELEMETRY_URL:-}
+      --unsafe-ws-external=${CHAIN_WS_UNSAFE:-false}
+      --unsafe-rpc-external=${CHAIN_RPC_UNSAFE:-false}
+      --rpc-cors all
+      --execution ${CHAIN_EXECUTION:-WASM}
+      --wasm-execution ${CHAIN_WASM_EXECUTION:-compiled}
+      --pruning ${CHAIN_PRUNING:-1000}
+      --bootnodes ${CHAIN_BOOTNODES:-}
+      --chain ${CHAIN_SPEC:-local}
+    environment:
+      <<: *env-common
+      HEALTH_PORT: "9615"
+    ports:
+      - "${CHAIN_P2P_PORT:-30333}:30333/tcp"
+      - "${CHAIN_RPC_PORT:-9944}:9944/tcp"      # WS
+      - "${CHAIN_HTTP_PORT:-9933}:9933/tcp"     # HTTP RPC
+      - "${CHAIN_METRICS_PORT:-9615}:9615/tcp"  # Prometheus
+    volumes:
+      - chain_node_data:/var/lib/chain
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9933/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - core
+      - observability
+
+  chain-indexer:
+    image: ${CHAIN_INDEXER_IMAGE:-ghcr.io/aethernova/chain-indexer:latest}
+    container_name: chain-indexer
+    depends_on:
+      chain-node:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *env-common
+      DATABASE_URL: postgres://${POSTGRES_USER:-chain}:${POSTGRES_PASSWORD:-chain}@postgres:5432/${POSTGRES_DB:-chain}
+      WS_ENDPOINT: ws://chain-node:9944
+    command: >
+      ${CHAIN_INDEXER_CMD:-/usr/local/bin/chain-indexer}
+      --ws ws://chain-node:9944
+      --db ${DATABASE_URL}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h postgres -p 5432 -U ${POSTGRES_USER:-chain} -d ${POSTGRES_DB:-chain} || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - chain_indexer_data:/var/lib/indexer
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - core
+      - observability
+
+  chain-api:
+    image: ${CHAIN_API_IMAGE:-ghcr.io/aethernova/chain-api:latest}
+    container_name: chain-api
+    depends_on:
+      chain-node:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      <<: *env-common
+      DATABASE_URL: postgres://${POSTGRES_USER:-chain}:${POSTGRES_PASSWORD:-chain}@postgres:5432/${POSTGRES_DB:-chain}
+      REDIS_URL: redis://redis:6379/0
+      RPC_HTTP: http://chain-node:9933
+      RPC_WS: ws://chain-node:9944
+      PORT: ${CHAIN_API_PORT_INTERNAL:-8080}
+    command: >
+      ${CHAIN_API_CMD:-/usr/local/bin/chain-api}
+      --listen 0.0.0.0:${CHAIN_API_PORT_INTERNAL:-8080}
+    expose:
+      - "${CHAIN_API_PORT_INTERNAL:-8080}"
+    healthcheck:
+      <<: *hc-curl
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    volumes:
+      - chain_api_cache:/var/cache/chain-api
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - core
+      - edge
+      - observability
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: chain-edge
+    depends_on:
+      chain-api:
+        condition: service_started
+      grafana:
+        condition: service_started
+    ports:
+      - "${EDGE_HTTP_PORT:-8088}:80"
+    volumes:
+      - type: bind
+        source: ${NGINX_CONF_PATH:-./nginx.conf}
+        target: /etc/nginx/nginx.conf
+        read_only: true
+    healthcheck:
+      <<: *hc-curl
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - edge
+      - observability
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: chain-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-chain}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chain}
+      POSTGRES_DB: ${POSTGRES_DB:-chain}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: ["postgres", "-c", "shared_buffers=512MB", "-c", "max_connections=200", "-c", "log_min_duration_statement=500"]
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chain} -d ${POSTGRES_DB:-chain} -h 127.0.0.1 -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - core
+      - observability
+
+  redis:
+    image: redis:7-alpine
+    container_name: chain-redis
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - core
+      - observability
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: chain-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - type: bind
+        source: ${PROMETHEUS_CONFIG_PATH:-./prometheus.yml}
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - observability
+      - core
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    container_name: chain-grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASS:-admin}
+      GF_SERVER_DOMAIN: ${GRAFANA_DOMAIN:-localhost}
+      GF_USERS_DEFAULT_THEME: ${GRAFANA_THEME:-dark}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      loki:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    healthcheck:
+      <<: *hc-curl
+      test: ["CMD-SHELL", "apk add --no-cache curl >/dev/null 2>&1 || true; curl -fsS http://localhost:3000/api/health || exit 1"]
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - observability
+
+  loki:
+    image: grafana/loki:2.9.8
+    container_name: chain-loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    volumes:
+      - loki_data:/loki
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - observability
+
+  promtail:
+    image: grafana/promtail:2.9.8
+    container_name: chain-promtail
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - type: bind
+        source: ${PROMTAIL_CONFIG_PATH:-./promtail.yml}
+        target: /etc/promtail/config.yml
+        read_only: true
+    depends_on:
+      loki:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - observability
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: chain-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - observability
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: chain-cadvisor
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "${CADVISOR_PORT:-8081}:8080"
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - observability
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: chain-node-exporter
+    pid: host
+    network_mode: host
+    command:
+      - "--path.rootfs=/host"
+    volumes:
+      - /:/host:ro,rslave
+    restart: unless-stopped
+    logging: *default-logging
+    # node-exporter on host network joins Prometheus via observability network
+    networks:
+      - observability

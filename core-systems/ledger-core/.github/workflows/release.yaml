@@ -1,0 +1,188 @@
+name: Release Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Тип релиза (major, minor, patch, prerelease)'
+        required: true
+        default: 'patch'
+      deploy_to_prod:
+        description: 'Деплой в production (true/false)'
+        required: false
+        default: 'false'
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write       # Для создания релиза
+  packages: write       # Для публикации артефактов в registry
+  id-token: write       # Для OpenID Connect (OIDC) в облаках
+  actions: read
+
+jobs:
+  prepare:
+    name: Prepare Environment
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "ledger-core-bot"
+          git config --global user.email "ci@ledger-core.local"
+
+      - name: Determine version (Semantic Release)
+        id: version
+        uses: cycjimmy/semantic-release-action@v3
+        with:
+          dry_run: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      matrix:
+        python-version: [ "3.10", "3.11" ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run Pytest
+        run: pytest --maxfail=1 --disable-warnings --cov=ledger_core tests/
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  build:
+    name: Build Artifacts
+    runs-on: ubuntu-latest
+    needs: [prepare, tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Python Package
+        run: |
+          pip install build
+          python -m build
+
+      - name: Build Rust Components
+        run: cargo build --release
+
+      - name: Build Node.js Frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledger-core-${{ needs.prepare.outputs.release_version }}
+          path: |
+            dist/**
+            target/release/**
+            frontend/build/**
+
+  sign:
+    name: Sign Artifacts
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          echo "${{ secrets.GPG_KEY_PASSPHRASE }}" > passphrase.txt
+
+      - name: Sign files
+        run: |
+          for f in dist/*; do
+            gpg --batch --passphrase-file passphrase.txt --armor --detach-sign "$f"
+          done
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, sign]
+    if: github.ref_type == 'tag'
+    steps:
+      - name: Generate Changelog
+        uses: mikepenz/release-changelog-builder-action@v4
+        id: changelog
+        with:
+          configuration: .github/changelog-config.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.changelog }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') }}
+          files: |
+            dist/**
+            target/release/**
+            frontend/build/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: release
+    if: needs.prepare.outputs.release_version != '' && github.event.inputs.deploy_to_prod == 'true'
+    steps:
+      - name: Deploy using Ansible
+        uses: dawidd6/action-ansible-playbook@v2
+        with:
+          playbook: deploy/prod.yml
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          inventory: prod-inventory
+
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "Ledger-core ${{ needs.prepare.outputs.release_version }} успешно задеплоен в production"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

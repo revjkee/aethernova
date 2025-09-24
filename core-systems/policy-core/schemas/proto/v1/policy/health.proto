@@ -1,0 +1,148 @@
+// file: policy-core/schemas/proto/v1/policy/health.proto
+syntax = "proto3";
+
+package policy.v1;
+
+option cc_enable_arenas = true;
+option java_multiple_files = true;
+option java_package = "com.aethernova.policy.v1";
+option java_outer_classname = "PolicyHealthProto";
+option csharp_namespace = "Aethernova.Policy.V1";
+option go_package = "github.com/aethernova/policy-core/gen/policy/v1;policyv1";
+option php_namespace = "Aethernova\\Policy\\V1";
+option ruby_package = "Aethernova::Policy::V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/rpc/status.proto";
+import "google/api/annotations.proto";
+
+// Проба, к которой относится проверка. Позволяет различать семантику /healthz, /readyz, /startupz.
+enum ProbeKind {
+  PROBE_KIND_UNSPECIFIED = 0;
+  LIVENESS = 1;  // жив ли процесс в принципе
+  READINESS = 2; // готов ли принимать трафик
+  STARTUP = 3;   // завершил ли инициализацию/миграции
+}
+
+// Обобщенный статус обслуживания сервиса или зависимости.
+enum ServingStatus {
+  SERVING_STATUS_UNSPECIFIED = 0;
+  SERVING = 1;       // полностью работоспособен
+  NOT_SERVING = 2;   // недоступен или не готов
+  DEGRADED = 3;      // работает, но деградировал (например, по SLO)
+  MAINTENANCE = 4;   // профилактика/плановые работы
+  STARTING = 5;      // инициализация
+  STOPPING = 6;      // остановка/дренаж коннектов
+}
+
+// Описание статуса зависимости (БД, брокер, внешний сервис).
+message Dependency {
+  string name = 1;                                // человекочитаемое имя/ключ
+  ServingStatus status = 2;                       // статус зависимости
+  google.protobuf.Duration latency = 3;           // латентность последней проверки
+  google.protobuf.Timestamp last_checked = 4;     // когда проверялась
+  google.rpc.Status last_error = 5;               // последняя ошибка (если была)
+  string endpoint = 6;                            // URI или DSN зависимости
+  map<string, string> attributes = 7;             // произвольные атрибуты (shard, region и т.п.)
+  // Расширение на будущее:
+  // reserved 8 to 15;
+}
+
+// Запрос на проверку здоровья.
+message HealthCheckRequest {
+  // Имя сервиса/сабкомпонента. Пусто — статус всего приложения.
+  string service = 1;
+  ProbeKind probe = 2;                  // тип пробы (по умолчанию READINESS)
+  bool include_dependencies = 3;        // вернуть статусы зависимостей
+  bool wait_for_ready = 4;              // дождаться готовности (с учетом таймаутов NLB)
+  // Зарезервировано для будущих фильтров/tenant:
+  // reserved 5, 6;
+}
+
+// Ответ о состоянии.
+message HealthCheckResponse {
+  ServingStatus status = 1;                      // агрегированный статус по probe
+  string service = 2;                            // echo из запроса
+  ProbeKind probe = 3;                           // echo из запроса
+  google.protobuf.Timestamp checked_at = 4;      // время формирования ответа
+
+  // Версионность/сборка
+  string version = 5;        // семвер или краткая версия
+  string revision = 6;       // git SHA или иная ревизия
+  string node = 7;           // имя узла/инстанса
+  string region = 8;         // регион/зона
+
+  repeated Dependency dependencies = 9;          // статусы зависимостей (если запрошено)
+  map<string, string> diagnostics = 10;          // ключевые диагностические метрики
+  uint64 outages_total = 11;                     // накопительное число отказов
+  double p95_latency_ms = 12;                    // опциональные показатели SLI
+  double p99_latency_ms = 13;
+
+  // Зарезервировано под будущее расширение, чтобы не ломать ABI:
+  // reserved 14 to 19;
+}
+
+// Поток наблюдения за здоровьем.
+message WatchRequest {
+  string service = 1;
+  ProbeKind probe = 2;
+  google.protobuf.Duration min_interval = 3; // минимальный интервал эмиссии снимков
+  bool include_dependencies = 4;
+  // reserved 5;
+}
+
+message WatchEvent {
+  HealthCheckResponse snapshot = 1;
+}
+
+// Информация о сборке/фичах.
+message BuildInfo {
+  string version = 1;
+  string commit_sha = 2;
+  string vcs_url = 3;
+  google.protobuf.Timestamp build_time = 4;
+  string runtime = 5;                // например, "go1.22.3", "python3.12", "rustc1.79"
+  repeated string features = 6;      // включенные фичефлаги/модули
+  map<string, string> metadata = 7;  // любые дополнительные детали
+}
+
+// Краткая сводка метрик для lightweight-запросов управления.
+message MetricsSummary {
+  double uptime_seconds = 1;
+  double cpu_utilization = 2;   // 0..1
+  uint64 rss_bytes = 3;
+  double rps = 4;
+  // reserved 5 to 9;
+}
+
+// Основной сервис здоровья policy-core.
+// Совместим с практикой gRPC Health Checking: Check (унарный) и Watch (серверный стрим).
+service PolicyHealth {
+  // Универсальная проверка: liveness/readiness/startup.
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse) {
+    option (google.api.http) = {
+      get: "/v1/healthz"
+      additional_bindings { get: "/v1/readyz" }
+      additional_bindings { get: "/v1/startupz" }
+    };
+  }
+
+  // Наблюдение за изменениями статуса.
+  rpc Watch(WatchRequest) returns (stream WatchEvent) {
+    option (google.api.http) = {
+      get: "/v1/healthz/watch"
+    };
+  }
+
+  // Информация о сборке.
+  rpc GetBuildInfo(google.protobuf.Empty) returns (BuildInfo) {
+    option (google.api.http) = { get: "/v1/buildinfo" };
+  }
+
+  // Краткая сводка эксплуатационных метрик.
+  rpc GetMetricsSummary(google.protobuf.Empty) returns (MetricsSummary) {
+    option (google.api.http) = { get: "/v1/metrics/summary" };
+  }
+}

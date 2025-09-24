@@ -1,0 +1,161 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# База
+resources:
+  - ../../base
+
+# Пространство имён и постфикс имён для изоляции dev
+namespace: dev-datafabric
+nameSuffix: -dev
+
+# Единые метки/аннотации
+commonLabels:
+  app.kubernetes.io/environment: dev
+  app.kubernetes.io/owner: platform-team
+commonAnnotations:
+  reloader.stakater.com/auto: "true"
+  backup.velero.io/backup-volumes: ""
+
+# Образы: подмена реестра/тега для dev
+images:
+  - name: ghcr.io/aethernova/datafabric-core
+    newName: ghcr.io/aethernova/datafabric-core
+    newTag: v0.1.0-rc.0-dev
+
+# Генераторы: дополняем базовые ConfigMap/Secret (merge)
+# Переменные окружения для dev: расширенные логи, повышенная семплинг‑доля трасс
+configMapGenerator:
+  - name: datafabric-core-config
+    behavior: merge
+    literals:
+      - APP_ENV=dev
+      - LOG_LEVEL=DEBUG
+      - OTEL_TRACES_SAMPLER_ARG=0.2
+      - PROMETHEUS_ENABLED=true
+      - DEBUG_PAYLOAD_ECHO=true
+      - TRACE_SAMPLE_INPUTS=true
+      - UVICORN_WORKERS=1
+  - name: datafabric-core-otel
+    behavior: merge
+    literals:
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=datafabric-core,service.namespace=datafabric,service.version=0.1.0-rc.0,deployment.environment=dev,cloud.region=eu-north-1
+
+# Пример секретов для dev (плейсхолдеры, замените оверлеем/SealedSecret в CI)
+secretGenerator:
+  - name: datafabric-core-secrets
+    behavior: merge
+    literals:
+      - SECRET_KEY=dev-change-me
+      - PG_PASSWORD=postgres
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+    type: Opaque
+
+# Реплики (Deployment) — целимся в небольшую ноду dev
+replicas:
+  - name: datafabric-core
+    count: 2
+
+# Патчи JSON6902 для точечного переопределения манифестов base
+patches:
+  # 1) Deployment: ресурсы, env, пробки, нод‑селекторы для dev
+  - target:
+      version: v1
+      kind: Deployment
+      name: datafabric-core
+      group: apps
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: http://otel-collector.dev.svc:4317
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: APP_ENV
+          value: dev
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 6
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 5
+      - op: add
+        path: /spec/template/spec/containers/0/startupProbe
+        value:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 1
+          periodSeconds: 2
+          failureThreshold: 30
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          kubernetes.io/os: linux
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - key: "workload"
+            operator: "Equal"
+            value: "dev"
+            effect: "NoSchedule"
+
+  # 2) Service: аннотации для Prometheus‑скрейпа в dev
+  - target:
+      version: v1
+      kind: Service
+      name: datafabric-core
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9102"
+          prometheus.io/path: "/metrics"
+
+  # 3) HPA: мягкие границы для дев‑кластера
+  - target:
+      version: v2
+      group: autoscaling
+      kind: HorizontalPodAutoscaler
+      name: datafabric-core
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10
+      - op: replace
+        path: /spec/behavior/scaleDown/stabilizationWindowSeconds
+        value: 120
+
+# Конфигурация генерации имен (хэши конфигов в аннотациях → триггер rollout)
+generatorOptions:
+  disableNameSuffixHash: false

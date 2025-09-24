@@ -1,0 +1,397 @@
+# DataFabric Core — Data Retention Policy
+schema:
+  version: 1
+  format: "aethernova.retention/1.0"
+  owner: "data-governance"
+  updated_at: "2025-08-14"
+  enums:
+    environments: ["dev","staging","prod"]
+    data_classes: ["raw_events","enriched_events","analytics","operational_logs","audit_logs","backups","snapshots","pii_profile"]
+    storages: ["postgres","s3","kafka","redis","elastic","filesystem"]
+    actions: ["retain","transition","soft_delete","quarantine","hard_delete"]
+    legal_hold_reasons: ["litigation","regulatory","security_incident","customer_request"]
+meta:
+  service: "datafabric-core"
+  region_default: "eu-north-1"
+  legal_contact: "legal@company.example"
+  dpo_contact: "dpo@company.example"
+
+defaults:
+  # Общие окна безопасности и SLA удаления
+  safety_windows:
+    grace_period: "P7D"              # время между soft и hard delete по умолчанию
+    quarantine_min: "P14D"           # минимальный срок карантина
+  deletion_sla:
+    pii: "72h"                       # PII удаляется окончательно в течение 72 часов после конца grace/hold
+    non_pii: "7d"
+  # Поведение при коллизиях (удержание/удаление)
+  precedence:
+    - "legal_hold"
+    - "retention_overrides"
+    - "environment_rules"
+  audit:
+    enabled: true
+    sink: "otlp"                     # otlp|stdout|s3
+    redact_fields: ["subject_id","token","key_material"]
+  dry_run:
+    enabled: true                    # включить симуляцию в dev/staging
+    emit_diff: true
+
+# Каталоги данных (привязка логических классов к физическим локациям)
+catalog:
+  raw_events:
+    description: "Сырые входящие события /ingest."
+    storage_targets:
+      - type: "s3"
+        bucket_env_var: "S3_BUCKET"
+        prefix: "raw/"
+      - type: "kafka"
+        topics: ["dfc.raw.v1"]
+  enriched_events:
+    description: "Нормализованные/обогащенные события."
+    storage_targets:
+      - type: "s3"
+        prefix: "enriched/"
+      - type: "postgres"
+        database: "datafabric"
+        tables: ["events_enriched"]
+  analytics:
+    description: "Паркет‑данные для аналитики (колд‑сторедж)."
+    storage_targets:
+      - type: "s3"
+        prefix: "analytics/"
+  operational_logs:
+    description: "Технические логи приложения."
+    storage_targets:
+      - type: "s3"
+        prefix: "logs/app/"
+  audit_logs:
+    description: "Аудит действий/доступа (immutable)."
+    storage_targets:
+      - type: "s3"
+        prefix: "logs/audit/"
+  backups:
+    description: "RDS/снапшоты/архивы конфигурации."
+    storage_targets:
+      - type: "s3"
+        prefix: "backups/"
+  snapshots:
+    description: "Временные снепшоты таблиц/паркетов."
+    storage_targets:
+      - type: "s3"
+        prefix: "snapshots/"
+  pii_profile:
+    description: "Профили пользователей, содержащие PII."
+    storage_targets:
+      - type: "postgres"
+        database: "datafabric"
+        tables: ["user_profile","user_address"]
+      - type: "s3"
+        prefix: "pii/"
+
+# Правила по окружениям и классам данных
+rules:
+  dev:
+    dry_run: true
+    classes:
+      raw_events:
+        retain: "P7D"
+        s3:
+          transitions:
+            - { after: "P3D", storage_class: "STANDARD_IA" }
+          deletions:
+            - { after: "P7D", action: "soft_delete" }
+            - { after: "P14D", action: "hard_delete" }
+        kafka:
+          topic_ttl: "P3D"
+      enriched_events:
+        retain: "P14D"
+        postgres:
+          purge:
+            where: "arrived_at < now() - interval '14 days'"
+            batch_rows: 5000
+            vacuum: "auto"
+      analytics:
+        retain: "P30D"
+        s3:
+          transitions:
+            - { after: "P7D", storage_class: "STANDARD_IA" }
+            - { after: "P21D", storage_class: "GLACIER_IR" }
+          deletions:
+            - { after: "P30D", action: "soft_delete" }
+            - { after: "P37D", action: "hard_delete" }
+      operational_logs:
+        retain: "P14D"
+        s3:
+          deletions:
+            - { after: "P14D", action: "hard_delete" }
+      audit_logs:
+        retain: "P90D"
+        s3:
+          object_lock:
+            mode: "GOVERNANCE"
+            days: 90
+      backups:
+        retain: "P14D"
+      snapshots:
+        retain: "P7D"
+      pii_profile:
+        retain: "P14D"
+        postgres:
+          purge:
+            where: "deleted_at is not null and deleted_at < now() - interval '7 days'"
+            batch_rows: 2000
+
+  staging:
+    dry_run: true
+    classes:
+      raw_events:
+        retain: "P14D"
+        s3:
+          transitions:
+            - { after: "P7D", storage_class: "STANDARD_IA" }
+          deletions:
+            - { after: "P14D", action: "soft_delete" }
+            - { after: "P21D", action: "hard_delete" }
+        kafka:
+          topic_ttl: "P7D"
+      enriched_events:
+        retain: "P30D"
+        postgres:
+          purge:
+            where: "arrived_at < now() - interval '30 days'"
+            batch_rows: 10000
+            vacuum: "full_if_bloat>20%"
+      analytics:
+        retain: "P90D"
+        s3:
+          transitions:
+            - { after: "P14D", storage_class: "STANDARD_IA" }
+            - { after: "P45D", storage_class: "GLACIER_IR" }
+          deletions:
+            - { after: "P90D", action: "soft_delete" }
+            - { after: "P100D", action: "hard_delete" }
+      operational_logs:
+        retain: "P30D"
+        s3:
+          deletions:
+            - { after: "P30D", action: "hard_delete" }
+      audit_logs:
+        retain: "P180D"
+        s3:
+          object_lock:
+            mode: "GOVERNANCE"
+            days: 180
+      backups:
+        retain: "P30D"
+      snapshots:
+        retain: "P14D"
+      pii_profile:
+        retain: "P30D"
+        postgres:
+          purge:
+            where: "deleted_at is not null and deleted_at < now() - interval '14 days'"
+            batch_rows: 5000
+
+  prod:
+    dry_run: false
+    classes:
+      raw_events:
+        retain: "P30D"
+        s3:
+          transitions:
+            - { after: "P7D", storage_class: "STANDARD_IA" }
+            - { after: "P21D", storage_class: "GLACIER_IR" }
+          deletions:
+            - { after: "P30D", action: "soft_delete" }
+            - { after: "P37D", action: "hard_delete" }
+        kafka:
+          topic_ttl: "P14D"
+      enriched_events:
+        retain: "P180D"
+        s3:
+          transitions:
+            - { after: "P30D", storage_class: "STANDARD_IA" }
+            - { after: "P90D", storage_class: "GLACIER_IR" }
+            - { after: "P150D", storage_class: "DEEP_ARCHIVE" }
+          deletions:
+            - { after: "P180D", action: "soft_delete" }
+            - { after: "P210D", action: "hard_delete" }
+        postgres:
+          purge:
+            where: "arrived_at < now() - interval '180 days'"
+            batch_rows: 25000
+            vacuum: "analyze"
+      analytics:
+        retain: "P365D"
+        s3:
+          transitions:
+            - { after: "P30D", storage_class: "STANDARD_IA" }
+            - { after: "P90D", storage_class: "GLACIER_IR" }
+            - { after: "P180D", storage_class: "DEEP_ARCHIVE" }
+          deletions:
+            - { after: "P395D", action: "hard_delete" }
+      operational_logs:
+        retain: "P90D"
+        s3:
+          deletions:
+            - { after: "P90D", action: "hard_delete" }
+      audit_logs:
+        retain: "P365D"
+        s3:
+          object_lock:
+            mode: "COMPLIANCE"     # неизменяемость аудита
+            days: 365
+      backups:
+        retain: "P35D"
+        s3:
+          transitions:
+            - { after: "P21D", storage_class: "GLACIER_IR" }
+          deletions:
+            - { after: "P35D", action: "hard_delete" }
+      snapshots:
+        retain: "P14D"
+      pii_profile:
+        retain: "P90D"
+        postgres:
+          purge:
+            where: "deleted_at is not null and deleted_at < now() - interval '30 days'"
+            batch_rows: 10000
+
+# Правила GDPR/PII (удаление по запросу субъекта данных)
+gdpr:
+  subject_erasure:
+    enabled: true
+    request_window_sla: "72h"
+    matchers:
+      # Определяет, как находим записи субъекта во всех системах
+      - class: "pii_profile"
+        postgres:
+          by:
+            - { table: "user_profile", column: "subject_id" }
+            - { table: "user_address", column: "subject_id" }
+        s3:
+          by_key_template: "pii/{subject_id}/"
+      - class: "enriched_events"
+        s3:
+          by_query: "tag:subject_id={subject_id}"
+    process:
+      steps:
+        - "soft_delete"   # помечаем к удалению (не выдаем в ответы)
+        - "quarantine"    # перемещаем/шифруем в карантинный префикс
+        - "hard_delete"   # физическое удаление после проверки аудита
+      approvals:
+        required_roles: ["DPO","DataSteward"]
+      evidence:
+        storage: "audit_logs"  # журналируем хэши удалённых объектов
+
+# Legal Hold (удержание данных независимо от TTL)
+legal_hold:
+  enabled: true
+  policy:
+    approvers: ["legal","security"]
+    reasons: ["litigation","regulatory","security_incident","customer_request"]
+    scope:
+      allow:
+        - "raw_events"
+        - "enriched_events"
+        - "analytics"
+        - "audit_logs"
+        - "pii_profile"
+    effect:
+      block_actions: ["soft_delete","quarantine","hard_delete"]  # retain разрешён
+    expiry:
+      default: "P90D"              # по умолчанию, если не указана дата конца
+  records:
+    # Список активных удержаний — управляется системой, не редактировать вручную.
+    managed_by: "system"
+    items: []
+
+# Процессы исполнения (execution pipelines)
+execution:
+  schedules:
+    # Cron в TZ=UTC
+    s3_lifecycle_sync: "0 3 * * *"        # генерация/синхронизация S3 Lifecycle из правил
+    postgres_purge:     "*/10 * * * *"    # фоновый пуржинг малыми батчами
+    kafka_ttl_verify:   "0 * * * *"       # проверка соответствия topic TTL
+    quarantine_cleanup: "0 2 * * *"       # удаление истёкшего карантина
+    audit_compaction:   "0 1 * * *"       # компакция/архивация аудита
+  s3:
+    quarantine_prefix: "_quarantine/"
+    soft_delete_tag:   "dfc:soft_deleted=true"
+    object_lock:
+      enabled: true
+      mode_default: "GOVERNANCE"
+      min_days_default: 7
+  postgres:
+    vacuum:
+      mode: "auto"  # auto|analyze|full_if_bloat>20%
+      bloat_threshold_percent: 20
+    delete_batch_rows_default: 10000
+    deadlock_retry:
+      attempts: 3
+      backoff_ms: 250
+  kafka:
+    enforce_topic_ttl: true
+  safety:
+    # Дополнительные предохранители
+    max_daily_delete_objects: 100000
+    max_daily_delete_bytes: "1TiB"
+    halt_on_guardrail_breach: true
+
+# Контроль соответствия (compliance)
+compliance:
+  checks:
+    - name: "s3_lifecycle_matches_policy"
+      severity: "high"
+      description: "Правила S3 Lifecycle соответствуют retention.yaml"
+    - name: "pii_delete_sla_met"
+      severity: "critical"
+      description: "PII удаляется в пределах SLA"
+    - name: "legal_hold_respected"
+      severity: "critical"
+      description: "Legal Hold блокирует удаление"
+    - name: "audit_immutability"
+      severity: "high"
+      description: "Аудит хранится с Object Lock/COMPLIANCE"
+  reporting:
+    cadence: "daily"
+    recipients: ["security@company.example","legal@company.example","platform@company.example"]
+
+# Валидация для CI
+validation:
+  require:
+    - "rules.prod.classes.audit_logs.s3.object_lock.mode"
+    - "gdpr.subject_erasure.enabled"
+    - "legal_hold.enabled"
+  constraints:
+    - key: "rules.prod.classes.enriched_events.retain"
+      min_iso8601_duration: "P90D"
+    - key: "rules.prod.classes.analytics.retain"
+      min_iso8601_duration: "P180D"
+    - key: "defaults.safety_windows.grace_period"
+      min_iso8601_duration: "P2D"
+    - key: "execution.s3.object_lock.mode_default"
+      allowed: ["GOVERNANCE","COMPLIANCE"]
+  cross_references:
+    - ensure: "catalog.*.storage_targets[].type"
+      in_set: ["s3","postgres","kafka","redis","elastic","filesystem"]
+  dry_run:
+    enforce_in: ["dev","staging"]
+
+# Маппинг в окружения переменных и инфра‑политик (подсказки генератору)
+infra_mapping:
+  s3:
+    bucket_env_var: "S3_BUCKET"
+    lifecycle_tag_soft_deleted: "dfc:soft_deleted"
+    storage_class_keys:
+      - "STANDARD_IA"
+      - "GLACIER_IR"
+      - "DEEP_ARCHIVE"
+  postgres:
+    conn_env:
+      host: "PG_HOST"
+      port: "PG_PORT"
+      db: "PG_DB"
+  kafka:
+    brokers_env: "KAFKA_BROKERS"

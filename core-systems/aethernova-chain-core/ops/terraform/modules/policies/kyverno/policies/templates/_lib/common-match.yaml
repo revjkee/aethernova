@@ -1,0 +1,152 @@
+# Kyverno common match/exclude library
+# Стандартизированные блоки для повторного использования через YAML-алиасы.
+# Совместимо с правилами Kyverno (match/exclude), Kubernetes Admission operations,
+# objectSelector/namespaceSelector и типовыми исключениями системных NS.
+#
+# Документация:
+# - Kyverno match/exclude: https://main.kyverno.io/docs/policy-types/cluster-policy/match-exclude/
+# - Kyverno preconditions: https://release-1-11-0.kyverno.io/docs/writing-policies/preconditions/
+# - Kyverno CEL validate: https://kyverno.io/docs/policy-types/cluster-policy/validate/
+# - Kyverno namespaceSelector (webhooks): https://kyverno.io/docs/installation/customization/
+# - Kubernetes Admission operations: https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/
+
+# -----------------------------------------------------------------------------
+# 1) Базовые селекторы пространств имён и меток
+# -----------------------------------------------------------------------------
+
+# Системные namespace, которые по умолчанию исключаются из проверок.
+commonExcludedNamespaces: &commonExcludedNamespaces
+  - kube-system
+  - kube-public
+  - kube-node-lease
+  - kyverno
+  - kyverno-system
+  - gatekeeper-system
+
+# Универсальный namespaceSelector для исключения системных NS по имени-метке.
+# Рекомендуется помечать все NS стандартной меткой kubernetes.io/metadata.name=<ns>
+# и использовать её для selector’ов.
+commonNamespaceSelectorExcludeSystem: &commonNamespaceSelectorExcludeSystem
+  matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values: *commonExcludedNamespaces
+
+# Пример objectSelector для исключения «сервисных» объектов (по меткам).
+# Подключайте при необходимости через алиас.
+commonObjectSelectorExcludeService: &commonObjectSelectorExcludeService
+  matchExpressions:
+    - key: app.kubernetes.io/part-of
+      operator: NotIn
+      values: ["cluster-services", "observability-core"]
+
+# -----------------------------------------------------------------------------
+# 2) Универсальные наборы «kinds» для Pod и контроллеров Pod
+#    (Kyverno автоматически расширяет Pod-политики на контроллеры, но
+#     явное перечисление повышает читаемость и предсказуемость) 
+#    refs: практики Kyverno по match/exclude
+# -----------------------------------------------------------------------------
+kindsPodAndControllers: &kindsPodAndControllers
+  - Pod
+  - Deployment
+  - StatefulSet
+  - DaemonSet
+  - Job
+  - CronJob
+  - ReplicaSet
+
+# -----------------------------------------------------------------------------
+# 3) Универсальные операции Admission для validate/mutate/verifyImages
+#    CREATE/UPDATE/DELETE/CONNECT — операции Kubernetes Admission. 
+#    refs: Kubernetes docs (Admission controllers / webhook rules)
+# -----------------------------------------------------------------------------
+admissionOperationsAll: &admissionOperationsAll
+  - CREATE
+  - UPDATE
+  - DELETE
+  - CONNECT
+
+admissionOperationsCreateUpdate: &admissionOperationsCreateUpdate
+  - CREATE
+  - UPDATE
+
+# -----------------------------------------------------------------------------
+# 4) Общие блоки match/exclude (используйте через алиасы в правилах Kyverno)
+#    Структура match/exclude соответствует Kyverno:
+#    match:
+#      any: | all:
+#        - resources: { kinds, namespaces, operations, selector... }
+#    refs: Kyverno match/exclude
+# -----------------------------------------------------------------------------
+
+# Блок «match» для namespaced-ресурсов Pod и контроллеров,
+# с фильтрацией по операциям CREATE/UPDATE.
+commonMatchPodsCU: &commonMatchPodsCU
+  any:
+    - resources:
+        kinds: *kindsPodAndControllers
+        operations: *admissionOperationsCreateUpdate
+
+# Блок «match» для всех операций по Pod и контроллерам.
+commonMatchPodsAllOps: &commonMatchPodsAllOps
+  any:
+    - resources:
+        kinds: *kindsPodAndControllers
+        operations: *admissionOperationsAll
+
+# Блок «exclude» с исключением системных NS и, при необходимости, сервисных объектов.
+commonExcludeSystemNs: &commonExcludeSystemNs
+  any:
+    - resources:
+        namespaces: *commonExcludedNamespaces
+    - resources:
+        selector: *commonObjectSelectorExcludeService
+
+# -----------------------------------------------------------------------------
+# 5) Примеси (mixins) для аннотаций/лейблов единообразия
+# -----------------------------------------------------------------------------
+commonAnnotations: &commonAnnotations
+  policies.kyverno.io/category: "Best Practices"
+  policies.kyverno.io/severity: "high"
+  app.kubernetes.io/part-of: "aethernova-chain-core"
+  app.kubernetes.io/managed-by: "kyverno"
+
+commonLabels: &commonLabels
+  app.kubernetes.io/name: "kyverno-policy"
+  app.kubernetes.io/component: "policy"
+  app.kubernetes.io/part-of: "aethernova-chain-core"
+
+# -----------------------------------------------------------------------------
+# 6) Типовая предиката (preconditions) для пропуска «нерелевантных» ресурсов
+#    После успешного match/exclude предикаты позволяют сузить применение правила.
+#    Здесь — пример: выполнять правило только если в Pod есть containers.
+#    refs: Kyverno preconditions
+# -----------------------------------------------------------------------------
+commonPreconditionsHasContainers: &commonPreconditionsHasContainers
+  all:
+    - key: "{{ request.object.spec.containers || `[]` | length(@) }}"
+      operator: GreaterThanOrEquals
+      value: 1
+
+# -----------------------------------------------------------------------------
+# 7) Готовые алиасы для включения в правила Kyverno
+#    Пример использования (в ваших ClusterPolicy/Policy):
+#
+#    spec:
+#      rules:
+#        - name: example-rule
+#          match: *commonMatchPodsCU
+#          exclude: *commonExcludeSystemNs
+#          preconditions: *commonPreconditionsHasContainers
+#
+#    (Аннотации/лейблы можно подтянуть на уровень metadata через шаблонизатор:
+#     Helm/Kustomize/ytt/terraform-tpl.)
+# -----------------------------------------------------------------------------
+commonRuleMatchCU: &commonRuleMatchCU
+  <<: *commonMatchPodsCU
+
+commonRuleMatchAllOps: &commonRuleMatchAllOps
+  <<: *commonMatchPodsAllOps
+
+commonRuleExcludeSystem: &commonRuleExcludeSystem
+  <<: *commonExcludeSystemNs

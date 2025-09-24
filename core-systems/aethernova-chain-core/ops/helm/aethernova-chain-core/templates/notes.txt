@@ -1,0 +1,123 @@
+{{- /*
+Aethernova Chain Core — NOTES
+Path: ops/helm/aethernova-chain-core/templates/notes.txt
+Purpose:
+  Human-friendly post-install/upgrade output with operational next-steps,
+  endpoints, security knobs, and diagnostics tailored by values.
+Inputs:
+  .Values.service.*, .Values.image.*, .Values.rbac.*, .Values.telemetry.*, etc.
+*/ -}}
+
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- $fullname := printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- $ns := .Release.Namespace -}}
+{{- $svc := default (printf "%s-svc" $fullname) .Values.service.name -}}
+{{- $saName := default (printf "%s-sa" $fullname) .Values.serviceAccount.name -}}
+{{- $svcType := default "ClusterIP" .Values.service.type -}}
+{{- $p2pPort := default 30333 .Values.service.ports.p2p -}}
+{{- $rpcPort := default 26657 .Values.service.ports.rpc -}}
+{{- $metricsPort := default 9600 .Values.service.ports.metrics -}}
+{{- $image := printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) -}}
+{{- $replicas := default 1 .Values.replicaCount -}}
+{{- $rbac := default true .Values.rbac.create -}}
+{{- $clusterWide := default false .Values.rbac.clusterWide -}}
+{{- $otelEnabled := default false .Values.telemetry.tracing.enabled -}}
+{{- $sentryEnabled := default false .Values.telemetry.sentry.enabled -}}
+{{- $psaLevel := default "restricted" .Values.podSecurity.level -}}
+{{- $activeProfile := default "btc2_finality" .Values.config.profile -}}
+{{- $ingName := default (printf "%s-ingress" $fullname) .Values.ingress.name -}}
+{{- $hasIngress := and .Values.ingress.enabled (eq $svcType "ClusterIP") -}}
+
+Aethernova Chain Core
+Release:      {{ .Release.Name }}
+Namespace:    {{ $ns }}
+Chart:        {{ .Chart.Name }}-{{ .Chart.Version }}
+AppVersion:   {{ default .Chart.AppVersion .Values.image.tag }}
+Image:        {{ $image }}
+Replicas:     {{ $replicas }}
+Profile:      {{ $activeProfile }}
+
+Service
+  Name:       {{ $svc }}
+  Type:       {{ $svcType }}
+  Ports:
+    - P2P:       {{ $p2pPort }}
+    - RPC:       {{ $rpcPort }}
+    - Metrics:   {{ $metricsPort }}
+
+Access
+{{- if eq $svcType "LoadBalancer" }}
+  External access (when provisioned by cloud LB):
+    P2P:     lb://{{ $svc }}.{{ $ns }}.svc:{{ $p2pPort }}
+    RPC:     lb://{{ $svc }}.{{ $ns }}.svc:{{ $rpcPort }}
+{{- else if eq $svcType "NodePort" }}
+  NodePorts:
+    P2P:     nodeport://{{ $svc }}:{{ $p2pPort }} (see `kubectl get svc {{ $svc }} -n {{ $ns }}`)
+    RPC:     nodeport://{{ $svc }}:{{ $rpcPort }} (see `kubectl get svc {{ $svc }} -n {{ $ns }}`)
+{{- else }}
+  Port-forward for local access:
+    kubectl -n {{ $ns }} port-forward svc/{{ $svc }}  {{ $rpcPort }}:{{ $rpcPort }} {{ $metricsPort }}:{{ $metricsPort }}
+    RPC endpoint:      http://127.0.0.1:{{ $rpcPort }}
+    Prometheus metrics: http://127.0.0.1:{{ $metricsPort }}/metrics
+{{- end }}
+
+{{- if $hasIngress }}
+Ingress
+  Name:      {{ $ingName }}
+  Host(s):   {{- range .Values.ingress.hosts }} {{ .host }}{{- end }}
+  Note: ensure DNS → IngressController is configured.
+{{- end }}
+
+Security
+  ServiceAccount:      {{ $saName | default (printf "%s-sa" $fullname) }}
+  RBAC:
+    Namespaced Role:   {{- if $rbac }} enabled{{ else }} disabled{{ end }}
+    ClusterRole:       {{- if $clusterWide }} enabled (use only if necessary){{ else }} disabled{{ end }}
+  Pod Security:        {{ $psaLevel }} (via .Values.podSecurity.level)
+  Secrets:
+    - chain-core-secrets        (Opaque, immutable) — ops/k8s/base/secret.yaml
+    - chain-core-p2p-key        (Opaque, immutable, node.key)
+  Warning: keep secrets out of VCS and CI logs.
+
+Observability
+  Metrics:             {{ if .Values.telemetry.metrics.enabled }}enabled{{ else }}disabled{{ end }}
+  Tracing(OTLP):       {{ if $otelEnabled }}enabled ({{ .Values.telemetry.tracing.endpoint }}){{ else }}disabled{{ end }}
+  Sentry:              {{ if $sentryEnabled }}enabled{{ else }}disabled{{ end }}
+
+Readiness & Diagnostics
+  Wait for readiness:
+    kubectl -n {{ $ns }} rollout status statefulset/{{ $fullname }} --timeout=5m
+  Pod status:
+    kubectl -n {{ $ns }} get pods -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/name={{ $name }}
+  Logs (last 200 lines):
+    kubectl -n {{ $ns }} logs sts/{{ $fullname }} -c node --tail=200
+  Describe:
+    kubectl -n {{ $ns }} describe sts/{{ $fullname }}
+  Events (namespace):
+    kubectl -n {{ $ns }} get events --sort-by=.metadata.creationTimestamp
+
+P2P bootstrap
+  Ensure at least two seeds are reachable from this cluster.
+  Current seeds (from values):
+{{- range $i, $s := .Values.config.p2p.seeds }}
+    - {{ $s }}
+{{- else }}
+    - none configured
+{{- end }}
+
+RPC quick-check
+  Height:
+    curl -s http://{{ $svc }}.{{ $ns }}.svc:{{ $rpcPort }}/status | jq '.result.sync_info.latest_block_height'
+  Health:
+    curl -s http://{{ $svc }}.{{ $ns }}.svc:{{ $rpcPort }}/health
+
+Upgrade hints
+  Dry-run:
+    helm upgrade --install {{ .Release.Name }} {{ .Chart.Name }} -n {{ $ns }} --dry-run --debug
+  Diff (if plugin installed):
+    helm diff upgrade {{ .Release.Name }} . -n {{ $ns }}
+
+Uninstall
+  helm uninstall {{ .Release.Name }} -n {{ $ns }}
+
+Notes generated at: {{ now | date "2006-01-02T15:04:05Z07:00" }}

@@ -1,0 +1,106 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: physical-integration-core
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: service-monitor
+    app.kubernetes.io/part-of: physical-integration-core
+    app.kubernetes.io/component: observability
+    app.kubernetes.io/managed-by: prometheus-operator
+    monitoring.neurocity.dev/profile: prod
+spec:
+  # Используется как значение job в метриках, если присутствует у Service.
+  jobLabel: app.kubernetes.io/name
+
+  # Ограничиваем сборку конкретными пространствами имён, где живут модули физической интеграции.
+  namespaceSelector:
+    matchNames:
+      - physical-integration
+      - edge
+      - iot-gateway
+
+  # Отбираем только те Service, которые явно помечены для скрейпа и принадлежат ядру.
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: physical-integration-core
+      observability.neurocity.dev/scrape: "true"
+
+  # Перенести эти label из Service в таргеты Prometheus.
+  targetLabels:
+    - app.kubernetes.io/instance
+    - app.kubernetes.io/version
+    - app.kubernetes.io/component
+    - app.kubernetes.io/name
+
+  # Перенести эти label из Pod (за Endpoints) в таргеты (оператор добавит их при резолве).
+  podTargetLabels:
+    - security.neurocity.dev/zone
+    - topology.kubernetes.io/zone
+
+  endpoints:
+    # Профиль 1: стандартный HTTP сбор с именованного порта "metrics"
+    - port: metrics
+      scheme: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true
+      honorTimestamps: true
+      followRedirects: true
+      enableHttp2: true
+      relabelings:
+        # Собирать только готовые эндпоинты
+        - action: keep
+          sourceLabels: [__meta_kubernetes_endpoint_ready]
+          regex: "true"
+        # Нормализовать базовые атрибуты среды
+        - action: replace
+          sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: kubernetes_namespace
+        - action: replace
+          sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: kubernetes_service
+        - action: replace
+          sourceLabels: [__meta_kubernetes_endpoint_port_name]
+          targetLabel: kubernetes_port_name
+
+    # Профиль 2: защищенный сбор через HTTPS с mTLS и bearer-токеном
+    - port: https-metrics
+      scheme: https
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true
+      honorTimestamps: true
+      enableHttp2: true
+      tlsConfig:
+        insecureSkipVerify: false
+        serverName: device-bridge.internal
+        ca:
+          secret:
+            name: physical-integration-metrics-ca
+            key: ca.crt
+        cert:
+          secret:
+            name: physical-integration-metrics-client
+            key: tls.crt
+        keySecret:
+          name: physical-integration-metrics-client
+          key: tls.key
+      bearerTokenSecret:
+        name: prometheus-bearer-token
+        key: token
+      relabelings:
+        - action: keep
+          sourceLabels: [__meta_kubernetes_endpoint_ready]
+          regex: "true"
+        - action: replace
+          sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: kubernetes_namespace
+        - action: replace
+          sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: kubernetes_service
+        - action: replace
+          sourceLabels: [__meta_kubernetes_endpoint_port_name]
+          targetLabel: kubernetes_port_name

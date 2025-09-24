@@ -1,0 +1,190 @@
+{{- /*
+  Industrial-grade Service template for oblivionvault-core.
+  Expects helpers:
+    - "oblivionvault-core.name"
+    - "oblivionvault-core.fullname"
+    - "oblivionvault-core.labels"
+    - "oblivionvault-core.selectorLabels"
+  Typically defined in _helpers.tpl
+*/ -}}
+{{- $fullName := include "oblivionvault-core.fullname" . -}}
+{{- $labels := include "oblivionvault-core.labels" . | fromYaml -}}
+{{- $selector := include "oblivionvault-core.selectorLabels" . | fromYaml -}}
+{{- $svc := .Values.service | default dict -}}
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullName }}
+  {{- if .Values.namespace }}
+  namespace: {{ .Values.namespace }}
+  {{- end }}
+  labels:
+    {{- $labels | toYaml | nindent 4 }}
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: neurocity
+    {{- with $svc.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if or $svc.annotations .Values.metrics.service.annotations }}
+  annotations:
+    {{- with $svc.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.metrics.service.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  {{- /* Service type & headless */}}
+  {{- if eq (default "ClusterIP" $svc.type) "Headless" }}
+  clusterIP: None
+  {{- else if $svc.clusterIP }}
+  clusterIP: {{ $svc.clusterIP }}
+  {{- end }}
+
+  type: {{- if eq (default "ClusterIP" $svc.type) "Headless" -}} ClusterIP {{- else -}} {{ default "ClusterIP" $svc.type }} {{- end }}
+
+  {{- /* Dual-stack controls */}}
+  {{- with $svc.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with $svc.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  {{- /* Internal traffic policy */}}
+  {{- with $svc.internalTrafficPolicy }}
+  internalTrafficPolicy: {{ . }}
+  {{- end }}
+
+  {{- /* External traffic policy for NodePort/LB */}}
+  {{- if or (eq (default "ClusterIP" $svc.type) "LoadBalancer") (eq (default "ClusterIP" $svc.type) "NodePort") }}
+  {{- with $svc.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- end }}
+
+  {{- /* Topology-aware hints (K8s >=1.24) */}}
+  {{- with $svc.topologyAwareHints }}
+  {{- if .enabled }}
+  {{- if not (hasKey $.ObjectMeta "annotations") }}{{- /* ensure annotations object for hints */ -}}{{- end -}}
+  {{- /* Note: since k8s v1.27 hints are in spec. But most distros still use annotation gateway. */ -}}
+  {{- end }}
+  {{- end }}
+
+  {{- /* Session Affinity */}}
+  {{- with $svc.sessionAffinity }}
+  sessionAffinity: {{ .type | default "None" }}
+  {{- if and (.type) (eq (.type | toString) "ClientIP") }}
+  {{- with .config }}
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ default 10800 .timeoutSeconds }}
+  {{- end }}
+  {{- end }}
+  {{- else }}
+  sessionAffinity: None
+  {{- end }}
+
+  {{- /* LB specific fields */}}
+  {{- if eq (default "ClusterIP" $svc.type) "LoadBalancer" }}
+  {{- with $svc.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with $svc.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with $svc.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $svc.allocateLoadBalancerNodePorts }}
+  allocateLoadBalancerNodePorts: {{ . }}
+  {{- end }}
+  {{- with $svc.healthCheckNodePort }}
+  healthCheckNodePort: {{ . }}
+  {{- end }}
+  {{- end }}
+
+  {{- /* ExternalIPs if any */}}
+  {{- with $svc.externalIPs }}
+  externalIPs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  {{- /* Ports */}}
+  ports:
+    {{- $http := $svc.ports.http | default dict -}}
+    {{- if or (not (hasKey $svc "ports")) (hasKey $svc.ports "http") }}
+    {{- if ne (default false $http.disabled) true }}
+    - name: {{ default "http" $http.name }}
+      port: {{ default 80 $http.port }}
+      targetPort: {{ default 8080 $http.targetPort }}
+      protocol: TCP
+      {{- with $http.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
+      {{- with $http.appProtocol }}
+      appProtocol: {{ . }}
+      {{- else }}
+      appProtocol: http
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- $grpc := $svc.ports.grpc | default dict -}}
+    {{- if hasKey $svc.ports "grpc" }}
+    {{- if ne (default false $grpc.disabled) true }}
+    - name: {{ default "grpc" $grpc.name }}
+      port: {{ default 9000 $grpc.port }}
+      targetPort: {{ default 9000 $grpc.targetPort }}
+      protocol: TCP
+      {{- with $grpc.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
+      {{- with $grpc.appProtocol }}
+      appProtocol: {{ . }}
+      {{- else }}
+      appProtocol: grpc
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- $metrics := $svc.ports.metrics | default dict -}}
+    {{- if hasKey $svc.ports "metrics" }}
+    {{- if ne (default false $metrics.disabled) true }}
+    - name: {{ default "metrics" $metrics.name }}
+      port: {{ default 9090 $metrics.port }}
+      targetPort: {{ default 9090 $metrics.targetPort }}
+      protocol: TCP
+      {{- with $metrics.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
+      {{- with $metrics.appProtocol }}
+      appProtocol: {{ . }}
+      {{- else }}
+      appProtocol: http
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- /* Arbitrary extra ports */}}
+    {{- with $svc.extraPorts }}
+    {{- range . }}
+    - name: {{ .name }}
+      port: {{ .port }}
+      targetPort: {{ default .port .targetPort }}
+      protocol: {{ default "TCP" .protocol }}
+      {{- with .nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
+      {{- with .appProtocol }}
+      appProtocol: {{ . }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
+
+  selector:
+    {{- $selector | toYaml | nindent 4 }}

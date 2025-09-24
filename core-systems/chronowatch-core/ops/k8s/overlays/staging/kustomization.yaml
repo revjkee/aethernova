@@ -1,0 +1,232 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: chronowatch-staging
+nameSuffix: -stg
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/environment: staging
+  app.kubernetes.io/part-of: chronowatch-core
+
+commonAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+  maintenance.window: "none"
+  risk.profile: "medium"
+  backup.policy: "app-aware"
+
+images:
+  - name: ghcr.io/your-org/chronowatch-core
+    newName: ghcr.io/your-org/chronowatch-core
+    newTag: v1.0.0-stg
+
+replicas:
+  - name: chronowatch-core
+    count: 3
+
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    owner.team: "platform"
+
+configMapGenerator:
+  - name: chronowatch-config
+    behavior: create
+    literals:
+      - CHRONO_TZ=Europe/Stockholm
+      - LOG_LEVEL=info
+      - SCHEDULER_DEFAULT_SLA_MS=1000
+      - SCHEDULER_SHARDS=16
+      - OTLP_ENDPOINT=http://otel-collector:4317
+      - PROM_PATH=/metrics
+
+secretGenerator:
+  - name: chronowatch-secrets
+    behavior: create
+    literals:
+      - DB_DSN=postgresql+asyncpg://user:pass@postgres:5432/chronowatch
+      - JWT_AUDIENCE=chronowatch
+      - JWT_ISSUER=https://auth.staging.local/
+    type: Opaque
+  - name: chronowatch-tls
+    behavior: create
+    files:
+      - tls.crt=./certs/staging.crt
+      - tls.key=./certs/staging.key
+    type: kubernetes.io/tls
+
+patches:
+  # DEPLOYMENT HARDENING + RESOURCES + PROBES + ENV FROM CONFIG/SECRET
+  - target:
+      kind: Deployment
+      name: chronowatch-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: chronowatch-core
+        labels:
+          security.audited: "true"
+      spec:
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 25%
+        template:
+          metadata:
+            annotations:
+              checksum/config: ${CONFIG_CHECKSUM}
+              checksum/secret: ${SECRET_CHECKSUM}
+          spec:
+            automountServiceAccountToken: true
+            enableServiceLinks: false
+            dnsPolicy: ClusterFirst
+            terminationGracePeriodSeconds: 30
+            securityContext:
+              seccompProfile:
+                type: RuntimeDefault
+            nodeSelector:
+              kubernetes.io/os: linux
+            tolerations:
+              - key: "workload"
+                operator: "Equal"
+                value: "background"
+                effect: "NoSchedule"
+            affinity:
+              podAntiAffinity:
+                preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 100
+                    podAffinityTerm:
+                      labelSelector:
+                        matchLabels:
+                          app.kubernetes.io/name: chronowatch-core
+                      topologyKey: kubernetes.io/hostname
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: topology.kubernetes.io/zone
+                whenUnsatisfiable: ScheduleAnyway
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: chronowatch-core
+            containers:
+              - name: chronowatch
+                # image переопределяется секцией images выше
+                imagePullPolicy: IfNotPresent
+                envFrom:
+                  - configMapRef:
+                      name: chronowatch-config
+                  - secretRef:
+                      name: chronowatch-secrets
+                ports:
+                  - name: http
+                    containerPort: 8080
+                  - name: grpc
+                    containerPort: 9090
+                readinessProbe:
+                  httpGet:
+                    path: /healthz/ready
+                    port: http
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  failureThreshold: 6
+                livenessProbe:
+                  httpGet:
+                    path: /healthz/live
+                    port: http
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                resources:
+                  requests:
+                    cpu: "250m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "1"
+                    memory: "1Gi"
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  runAsNonRoot: true
+                  runAsUser: 10001
+                  runAsGroup: 10001
+                  capabilities:
+                    drop: [ "ALL" ]
+                volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+                  - name: tls
+                    mountPath: /etc/chronowatch/tls
+                    readOnly: true
+            volumes:
+              - name: tmp
+                emptyDir: {}
+              - name: tls
+                secret:
+                  secretName: chronowatch-tls
+
+  # SERVICE HARDENING + METRICS PORT ANNOTATIONS (если базовый сервис отличается)
+  - target:
+      kind: Service
+      name: chronowatch-core
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: chronowatch-core
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "8080"
+          prometheus.io/path: "/metrics"
+      spec:
+        type: ClusterIP
+        ports:
+          - name: http
+            port: 80
+            targetPort: 8080
+          - name: grpc
+            port: 9090
+            targetPort: 9090
+
+  # INGRESS STAGING HOST + TLS
+  - target:
+      kind: Ingress
+      name: chronowatch-core
+    patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: chronowatch-core
+        annotations:
+          kubernetes.io/ingress.class: nginx
+          nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+          nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+          nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      spec:
+        tls:
+          - hosts:
+              - chronowatch.staging.local
+            secretName: chronowatch-tls
+        rules:
+          - host: chronowatch.staging.local
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: chronowatch-core-stg
+                      port:
+                        number: 80
+
+# Примитивная подстановка контрольных сумм конфигов/секретов (опционально),
+# если вы используете внешний генератор. Можно оставить как есть — Kustomize добавит hash в имя.
+vars: []

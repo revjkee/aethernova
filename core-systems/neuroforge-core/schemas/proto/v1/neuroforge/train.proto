@@ -1,0 +1,382 @@
+// neuroforge-core/schemas/proto/v1/neuroforge/train.proto
+syntax = "proto3";
+
+package neuroforge.v1;
+
+option go_package = "github.com/neuroforge/neuroforge-core/schemas/proto/v1;nfv1";
+option java_multiple_files = true;
+option java_package = "io.neuroforge.v1";
+option csharp_namespace = "Neuroforge.V1";
+option objc_class_prefix = "NFV1";
+option optimize_for = SPEED;
+
+// -------------------------------
+// Общие зависимости
+// -------------------------------
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+
+// -------------------------------
+// Перечисления
+// -------------------------------
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_PENDING           = 1;  // Принято, в очереди
+  JOB_VALIDATING        = 2;  // Идёт валидация входных параметров/доступа к данным
+  JOB_PREPARING         = 3;  // Подготовка окружения/образов/узлов
+  JOB_RUNNING           = 4;  // Обучение запущено
+  JOB_SUCCEEDED         = 5;  // Успех
+  JOB_FAILED            = 6;  // Неуспех (фаза/причина в ErrorInfo)
+  JOB_CANCELLED         = 7;  // Отменено пользователем/политикой
+}
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW         = 1;
+  PRIORITY_NORMAL      = 2;
+  PRIORITY_HIGH        = 3;
+  PRIORITY_URGENT      = 4;
+}
+
+enum Framework {
+  FRAMEWORK_UNSPECIFIED = 0;
+  FRAMEWORK_PYTORCH     = 1;
+  FRAMEWORK_TENSORFLOW  = 2;
+  FRAMEWORK_XGBOOST     = 3;
+  FRAMEWORK_SKLEARN     = 4;
+  FRAMEWORK_LIGHTGBM    = 5;
+  FRAMEWORK_CUSTOM      = 9;
+}
+
+enum LogLevel {
+  LOG_LEVEL_UNSPECIFIED = 0;
+  LOG_DEBUG             = 1;
+  LOG_INFO              = 2;
+  LOG_WARN              = 3;
+  LOG_ERROR             = 4;
+}
+
+// -------------------------------
+// Повторно используемые структуры
+// -------------------------------
+
+message ErrorInfo {
+  // Короткий код ошибки (желательно соответствующий внутренним кодам)
+  string code = 1;
+  // Человекочитаемое описание (для операторов/логов)
+  string message = 2;
+  // Машиночитаемые детали (можно Any для расширений)
+  map<string, string> details = 3;
+  google.protobuf.Any cause = 4;
+}
+
+message MetricPoint {
+  string name = 1;
+  double value = 2;
+  map<string, string> labels = 3;
+  google.protobuf.Timestamp time = 4;
+}
+
+// -------------------------------
+// Источники датасетов
+// -------------------------------
+
+message DatasetSource {
+  // Логическое имя набора данных (для аудита/каталога)
+  string name = 1;
+  // Версия/снимок
+  string version = 2;
+  // Произвольные ярлыки для маршрутизации/биллинга
+  map<string, string> labels = 3;
+
+  oneof source {
+    S3Source s3 = 10;
+    GcsSource gcs = 11;
+    HttpSource http = 12;
+    NfsSource nfs = 13;
+  }
+
+  // Опциональный манифест (например, список партиций) в JSON/JSONL
+  string manifest_uri = 20;
+  // Контрольные суммы для манифеста/корня
+  string checksum = 21;
+}
+
+message S3Source {
+  // Формат: s3://bucket/prefix или s3://bucket/object
+  string uri = 1;
+  // Необязательная привязка KMS (если требуется расшифровка на чтение)
+  string kms_key_id = 2;
+  // Пользовательские заголовки/параметры подписанных URL
+  map<string, string> headers = 3;
+}
+
+message GcsSource {
+  string uri = 1; // gs://bucket/prefix|object
+  map<string, string> headers = 2;
+}
+
+message HttpSource {
+  string url = 1;
+  // Только для доверенных внутренних источников
+  map<string, string> headers = 2;
+  bool allow_insecure_tls = 3;
+}
+
+message NfsSource {
+  string server = 1; // host/ip
+  string path = 2;   // экспортированный путь
+  bool read_only = 3;
+}
+
+// -------------------------------
+// Приёмники артефактов/чекпойнтов
+// -------------------------------
+
+message ArtifactSink {
+  oneof sink {
+    S3Sink s3 = 1;
+    GcsSink gcs = 2;
+    FSSink fs = 3;
+  }
+  // Сколько дней хранить артефакты (для систем lifecycle-политик)
+  int32 retention_days = 10;
+  // Лейблы на артефакты (каталог/биллинг)
+  map<string, string> labels = 11;
+}
+
+message S3Sink {
+  string uri = 1;        // s3://bucket/prefix
+  string kms_key_id = 2; // шифрование на запись
+  bool object_lock = 3;  // если требуется защитить артефакты
+}
+
+message GcsSink {
+  string uri = 1;       // gs://bucket/prefix
+  string kms_key_name = 2;
+}
+
+message FSSink {
+  string path = 1;      // локальный/разделяемый каталог
+}
+
+// -------------------------------
+// Спецификации модели, гиперпарам и ресурсов
+// -------------------------------
+
+message ModelSpec {
+  Framework framework = 1;
+  // Дескриптор/архитектура (напр. "resnet50", "transformer-xl")
+  string architecture = 2;
+  // Контейнерный образ среды выполнения
+  string image = 3;
+  // Точка входа (скрипт/модуль)
+  string entrypoint = 4;
+  repeated string args = 5;
+  map<string, string> env = 6;
+  // Версия кода/коммита (для отслеживания воспроизводимости)
+  string code_version = 7;
+
+  // Зарезервировано для будущих полей (не переиспользовать номера)
+  reserved 15, 16, 17;
+}
+
+message HyperParameter {
+  // Универсальный параметр: одно из чисел/строка/булево
+  string name = 1;
+  oneof value {
+    double double_value = 2;
+    int64 int_value = 3;
+    string string_value = 4;
+    bool bool_value = 5;
+  }
+}
+
+message HyperParameters {
+  repeated HyperParameter params = 1;
+  // Свободная форма для редко используемых скалярных настроек
+  map<string, string> extras = 2;
+}
+
+message ResourceSpec {
+  // CPU в милликорах (1000 = 1 vCPU)
+  int32 cpu_milli = 1;
+  // Память в MiB
+  int32 memory_mib = 2;
+  // Количество GPU
+  int32 gpu_count = 3;
+  // Тип/класс GPU (например, "nvidia-a100-40gb")
+  string gpu_type = 4;
+  // Ограничения планирования узлов/зон
+  map<string, string> node_selector = 5;
+  // Тайм-лимиты
+  google.protobuf.Duration max_run_time = 6;
+  // Ресурсы для диск-IO/локального SSD (MiB)
+  int32 local_ssd_mib = 7;
+}
+
+// -------------------------------
+// Чекпойнты и артефакты
+// -------------------------------
+
+message Checkpoint {
+  string uri = 1; // Местоположение чекпойнта
+  int64 step = 2; // Номер шага/эпохи
+  map<string, double> metrics = 3;
+  google.protobuf.Timestamp time = 4;
+}
+
+// -------------------------------
+// Основной ресурс: TrainingJob
+// -------------------------------
+
+message TrainingJob {
+  // Идентификатор ресурса: "trainingJobs/{id}"
+  string name = 1;
+
+  JobState state = 2;
+  Priority priority = 3;
+
+  // Декларативная спецификация
+  DatasetSource dataset = 10;
+  ModelSpec model = 11;
+  HyperParameters hyperparameters = 12;
+  ResourceSpec resources = 13;
+  ArtifactSink output = 14;
+
+  // Технические поля
+  map<string, string> labels = 20;
+  string etag = 21; // Для optimistic locking
+  string created_by = 22;
+
+  // Таймстемпы жизненного цикла
+  google.protobuf.Timestamp create_time = 30;
+  google.protobuf.Timestamp update_time = 31;
+  google.protobuf.Timestamp start_time = 32;
+  google.protobuf.Timestamp end_time = 33;
+
+  // Результаты/диагностика
+  ErrorInfo error = 40;
+  repeated Checkpoint checkpoints = 41;
+  map<string, double> final_metrics = 42;
+
+  // Резерв под будущее расширение
+  reserved 50, 51, 52;
+}
+
+// -------------------------------
+// Запросы/ответы сервиса
+// -------------------------------
+
+message SubmitTrainingJobRequest {
+  // Идемпотентный ключ клиента (например, UUID v4)
+  string idempotency_key = 1;
+  // Для трассировки распределённых запросов
+  string correlation_id = 2;
+  // Включить только валидацию без запуска
+  bool validate_only = 3;
+  // Декларация задания
+  TrainingJob job = 10;
+}
+
+message SubmitTrainingJobResponse {
+  TrainingJob job = 1;
+}
+
+message GetTrainingJobRequest {
+  string name = 1; // "trainingJobs/{id}"
+}
+
+message CancelTrainingJobRequest {
+  string name = 1;
+  string reason = 2;
+  // Если etag задан, отмена произойдёт только при совпадении
+  string etag = 3;
+}
+
+message ListTrainingJobsRequest {
+  // Фильтр (язык фильтров свободной формы, напр. "state=RUNNING priority>=HIGH label.env=prod")
+  string filter = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListTrainingJobsResponse {
+  repeated TrainingJob jobs = 1;
+  string next_page_token = 2;
+}
+
+message StreamLogsRequest {
+  string name = 1; // job name
+  // Отдавать логи, начиная с указанного времени (опционально)
+  google.protobuf.Timestamp since_time = 2;
+  // Максимальная степень подробности (например, не ниже INFO)
+  LogLevel min_level = 3;
+}
+
+message StreamLogsResponse {
+  google.protobuf.Timestamp time = 1;
+  LogLevel level = 2;
+  string message = 3;
+  // Произвольные поля структуры лог-строк
+  map<string, string> fields = 4;
+}
+
+message StreamMetricsRequest {
+  string name = 1; // job name
+  // Список интересующих метрик (пусто — все)
+  repeated string names = 2;
+  // Стартовое время окна
+  google.protobuf.Timestamp since_time = 3;
+}
+
+message StreamMetricsResponse {
+  repeated MetricPoint points = 1;
+}
+
+message UploadArtifactRequest {
+  // Куда загружаем: "trainingJobs/{id}/artifacts/{kind}"
+  string parent = 1;
+  // Поток чанков
+  bytes chunk = 2;
+  // При необходимости контрольная сумма чанка (hex/база64) — опционально
+  string checksum = 3;
+  // Последний ли это чанк
+  bool last = 4;
+}
+
+message UploadArtifactResponse {
+  // Итоговый URI артефакта
+  string artifact_uri = 1;
+  // Итоговый размер в байтах
+  int64 size = 2;
+}
+
+// -------------------------------
+// Сервис
+// -------------------------------
+
+service TrainingService {
+  // Идемпотентная постановка задания на обучение.
+  rpc SubmitTrainingJob(SubmitTrainingJobRequest) returns (SubmitTrainingJobResponse);
+
+  // Получить текущее состояние задания.
+  rpc GetTrainingJob(GetTrainingJobRequest) returns (TrainingJob);
+
+  // Отмена задания (best effort).
+  rpc CancelTrainingJob(CancelTrainingJobRequest) returns (TrainingJob);
+
+  // Список заданий с пагинацией.
+  rpc ListTrainingJobs(ListTrainingJobsRequest) returns (ListTrainingJobsResponse);
+
+  // Поток логов в реальном времени (server streaming).
+  rpc StreamLogs(StreamLogsRequest) returns (stream StreamLogsResponse);
+
+  // Поток метрик обучения (server streaming).
+  rpc StreamMetrics(StreamMetricsRequest) returns (stream StreamMetricsResponse);
+
+  // Клиентская потоковая загрузка артефактов (чекпойнтов/моделей).
+  rpc UploadArtifact(stream UploadArtifactRequest) returns (UploadArtifactResponse);
+}

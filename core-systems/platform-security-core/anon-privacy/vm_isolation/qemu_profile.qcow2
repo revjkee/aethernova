@@ -1,0 +1,54 @@
+#!/bin/bash
+
+# === TeslaAI Secure QEMU Profile Generator v1.0 ===
+# Назначение: сборка базового .qcow2-образа с жёсткой изоляцией и сетевой защитой
+# Требования: qemu-utils, debootstrap, genisoimage, iptables, apparmor
+
+set -euo pipefail
+
+ISO_NAME="teslaai_debian.iso"
+QCOW2_NAME="qemu_profile.qcow2"
+IMAGE_SIZE="15G"
+MOUNT_DIR="/mnt/teslaai_vm_root"
+DISTRO="bullseye"
+ARCH="amd64"
+HOSTNAME="anon-vm"
+USERNAME="agentx"
+
+echo "[*] Создание qcow2-диска ($IMAGE_SIZE)..."
+qemu-img create -f qcow2 "$QCOW2_NAME" "$IMAGE_SIZE"
+
+echo "[*] Установка базовой Debian-системы через debootstrap..."
+mkdir -p "$MOUNT_DIR"
+debootstrap --arch=$ARCH $DISTRO "$MOUNT_DIR" http://deb.debian.org/debian/
+
+echo "[*] Конфигурация системы..."
+cat > "$MOUNT_DIR/etc/hostname" <<EOF
+$HOSTNAME
+EOF
+
+cat > "$MOUNT_DIR/etc/network/interfaces" <<EOF
+auto lo
+iface lo inet loopback
+EOF
+
+chroot "$MOUNT_DIR" /bin/bash -c "
+apt update && apt install -y openssh-server sudo net-tools iptables ufw \
+  wireguard resolvconf curl tor apparmor apparmor-profiles apparmor-utils \
+  fail2ban gnupg2 whonixcheck secure-delete \
+  busybox tzdata ca-certificates
+
+adduser --disabled-password --gecos '' $USERNAME
+echo '$USERNAME ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
+# Ужесточение безопасности:
+systemctl disable systemd-networkd-wait-online.service
+ufw default deny incoming && ufw default allow outgoing && ufw enable
+systemctl enable tor
+"
+
+echo "[*] Очистка временных данных..."
+umount -l "$MOUNT_DIR"
+rm -rf "$MOUNT_DIR"
+
+echo "[+] Базовый защищённый образ готов: $QCOW2_NAME"

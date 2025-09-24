@@ -1,0 +1,162 @@
+# ------------------------------------------------------------------------------
+# Ingress (NGINX Ingress Controller) — основной edge с Zero-Trust настройками
+# ------------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ztc-api
+  namespace: zero-trust-core
+  labels:
+    app.kubernetes.io/name: ztc-api
+    app.kubernetes.io/part-of: zero-trust-core
+    app.kubernetes.io/component: edge
+    app.kubernetes.io/environment: prod
+  annotations:
+    # ----- TLS/HSTS/Redirect -----
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/ssl-protocols: "TLSv1.2 TLSv1.3"
+    nginx.ingress.kubernetes.io/ssl-ciphers: "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+
+    # ----- Безопасные заголовки (server/configuration snippets) -----
+    nginx.ingress.kubernetes.io/server-snippet: |
+      # Защитные заголовки на уровне сервера
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header Referrer-Policy "no-referrer" always;
+      add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+      # CSP по умолчанию максимально строгая; при необходимости ослабьте через values/patch
+      add_header Content-Security-Policy "default-src 'none'; base-uri 'none'; frame-ancestors 'none';" always;
+
+    # ----- Ограничение трафика на edge (DoS smog) -----
+    nginx.ingress.kubernetes.io/limit-rps: "20"          # запросов/сек на IP
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+    nginx.ingress.kubernetes.io/limit-connections: "50"  # одновременных соед. на IP
+
+    # ----- Модули WAF (ModSecurity + OWASP CRS) -----
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/enable-owasp-modsecurity-crs: "true"
+
+    # ----- Размеры/буферы/таймауты -----
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+
+    # ----- WebSocket/HTTP2/GRPC -----
+    nginx.ingress.kubernetes.io/websocket-services: "security-core-api"
+    # Для gRPC можно включить протокол на уровне сервис-анкета/доп. Ingress (см. ниже при необходимости)
+
+    # ----- Доступ по спискам (опционально включить) -----
+    # nginx.ingress.kubernetes.io/whitelist-source-range: "203.0.113.0/24,198.51.100.0/24"
+
+    # ----- CORS (ограничьте доменами вашего фронтенда) -----
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.zero-trust.example.com"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET,PUT,POST,PATCH,DELETE,OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization,Content-Type,X-Request-Id"
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+
+    # ----- cert-manager (автоматическая выдача сертификатов) -----
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.zero-trust.example.com
+      secretName: ztc-wildcard-tls
+  rules:
+    - host: api.zero-trust.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: security-core-api
+                port:
+                  number: 8080
+
+---
+# ------------------------------------------------------------------------------
+# Ingress (опциональный mTLS: требование клиентских сертификатов на edge)
+# Включите, если необходимо клиентское удостоверение кластера/машины/агента.
+# ------------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ztc-api-mtls
+  namespace: zero-trust-core
+  labels:
+    app.kubernetes.io/name: ztc-api
+    app.kubernetes.io/part-of: zero-trust-core
+    app.kubernetes.io/component: edge
+    app.kubernetes.io/environment: prod
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/auth-tls-secret: "zero-trust-core/ztc-ca-bundle"   # Secret с CA цепочкой (tls.crt)
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    nginx.ingress.kubernetes.io/auth-tls-verify-depth: "2"
+    nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream: "true"
+    # Остальные политики аналогичны основному ingress; упростим для примера
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [ "agents.zero-trust.example.com" ]
+      secretName: ztc-wildcard-tls
+  rules:
+    - host: agents.zero-trust.example.com
+      http:
+        paths:
+          - path: /mtls/
+            pathType: Prefix
+            backend:
+              service:
+                name: security-core-agents
+                port:
+                  number: 8443
+
+---
+# ------------------------------------------------------------------------------
+# Ingress (опциональный canary с 10% весом или по заголовку X-Canary)
+# Используется для поэтапных релизов API.
+# ------------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ztc-api-canary
+  namespace: zero-trust-core
+  labels:
+    app.kubernetes.io/name: ztc-api
+    app.kubernetes.io/part-of: zero-trust-core
+    app.kubernetes.io/component: edge
+    app.kubernetes.io/environment: prod
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    # Один из режимов: по заголовку…
+    nginx.ingress.kubernetes.io/canary-by-header: "X-Canary"
+    nginx.ingress.kubernetes.io/canary-by-header-value: "1"
+    # …или по весу (раскомментируйте и удалите by-header при необходимости)
+    # nginx.ingress.kubernetes.io/canary-weight: "10"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.zero-trust.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                # Canary‑сервис (vNext)
+                name: security-core-api-canary
+                port:
+                  number: 8080

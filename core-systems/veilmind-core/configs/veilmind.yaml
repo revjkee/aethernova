@@ -1,0 +1,502 @@
+# ==============================================================================
+# VeilMind Core — Industrial Configuration
+# Centralized, profile-driven, zero-trust ready configuration
+# ==============================================================================
+version: 1
+
+metadata:
+  service:
+    name: veilmind-core
+    component: api-gateway
+    owner: platform@company.tld
+    team: platform
+    domain: veilmind
+    environment: ${ENVIRONMENT:-dev}   # dev|stage|prod
+  build:
+    git_commit: ${GIT_COMMIT:-unknown}
+    git_branch: ${GIT_BRANCH:-unknown}
+    build_at: ${BUILD_AT:-unknown}
+  labels:
+    app.kubernetes.io/part-of: veilmind
+    app.kubernetes.io/component: core
+    security.tier: critical
+    data.classification: confidential
+
+# ------------------------------------------------------------------------------
+# Defaults via YAML anchors (can be reused/overridden by profiles)
+# ------------------------------------------------------------------------------
+_defaults: &defaults
+  server:
+    http:
+      enabled: true
+      host: 0.0.0.0
+      port: ${HTTP_PORT:-8080}
+      # Strict timeouts prevent slowloris/resource exhaustion
+      timeouts:
+        read: 10s
+        write: 20s
+        idle: 60s
+        header: 5s
+      cors:
+        enabled: true
+        allow_origins: ["${CORS_ORIGINS:-https://app.example.com}"]
+        allow_methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+        allow_headers: ["Authorization","Content-Type","X-Request-ID"]
+        expose_headers: ["X-Request-ID","Retry-After"]
+        allow_credentials: false
+        max_age: 600
+      rate_limit:
+        enabled: true
+        # Token bucket per client_id/IP/route
+        policies:
+          - id: rl-default
+            selector: route:"/api/*"
+            capacity: 200
+            refill_per_sec: 50
+            burst: 50
+          - id: rl-auth
+            selector: route:"/api/auth/*"
+            capacity: 60
+            refill_per_sec: 10
+            burst: 10
+      hsts:
+        enabled: true
+        max_age_seconds: 31536000
+        include_subdomains: true
+        preload: true
+    grpc:
+      enabled: true
+      host: 0.0.0.0
+      port: ${GRPC_PORT:-9090}
+      keepalive:
+        time: 30s
+        timeout: 5s
+        permit_without_stream: false
+      max_concurrent_streams: 1024
+      max_recv_msg_mb: 16
+      max_send_msg_mb: 16
+  security:
+    zero_trust:
+      intent_validation: true
+      strict_transport_security: true
+      disable_plain_http: true
+      jwt_audience_check: true
+      jwt_azp_check: true
+      enforce_pinned_ca: true
+    tls:
+      enabled: true
+      min_version: TLS1_3
+      curve_preferences: ["X25519","P-256"]
+      cipher_suites: []     # TLS 1.3 ciphers auto-selected
+      mtls:
+        enabled: true
+        mode: require_and_verify_client_cert
+        trust_store:
+          provider: vault
+          path: ${VAULT_PKI_BUNDLE_PATH:-pki/ca_bundle.pem}
+        cert_ref:
+          provider: vault
+          crt_path: ${VAULT_CERT_PATH:-pki/issue/veilmind-core}
+          key_path: ${VAULT_KEY_PATH:-pki/private/veilmind-core}
+        rotation:
+          enabled: true
+          check_interval: 10m
+          renew_before: 72h
+    authn:
+      oidc:
+        enabled: true
+        issuer: ${OIDC_ISSUER:-https://auth.example.com/}
+        client_id: ${OIDC_CLIENT_ID:-veilmind-core}
+        client_secret_ref:
+          provider: secretManager
+          key: ${OIDC_CLIENT_SECRET_KEY:-oidc/veilmind-core}
+        jwks_cache_ttl: 10m
+        allowed_alg: ["RS256","ES256"]
+      jwt:
+        enabled: true
+        audiences: ["veilmind-core","veilmind"]
+        required_scopes: ["api.read","api.write"]
+        leeway: 30s
+    authz:
+      rbac:
+        default_role: "viewer"
+        roles:
+          - name: viewer
+            allow: ["GET:/api/*"]
+          - name: editor
+            allow: ["GET:/api/*","POST:/api/*","PUT:/api/*","PATCH:/api/*"]
+          - name: admin
+            allow: ["*:*"]
+        attribute_policies:
+          - name: tenant_isolation
+            when:
+              match_claim: "tenant_id"
+            deny_if_missing: true
+    headers:
+      secure:
+        - name: X-Content-Type-Options
+          value: nosniff
+        - name: X-Frame-Options
+          value: DENY
+        - name: Referrer-Policy
+          value: no-referrer
+        - name: Permissions-Policy
+          value: "geolocation=(), microphone=()"
+        - name: X-XSS-Protection
+          value: "0"
+  observability:
+    logging:
+      level: ${LOG_LEVEL:-INFO}    # TRACE|DEBUG|INFO|WARN|ERROR
+      format: json
+      include_caller: true
+      sanitize_fields: ["password","token","authorization","set-cookie"]
+      sampling:
+        enabled: true
+        initial: 5
+        thereafter: 100
+      destinations:
+        - type: stdout
+        - type: loki
+          url: ${LOKI_URL:-http://loki:3100}
+          labels:
+            app: veilmind-core
+            env: ${ENVIRONMENT:-dev}
+    tracing:
+      enabled: true
+      exporter: otlp
+      otlp:
+        endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+        protocol: grpc
+      sampler:
+        type: parentbased_traceidratio
+        ratio: ${OTEL_TRACES_SAMPLER_ARG:-0.10}
+      service_name: veilmind-core
+      resource:
+        service.version: ${SERVICE_VERSION:-0.0.0}
+        deployment.environment: ${ENVIRONMENT:-dev}
+    metrics:
+      enabled: true
+      port: ${METRICS_PORT:-9102}
+      path: /metrics
+      runtime:
+        process: true
+        go: true
+        jvm: false
+      custom_labels:
+        service: veilmind-core
+        env: ${ENVIRONMENT:-dev}
+    profiling:
+      enabled: true
+      pprof:
+        host: 0.0.0.0
+        port: ${PPROF_PORT:-6060}
+  resiliency:
+    timeouts:
+      connect: 2s
+      request: 3s
+      upstream: 5s
+    retries:
+      attempts: 3
+      per_try_timeout: 2s
+      backoff:
+        kind: exponential
+        base: 100ms
+        max: 2s
+      retry_on: ["5xx","connect-failure","retriable-4xx"]
+    circuit_breaker:
+      enabled: true
+      failure_rate_threshold: 50         # %
+      slow_call_rate_threshold: 50       # %
+      slow_call_duration_threshold: 2s
+      sliding_window_size: 20
+      sliding_window_type: count
+      permitted_calls_in_half_open: 5
+      wait_duration_in_open_state: 30s
+    bulkhead:
+      enabled: true
+      max_concurrent_calls: 256
+      max_queue_size: 1024
+  data:
+    postgres:
+      enabled: true
+      dsn: ${PG_DSN:-postgresql://veilmind:${PG_PASSWORD}@postgres:5432/veilmind?sslmode=verify-full}
+      max_open_conns: 50
+      max_idle_conns: 10
+      conn_max_lifetime: 30m
+      conn_max_idle_time: 10m
+      migration:
+        enabled: true
+        dir: ${MIGRATIONS_DIR:-/app/migrations}
+        on_start: up
+    redis:
+      enabled: true
+      addr: ${REDIS_ADDR:-redis:6379}
+      db: ${REDIS_DB:-0}
+      tls: true
+      username: ${REDIS_USERNAME:-}
+      password_ref:
+        provider: secretManager
+        key: ${REDIS_PASSWORD_KEY:-redis/veilmind-core}
+      pool_size: 50
+      min_idle_conns: 5
+      dial_timeout: 1s
+      read_timeout: 500ms
+      write_timeout: 500ms
+    kafka:
+      enabled: true
+      brokers: ${KAFKA_BROKERS:-kafka-0:9092,kafka-1:9092}
+      client_id: veilmind-core
+      tls:
+        enabled: true
+        insecure_skip_verify: false
+      sasl:
+        enabled: ${KAFKA_SASL_ENABLED:-false}
+        mechanism: ${KAFKA_SASL_MECH:-SCRAM-SHA-256}
+        username: ${KAFKA_USERNAME:-}
+        password_ref:
+          provider: secretManager
+          key: ${KAFKA_PASSWORD_KEY:-kafka/veilmind-core}
+      topics:
+        in_events: veilmind.events.in
+        out_events: veilmind.events.out
+      producer:
+        acks: all
+        compression: snappy
+        batch_size: 1048576
+        linger_ms: 5
+      consumer:
+        group_id: veilmind-core
+        session_timeout_ms: 10000
+        auto_offset_reset: latest
+  cache:
+    default_ttl: 300s
+    negative_ttl: 30s
+    max_object_size_kb: 256
+  api:
+    base_path: /api
+    pagination:
+      default_limit: 50
+      max_limit: 1000
+    request_id:
+      header: X-Request-ID
+      generate_if_missing: true
+  quotas:
+    enabled: true
+    window: 60s
+    limits:
+      # per tenant quotas
+      - selector: tenant_id:"*"
+        limit: 1000
+      # per user quotas
+      - selector: sub:"*"
+        limit: 300
+  privacy:
+    pii_redaction:
+      enabled: true
+      strategies:
+        - json_paths: ["$.email","$.phone","$.ssn"]
+          mode: hash
+        - json_paths: ["$.password","$.token"]
+          mode: remove
+  features:
+    flags:
+      # Gradual rollout example
+      new_router: ${FF_NEW_ROUTER:-false}
+      async_jobs_v2: ${FF_ASYNC_JOBS_V2:-false}
+    dynamic_reload:
+      enabled: true
+      watch_interval: 10s
+
+# ------------------------------------------------------------------------------
+# Profiles (dev/stage/prod) inherit from defaults and override where needed
+# ------------------------------------------------------------------------------
+profiles:
+  dev:
+    <<: *defaults
+    observability:
+      <<: *defaults.observability
+      logging:
+        <<: *defaults.observability.logging
+        level: DEBUG
+        sampling:
+          enabled: false
+      tracing:
+        <<: *defaults.observability.tracing
+        sampler:
+          type: parentbased_traceidratio
+          ratio: 1.0
+    security:
+      <<: *defaults.security
+      tls:
+        <<: *defaults.security.tls
+        mtls:
+          <<: *defaults.security.tls.mtls
+          enabled: false
+      authn:
+        <<: *defaults.security.authn
+        oidc:
+          <<: *defaults.security.authn.oidc
+          enabled: false
+    data:
+      <<: *defaults.data
+      postgres:
+        <<: *defaults.data.postgres
+        dsn: ${PG_DSN:-postgresql://veilmind:veilmind@localhost:5432/veilmind?sslmode=disable}
+      redis:
+        <<: *defaults.data.redis
+        tls: false
+      kafka:
+        <<: *defaults.data.kafka
+        enabled: false
+  stage:
+    <<: *defaults
+    observability:
+      <<: *defaults.observability
+      tracing:
+        <<: *defaults.observability.tracing
+        sampler:
+          type: parentbased_traceidratio
+          ratio: 0.2
+    resiliency:
+      <<: *defaults.resiliency
+      retries:
+        <<: *defaults.resiliency.retries
+        attempts: 4
+    quotas:
+      <<: *defaults.quotas
+      limits:
+        - selector: tenant_id:"*"
+          limit: 5000
+        - selector: sub:"*"
+          limit: 1000
+  prod:
+    <<: *defaults
+    server:
+      <<: *defaults.server
+      http:
+        <<: *defaults.server.http
+        port: ${HTTP_PORT:-8080}
+        rate_limit:
+          enabled: true
+          policies:
+            - id: rl-default
+              selector: route:"/api/*"
+              capacity: 1000
+              refill_per_sec: 200
+              burst: 200
+            - id: rl-auth
+              selector: route:"/api/auth/*"
+              capacity: 200
+              refill_per_sec: 40
+              burst: 40
+      grpc:
+        <<: *defaults.server.grpc
+        port: ${GRPC_PORT:-9090}
+    security:
+      <<: *defaults.security
+      tls:
+        <<: *defaults.security.tls
+        mtls:
+          <<: *defaults.security.tls.mtls
+          enabled: true
+      authn:
+        <<: *defaults.security.authn
+        oidc:
+          <<: *defaults.security.authn.oidc
+          enabled: true
+    observability:
+      <<: *defaults.observability
+      logging:
+        <<: *defaults.observability.logging
+        level: INFO
+      tracing:
+        <<: *defaults.observability.tracing
+        sampler:
+          type: parentbased_traceidratio
+          ratio: 0.05
+    resiliency:
+      <<: *defaults.resiliency
+      retries:
+        <<: *defaults.resiliency.retries
+        attempts: 2
+      circuit_breaker:
+        <<: *defaults.resiliency.circuit_breaker
+        failure_rate_threshold: 25
+        slow_call_rate_threshold: 25
+        wait_duration_in_open_state: 60s
+      bulkhead:
+        <<: *defaults.resiliency.bulkhead
+        max_concurrent_calls: 1024
+        max_queue_size: 4096
+    data:
+      <<: *defaults.data
+      postgres:
+        <<: *defaults.data.postgres
+        dsn: ${PG_DSN:-postgresql://veilmind:${PG_PASSWORD}@postgres:5432/veilmind?sslmode=verify-full}
+        max_open_conns: 200
+        max_idle_conns: 30
+      redis:
+        <<: *defaults.data.redis
+        pool_size: 200
+        min_idle_conns: 20
+      kafka:
+        <<: *defaults.data.kafka
+        enabled: true
+    quotas:
+      <<: *defaults.quotas
+      limits:
+        - selector: tenant_id:"*"
+          limit: 10000
+        - selector: sub:"*"
+          limit: 3000
+
+# ------------------------------------------------------------------------------
+# Secrets Providers configuration (abstract references above resolve here)
+# ------------------------------------------------------------------------------
+secrets:
+  providers:
+    vault:
+      address: ${VAULT_ADDR:-http://vault:8200}
+      namespace: ${VAULT_NAMESPACE:-}
+      auth:
+        method: approle
+        role_id: ${VAULT_ROLE_ID}
+        secret_id_ref:
+          env: VAULT_SECRET_ID
+      tls:
+        verify: ${VAULT_TLS_VERIFY:-true}
+    secretManager:
+      provider: gcp
+      project_id: ${GCP_PROJECT_ID:-project}
+      auth:
+        method: workload_identity
+      cache_ttl: 300s
+
+# ------------------------------------------------------------------------------
+# SLOs & Alerts hints (consumed by app and/or exported as labels/metrics)
+# ------------------------------------------------------------------------------
+slos:
+  availability:
+    target: 99.95
+    window: 30d
+  latency:
+    http_p99_seconds: 0.8
+    http_p95_seconds: 0.4
+  error_budget:
+    policy:
+      fast_burn_alert_minutes: 5
+      slow_burn_alert_hours: 6
+
+# ------------------------------------------------------------------------------
+# Runtime validation schema (optional; used by config loader)
+# ------------------------------------------------------------------------------
+schema:
+  validate_on_start: true
+  fail_fast: true
+  allowed_environments: ["dev","stage","prod"]
+
+# ------------------------------------------------------------------------------
+# Active profile resolution (loader should select profiles.${ENVIRONMENT} merged
+# over defaults; this field is informational for ops visibility)
+# ------------------------------------------------------------------------------
+active_profile: ${ENVIRONMENT:-dev}

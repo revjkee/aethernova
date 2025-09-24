@@ -1,0 +1,369 @@
+# oblivionvault-core/configs/env/staging.yaml
+# Industrial-grade environment config for STAGING
+# Secrets MUST come from environment variables or secret stores (Vault/Secrets Manager).
+# This file is immutable by CI; changes require PR.
+
+version: 1
+environment:
+  name: staging
+  service_name: oblivionvault-core
+  region: eu-north-1
+  timezone: Europe/Stockholm
+  commit: ${GIT_COMMIT_SHA:-unknown}
+  build_number: ${BUILD_NUMBER:-dev}
+  release: ${RELEASE_TAG:-none}
+
+# ---------- Common anchors (DRY) ----------
+_common_timeouts: &common_timeouts
+  connect: 3s
+  read: 5s
+  write: 5s
+  idle: 60s
+  request: 15s
+
+_common_retries: &common_retries
+  attempts: 3
+  backoff:
+    type: expo
+    base: 200ms
+    max: 3s
+  retry_on:
+    - 408 # Request Timeout
+    - 425 # Too Early
+    - 429 # Too Many Requests
+    - 500
+    - 502
+    - 503
+    - 504
+
+_common_circuit_breaker: &common_cb
+  enabled: true
+  failure_threshold: 0.5       # 50% failures
+  minimum_requests: 20
+  open_state_duration: 30s
+  half_open_max_calls: 5
+
+_common_tls: &common_tls
+  min_version: "1.2"
+  max_version: "1.3"
+  ciphers:
+    - TLS_AES_256_GCM_SHA384
+    - TLS_CHACHA20_POLY1305_SHA256
+    - TLS_AES_128_GCM_SHA256
+  prefer_server_ciphers: true
+  hsts:
+    enabled: true
+    max_age: 31536000
+    include_subdomains: true
+    preload: false
+
+_common_pooling: &common_pooling
+  max_idle_conns: 50
+  max_open_conns: 100
+  conn_max_idle_time: 5m
+  conn_max_lifetime: 30m
+
+_common_pg_settings: &pg_settings
+  sslmode: require
+  application_name: oblivionvault-core-staging
+  statement_timeout_ms: 15000
+  lock_timeout_ms: 5000
+
+_common_logging: &logging_ref
+  config_file: configs/logging.yaml
+  level: ${LOG_LEVEL:-INFO}
+  json: ${LOG_JSON:-true}
+  dir: ${LOG_DIR:-/var/log/oblivionvault}
+  rotate_bytes: ${LOG_ROTATE_BYTES:-52428800}   # 50MB
+  rotate_backups: ${LOG_ROTATE_BACKUPS:-10}
+
+# ---------- Application ----------
+app:
+  url: https://staging.oblivionvault.example.com
+  bind:
+    host: 0.0.0.0
+    port: ${PORT:-8080}
+  workers:
+    # For Gunicorn/Uvicorn workers in staging: CPU*2+1, but cap to 4
+    web: ${WEB_WORKERS:-4}
+    tasks: ${TASK_WORKERS:-4}
+  debug: false
+  tracing_enabled: true
+  metrics_enabled: true
+  profiling_enabled: false
+  logging: *logging_ref
+
+api:
+  openapi:
+    enabled: true
+    path: /openapi.json
+    docs_path: /docs
+  pagination:
+    default_limit: 50
+    max_limit: 200
+  rate_limits:
+    # Token bucket per client (IP or API key)
+    enabled: true
+    identifier: ip
+    rules:
+      - name: burst-read
+        window: 1s
+        capacity: 20
+        refill: 20
+      - name: steady-read
+        window: 60s
+        capacity: 600
+        refill: 600
+      - name: write-endpoints
+        window: 60s
+        capacity: 120
+        refill: 120
+
+security:
+  tls: *common_tls
+  cors:
+    enabled: true
+    allow_origins:
+      - https://staging.oblivionvault.example.com
+      - https://app-staging.oblivionvault.example.com
+    allow_methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    allow_headers: [Authorization, Content-Type, X-Request-ID, X-CSRF-Token]
+    allow_credentials: true
+    max_age: 600
+  csrf:
+    enabled: true
+    cookie_name: __Host-csrf
+    header_name: X-CSRF-Token
+    same_site: Lax
+    secure: true
+  headers:
+    x_frame_options: DENY
+    x_content_type_options: nosniff
+    referrer_policy: no-referrer
+    permissions_policy: "geolocation=(), microphone=(), camera=()"
+  auth:
+    jwt:
+      enabled: true
+      algorithm: RS256
+      public_key_pem: ${JWT_PUBLIC_KEY_PEM:?set}
+      issuer: https://staging.oblivionvault.example.com
+      audience: oblivionvault-clients
+      access_ttl: 15m
+      refresh_ttl: 14d
+      clock_skew: 5s
+    oauth2:
+      enabled: false
+    session:
+      enabled: false
+  encryption:
+    at_rest_kms_key: ${KMS_KEY_ID:-""}
+    # App-level envelope encryption (optionally via AWS KMS/HashiCorp Vault Transit)
+    envelope:
+      enabled: false
+
+# ---------- Persistence ----------
+database:
+  driver: postgres
+  dsn: ${DATABASE_URL:-postgresql+psycopg2://app:password@localhost:5432/oblivionvault}
+  pool: *common_pooling
+  options: *pg_settings
+  migrations:
+    enabled: true
+    path: alembic/
+    run_on_start: true
+  read_replicas:
+    enabled: false
+    targets: []
+  healthcheck:
+    interval: 10s
+    timeout: 2s
+    failure_threshold: 3
+
+redis:
+  url: ${REDIS_URL:-redis://localhost:6379/0}
+  tls: false
+  pool:
+    max_connections: 200
+    socket_timeout: 2s
+    socket_connect_timeout: 1s
+
+object_storage:
+  provider: s3
+  endpoint: ${S3_ENDPOINT:-https://s3.eu-north-1.amazonaws.com}
+  region: eu-north-1
+  bucket: ${S3_BUCKET:-oblivionvault-staging}
+  access_key_id: ${S3_ACCESS_KEY_ID:?set}
+  secret_access_key: ${S3_SECRET_ACCESS_KEY:?set}
+  force_path_style: false
+  upload:
+    multipart_threshold_mb: 8
+    max_concurrency: 4
+    part_size_mb: 8
+    acl: private
+  server_side_encryption:
+    enabled: true
+    type: aws:kms
+    kms_key_id: ${S3_KMS_KEY_ID:-""}
+
+# ---------- Messaging / Tasks ----------
+broker:
+  type: rabbitmq
+  url: ${RABBITMQ_URL:-amqp://guest:guest@localhost:5672/}
+  # For Kafka, switch type: kafka and provide brokers/topics
+  queues:
+    default: ov.default
+    critical: ov.critical
+    low: ov.low
+  prefetch_count: 16
+  publisher_confirms: true
+
+tasks:
+  backend: celery
+  broker_url: ${CELERY_BROKER_URL:-${RABBITMQ_URL}}
+  result_backend: ${CELERY_RESULT_BACKEND:-${REDIS_URL}}
+  timezone: Europe/Stockholm
+  task_acks_late: true
+  worker_max_tasks_per_child: 500
+  task_soft_time_limit_s: 30
+  task_time_limit_s: 60
+  concurrency: ${TASK_WORKERS:-4}
+  queues:
+    - name: ov.default
+      concurrency: 2
+    - name: ov.critical
+      concurrency: 1
+    - name: ov.low
+      concurrency: 1
+  beat:
+    enabled: true
+    schedule:
+      cleanup-temp:
+        task: app.tasks.cleanup_temp
+        cron: "*/15 * * * *"
+
+# ---------- HTTP clients (global defaults) ----------
+http_clients:
+  defaults:
+    timeouts: *common_timeouts
+    retries: *common_retries
+    circuit_breaker: *common_cb
+    tls:
+      verify: true
+  services:
+    identity:
+      base_url: ${IDENTITY_API_URL:-https://id-staging.oblivionvault.example.com}
+    payments:
+      base_url: ${PAYMENTS_API_URL:-https://pay-staging.oblivionvault.example.com}
+    notifications:
+      base_url: ${NOTIFY_API_URL:-https://notify-staging.oblivionvault.example.com}
+
+# ---------- Observability ----------
+telemetry:
+  tracing:
+    enabled: true
+    exporter: otlp
+    protocol: http/protobuf
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+    service_name: ${OTEL_SERVICE_NAME:-oblivionvault-core}
+    sample_ratio: 0.1
+    resource:
+      environment: staging
+      service.version: ${RELEASE_TAG:-0.0.0}
+  metrics:
+    enabled: true
+    exporter: prometheus
+    bind: 0.0.0.0:9090
+    path: /metrics
+  logs:
+    enabled: true
+    forward_to: cloudwatch # or loki
+    level: ${LOG_LEVEL:-INFO}
+  log_correlation:
+    trace_header_names: [traceparent, x-b3-traceid]
+    inject_into_logs: true
+
+# ---------- Access & audit ----------
+audit:
+  enabled: true
+  redact:
+    fields: [password, token, secret, authorization]
+  sink:
+    type: file
+    path: ${AUDIT_LOG_PATH:-/var/log/oblivionvault/audit.log}
+
+access_logs:
+  enabled: true
+  sink:
+    type: file
+    path: ${ACCESS_LOG_PATH:-/var/log/oblivionvault/access.log}
+  exclude_paths:
+    - /health
+    - /ready
+    - /metrics
+
+# ---------- Feature flags ----------
+features:
+  allow_user_signup: true
+  enable_beta_endpoints: true
+  strict_schema_validation: true
+
+# ---------- Mail ----------
+mail:
+  provider: smtp
+  host: ${SMTP_HOST:-smtp.mailtrap.io}
+  port: ${SMTP_PORT:-587}
+  starttls: true
+  username: ${SMTP_USER:?set}
+  password: ${SMTP_PASS:?set}
+  from: "OblivionVault Staging <no-reply@staging.oblivionvault.example.com>"
+
+# ---------- Migrations / bootstrap ----------
+bootstrap:
+  run_db_migrations: true
+  create_admin_if_missing: false
+  seed_demo_data: false
+
+# ---------- Runtime (web server) ----------
+runtime:
+  server: uvicorn
+  uvicorn:
+    host: 0.0.0.0
+    port: ${PORT:-8080}
+    workers: ${WEB_WORKERS:-4}
+    timeout_keep_alive: 5
+    proxy_headers: true
+    forwarded_allow_ips: "*"
+    # log config picked from app.logging.config_file
+  gunicorn:
+    # If used instead of pure uvicorn workers
+    workers: ${WEB_WORKERS:-4}
+    worker_class: uvicorn.workers.UvicornWorker
+    graceful_timeout: 30
+    timeout: 60
+    keepalive: 5
+    max_requests: 5000
+    max_requests_jitter: 200
+
+# ---------- Data retention / GDPR ----------
+retention:
+  pii:
+    purge_after_days: 365
+  logs:
+    info_days: 30
+    error_days: 90
+  audit_days: 365
+
+# ---------- Health / readiness ----------
+health:
+  liveness:
+    path: /live
+    initial_delay: 5s
+    period: 10s
+    timeout: 1s
+    failure_threshold: 3
+  readiness:
+    path: /ready
+    initial_delay: 10s
+    period: 10s
+    timeout: 1s
+    failure_threshold: 3

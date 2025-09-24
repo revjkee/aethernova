@@ -1,0 +1,287 @@
+# NeuroForge Inference Route Template (industrial)
+# Используйте как источник правды для собственного шлюза/роутера и генераторов конфигов.
+# Переменные окружения разрешаются как ${VAR:default}.
+
+version: 1
+schema: neuroforge.inference.route.v1
+
+meta:
+  id: "inference-api"
+  owner: "team-ml-platform"
+  description: "Маршруты инференса для онлайн API"
+  environment: "${ENV:dev}"          # dev|staging|prod
+  created_at: "2025-01-01T00:00:00Z"
+
+global:
+  server:
+    listen: "0.0.0.0"
+    port: ${PORT:8080}
+    http2: true
+    max_conns: ${MAX_CONNS:4096}
+    request_body_limit_mb: ${REQ_LIMIT_MB:8}   # лимит на тело запроса
+
+  auth:
+    # Режимы: none|api_key|jwt|oauth2|mtls
+    mode: "${AUTH_MODE:none}"
+    api_key:
+      header: "x-api-key"
+      keys_source: "env"                       # env|file|vault
+      keys_env_var: "ALLOWED_API_KEYS"         # CSV или список
+    jwt:
+      issuer: "${JWT_ISSUER:}"
+      audience: "${JWT_AUD:}"
+      jwks_uri: "${JWT_JWKS_URI:}"
+      clock_skew_sec: 60
+      required_claims: ["sub"]
+    mtls:
+      ca_bundle_path: "${MTLS_CA:/etc/ssl/mtls-ca.pem}"
+      require_san: true
+
+  cors:
+    enabled: true
+    allow_origins: ["${CORS_ORIGIN:https://example.com}"]
+    allow_methods: ["GET","POST","OPTIONS"]
+    allow_headers: ["content-type","authorization","x-api-key","x-request-id"]
+    expose_headers: ["x-request-id"]
+    max_age_sec: 600
+    allow_credentials: false
+
+  rate_limit:
+    enabled: true
+    strategy: "token_bucket"
+    key: "api_key_or_ip"                         # api_key|ip|api_key_or_ip
+    requests_per_sec: ${RPS_LIMIT:50}
+    burst: ${RPS_BURST:100}
+    window_sec: 1
+
+  retries:
+    attempts: ${RETRY_ATTEMPTS:2}
+    per_try_timeout_ms: ${RETRY_PER_TRY_MS:500}
+    retry_on: ["connect-failure","refused-stream","5xx","gateway-error","retriable-status-codes"]
+    retriable_status_codes: [429, 503]
+
+  timeouts:
+    request_timeout_ms: ${REQ_TIMEOUT_MS:3000}
+    idle_timeout_ms: ${IDLE_TIMEOUT_MS:15000}
+
+  circuit_breaker:
+    enabled: true
+    max_pending_requests: 1024
+    max_requests: 2048
+    max_retries: 3
+    # Политики открытия/закрытия
+    failure_rate_threshold: 0.5
+    open_state_duration_ms: 10000
+    half_open_max_requests: 50
+
+  observability:
+    tracing:
+      enabled: true
+      # заголовки пропагации трейсинга, совместимые с W3C/Zipkin
+      propagate_headers: ["traceparent","tracestate","x-b3-traceid","x-b3-spanid","x-b3-sampled","x-request-id"]
+      sample_ratio: ${TRACE_SAMPLE:0.05}
+      service_name: "neuroforge-inference"
+    metrics:
+      enabled: true
+      format: "prometheus"
+      port: ${METRICS_PORT:9091}
+      path: "/metrics"
+    logging:
+      level: "${LOG_LEVEL:INFO}"
+      redact_pii: true
+      pii_fields: ["email","phone","ssn","card","user_id"]
+
+  cache:
+    enabled: false
+    ttl_sec: 30
+    key_template: "route:{route_id}:body:{hash(body)}"
+    negative_ttl_sec: 5
+
+  # Общие настройки для батчинга; может быть переопределено в маршрутах
+  batching:
+    enabled: false
+    max_batch_size: 16
+    max_batch_latency_ms: 20
+    flush_on_timeout: true
+
+  # Контрольные показатели для SLO/алертинга
+  slo:
+    p99_latency_ms: 800
+    error_rate_max: 0.01
+
+# Описание backends (целей) переиспользуемое в маршрутах
+backends:
+  - name: "model-v1-http"
+    protocol: "http"                              # http|grpc
+    url: "${MODEL_V1_URL:http://model-v1:8000}"
+    healthcheck:
+      path: "/health"
+      interval_ms: 2000
+      timeout_ms: 500
+      unhealthy_threshold: 3
+      healthy_threshold: 2
+    # Вставляем заголовки к целевому сервису
+    headers:
+      add:
+        x-traffic-source: "inference-gateway"
+  - name: "model-v2-grpc"
+    protocol: "grpc"
+    url: "${MODEL_V2_URL:grpc://model-v2:9000}"
+    healthcheck:
+      grpc: true
+      interval_ms: 2000
+      timeout_ms: 500
+      unhealthy_threshold: 3
+      healthy_threshold: 2
+
+# Правила маршрутизации
+routes:
+  - id: "predict-v1"
+    description: "Синхронный инференс через HTTP JSON"
+    match:
+      path: "/v1/infer"
+      methods: ["POST"]
+      content_types: ["application/json"]
+    transform:
+      request:
+        # Проверка и нормализация входа
+        validate_json_schema:
+          enabled: true
+          # Укажите путь к схеме или встроите inline
+          schema_path: "${SCHEMA_INFER_REQ:configs/schemas/infer_request.schema.json}"
+        # Маппинг входной модели
+        mapping:
+          # Пример: извлекаем из тела поля для конкретного сервиса
+          template: |
+            {
+              "inputs": {{ body.inputs | tojson }},
+              "params": {
+                "temperature": {{ body.params.temperature | default(0.0) }},
+                "top_p": {{ body.params.top_p | default(1.0) }},
+                "max_tokens": {{ body.params.max_tokens | default(256) }}
+              },
+              "metadata": {
+                "request_id": "{{ headers['x-request-id'] | default(uuid()) }}"
+              }
+            }
+      response:
+        # Пример нормализации ответа к унифицированному формату
+        mapping:
+          template: |
+            {
+              "request_id": "{{ upstream.body.metadata.request_id | default(headers['x-request-id']) }}",
+              "outputs": {{ upstream.body.outputs | tojson }},
+              "usage": {{ upstream.body.usage | default({}) | tojson }}
+            }
+        redact_fields: ["outputs.debug","usage.internal"]
+        validate_json_schema:
+          enabled: false
+          schema_path: ""
+
+    # Управление трафиком: сплит между версиями модели и теневая отправка
+    traffic:
+      split:
+        - backend: "model-v1-http"
+          weight: 80
+        - backend: "model-v2-grpc"
+          weight: 20
+      shadow:
+        enabled: true
+        backend: "model-v2-grpc"
+        sample_ratio: 0.05             # 5% запросов уходят в тень без влияния на ответ
+        strip_request_body: false
+
+    # Индивидуальные политики для маршрута (перекрывают global)
+    retries:
+      attempts: 2
+      per_try_timeout_ms: 700
+      retry_on: ["5xx","connect-failure"]
+    timeouts:
+      request_timeout_ms: 2500
+    circuit_breaker:
+      enabled: true
+      failure_rate_threshold: 0.4
+      open_state_duration_ms: 8000
+    batching:
+      enabled: true
+      max_batch_size: 8
+      max_batch_latency_ms: 15
+      # Встроенный аггрегатор: как склеивать запросы и расклеивать ответы
+      aggregator:
+        request_join:
+          template: |
+            { "batched": true, "items": [ {% for r in batch %} {{ r.body | tojson }} {% if not loop.last %},{% endif %} {% endfor %} ] }
+        response_split:
+          template: |
+            [ {% for item in upstream.body.items %} {{ item | tojson }} {% if not loop.last %},{% endif %} {% endfor %} ]
+
+    cache:
+      enabled: true
+      ttl_sec: 10
+      key_template: "route:predict-v1:input:{hash(body.inputs)}:params:{hash(body.params)}"
+
+    security:
+      # Удаление PII в логах и форвардинге
+      redact_in_logs: ["body.inputs.email","body.inputs.phone"]
+      block_payload_patterns:
+        - type: "regex"
+          field: "body.inputs.text"
+          pattern: "(?i)password|ssn|credit[- ]?card"
+      allow_client_headers: ["x-request-id","x-api-key"]
+      drop_client_headers: ["x-forwarded-for"]
+
+    # Ограничение нагрузки на бэкенд по concurrency
+    concurrency:
+      max_inflight_requests: 512
+      queue_limit: 1024
+      reject_code: 429
+
+  - id: "predict-stream"
+    description: "Стриминговый gRPC маршрут"
+    match:
+      path: "/v1/stream"         # публичный endpoint; внутри маппится на gRPC
+      methods: ["POST","GET"]
+      content_types: ["application/json","text/event-stream"]
+    traffic:
+      split:
+        - backend: "model-v2-grpc"
+          weight: 100
+    stream:
+      protocol: "sse"            # sse|websocket|grpc
+      heartbeat_ms: 15000
+      buffer_limit: 64
+    timeouts:
+      request_timeout_ms: 60000
+    retries:
+      attempts: 1
+
+# Политика ошибок и маппинг статусов
+errors:
+  hide_upstream_details: true
+  map:
+    - when: "connect-timeout"
+      status: 504
+      body:
+        code: "GATEWAY_TIMEOUT"
+        message: "Upstream timeout"
+    - when: "circuit-open"
+      status: 503
+      body:
+        code: "SERVICE_UNAVAILABLE"
+        message: "Circuit breaker open"
+    - when_status: [429]
+      status: 429
+      body:
+        code: "RATE_LIMITED"
+        message: "Too Many Requests"
+    - when_status: [500,502,503]
+      status: 502
+      body:
+        code: "BAD_UPSTREAM"
+        message: "Bad upstream response"
+
+# Валидация конфигурации на уровне CI может проверять:
+# - наличие backends, указанных в routes.traffic.*;
+# - корректность сумм weight=100;
+# - уникальность routes[].match.path и методов;
+# - существование файлов схем.

@@ -1,0 +1,251 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aethernova-chain-core-rules
+  labels:
+    app.kubernetes.io/name: prometheus-rules
+    app.kubernetes.io/part-of: aethernova-chain-core
+    app.kubernetes.io/component: observability
+spec:
+  groups:
+    # =======================================================================
+    # 1) Availability & Targets
+    # Документация по alerting rules и семантике for/labels/annotations:
+    # https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
+    # =======================================================================
+    - name: availability.rules
+      interval: 30s
+      rules:
+        - alert: TargetDown
+          expr: up == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: core
+            scope: target
+          annotations:
+            summary: Target down ({{ $labels.job }} / {{ $labels.instance }})
+            description: "{{ $labels.job }} on {{ $labels.instance }} is not reachable for 2m."
+            runbook_url: https://prometheus.io/docs/practices/alerting/
+        - alert: AnyJobMissing
+          expr: sum by (job) (up) == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: core
+            scope: job
+          annotations:
+            summary: All targets missing for job {{ $labels.job }}
+            description: "No alive targets for job={{ $labels.job }}."
+        - alert: ScrapeConfigMissingSeries
+          expr: absent(up)
+          for: 5m
+          labels:
+            severity: warning
+            scope: meta
+          annotations:
+            summary: No 'up' series present
+            description: "No 'up' series exist for the current scrape set. Check Prometheus scrape configs."
+            docs: https://prometheus.io/docs/prometheus/latest/querying/functions/#absent
+
+    # =======================================================================
+    # 2) Application performance (generic HTTP/RPC)
+    # Используются общеизвестные метрики и bucket-гистограммы; настраивайте имена под своё приложение.
+    # =======================================================================
+    - name: app.performance.rules
+      interval: 30s
+      rules:
+        - alert: HighErrorRate5m
+          expr: |
+            sum by (job) (rate(http_requests_total{code=~"5.."}[5m]))
+              /
+            clamp_min(sum by (job) (rate(http_requests_total[5m])), 1e-9)
+              > 0.05
+          for: 10m
+          labels:
+            severity: critical
+            team: core
+          annotations:
+            summary: High 5xx error rate (>5% for 10m)
+            description: "job={{ $labels.job }} 5xx ratio is {{ $value | humanizePercentage }} over 10m."
+        - alert: P99LatencyHigh
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+            ) > 0.75
+          for: 10m
+          labels:
+            severity: warning
+            team: core
+          annotations:
+            summary: P99 latency high (>750ms)
+            description: "P99 latency exceeds 750ms for 10m."
+
+    # =======================================================================
+    # 3) Resources (Node/Container) — совместимо с cAdvisor/kube-state-metrics
+    # =======================================================================
+    - name: resources.rules
+      interval: 30s
+      rules:
+        - alert: NodeFilesystemSpaceLow
+          expr: |
+            (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) < 0.1
+          for: 10m
+          labels:
+            severity: critical
+            team: sre
+          annotations:
+            summary: Node filesystem space low (<10%)
+            description: "Less than 10% disk space available on {{ $labels.device }} at {{ $labels.instance }}."
+        - alert: ContainerMemorySaturation
+          expr: |
+            sum by (namespace, pod) (container_memory_working_set_bytes{container!="",image!=""})
+              /
+            sum by (namespace, pod) (container_spec_memory_limit_bytes{container!="",image!=""} > 0)
+              > 0.9
+          for: 15m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: Container memory >90% of limit
+            description: "Pod {{ $labels.pod }} in {{ $labels.namespace }} is above 90% memory limit."
+        - alert: ContainerFrequentRestarts
+          expr: |
+            increase(kube_pod_container_status_restarts_total[10m]) > 3
+          for: 0m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: Container restarting frequently
+            description: "Container {{ $labels.container }} in pod {{ $labels.pod }} restarted >3 times in 10m."
+        - alert: CPUThrottlingHigh
+          expr: |
+            sum by (namespace, pod) (rate(container_cpu_cfs_throttled_seconds_total{container!=""}[5m]))
+              /
+            clamp_min(sum by (namespace, pod) (rate(container_cpu_cfs_periods_total{container!=""}[5m])), 1e-9)
+              > 0.25
+          for: 15m
+          labels:
+            severity: warning
+            team: sre
+          annotations:
+            summary: High CPU throttling (>25%)
+            description: "Pod {{ $labels.pod }} experiencing CPU throttling >25% for 15m."
+
+    # =======================================================================
+    # 4) Kubernetes health (kube-state-metrics)
+    # =======================================================================
+    - name: kubernetes.health.rules
+      interval: 30s
+      rules:
+        - alert: KubePodCrashLooping
+          expr: |
+            (rate(kube_pod_container_status_terminated_reason{reason="Error"}[5m]) > 0)
+             or on(namespace,pod)
+            (max_over_time(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}[5m]) > 0)
+          for: 10m
+          labels:
+            severity: critical
+            team: sre
+          annotations:
+            summary: Pod crash looping
+            description: "Pod {{ $labels.pod }} in {{ $labels.namespace }} is crash looping."
+        - alert: KubePodNotReady
+          expr: |
+            kube_pod_status_phase{phase=~"Pending|Failed|Unknown"} == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Pod not ready for 15m
+            description: "Pod {{ $labels.pod }} in {{ $labels.namespace }} is {{ $labels.phase }}."
+
+    # =======================================================================
+    # 5) OpenTelemetry pipeline (если используется локальный Collector/OTLP)
+    # Рекомендации по построению пайплайнов и интеграции с Alertmanager:
+    # https://prometheus.io/docs/alerting/latest/alertmanager/
+    # =======================================================================
+    - name: otel.pipeline.rules
+      interval: 30s
+      rules:
+        - alert: OTLPExporterFailures
+          expr: |
+            rate(otelcol_exporter_send_failed_metric_points[5m])
+            + rate(otelcol_exporter_send_failed_spans[5m])
+            + rate(otelcol_exporter_send_failed_log_records[5m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+            team: observability
+          annotations:
+            summary: OpenTelemetry exporter failures
+            description: "OTel Collector exporter reports send failures for at least one signal for 10m."
+        - alert: OTLPQueueSaturation
+          expr: |
+            (otelcol_exporter_queue_capacity - otelcol_exporter_queue_size) / otelcol_exporter_queue_capacity < 0.1
+          for: 10m
+          labels:
+            severity: warning
+            team: observability
+          annotations:
+            summary: OpenTelemetry exporter queue nearly full (<10% free)
+            description: "Exporter queue free capacity below 10%."
+
+    # =======================================================================
+    # 6) Blockchain-node templates (настройте метрики под своё ядро).
+    # Если конкретные метрики в вашем бинаре отличаются — переименуйте селекторы.
+    # Не могу подтвердить это — имена приведены как типовые шаблоны.
+    # =======================================================================
+    - name: chain.node.rules
+      interval: 30s
+      rules:
+        - alert: ChainNodeLagging
+          expr: |
+            max( chain_block_height{role="validator"} )
+              - on() group_left
+            chain_block_height{instance=~".*"} > 5
+          for: 10m
+          labels:
+            severity: critical
+            team: core
+          annotations:
+            summary: Node is lagging behind tip (>5 blocks)
+            description: "Instance {{ $labels.instance }} lags behind chain tip by {{ $value }} blocks."
+        - alert: PeerCountLow
+          expr: chain_peer_count < 3
+          for: 15m
+          labels:
+            severity: warning
+            team: core
+          annotations:
+            summary: Low peer count (<3)
+            description: "Peer connectivity degraded ({{ $value }} peers)."
+        - alert: MempoolBacklogHigh
+          expr: chain_mempool_tx_count > 5000
+          for: 10m
+          labels:
+            severity: warning
+            team: core
+          annotations:
+            summary: Mempool backlog high (>5000 tx)
+            description: "Throughput/broadcast issues possible."
+
+    # =======================================================================
+    # 7) Recording rules (ускорение типовых запросов и дашбордов)
+    # Официальная документация по recording rules:
+    # https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/
+    # =======================================================================
+    - name: recording.rules
+      interval: 30s
+      rules:
+        - record: job:http_requests_total:rate5m
+          expr: sum by (job) (rate(http_requests_total[5m]))
+        - record: job:http_request_duration_seconds:p99
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le, job) (rate(http_request_duration_seconds_bucket[5m]))
+            )

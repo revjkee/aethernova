@@ -1,0 +1,478 @@
+# OblivionVault Core - Industrial Archive Configuration
+# Schema version of this config
+version: "1.0"
+
+environment:
+  name: "production"            # production | staging | dev
+  region: "eu-north-1"          # primary region for control-plane
+  timezone: "Europe/Stockholm"  # schedules and audits reference tz
+
+defaults:
+  # Default profile used when job doesn't specify profile explicitly
+  default_profile: "hot"
+  # Global retry/backoff for archive operations (can be overridden per-profile)
+  retries:
+    max_attempts: 8
+    backoff:
+      type: "exponential"       # constant | exponential | jittered
+      base_seconds: 2
+      max_seconds: 60
+      jitter: true
+  # Concurrency and I/O throttling guards
+  concurrency:
+    max_concurrent_jobs: 6
+    max_concurrent_uploads: 8
+    max_concurrent_downloads: 8
+  network:
+    # Hard cap to avoid link saturation (per node)
+    max_bandwidth_mbps: 600
+    tls:
+      enforce: true
+      min_version: "1.2"
+      verify_peer: true
+  # Global integrity verification
+  integrity:
+    checksum: "sha256"          # sha256 | blake3
+    verify_on_write: true
+    periodic_audit:
+      enabled: true
+      schedule: "0 03 * * *"    # daily 03:00
+      sample_rate: 0.05          # 5% objects per run
+      deep_scan_days: 30         # full coverage within N days
+  # Metrics/Logging for all profiles
+  observability:
+    metrics:
+      prometheus:
+        enabled: true
+        labels:
+          app.kubernetes.io/part-of: "oblivionvault-core"
+          app.kubernetes.io/component: "archive"
+    logging:
+      level: "info"              # debug | info | warn | error
+      json: true
+  # Budget guards (alerts only, enforcement per-profile if enabled)
+  budgets:
+    storage_budget_usd_month: 3000
+    egress_budget_usd_month: 800
+    alerts:
+      warn_threshold_pct: 80
+      crit_threshold_pct: 95
+
+# Access control at control-plane level (K8s/RBAC maps)
+access_control:
+  # Which namespaces are allowed to run archive jobs with this config
+  allowed_namespaces:
+    - "oblivionvault"
+    - "data-pipeline"
+  # Allowed service accounts (optional hardening)
+  allowed_service_accounts:
+    - "system:serviceaccount:oblivionvault:archiver"
+    - "system:serviceaccount:data-pipeline:archiver"
+
+# Notification endpoints (secrets are referenced via env/secretKeyRef at runtime)
+notifications:
+  channels:
+    - id: "ops-slack"
+      type: "slack"
+      webhook: "${SLACK_ARCHIVE_WEBHOOK}"   # from env/secret
+      on_events: ["FAILED_JOB","INTEGRITY_MISMATCH","BUDGET_WARN","BUDGET_CRIT","SLO_VIOLATION"]
+    - id: "email-noc"
+      type: "email"
+      smtp:
+        host: "${SMTP_HOST}"
+        port: 587
+        username: "${SMTP_USER}"
+        password: "${SMTP_PASS}"
+        starttls: true
+      to: ["noc@example.com"]
+      on_events: ["FAILED_JOB","DR_FAILOVER","LEGAL_HOLD_SET"]
+    - id: "pagerduty"
+      type: "webhook"
+      url: "${PAGERDUTY_EVENTS_URL}"
+      headers:
+        X-Routing-Key: "${PAGERDUTY_ROUTING_KEY}"
+      on_events: ["FAILED_JOB","DR_DEGRADED","SLO_VIOLATION"]
+
+# Disaster Recovery and Cross-Region settings (policy-level; concrete routing per profile)
+dr:
+  rpo_minutes: 30                 # desired Recovery Point Objective
+  rto_minutes: 120                # desired Recovery Time Objective
+  cross_region_replication:
+    enabled: true
+    mode: "async"                 # async | sync (costly)
+    failover_order:
+      - "eu-central-1"
+      - "eu-west-1"
+  # Legal/compliance guardrails
+  compliance:
+    gdpr:
+      pii_erasure_supported: true
+      # For immutable stores, erasure is via tombstone + crypto-shred
+    iso27001: true
+    soc2: true
+
+# Storage profiles define retention, backend and processing logic
+profiles:
+  # HOT: short retention, high performance
+  - id: "hot"
+    description: "Short-lived, high-access archive for recent snapshots and rollbacks"
+    enabled: true
+
+    retention:
+      min_days: 7
+      max_days: 30
+      delete_after_expiry: true
+    immutability:
+      enabled: true
+      mode: "governance"         # governance | compliance
+      legal_hold_label: "none"
+    lifecycle:
+      # Transition to infrequent-access after 7 days
+      transitions:
+        - after_days: 7
+          storage_class: "STANDARD_IA"  # S3 class example; mapped per backend
+      noncurrent_expiration_days: 45
+
+    storage:
+      type: "s3"                  # s3 | gcs | azure | filesystem
+      s3:
+        bucket: "${S3_BUCKET_HOT}"
+        region: "${S3_REGION:=eu-north-1}"
+        endpoint: ""              # for S3-compatible, e.g. MinIO
+        path_style: false
+        prefix: "archive/hot"
+        sse: "aws:kms"            # AES256 | aws:kms
+        kms_key_arn: "${S3_KMS_ARN_HOT}"
+        canned_acl: "private"
+        storage_class: "STANDARD"
+        multipart:
+          part_size_mb: 64
+          concurrency: 8
+        credentials:
+          access_key_id: "${S3_ACCESS_KEY_ID}"
+          secret_access_key: "${S3_SECRET_ACCESS_KEY}"
+          session_token: "${S3_SESSION_TOKEN:-}"
+      # Optional secondary destination for DR fan-out
+      replication:
+        enabled: true
+        destinations:
+          - type: "s3"
+            s3:
+              bucket: "${S3_BUCKET_HOT_DR}"
+              region: "eu-central-1"
+              prefix: "archive/hot"
+              storage_class: "STANDARD_IA"
+
+    processing:
+      encryption:
+        enabled: true
+        algo: "aes-256-gcm"
+        key_source: "secret"      # secret | kms
+        key_ref: "${CRYPT_KEY_HOT}"  # base64 key or secret ref (driver-specific)
+        rotation_days: 90
+      compression:
+        enabled: true
+        algo: "zstd"              # zstd | gzip | lz4
+        level: 10
+      deduplication:
+        enabled: true
+        chunker:
+          type: "fastcdc"         # fixed | buzhash | fastcdc
+          avg_chunk_kb: 512
+          min_chunk_kb: 128
+          max_chunk_kb: 2048
+
+    scheduler:
+      # Backups for hot data sets
+      full:        "0 1 * * 1"    # weekly full (Mon 01:00)
+      incremental: "0 */6 * * *"  # every 6h
+      snapshot:    "*/15 * * * *" # lightweight app-level snapshots
+
+    limits:
+      concurrency:
+        max_concurrent_jobs: 8
+      bandwidth_mbps: 800
+      object_size_mb:
+        max_single: 51200         # 50 GB per object
+      budgets:
+        enforce: false            # warn-only in HOT
+
+    restore:
+      temp_dir: "/var/lib/oblivionvault/tmp"
+      overwrite_policy: "safe"    # safe | force | skip
+      throttle_mbps: 400
+
+  # WARM: medium retention, cost-optimized
+  - id: "warm"
+    description: "Medium-term retention with cost-optimized access"
+    enabled: true
+
+    retention:
+      min_days: 30
+      max_days: 365
+      delete_after_expiry: true
+    immutability:
+      enabled: true
+      mode: "governance"
+      legal_hold_label: "none"
+    lifecycle:
+      transitions:
+        - after_days: 30
+          storage_class: "STANDARD_IA"
+        - after_days: 120
+          storage_class: "GLACIER_IR"    # Instant Retrieval
+      noncurrent_expiration_days: 395
+
+    storage:
+      type: "s3"
+      s3:
+        bucket: "${S3_BUCKET_WARM}"
+        region: "${S3_REGION:=eu-north-1}"
+        prefix: "archive/warm"
+        sse: "aws:kms"
+        kms_key_arn: "${S3_KMS_ARN_WARM}"
+        storage_class: "STANDARD_IA"
+        multipart:
+          part_size_mb: 128
+          concurrency: 6
+        credentials:
+          access_key_id: "${S3_ACCESS_KEY_ID}"
+          secret_access_key: "${S3_SECRET_ACCESS_KEY}"
+      replication:
+        enabled: true
+        destinations:
+          - type: "s3"
+            s3:
+              bucket: "${S3_BUCKET_WARM_DR}"
+              region: "eu-west-1"
+              prefix: "archive/warm"
+              storage_class: "GLACIER_IR"
+
+    processing:
+      encryption:
+        enabled: true
+        algo: "aes-256-gcm"
+        key_source: "kms"
+        kms_key_arn: "${S3_KMS_ARN_WARM}"
+        rotation_days: 180
+      compression:
+        enabled: true
+        algo: "zstd"
+        level: 12
+      deduplication:
+        enabled: true
+        chunker:
+          type: "fastcdc"
+          avg_chunk_kb: 1024
+          min_chunk_kb: 256
+          max_chunk_kb: 8192
+
+    scheduler:
+      full:        "0 2 * * 1"
+      incremental: "0 */12 * * *"
+      snapshot:    "0 */2 * * *"
+
+    limits:
+      concurrency:
+        max_concurrent_jobs: 6
+      bandwidth_mbps: 500
+      budgets:
+        enforce: true
+        storage_budget_usd_month: 2000
+        egress_budget_usd_month: 500
+
+    restore:
+      temp_dir: "/var/lib/oblivionvault/tmp"
+      overwrite_policy: "safe"
+      throttle_mbps: 200
+
+  # COLD: long retention, archival tiers
+  - id: "cold"
+    description: "Long-term archival with minimum cost"
+    enabled: true
+
+    retention:
+      min_days: 365
+      max_days: 3650          # up to 10 years
+      delete_after_expiry: false   # manual approval required via workflow
+    immutability:
+      enabled: true
+      mode: "compliance"
+      legal_hold_label: "regulatory"
+    lifecycle:
+      transitions:
+        - after_days: 0
+          storage_class: "GLACIER_DEEP_ARCHIVE"
+      noncurrent_expiration_days: 3655
+
+    storage:
+      type: "s3"
+      s3:
+        bucket: "${S3_BUCKET_COLD}"
+        region: "${S3_REGION:=eu-north-1}"
+        prefix: "archive/cold"
+        sse: "aws:kms"
+        kms_key_arn: "${S3_KMS_ARN_COLD}"
+        storage_class: "GLACIER_DEEP_ARCHIVE"
+        multipart:
+          part_size_mb: 256
+          concurrency: 4
+        credentials:
+          access_key_id: "${S3_ACCESS_KEY_ID}"
+          secret_access_key: "${S3_SECRET_ACCESS_KEY}"
+      replication:
+        enabled: true
+        destinations:
+          - type: "azure"
+            azure:
+              account_name: "${AZURE_ACCOUNT}"
+              container: "${AZURE_CONTAINER_COLD}"
+              prefix: "archive/cold"
+              storage_tier: "Cool"
+              sas_token: "${AZURE_SAS_TOKEN_COLD}"
+
+    processing:
+      encryption:
+        enabled: true
+        algo: "aes-256-gcm"
+        key_source: "kms"
+        kms_key_arn: "${S3_KMS_ARN_COLD}"
+        rotation_days: 365
+      compression:
+        enabled: true
+        algo: "zstd"
+        level: 15
+      deduplication:
+        enabled: true
+        chunker:
+          type: "fastcdc"
+          avg_chunk_kb: 2048
+          min_chunk_kb: 512
+          max_chunk_kb: 16384
+
+    scheduler:
+      full:        "0 3 1 * *"   # monthly full
+      incremental: "0 4 * * 1"   # weekly inc
+      snapshot:    "0 5 * * 1"
+
+    limits:
+      concurrency:
+        max_concurrent_jobs: 3
+      bandwidth_mbps: 200
+      budgets:
+        enforce: true
+        storage_budget_usd_month: 800
+        egress_budget_usd_month: 100
+
+    restore:
+      temp_dir: "/var/lib/oblivionvault/tmp"
+      overwrite_policy: "safe"
+      throttle_mbps: 50
+      # Cold restores may require async retrieval tickets
+      cold_retrieval:
+        mode: "async"
+        expected_hours: 12
+
+  # LEGAL: legal hold / WORM vault, strict deletion control
+  - id: "legal"
+    description: "WORM vault for legal holds; deletions only via governance workflow"
+    enabled: true
+
+    retention:
+      min_days: 1825
+      max_days: 0                  # 0 = indefinite until legal hold is removed
+      delete_after_expiry: false
+    immutability:
+      enabled: true
+      mode: "compliance"
+      legal_hold_label: "legal-hold"
+    lifecycle:
+      transitions:
+        - after_days: 0
+          storage_class: "GLACIER_IR"
+    storage:
+      type: "gcs"
+      gcs:
+        bucket: "${GCS_BUCKET_LEGAL}"
+        prefix: "archive/legal"
+        storage_class: "ARCHIVE"
+        uniform_bucket_level_access: true
+        service_account_key: "${GCS_SA_KEY_JSON}"  # JSON creds or secret ref
+    processing:
+      encryption:
+        enabled: true
+        algo: "aes-256-gcm"
+        key_source: "secret"
+        key_ref: "${CRYPT_KEY_LEGAL}"
+        rotation_days: 365
+      compression:
+        enabled: true
+        algo: "zstd"
+        level: 12
+      deduplication:
+        enabled: false  # prefer maximal simplicity for legal workflows
+    scheduler:
+      full:        "0 1 1 */3 *"  # quarterly full
+      incremental: "0 2 1 * *"    # monthly inc
+      snapshot:    "0 3 1 * *"
+    limits:
+      concurrency:
+        max_concurrent_jobs: 2
+      bandwidth_mbps: 100
+      budgets:
+        enforce: true
+        storage_budget_usd_month: 1200
+        egress_budget_usd_month: 50
+    restore:
+      temp_dir: "/var/lib/oblivionvault/tmp"
+      overwrite_policy: "skip"    # never overwrite; export-only
+      throttle_mbps: 20
+
+# Catalog & Index options (for fast search/listing)
+catalog:
+  index_db:
+    type: "embedded"              # embedded | external
+    path: "/var/lib/oblivionvault/catalog.db"
+    retention_days: 365
+  # Bloom/secondary indexes for fast existence checks
+  bloom_filters:
+    enabled: true
+    fpp: 0.01
+  # Snapshot of manifest set for DR rebuilds
+  manifest_snapshots:
+    enabled: true
+    schedule: "30 2 * * *"        # 02:30 daily
+    keep_last: 14
+
+# SLOs for archiving/restore processes (monitored & alerted)
+slos:
+  archive_job_success_rate:
+    target_pct: 99.5
+    window_days: 30
+  restore_p95_time_minutes:
+    target: 45
+    window_days: 30
+  integrity_audit_coverage:
+    target_pct: 95
+    window_days: 30
+
+# Guardrails & validations
+validation:
+  # Prevent start of job if RPO/RTO would be violated
+  enforce_slo_at_submit: true
+  # Dry-run guard for destructive operations (deletion, re-key, re-encrypt)
+  destructive_ops_require_approval: true
+  # Minimum free space check on temp_dir prior to restore (% of largest object)
+  min_free_space_ratio: 1.5
+
+# Mapping of dataset → profile (optional defaults)
+datasets:
+  rules:
+    - match: "db/*"
+      profile: "hot"
+    - match: "logs/*"
+      profile: "warm"
+    - match: "ml/artifacts/*"
+      profile: "cold"
+    - match: "legal/*"
+      profile: "legal"

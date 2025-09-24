@@ -1,0 +1,100 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cybersecurity-core
+  labels:
+    app.kubernetes.io/name: cybersecurity-core
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "1.0.0"
+  # В base обычно не указываем namespace — задается overlay'ем.
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cybersecurity-core
+
+  # Минимум реплик для высокой доступности и холодного старта.
+  minReplicas: 3
+  # Верхняя граница, чтобы не «затопить» кластер.
+  maxReplicas: 50
+
+  # Многомерные метрики: CPU, память, RPS на pod и внешний сигнал очереди.
+  metrics:
+    # 1) CPU: удерживаем среднюю загрузку на pod ~60%
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+    # 2) Память: удерживаем ~70% для предотвращения OOM и избыточного апскейла.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # 3) Pods-метрика: средний RPS на pod через Prometheus Adapter (пример).
+    # Требуется корректная экспозиция и mapping метрики на имя requests_per_second.
+    - type: Pods
+      pods:
+        metric:
+          name: requests_per_second
+          # Опциональный selector, если адаптер маппит метрики по меткам.
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: cybersecurity-core
+        target:
+          type: AverageValue
+          # Порог: целим ~100 RPS на pod перед апскейлом.
+          averageValue: "100"
+
+    # 4) External-метрика: размер очереди (пример — RabbitMQ/критическая очередь alert'ов).
+    # Используйте ваш реальный mapping в Prometheus Adapter.
+    - type: External
+      external:
+        metric:
+          name: queue_messages_ready
+          selector:
+            matchLabels:
+              system: rabbitmq
+              queue: alerts
+        target:
+          type: AverageValue
+          # Если на pod в среднем >1000 сообщений в очереди — апскейл.
+          averageValue: "1000"
+
+  # Управление поведением для сглаживания: агрессивный, но контролируемый апскейл
+  # и консервативный даунскейл с окном стабилизации.
+  behavior:
+    scaleUp:
+      # Быстро реагируем на всплески (минимальное окно).
+      stabilizationWindowSeconds: 30
+      selectPolicy: Max
+      policies:
+        # Разрешаем удваивать число реплик раз в минуту...
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        # ...но не более чем +4 pod'а за 60 секунд.
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+    scaleDown:
+      # Даем 5 минут на стабилизацию, чтобы избежать пинг-понга.
+      stabilizationWindowSeconds: 300
+      # Консервативный даунскейл: выбираем минимально агрессивную политику.
+      selectPolicy: Min
+      policies:
+        # Снижаем не более чем на 10% в минуту...
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+        # ...и не более чем на 1 pod в минуту.
+        - type: Pods
+          value: 1
+          periodSeconds: 60

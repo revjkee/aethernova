@@ -1,0 +1,140 @@
+{{- /*
+File: ops/helm/aethernova-chain-core/templates/hpa-api.yaml
+Purpose: HorizontalPodAutoscaler for API workload with production-grade behavior.
+*/ -}}
+{{- if .Values.api.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "aethernova-chain-core.api.fullname" . }}
+  namespace: {{ include "aethernova-chain-core.namespace" . }}
+  labels:
+    {{- include "aethernova-chain-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: aethernova-chain-core
+  {{- with .Values.api.hpa.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: {{ default "apps/v1" .Values.api.hpa.targetRef.apiVersion }}
+    kind:       {{ default "Deployment" .Values.api.hpa.targetRef.kind }}
+    name:       {{ default (include "aethernova-chain-core.api.fullname" .) .Values.api.hpa.targetRef.name }}
+  minReplicas: {{ .Values.api.hpa.minReplicas | default 2 }}
+  maxReplicas: {{ .Values.api.hpa.maxReplicas | default 20 }}
+
+  {{- /* ----- Metrics Section ----- */}}
+  metrics:
+    {{- /* CPU utilization metric */}}
+    {{- if .Values.api.hpa.metrics.cpu.enabled }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.api.hpa.metrics.cpu.targetUtilization | default 60 }}
+    {{- end }}
+
+    {{- /* Memory utilization metric */}}
+    {{- if .Values.api.hpa.metrics.memory.enabled }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.api.hpa.metrics.memory.targetUtilization | default 70 }}
+    {{- end }}
+
+    {{- /* RPS/QPS metric via custom or external metric adapter (e.g., Prometheus Adapter) */}}
+    {{- if .Values.api.hpa.metrics.rps.enabled }}
+    - type: Pods
+      pods:
+        metric:
+          {{- if .Values.api.hpa.metrics.rps.prometheus }}
+          # Example: Prometheus Adapter metric name
+          name: {{ .Values.api.hpa.metrics.rps.prometheus.metricName | default "http_requests_per_second" }}
+          {{- else }}
+          name: {{ .Values.api.hpa.metrics.rps.metricName | default "requests_per_second" }}
+          {{- end }}
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.api.hpa.metrics.rps.targetAverage | default "5" | quote }}
+    {{- end }}
+
+    {{- /* Optional custom external metrics (array) */}}
+    {{- range $i, $m := .Values.api.hpa.metrics.extra }}
+    - type: {{ $m.type | default "External" }}
+      {{- if eq ($m.type | default "External") "External" }}
+      external:
+        metric:
+          name: {{ required (printf "api.hpa.metrics.extra[%d].metric.name is required" $i) $m.metric.name }}
+          {{- with $m.metric.selector }}
+          selector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        target:
+          type: {{ required (printf "api.hpa.metrics.extra[%d].target.type is required" $i) $m.target.type }}
+          {{- if eq $m.target.type "Value" }}
+          value: {{ required (printf "api.hpa.metrics.extra[%d].target.value is required" $i) $m.target.value }}
+          {{- else if eq $m.target.type "AverageValue" }}
+          averageValue: {{ required (printf "api.hpa.metrics.extra[%d].target.averageValue is required" $i) $m.target.averageValue }}
+          {{- else if eq $m.target.type "Utilization" }}
+          averageUtilization: {{ required (printf "api.hpa.metrics.extra[%d].target.averageUtilization is required" $i) $m.target.averageUtilization }}
+          {{- end }}
+      {{- else if eq $m.type "Pods" }}
+      pods:
+        metric:
+          name: {{ required (printf "api.hpa.metrics.extra[%d].metric.name is required" $i) $m.metric.name }}
+          {{- with $m.metric.selector }}
+          selector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        target:
+          type: {{ required (printf "api.hpa.metrics.extra[%d].target.type is required" $i) $m.target.type }}
+          {{- if eq $m.target.type "AverageValue" }}
+          averageValue: {{ required (printf "api.hpa.metrics.extra[%d].target.averageValue is required" $i) $m.target.averageValue }}
+          {{- else if eq $m.target.type "Utilization" }}
+          averageUtilization: {{ required (printf "api.hpa.metrics.extra[%d].target.averageUtilization is required" $i) $m.target.averageUtilization }}
+          {{- end }}
+      {{- else if eq $m.type "Resource" }}
+      resource:
+        name: {{ required (printf "api.hpa.metrics.extra[%d].resource.name is required" $i) $m.resource.name }}
+        target:
+          type: {{ required (printf "api.hpa.metrics.extra[%d].target.type is required" $i) $m.target.type }}
+          {{- if eq $m.target.type "AverageValue" }}
+          averageValue: {{ required (printf "api.hpa.metrics.extra[%d].target.averageValue is required" $i) $m.target.averageValue }}
+          {{- else if eq $m.target.type "Utilization" }}
+          averageUtilization: {{ required (printf "api.hpa.metrics.extra[%d].target.averageUtilization is required" $i) $m.target.averageUtilization }}
+          {{- end }}
+      {{- end }}
+    {{- end }}
+
+  {{- /* ----- Behavior Section (scale up/down policies) ----- */}}
+  behavior:
+    {{- /*
+      Defaults: faster scaleUp, conservative scaleDown.
+      Policies use Percent/Pods with periodSeconds. Stabilization helps avoid flapping.
+    */}}
+    scaleUp:
+      stabilizationWindowSeconds: {{ .Values.api.hpa.behavior.scaleUp.stabilizationWindowSeconds | default 30 }}
+      policies:
+        - type: Percent
+          value: {{ .Values.api.hpa.behavior.scaleUp.percent | default 100 }}
+          periodSeconds: {{ .Values.api.hpa.behavior.scaleUp.periodSeconds | default 60 }}
+        - type: Pods
+          value: {{ .Values.api.hpa.behavior.scaleUp.pods | default 4 }}
+          periodSeconds: {{ .Values.api.hpa.behavior.scaleUp.periodSeconds | default 60 }}
+      selectPolicy: {{ .Values.api.hpa.behavior.scaleUp.selectPolicy | default "Max" }}
+    scaleDown:
+      stabilizationWindowSeconds: {{ .Values.api.hpa.behavior.scaleDown.stabilizationWindowSeconds | default 300 }}
+      policies:
+        - type: Percent
+          value: {{ .Values.api.hpa.behavior.scaleDown.percent | default 50 }}
+          periodSeconds: {{ .Values.api.hpa.behavior.scaleDown.periodSeconds | default 60 }}
+        - type: Pods
+          value: {{ .Values.api.hpa.behavior.scaleDown.pods | default 2 }}
+          periodSeconds: {{ .Values.api.hpa.behavior.scaleDown.periodSeconds | default 60 }}
+      selectPolicy: {{ .Values.api.hpa.behavior.scaleDown.selectPolicy | default "Min" }}
+
+{{- end }}

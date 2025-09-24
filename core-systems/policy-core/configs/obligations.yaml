@@ -1,0 +1,402 @@
+# policy-core/configs/obligations.yaml
+apiVersion: policy.aethernova.io/v1alpha1
+kind: ObligationsBundle
+
+metadata:
+  name: policy-core-obligations
+  version: "1.0.0"
+  revision: "2025-08-28"
+  environment: "prod"
+  owner: "platform-security-core"
+  labels:
+    app.kubernetes.io/name: policy-core
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: policy-core
+    risk.tier: "high"
+
+spec:
+  schemaVersion: "1.0"
+
+  # ---------- Глобальные значения по умолчанию ----------
+  defaults:
+    retry:
+      &retry_backoff
+      maxAttempts: 5
+      initialDelayMs: 200
+      maxDelayMs: 5000
+      jitter: true
+      strategy: exponential
+      backoffMultiplier: 2.0
+      retryOn:
+        - 429
+        - 502
+        - 503
+        - 504
+    deduplication:
+      windowMs: 300000         # 5 минут
+      idempotencyKeyTemplate: "{{ decision.id }}:{{ subject.id }}:{{ resource.id }}:{{ action }}"
+    circuitBreaker:
+      enabled: true
+      failureThreshold: 5
+      rollingWindowSec: 60
+      halfOpenAfterSec: 30
+    timeoutMs: 5000
+    priority: normal
+    kms:
+      defaultKeyArn: "arn:aws:kms:region:account:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # переопределите
+      encryptionAlgorithm: "AES/GCM/NoPadding"
+    redaction:
+      &redaction_defaults
+      mode: "mask"           # mask|hash|remove
+      mask:
+        &mask_defaults
+        keepStart: 2
+        keepEnd: 2
+        char: "*"
+      hash:
+        algorithm: "SHA-256"
+        saltSecretRef: "policy-core/hash-salt"   # secret name в K8s или vault path
+    audit:
+      sinkRef: "siem-otlp"
+      severity: "info"
+      format: "jsonl"
+      includeDecisionContext: true
+      piiStrategy: "redact"   # redact|hash|none
+    notification:
+      defaultChannel: "slack-sec"
+      defaultEmailFrom: "noreply@security.local"
+    telemetry:
+      emitMetrics: true
+      emitTraces: true
+      emitLogs: true
+
+  # ---------- Конечные точки (sinks) ----------
+  sinks:
+    - name: "siem-otlp"
+      type: "otlp"
+      config:
+        endpoint: "otel-collector:4317"
+        protocol: "grpc"
+        tls:
+          insecure: true
+        resourceAttributes:
+          service.name: "policy-core"
+          service.version: "{{ bundle.version }}"
+      reliability:
+        retry: *retry_backoff
+        timeoutMs: 3000
+
+    - name: "http-audit"
+      type: "http"
+      config:
+        url: "https://audit.internal/v1/events"
+        method: "POST"
+        headers:
+          Content-Type: "application/json"
+          X-Signature-Alg: "HMAC-SHA256"
+        auth:
+          type: "hmac"
+          secretRef: "policy-core/audit-hmac-key"
+      reliability:
+        retry: *retry_backoff
+        timeoutMs: 4000
+        circuitBreaker: *retry_backoff
+
+    - name: "kafka-dlp"
+      type: "kafka"
+      config:
+        brokers:
+          - "kafka-1:9092"
+          - "kafka-2:9092"
+        topic: "dlp.events.v1"
+        acks: "all"
+        security:
+          mechanism: "SCRAM-SHA-512"
+          usernameSecretRef: "policy-core/kafka-user"
+          passwordSecretRef: "policy-core/kafka-pass"
+      reliability:
+        retry: *retry_backoff
+
+    - name: "s3-quarantine"
+      type: "s3"
+      config:
+        bucket: "quarantine-bucket"
+        prefixTemplate: "policy-core/{{ date '2006-01-02' }}/{{ decision.id }}/"
+        serverSideEncryption: "aws:kms"
+        kmsKeyArn: "{{ defaults.kms.defaultKeyArn }}"
+      reliability:
+        retry: *retry_backoff
+
+    - name: "slack-sec"
+      type: "slack"
+      config:
+        webhookSecretRef: "policy-core/slack-webhook"
+        username: "policy-core"
+        iconEmoji: ":rotating_light:"
+      reliability:
+        retry: *retry_backoff
+
+    - name: "email-notify"
+      type: "smtp"
+      config:
+        host: "smtp.internal"
+        port: 587
+        starttls: true
+        usernameSecretRef: "policy-core/smtp-user"
+        passwordSecretRef: "policy-core/smtp-pass"
+        from: "{{ defaults.notification.defaultEmailFrom }}"
+      reliability:
+        retry: *retry_backoff
+
+  # ---------- Шаблоны сообщений ----------
+  templates:
+    - name: "audit.default"
+      content: |
+        {
+          "ts":"{{ nowRFC3339 }}",
+          "decisionId":"{{ decision.id }}",
+          "effect":"{{ decision.effect }}",
+          "policyId":"{{ policy.id }}",
+          "policyTags":{{ toJson policy.tags }},
+          "subject":{"id":"{{ subject.id }}","type":"{{ subject.type }}"},
+          "action":"{{ action }}",
+          "resource":{"id":"{{ resource.id }}","type":"{{ resource.type }}"},
+          "attributes":{{ toJson (redact attributes) }},
+          "reason":{{ toJson decision.reason }},
+          "environment":{{ toJson environment }},
+          "compliance":{{ toJson compliance }},
+          "severity":"{{ obligation.severity }}"
+        }
+
+    - name: "notify.slack.block"
+      content: |
+        {
+          "text": ":rotating_light: *{{ decision.effect }}* by policy *{{ policy.id }}*",
+          "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text":
+              "*Effect*: {{ decision.effect }}\n*Policy*: {{ policy.id }}\n*Subject*: {{ subject.id }}\n*Action*: {{ action }}\n*Resource*: {{ resource.id }}"}}
+          ]
+        }
+
+    - name: "deny.response.template"
+      content: |
+        {
+          "error":"access_denied",
+          "correlation_id":"{{ decision.id }}",
+          "message":"Access denied by policy {{ policy.id }}",
+          "details": {{ toJson (safe details) }}
+        }
+
+  # ---------- Набор обязательств ----------
+  obligations:
+
+    # 1) Глобальный аудит для всех решений
+    - id: "obl.audit.all"
+      description: "Аудит каждого решения PDP в SIEM и HTTP-аудит."
+      appliesTo:
+        effects: ["Allow", "Deny", "Challenge"]
+      when:
+        any: []        # без условий — для всех событий
+      actions:
+        - type: "audit_log"
+          sinkRef: "siem-otlp"
+          severity: "info"
+          templateRef: "audit.default"
+          piiStrategy: "redact"
+          idempotency:
+            dedupeWindowMs: 300000
+          sla:
+            timeoutMs: 3000
+        - type: "audit_log"
+          sinkRef: "http-audit"
+          severity: "info"
+          templateRef: "audit.default"
+
+    # 2) Блокировка + детерминированный ответ при Deny
+    - id: "obl.deny.response"
+      description: "Единый шаблон API-ответа при запрете."
+      appliesTo:
+        effects: ["Deny"]
+      when:
+        any: []        # любой Deny
+      actions:
+        - type: "mutate_response"
+          statusCode: 403
+          headers:
+            Content-Type: "application/json"
+            X-Correlation-Id: "{{ decision.id }}"
+          bodyTemplateRef: "deny.response.template"
+          sla:
+            timeoutMs: 100
+
+    # 3) DLP: Редакция PII полей при Allow для чувствительных ресурсов
+    - id: "obl.dlp.redact"
+      description: "Редакция PII при разрешении чтения чувствительных данных."
+      appliesTo:
+        effects: ["Allow"]
+      when:
+        all:
+          - policyTags: ["pii", "dlp"]
+          - resource:
+              type: ["customer_profile", "payment_card", "medical_record"]
+          - action: ["read", "search", "export"]
+      actions:
+        - type: "transform_response"
+          transforms:
+            - op: "redact"
+              fields:
+                - "body.ssn"
+                - "body.card.number"
+                - "body.email"
+                - "body.phone"
+              params: *redaction_defaults
+            - op: "mask"
+              fields:
+                - "body.card.cvv"
+              params: *mask_defaults
+          auditTrail:
+            enabled: true
+            sinkRef: "kafka-dlp"
+          sla:
+            timeoutMs: 300
+
+    # 4) Карантин файла при подозрении на утечку
+    - id: "obl.quarantine.attachment"
+      description: "Перемещение вложения в карантин S3 и уведомление Security."
+      appliesTo:
+        effects: ["Deny", "Challenge"]
+      when:
+        any:
+          - policyTags: ["dlp", "exfiltration"]
+          - attributes:
+              risk.score: ">=80"
+      actions:
+        - type: "store_object"
+          source:
+            kind: "attachment"
+            path: "request.files[*]"
+          sinkRef: "s3-quarantine"
+          encrypt:
+            kmsKeyArn: "{{ defaults.kms.defaultKeyArn }}"
+          metadata:
+            decisionId: "{{ decision.id }}"
+            subject: "{{ subject.id }}"
+            policyId: "{{ policy.id }}"
+        - type: "notify"
+          sinkRef: "slack-sec"
+          templateRef: "notify.slack.block"
+          severity: "high"
+
+    # 5) MFA-challenge при доступе к high-risk операциям
+    - id: "obl.mfa.challenge"
+      description: "Требовать MFA подтверждение для высокорисковых действий."
+      appliesTo:
+        effects: ["Challenge"]
+      when:
+        all:
+          - action: ["transfer", "delete", "approve", "rotate_key"]
+          - attributes:
+              risk.level: ["high"]
+      actions:
+        - type: "trigger_mfa"
+          provider: "totp"     # totp|webauthn|sms
+          timeoutSec: 120
+          auditTrail:
+            enabled: true
+            sinkRef: "http-audit"
+
+    # 6) Журналы согласий (consent) для PII экспорта
+    - id: "obl.consent.capture"
+      description: "Фиксация согласия пользователя на обработку при экспорте PII."
+      appliesTo:
+        effects: ["Allow"]
+      when:
+        all:
+          - action: ["export"]
+          - policyTags: ["pii", "gdpr"]
+      actions:
+        - type: "record_consent"
+          sinkRef: "http-audit"
+          templateRef: "audit.default"
+          legalBasis: "GDPR-Art6-1-a"
+          retention:
+            ttlDays: 3650
+
+    # 7) Обязательный watermark для отчётов
+    - id: "obl.watermark.reports"
+      description: "Водо́знак для PDF/CSV отчётов."
+      appliesTo:
+        effects: ["Allow"]
+      when:
+        all:
+          - resource:
+              type: ["report_pdf", "report_csv"]
+      actions:
+        - type: "watermark"
+          target: "response.body"
+          textTemplate: "Policy-Core • {{ subject.id }} • {{ nowRFC3339 }}"
+          opacity: 0.15
+          position: "diagonal"
+
+    # 8) SLO/метрики для критичных политик
+    - id: "obl.metrics.critical"
+      description: "Метрики латентности/ошибок для критичных политик."
+      appliesTo:
+        effects: ["Allow","Deny","Challenge"]
+      when:
+        any:
+          - policyTags: ["critical"]
+      actions:
+        - type: "emit_metrics"
+          metrics:
+            - name: "policy_obligation_duration_ms"
+              value: "{{ obligation.durationMs }}"
+              labels:
+                policy_id: "{{ policy.id }}"
+                effect: "{{ decision.effect }}"
+            - name: "policy_obligation_errors_total"
+              value: "{{ obligation.errorCount }}"
+              labels:
+                policy_id: "{{ policy.id }}"
+
+  # ---------- Соответствие требованиям (mapping) ----------
+  compliance:
+    mappings:
+      "obl.audit.all":
+        - framework: "ISO-27001"
+          control: "A.12.4.1"
+        - framework: "SOC2"
+          control: "CC7.2"
+      "obl.dlp.redact":
+        - framework: "GDPR"
+          control: "Art.25-DataProtectionByDesign"
+        - framework: "PCI-DSS"
+          control: "3.3"
+      "obl.consent.capture":
+        - framework: "GDPR"
+          control: "Art.7-ConditionsForConsent"
+      "obl.mfa.challenge":
+        - framework: "NIST-800-63B"
+          control: "AAL2"
+
+  # ---------- Профили окружений (патчи) ----------
+  profiles:
+    dev:
+      defaults:
+        audit:
+          severity: "debug"
+        retry:
+          maxAttempts: 2
+      sinks:
+        - name: "siem-otlp"
+          config:
+            endpoint: "otel-collector.dev:4317"
+    prod:
+      defaults:
+        audit:
+          severity: "info"
+      obligations:
+        - id: "obl.audit.all"
+          actions:
+            - type: "audit_log"
+              sinkRef: "siem-otlp"   # продовый SIEM обязателен

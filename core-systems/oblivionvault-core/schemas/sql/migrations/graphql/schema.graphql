@@ -1,0 +1,813 @@
+# OblivionVault Core - GraphQL Schema (industrial-grade)
+# Schema version: v1
+
+############################
+# Scalars and Directives  #
+############################
+
+scalar DateTime      # ISO-8601 UTC
+scalar UUID          # RFC 4122
+scalar JSON          # Arbitrary JSON
+scalar BigInt        # 64-bit integer
+scalar Decimal       # String-encoded decimal, e.g. "123.45"
+
+"""
+Authorization directive: require specific scopes.
+If any=true, at least one scope is sufficient, otherwise all are required.
+"""
+directive @auth(scopes: [AuthScope!]!, any: Boolean = false) on OBJECT | FIELD_DEFINITION
+
+"""Simple leaky-bucket rate limit at resolver level."""
+directive @rateLimit(window: Int!, max: Int!) on FIELD_DEFINITION
+
+"""Marks field/input containing PII or sensitive data."""
+directive @sensitive on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+
+"""Marks internal-only fields."""
+directive @internal on FIELD_DEFINITION | OBJECT
+
+enum AuthScope {
+  ADMIN
+  PRIVACY_OPS
+  ARCHIVE_READ
+  ARCHIVE_WRITE
+  POLICY_ADMIN
+  DSAR_OPS
+  AUDIT_READ
+  OBS_READ
+  BILLING_READ
+}
+
+#########################
+# Relay base interfaces #
+#########################
+
+interface Node {
+  id: ID!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+#########################
+# Common domain enums   #
+#########################
+
+enum Environment {
+  dev
+  staging
+  production
+}
+
+enum Region {
+  eu_north_1
+  eu_central_1
+  eu_west_1
+  us_east_1
+  us_west_2
+  custom
+}
+
+enum StorageClass {
+  STANDARD
+  STANDARD_IA
+  GLACIER_IR
+  GLACIER_DEEP_ARCHIVE
+  NEARLINE
+  COLDLINE
+  ARCHIVE
+  CUSTOM
+}
+
+enum RetentionState {
+  ACTIVE
+  WORM
+  LEGAL_HOLD
+  EXPIRED
+  DELETED
+  UNKNOWN
+}
+
+enum ImmutabilityMode {
+  governance
+  compliance
+  none
+}
+
+enum ProfileKind {
+  hot
+  warm
+  cold
+  legal
+}
+
+enum RetentionEventType {
+  POLICY_CREATED
+  POLICY_UPDATED
+  POLICY_DELETED
+  RETENTION_APPLIED
+  RETENTION_EXPIRED
+  RETENTION_EXTENDED
+  ARCHIVE_TRANSITION
+  LEGAL_HOLD_SET
+  LEGAL_HOLD_CLEARED
+  WORM_LOCK_ENABLED
+  WORM_LOCK_DISABLED
+  PURGE_REQUESTED
+  PURGE_APPROVED
+  PURGE_DENIED
+  PURGE_EXECUTED
+  REPLICATION_STARTED
+  REPLICATION_COMPLETED
+  REPLICATION_FAILED
+  INTEGRITY_AUDIT_STARTED
+  INTEGRITY_AUDIT_COMPLETED
+  INTEGRITY_AUDIT_FAILED
+  SLO_VIOLATION
+  BUDGET_THRESHOLD_REACHED
+}
+
+enum ReasonCode {
+  SCHEDULED
+  MANUAL_REQUEST
+  LEGAL_REQUEST
+  SECURITY_INCIDENT
+  COMPLIANCE_REQUIREMENT
+  POLICY_CHANGE
+  DR_EVENT
+  INTEGRITY_FAILURE
+  BUDGET_POLICY
+  OTHER
+}
+
+enum ActorKind {
+  USER
+  SERVICE
+  SYSTEM
+  ADMIN
+  PROCESS
+}
+
+enum DRMode {
+  ASYNC
+  SYNC
+  NONE
+}
+
+enum DRState {
+  HEALTHY
+  DEGRADED
+  FAILED
+  UNKNOWN
+}
+
+enum DSARStatus {
+  RECEIVED
+  VERIFICATION_PENDING
+  VERIFIED
+  IN_PROGRESS
+  READY
+  DELIVERED
+  PARTIAL_REFUSAL
+  REFUSED
+  CLOSED
+}
+
+enum DSARRight {
+  access
+  copy
+  rectification
+  erasure
+  restriction
+  portability
+  objection
+  marketing_opt_out
+  sale_opt_out
+  sensitive_data_limit
+  automated_decisioning_explanation
+  consent_withdrawal
+  profiling_opt_out
+}
+
+enum SortDirection {
+  ASC
+  DESC
+}
+
+#########################
+# Common value objects  #
+#########################
+
+type Actor implements Node {
+  id: ID!
+  kind: ActorKind!
+  subjectId: String!
+  displayName: String
+  ip: String
+  userAgent: String
+}
+
+type LabelKV {
+  key: String!
+  value: String!
+}
+
+type StorageTransition {
+  afterDays: Int!
+  storageClass: StorageClass!
+}
+
+type DRStatus {
+  mode: DRMode!
+  state: DRState!
+  replicationLagSeconds: BigInt
+  destinations: [String!]!
+}
+
+#########################
+# Core domain entities  #
+#########################
+
+type Dataset implements Node @auth(scopes: [ARCHIVE_READ]) {
+  id: ID!
+  key: String!
+  description: String
+  region: Region!
+  environment: Environment!
+  labels: [LabelKV!]!
+  bucket: String
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  policy: RetentionPolicy
+  stats: DatasetStats!
+}
+
+type DatasetStats {
+  objects: BigInt!
+  totalSizeBytes: BigInt!
+  activeSizeBytes: BigInt!
+  archivedSizeBytes: BigInt!
+  lastIngestAt: DateTime
+}
+
+type ObjectVersion implements Node @auth(scopes: [ARCHIVE_READ]) {
+  id: ID!
+  datasetId: ID!
+  objectKey: String!
+  versionId: String
+  sizeBytes: BigInt!
+  checksum: String
+  storageClass: StorageClass!
+  state: RetentionState!
+  createdAt: DateTime!
+  lastAccessAt: DateTime
+  expiresAt: DateTime
+  worm: WORMInfo
+  legalHold: LegalHold
+  dr: DRStatus
+  labels: [LabelKV!]!
+}
+
+type WORMInfo {
+  enabled: Boolean!
+  mode: ImmutabilityMode!
+  sinceAt: DateTime
+  untilAt: DateTime
+}
+
+type LegalHold implements Node @auth(scopes: [POLICY_ADMIN, PRIVACY_OPS], any: true) {
+  id: ID!
+  active: Boolean!
+  label: String
+  reason: String
+  createdAt: DateTime!
+  createdBy: Actor!
+  clearedAt: DateTime
+  clearedBy: Actor
+  resourceId: ID!
+}
+
+type RetentionPolicy implements Node @auth(scopes: [POLICY_ADMIN, ARCHIVE_READ], any: true) {
+  id: ID!
+  name: String!
+  profile: ProfileKind!
+  retentionMinDays: Int
+  retentionMaxDays: Int
+  immutabilityMode: ImmutabilityMode!
+  legalHoldLabel: String
+  transitions: [StorageTransition!]!
+  scheduledExpirationAt: DateTime
+  effectiveUntil: DateTime
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  createdBy: Actor!
+  updatedBy: Actor!
+  status: PolicyStatus!
+}
+
+type PolicyStatus {
+  attachedDatasets: BigInt!
+  violationsOpen: Int!
+  lastEvaluationAt: DateTime
+}
+
+type RetentionEvent implements Node @auth(scopes: [AUDIT_READ, ARCHIVE_READ], any: true) {
+  id: ID!
+  eventVersion: Int!
+  eventTime: DateTime!
+  producer: String!
+  service: String!
+  environment: Environment!
+  region: Region!
+  partitionKey: String!
+  eventType: RetentionEventType!
+  previousState: RetentionState
+  currentState: RetentionState
+  reason: ReasonCode!
+  actor: Actor!
+  resource: ResourceRef!
+  policy: PolicySnapshot
+  dr: DRStatus
+  metrics: EventMetrics
+  transitions: [StateTransition!]!
+  error: ErrorInfo
+  audit: AuditInfo!
+  labels: [LabelKV!]
+  extensions: JSON
+}
+
+type ResourceRef {
+  resourceType: ResourceType!
+  dataset: String
+  objectKey: String
+  versionId: String
+  bucket: String
+  storageClass: StorageClass
+  sizeBytes: BigInt
+  checksum: String
+  region: Region
+}
+
+enum ResourceType {
+  OBJECT
+  DATASET
+  POLICY
+  BUCKET
+  NAMESPACE
+}
+
+type PolicySnapshot {
+  policyId: ID!
+  profile: ProfileKind!
+  retentionMinDays: Int
+  retentionMaxDays: Int
+  immutabilityMode: ImmutabilityMode!
+  legalHoldLabel: String
+  scheduledExpirationAt: DateTime
+  effectiveUntil: DateTime
+  transitions: [StorageTransition!]!
+}
+
+type EventMetrics {
+  bytesMoved: BigInt
+  itemsAffected: BigInt
+  durationMs: BigInt
+  egressCost: Decimal
+  storageDeltaBytes: BigInt
+}
+
+type StateTransition {
+  from: RetentionState!
+  to: RetentionState!
+  at: DateTime!
+  reason: ReasonCode!
+  note: String
+}
+
+type ErrorInfo {
+  code: String
+  message: String
+  retryable: Boolean
+}
+
+type AuditInfo {
+  requestId: String
+  ticketId: String
+  traceId: String
+  payloadChecksum: String
+  extra: JSON
+}
+
+type BudgetStatus {
+  month: String!
+  storageBudgetUsd: Decimal!
+  storageUsedUsd: Decimal!
+  egressBudgetUsd: Decimal!
+  egressUsedUsd: Decimal!
+  warnThresholdPct: Int!
+  critThresholdPct: Int!
+}
+
+type SLOStatus {
+  windowDays: Int!
+  archiveJobSuccessRatePct: Decimal!
+  restoreP95TimeMinutes: Int!
+  integrityAuditCoveragePct: Decimal!
+  lastUpdatedAt: DateTime!
+}
+
+type DSARRequest implements Node @auth(scopes: [DSAR_OPS, PRIVACY_OPS], any: true) {
+  id: ID!
+  idempotencyKey: String
+  status: DSARStatus!
+  regime: String!
+  rights: [DSARRight!]!
+  preferredFormats: [String!]!
+  preferredLanguage: String
+  deliveryMethod: String
+  subject: DSARSubject! @sensitive
+  timeRange: DSARTimeRange
+  scope: DSARScope
+  verification: DSARVerification!
+  deadlines: DSARDeadlines!
+  legal: DSARLegal!
+  consents: DSARConsents
+  audit: AuditInfo!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type DSARSubject {
+  givenName: String
+  familyName: String
+  dateOfBirth: String
+  emails: [String!]
+  phones: [String!]
+  usernames: [String!]
+}
+
+type DSARTimeRange {
+  from: DateTime
+  to: DateTime
+  approximate: Boolean
+}
+
+type DSARScope {
+  categories: [String!]
+  includeDerivedInferences: Boolean
+  includeThirdParties: Boolean
+  includeProcessors: Boolean
+  includeBackupsArchives: String
+  systemsInclude: [String!]
+  systemsExclude: [String!]
+}
+
+type DSARVerification {
+  status: String!
+  assuranceLevel: String
+  requestedMethods: [String!]
+  completedMethods: [String!]
+}
+
+type DSARDeadlines {
+  receivedAt: DateTime!
+  dueAt: DateTime!
+  extensionRequested: Boolean!
+  extendedDueAt: DateTime
+  reason: String
+}
+
+type DSARLegal {
+  legalHoldActive: Boolean!
+  refusalGround: String
+  refusalDetails: String
+}
+
+type DSARConsents {
+  withdraw: [String!]
+  marketingEmailOptIn: Boolean
+  marketingSmsOptIn: Boolean
+  profilingOptIn: Boolean
+}
+
+#########################
+# Connections (Relay)   #
+#########################
+
+type DatasetEdge { node: Dataset!, cursor: String! }
+type DatasetConnection {
+  edges: [DatasetEdge!]!
+  nodes: [Dataset!]!
+  pageInfo: PageInfo!
+  totalCount: BigInt!
+}
+
+type ObjectVersionEdge { node: ObjectVersion!, cursor: String! }
+type ObjectVersionConnection {
+  edges: [ObjectVersionEdge!]!
+  nodes: [ObjectVersion!]!
+  pageInfo: PageInfo!
+  totalCount: BigInt!
+}
+
+type RetentionEventEdge { node: RetentionEvent!, cursor: String! }
+type RetentionEventConnection {
+  edges: [RetentionEventEdge!]!
+  nodes: [RetentionEvent!]!
+  pageInfo: PageInfo!
+  totalCount: BigInt!
+}
+
+type DSARRequestEdge { node: DSARRequest!, cursor: String! }
+type DSARRequestConnection {
+  edges: [DSARRequestEdge!]!
+  nodes: [DSARRequest!]!
+  pageInfo: PageInfo!
+  totalCount: BigInt!
+}
+
+#########################
+# Filters and Inputs    #
+#########################
+
+input LabelFilter {
+  key: String!
+  value: String
+}
+
+input DatasetFilter {
+  keys: [String!]
+  region: Region
+  environment: Environment
+  labelAny: [LabelFilter!]
+  labelAll: [LabelFilter!]
+  search: String
+  createdAfter: DateTime
+  createdBefore: DateTime
+}
+
+enum DatasetSortField { key createdAt updatedAt totalSizeBytes objects }
+input DatasetSort { field: DatasetSortField! = updatedAt, direction: SortDirection! = DESC }
+
+input ObjectFilter {
+  datasetKey: String
+  objectKeyPrefix: String
+  stateIn: [RetentionState!]
+  storageClassIn: [StorageClass!]
+  minSizeBytes: BigInt
+  maxSizeBytes: BigInt
+  createdAfter: DateTime
+  createdBefore: DateTime
+  expiresBefore: DateTime
+  labelAny: [LabelFilter!]
+}
+
+enum ObjectSortField { objectKey createdAt sizeBytes expiresAt }
+input ObjectSort { field: ObjectSortField! = createdAt, direction: SortDirection! = DESC }
+
+input EventFilter {
+  types: [RetentionEventType!]
+  reasonIn: [ReasonCode!]
+  datasetKey: String
+  objectKeyPrefix: String
+  region: Region
+  occurredAfter: DateTime
+  occurredBefore: DateTime
+  hasError: Boolean
+}
+
+enum EventSortField { eventTime }
+input EventSort { field: EventSortField! = eventTime, direction: SortDirection! = DESC }
+
+input DSARFilter {
+  statusIn: [DSARStatus!]
+  regime: String
+  rightIn: [DSARRight!]
+  receivedAfter: DateTime
+  receivedBefore: DateTime
+  emailContains: String
+}
+
+enum DSARSortField { createdAt updatedAt dueAt }
+input DSARSort { field: DSARSortField! = updatedAt, direction: SortDirection! = DESC }
+
+input TransitionInput {
+  afterDays: Int!
+  storageClass: StorageClass!
+}
+
+input UpsertPolicyInput {
+  id: ID
+  name: String!
+  profile: ProfileKind!
+  retentionMinDays: Int
+  retentionMaxDays: Int
+  immutabilityMode: ImmutabilityMode! = none
+  legalHoldLabel: String
+  transitions: [TransitionInput!]! = []
+  effectiveUntil: DateTime
+}
+
+type UpsertPolicyResult {
+  policy: RetentionPolicy!
+}
+
+input AttachPolicyInput {
+  datasetId: ID!
+  policyId: ID!
+}
+
+type AttachPolicyResult {
+  dataset: Dataset!
+  policy: RetentionPolicy!
+}
+
+input LegalHoldSetInput {
+  resourceId: ID!
+  label: String
+  reason: String
+}
+
+input LegalHoldClearInput {
+  legalHoldId: ID!
+  reason: String
+}
+
+type LegalHoldResult {
+  legalHold: LegalHold!
+}
+
+input WORMEnableInput {
+  resourceId: ID!
+  mode: ImmutabilityMode! = governance
+  untilAt: DateTime
+}
+
+input WORMDisableInput {
+  resourceId: ID!
+  reason: String
+}
+
+type WORMResult {
+  resourceId: ID!
+  worm: WORMInfo!
+}
+
+input PurgeRequestInput {
+  resourceId: ID!
+  reason: ReasonCode! = MANUAL_REQUEST
+  note: String
+}
+
+type PurgeRequestResult {
+  requestId: ID!
+  resourceId: ID!
+  state: String!
+}
+
+input DSARCreateInput {
+  idempotencyKey: String
+  regime: String!
+  rights: [DSARRight!]!
+  preferredFormats: [String!] = ["json","pdf"]
+  preferredLanguage: String = "ru"
+  deliveryMethod: String = "secure_portal"
+  subject: DSARSubjectInput! @sensitive
+  timeRange: DSARTimeRangeInput
+  scope: DSARScopeInput
+}
+
+input DSARSubjectInput {
+  givenName: String
+  familyName: String
+  dateOfBirth: String
+  emails: [String!]
+  phones: [String!]
+  usernames: [String!]
+}
+
+input DSARTimeRangeInput {
+  from: DateTime
+  to: DateTime
+  approximate: Boolean = false
+}
+
+input DSARScopeInput {
+  categories: [String!]
+  includeDerivedInferences: Boolean = true
+  includeThirdParties: Boolean = true
+  includeProcessors: Boolean = true
+  includeBackupsArchives: String = "policy_driven"
+  systemsInclude: [String!]
+  systemsExclude: [String!]
+}
+
+input DSARUpdateStatusInput {
+  id: ID!
+  status: DSARStatus!
+  refusalGround: String
+  refusalDetails: String
+}
+
+type DSARMutationResult {
+  dsar: DSARRequest!
+}
+
+#########################
+# Root operations       #
+#########################
+
+type Query {
+  node(id: ID!): Node
+
+  whoami: Actor @auth(scopes: [ARCHIVE_READ, POLICY_ADMIN, DSAR_OPS], any: true)
+
+  dataset(id: ID, key: String): Dataset @auth(scopes: [ARCHIVE_READ])
+  datasets(
+    filter: DatasetFilter
+    sort: DatasetSort = {field: updatedAt, direction: DESC}
+    first: Int = 25
+    after: String
+  ): DatasetConnection @auth(scopes: [ARCHIVE_READ]) @rateLimit(window: 60, max: 120)
+
+  objectVersion(id: ID!): ObjectVersion @auth(scopes: [ARCHIVE_READ])
+  objects(
+    filter: ObjectFilter
+    sort: ObjectSort = {field: createdAt, direction: DESC}
+    first: Int = 50
+    after: String
+  ): ObjectVersionConnection @auth(scopes: [ARCHIVE_READ]) @rateLimit(window: 60, max: 120)
+
+  retentionPolicy(id: ID!): RetentionPolicy @auth(scopes: [POLICY_ADMIN, ARCHIVE_READ], any: true)
+  retentionEvents(
+    filter: EventFilter
+    sort: EventSort = {field: eventTime, direction: DESC}
+    first: Int = 100
+    after: String
+  ): RetentionEventConnection @auth(scopes: [AUDIT_READ, ARCHIVE_READ], any: true)
+
+  dsar(id: ID!): DSARRequest @auth(scopes: [DSAR_OPS, PRIVACY_OPS], any: true)
+  dsars(
+    filter: DSARFilter
+    sort: DSARSort = {field: updatedAt, direction: DESC}
+    first: Int = 50
+    after: String
+  ): DSARRequestConnection @auth(scopes: [DSAR_OPS, PRIVACY_OPS], any: true)
+
+  budgetStatus(month: String): BudgetStatus @auth(scopes: [BILLING_READ, AUDIT_READ], any: true)
+  sloStatus(windowDays: Int = 30): SLOStatus @auth(scopes: [OBS_READ, AUDIT_READ], any: true)
+}
+
+type Mutation {
+  upsertRetentionPolicy(input: UpsertPolicyInput!): UpsertPolicyResult!
+    @auth(scopes: [POLICY_ADMIN])
+
+  attachPolicyToDataset(input: AttachPolicyInput!): AttachPolicyResult!
+    @auth(scopes: [POLICY_ADMIN])
+
+  setLegalHold(input: LegalHoldSetInput!): LegalHoldResult!
+    @auth(scopes: [POLICY_ADMIN, PRIVACY_OPS], any: true)
+
+  clearLegalHold(input: LegalHoldClearInput!): LegalHoldResult!
+    @auth(scopes: [POLICY_ADMIN, PRIVACY_OPS], any: true)
+
+  enableWORM(input: WORMEnableInput!): WORMResult!
+    @auth(scopes: [POLICY_ADMIN])
+
+  disableWORM(input: WORMDisableInput!): WORMResult!
+    @auth(scopes: [POLICY_ADMIN])
+
+  requestPurge(input: PurgeRequestInput!): PurgeRequestResult!
+    @auth(scopes: [POLICY_ADMIN])
+
+  createDSAR(input: DSARCreateInput!): DSARMutationResult!
+    @auth(scopes: [DSAR_OPS, PRIVACY_OPS], any: true)
+
+  updateDSARStatus(input: DSARUpdateStatusInput!): DSARMutationResult!
+    @auth(scopes: [DSAR_OPS, PRIVACY_OPS], any: true)
+}
+
+type Subscription {
+  retentionEvent(filter: EventFilter): RetentionEvent!
+    @auth(scopes: [AUDIT_READ, ARCHIVE_READ], any: true)
+
+  policyChanged(policyId: ID): RetentionPolicy!
+    @auth(scopes: [POLICY_ADMIN, ARCHIVE_READ], any: true)
+
+  dsarStatusChanged(id: ID): DSARRequest!
+    @auth(scopes: [DSAR_OPS, PRIVACY_OPS], any: true)
+}
+
+#########################
+# Schema entry points   #
+#########################
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}

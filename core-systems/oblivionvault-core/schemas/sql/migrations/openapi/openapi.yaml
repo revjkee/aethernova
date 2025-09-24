@@ -1,0 +1,736 @@
+openapi: 3.1.0
+info:
+  title: OblivionVault Core — SQL Migrations API
+  version: 1.0.0
+  summary: Управление миграциями БД (реестр, dry-run, план, apply/rollback, блокировки, операции).
+  description: |
+    Промышленный API для оркестрации SQL-миграций с поддержкой идемпотентных запросов,
+    блокировок, асинхронных операций и интеграции с реестром evidence.
+  termsOfService: https://oblivionvault.example/terms
+  contact:
+    name: Platform Engineering
+    email: platform@oblivionvault.example
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+externalDocs:
+  description: Runbooks
+  url: https://runbooks.example.com/oblivionvault-core/migrations
+servers:
+  - url: https://api.staging.oblivionvault.example
+    description: Staging
+  - url: https://api.oblivionvault.example
+    description: Production
+tags:
+  - name: Migrations
+    description: Реестр миграций и управление жизненным циклом.
+  - name: Execution
+    description: Dry-run, план, применение и откат.
+  - name: Locks
+    description: Блокировки на уровне БД/кластера для исключения гонок.
+  - name: Databases
+    description: Реестр целевых баз данных/кластеров.
+  - name: Operations
+    description: Длительные операции (apply/rollback и т.п.).
+  - name: Events
+    description: История событий и webhooks.
+  - name: Health
+    description: Технические эндпоинты /healthz, /readyz, /metrics.
+security:
+  - OAuth2: [migrations:read, migrations:write]
+  - ApiKey: []
+x-idempotency:
+  header: X-Idempotency-Key
+x-audit:
+  headers: [X-Audit-User, X-Audit-Reason, X-Evidence-Id]
+
+paths:
+  /v1/migrations:
+    get:
+      tags: [Migrations]
+      summary: Список миграций
+      operationId: listMigrations
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/pageSize'
+        - $ref: '#/components/parameters/sort'
+        - $ref: '#/components/parameters/databaseId'
+        - name: status
+          in: query
+          schema: { type: string, enum: [draft, pending, applied, rolled_back, failed] }
+        - name: tag
+          in: query
+          schema: { type: string }
+        - name: since
+          in: query
+          description: Фильтр по времени создания/изменения
+          schema: { $ref: '#/components/schemas/Timestamp' }
+      responses:
+        '200':
+          description: ОК
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MigrationList' }
+    post:
+      tags: [Migrations]
+      summary: Регистрация новой миграции
+      operationId: createMigration
+      parameters:
+        - $ref: '#/components/parameters/xRequestId'
+        - $ref: '#/components/parameters/xIdempotencyKey'
+        - $ref: '#/components/parameters/xEvidenceId'
+        - $ref: '#/components/parameters/xAuditUser'
+        - $ref: '#/components/parameters/xAuditReason'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MigrationCreate' }
+      responses:
+        '201':
+          description: Создано
+          headers:
+            Location: { description: URI миграции, schema: { type: string, format: uri } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Migration' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/migrations/{migrationId}:
+    parameters:
+      - $ref: '#/components/parameters/migrationId'
+    get:
+      tags: [Migrations]
+      summary: Получить миграцию
+      operationId: getMigration
+      responses:
+        '200': { description: ОК, content: { application/json: { schema: { $ref: '#/components/schemas/Migration' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Migrations]
+      summary: Обновить метаданные миграции
+      operationId: updateMigration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                title: { type: string, maxLength: 200 }
+                description: { type: string, maxLength: 4000 }
+                tags: { type: array, items: { type: string }, uniqueItems: true }
+      responses:
+        '200': { description: Обновлено, content: { application/json: { schema: { $ref: '#/components/schemas/Migration' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Migrations]
+      summary: Удалить черновик миграции
+      operationId: deleteMigration
+      responses:
+        '204': { description: Удалено }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/migrations/{migrationId}/plan:
+    parameters: [ { $ref: '#/components/parameters/migrationId' }, { $ref: '#/components/parameters/databaseId' } ]
+    get:
+      tags: [Execution]
+      summary: Построить план выполнения миграции
+      operationId: getPlan
+      responses:
+        '200': { description: ОК, content: { application/json: { schema: { $ref: '#/components/schemas/MigrationPlan' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/migrations/{migrationId}/dry-run:
+    parameters: [ { $ref: '#/components/parameters/migrationId' }, { $ref: '#/components/parameters/databaseId' } ]
+    post:
+      tags: [Execution]
+      summary: Dry-run (валидация/симуляция выполнения)
+      operationId: dryRun
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                statementTimeoutMs: { type: integer, minimum: 100, maximum: 600000, default: 30000 }
+                lockTimeoutMs: { type: integer, minimum: 100, maximum: 600000, default: 10000 }
+      responses:
+        '200': { description: Отчет dry-run, content: { application/json: { schema: { $ref: '#/components/schemas/DryRunReport' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/migrations/{migrationId}/apply:
+    parameters: [ { $ref: '#/components/parameters/migrationId' }, { $ref: '#/components/parameters/databaseId' } ]
+    post:
+      tags: [Execution]
+      summary: Применить миграцию
+      operationId: applyMigration
+      parameters:
+        - $ref: '#/components/parameters/xRequestId'
+        - $ref: '#/components/parameters/xIdempotencyKey'
+        - $ref: '#/components/parameters/xEvidenceId'
+        - $ref: '#/components/parameters/xAuditUser'
+        - $ref: '#/components/parameters/xAuditReason'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                transactional: { type: boolean, default: true }
+                stopOnWarning: { type: boolean, default: true }
+                acquireLock: { type: boolean, default: true }
+      responses:
+        '202':
+          description: Операция запущена
+          headers:
+            Location: { description: URI операции, schema: { type: string, format: uri } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '423': { description: Locked (есть активная блокировка), content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } } }
+
+  /v1/migrations/{migrationId}/rollback:
+    parameters: [ { $ref: '#/components/parameters/migrationId' }, { $ref: '#/components/parameters/databaseId' } ]
+    post:
+      tags: [Execution]
+      summary: Откатить миграцию
+      operationId: rollbackMigration
+      parameters:
+        - $ref: '#/components/parameters/xRequestId'
+        - $ref: '#/components/parameters/xIdempotencyKey'
+        - $ref: '#/components/parameters/xEvidenceId'
+        - $ref: '#/components/parameters/xAuditUser'
+        - $ref: '#/components/parameters/xAuditReason'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RollbackRequest' }
+      responses:
+        '202':
+          description: Операция запущена
+          headers:
+            Location: { description: URI операции, schema: { type: string, format: uri } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/migrations/apply:
+    post:
+      tags: [Execution]
+      summary: Батч-применение миграций по фильтрам/целевому состоянию
+      operationId: applyBatch
+      parameters:
+        - $ref: '#/components/parameters/xRequestId'
+        - $ref: '#/components/parameters/xIdempotencyKey'
+        - $ref: '#/components/parameters/xEvidenceId'
+        - $ref: '#/components/parameters/xAuditUser'
+        - $ref: '#/components/parameters/xAuditReason'
+        - $ref: '#/components/parameters/databaseId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [strategy]
+              properties:
+                strategy: { type: string, enum: [pending, to-version, tags], default: pending }
+                targetVersion: { type: string, pattern: '^v\\d{4}\\.\\d{2}\\.\\d{2}(-\\w+)?$' }
+                tags: { type: array, items: { type: string }, uniqueItems: true }
+                stopOnWarning: { type: boolean, default: true }
+                transactional: { type: boolean, default: false }
+      responses:
+        '202':
+          description: Операция запущена
+          headers:
+            Location: { schema: { type: string, format: uri } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+
+  /v1/locks:
+    get:
+      tags: [Locks]
+      summary: Список активных блокировок
+      operationId: listLocks
+      parameters:
+        - $ref: '#/components/parameters/databaseId'
+      responses:
+        '200': { description: ОК, content: { application/json: { schema: { $ref: '#/components/schemas/LockList' } } } }
+    post:
+      tags: [Locks]
+      summary: Захватить блокировку
+      operationId: acquireLock
+      parameters:
+        - $ref: '#/components/parameters/xIdempotencyKey'
+        - $ref: '#/components/parameters/databaseId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, ttlSeconds]
+              additionalProperties: false
+              properties:
+                scope: { type: string, enum: [cluster, database] }
+                ttlSeconds: { type: integer, minimum: 5, maximum: 3600 }
+      responses:
+        '201': { description: Захвачено, content: { application/json: { schema: { $ref: '#/components/schemas/Lock' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/locks/{lockId}:
+    parameters: [ { $ref: '#/components/parameters/lockId' } ]
+    delete:
+      tags: [Locks]
+      summary: Освободить блокировку
+      operationId: releaseLock
+      responses:
+        '204': { description: Освобождено }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/databases:
+    get:
+      tags: [Databases]
+      summary: Список целевых БД
+      operationId: listDatabases
+      responses:
+        '200': { description: ОК, content: { application/json: { schema: { $ref: '#/components/schemas/DatabaseList' } } } }
+    post:
+      tags: [Databases]
+      summary: Регистрация целевой БД
+      operationId: registerDatabase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Database' }
+      responses:
+        '201': { description: Создано, content: { application/json: { schema: { $ref: '#/components/schemas/Database' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/databases/{databaseId}:
+    parameters: [ { $ref: '#/components/parameters/databaseId' } ]
+    get:
+      tags: [Databases]
+      summary: Получить БД
+      operationId: getDatabase
+      responses:
+        '200': { description: ОК, content: { application/json: { schema: { $ref: '#/components/schemas/Database' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Databases]
+      summary: Обновить БД
+      operationId: updateDatabase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                description: { type: string, maxLength: 2000 }
+                tags: { type: array, items: { type: string }, uniqueItems: true }
+      responses:
+        '200': { description: Обновлено, content: { application/json: { schema: { $ref: '#/components/schemas/Database' } } } }
+    delete:
+      tags: [Databases]
+      summary: Удалить БД
+      operationId: deleteDatabase
+      responses:
+        '204': { description: Удалено }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/operations/{operationId}:
+    parameters: [ { $ref: '#/components/parameters/operationId' } ]
+    get:
+      tags: [Operations]
+      summary: Статус операции
+      operationId: getOperation
+      responses:
+        '200': { description: ОК, content: { application/json: { schema: { $ref: '#/components/schemas/Operation' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/events:
+    get:
+      tags: [Events]
+      summary: История событий
+      operationId: listEvents
+      parameters:
+        - name: type
+          in: query
+          schema: { type: string, enum: [migration.created, migration.applied, migration.rolled_back, migration.failed] }
+        - $ref: '#/components/parameters/databaseId'
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/pageSize'
+      responses:
+        '200': { description: ОК, content: { application/json: { schema: { $ref: '#/components/schemas/EventList' } } } }
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      responses: { '200': { description: OK } }
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      responses: { '200': { description: OK }, '503': { description: Not ready } }
+  /metrics:
+    get:
+      tags: [Health]
+      summary: OpenMetrics
+      responses:
+        '200':
+          description: OpenMetrics
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+                description: OpenMetrics/Prometheus формат
+
+webhooks:
+  migration.completed:
+    post:
+      summary: Событие — миграция завершена
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Event' }
+
+components:
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      description: OAuth2 (authorizationCode, client_credentials)
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.oblivionvault.example/oauth2/authorize
+          tokenUrl: https://auth.oblivionvault.example/oauth2/token
+          scopes:
+            migrations:read: Чтение
+            migrations:write: Запись
+        clientCredentials:
+          tokenUrl: https://auth.oblivionvault.example/oauth2/token
+          scopes:
+            migrations:read: Чтение
+            migrations:write: Запись
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    pageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+    sort:
+      name: sort
+      in: query
+      schema: { type: string, example: '-createdAt' }
+    databaseId:
+      name: databaseId
+      in: query
+      schema: { type: string, format: uuid }
+      description: Целевая БД
+    migrationId:
+      name: migrationId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    lockId:
+      name: lockId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    operationId:
+      name: operationId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    xRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema: { type: string, format: uuid }
+    xIdempotencyKey:
+      name: X-Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, minLength: 8, maxLength: 100 }
+    xEvidenceId:
+      name: X-Evidence-Id
+      in: header
+      required: false
+      schema: { type: string, maxLength: 200 }
+      description: Связь с записью в configs/evidence.yaml
+    xAuditUser:
+      name: X-Audit-User
+      in: header
+      required: false
+      schema: { type: string, maxLength: 120 }
+    xAuditReason:
+      name: X-Audit-Reason
+      in: header
+      required: false
+      schema: { type: string, maxLength: 400 }
+
+  responses:
+    NotFound:
+      description: Не найдено
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Конфликт/состояние препятствует операции
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unprocessable:
+      description: Валидационные ошибки
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    UUID:
+      type: string
+      format: uuid
+    Timestamp:
+      type: string
+      format: date-time
+
+    Problem:
+      type: object
+      additionalProperties: true
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string, format: uri }
+        traceId: { type: string }
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        pageSize: { type: integer }
+        total: { type: integer }
+
+    SQLSource:
+      type: object
+      additionalProperties: false
+      properties:
+        inlineSQL: { type: string, description: SQL, maxLength: 200000 }
+        artifactUri: { type: string, format: uri }
+        checksum: { type: string, pattern: '^[A-Fa-f0-9]{64,128}$' }
+      oneOf:
+        - required: [inlineSQL]
+        - required: [artifactUri, checksum]
+
+    MigrationCreate:
+      type: object
+      required: [version, spec]
+      additionalProperties: false
+      properties:
+        version:
+          type: string
+          pattern: '^v\\d{4}\\.\\d{2}\\.\\d{2}(-[a-z0-9]+)?$'
+          description: Семантика датой релиза, напр. v2025.08.25-a
+        title: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 4000 }
+        tags: { type: array, items: { type: string }, uniqueItems: true }
+        spec:
+          $ref: '#/components/schemas/MigrationSpec'
+
+    MigrationSpec:
+      type: object
+      required: [up]
+      additionalProperties: false
+      properties:
+        dbEngine: { type: string, enum: [postgres, mysql, sqlite, other], default: postgres }
+        up: { $ref: '#/components/schemas/SQLSource' }
+        down: { $ref: '#/components/schemas/SQLSource' }
+        preChecks:
+          type: array
+          items: { type: string }
+        postChecks:
+          type: array
+          items: { type: string }
+        transactional: { type: boolean, default: true }
+        requires:
+          type: array
+          description: Зависимости (версии, которые должны быть применены)
+          items: { type: string, pattern: '^v\\d{4}\\.\\d{2}\\.\\d{2}(-[a-z0-9]+)?$' }
+
+    MigrationStatus:
+      type: string
+      enum: [draft, pending, applied, rolled_back, failed]
+
+    Migration:
+      type: object
+      required: [id, version, status, createdAt, spec]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        version: { type: string }
+        status: { $ref: '#/components/schemas/MigrationStatus' }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+        updatedAt: { $ref: '#/components/schemas/Timestamp' }
+        title: { type: string }
+        description: { type: string }
+        tags: { type: array, items: { type: string }, uniqueItems: true }
+        spec: { $ref: '#/components/schemas/MigrationSpec' }
+        lastAppliedAt: { $ref: '#/components/schemas/Timestamp' }
+        databasesApplied:
+          type: array
+          items: { $ref: '#/components/schemas/UUID' }
+
+    MigrationList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Migration' }
+        pageInfo: { $ref: '#/components/schemas/Pagination' }
+
+    MigrationPlan:
+      type: object
+      properties:
+        migrationId: { $ref: '#/components/schemas/UUID' }
+        databaseId: { $ref: '#/components/schemas/UUID' }
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              order: { type: integer }
+              action: { type: string, enum: [pre-check, execute, post-check] }
+              sqlPreview: { type: string }
+        estimatedImpact:
+          type: object
+          properties:
+            locks: { type: array, items: { type: string } }
+            tablesTouched: { type: array, items: { type: string } }
+            requiresExclusiveLock: { type: boolean }
+
+    DryRunReport:
+      type: object
+      properties:
+        ok: { type: boolean }
+        warnings:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              message: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              message: { type: string }
+        executionTimeMs: { type: integer }
+
+    RollbackRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        strategy: { type: string, enum: [one-step, to-version, auto], default: one-step }
+        targetVersion: { type: string }
+
+    Lock:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        scope: { type: string, enum: [cluster, database] }
+        databaseId: { $ref: '#/components/schemas/UUID' }
+        owner: { type: string }
+        acquiredAt: { $ref: '#/components/schemas/Timestamp' }
+        expiresAt: { $ref: '#/components/schemas/Timestamp' }
+
+    LockList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Lock' }
+
+    Database:
+      type: object
+      required: [id, engine, dsnRef]
+      additionalProperties: false
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        name: { type: string, maxLength: 120 }
+        engine: { type: string, enum: [postgres, mysql, sqlite, other] }
+        dsnRef: { type: string, description: Ссылка на секрет/DSN }
+        description: { type: string, maxLength: 2000 }
+        tags: { type: array, items: { type: string }, uniqueItems: true }
+        createdAt: { $ref: '#/components/schemas/Timestamp' }
+
+    DatabaseList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Database' }
+
+    OperationStatus:
+      type: string
+      enum: [PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED]
+
+    Operation:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        type: { type: string, enum: [apply, rollback, batch-apply] }
+        status: { $ref: '#/components/schemas/OperationStatus' }
+        startedAt: { $ref: '#/components/schemas/Timestamp' }
+        finishedAt: { $ref: '#/components/schemas/Timestamp' }
+        percent: { type: number, minimum: 0, maximum: 100 }
+        result:
+          type: object
+          additionalProperties: true
+        error: { $ref: '#/components/schemas/Problem' }
+
+    Event:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        type: { type: string, enum: [migration.created, migration.applied, migration.rolled_back, migration.failed] }
+        at: { $ref: '#/components/schemas/Timestamp' }
+        migrationId: { $ref: '#/components/schemas/UUID' }
+        databaseId: { $ref: '#/components/schemas/UUID' }
+        details:
+          type: object
+          additionalProperties: true
+
+    EventList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Event' }
+        pageInfo: { $ref: '#/components/schemas/Pagination' }

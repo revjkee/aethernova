@@ -1,0 +1,211 @@
+# chronowatch-core/configs/templates/maintenance_window.example.yaml
+# Промышленный шаблон окна техобслуживания для ChronoWatch Core.
+# Предназначен для потребления CI/CD, Helm-хуками, ранбуками и ботами оповещений.
+
+version: "1.0.0"
+
+metadata:
+  id: "mw-2025-q3-db-patch"             # Уникальный идентификатор окна
+  name: "Q3 DB patch and core rollout"  # Человеко-читаемое имя
+  owner:
+    team: "sre"
+    contacts:
+      - "oncall@company.local"
+      - "sre-lead@company.local"
+  created_at: "2025-08-28T12:00:00Z"
+  updated_at: "2025-08-28T12:00:00Z"
+  labels:
+    service: "chronowatch-core"
+    env: "prod"
+    compliance: "change-managed"
+  annotations:
+    change.jira: "OPS-1234"
+    runbook.url: "https://runbooks.company.local/chronowatch/mw-q3"
+
+schedule:
+  timezone: "Europe/Stockholm"          # Базовая таймзона окна
+  # Допускается несколько окон (например, по кластерам/регионам).
+  windows:
+    - name: "EU1 primary window"
+      start: "2025-09-07T22:00:00"      # Локальное время в указанной таймзоне
+      end:   "2025-09-07T23:59:00"
+      recurrence:
+        # Вариант 1 (RRULE, RFC 5545); применится вместе с start/end как шаблон
+        rrule: "FREQ=WEEKLY;BYDAY=SU;COUNT=4"
+        # Вариант 2 (cron в таймзоне schedule.timezone); закомментируйте, если не требуется
+        # cron: "0 22 * * 0"
+      blackout: false                   # true = запрещено проводить изменения (информативное поле)
+      freeze: true                      # true = вводится фриз деплоев/релизов на период окна
+      severity: "high"                  # low|medium|high — для Risk-матрицы
+      scope:
+        clusters: ["prod-eu1"]
+        namespaces: ["chronowatch"]
+        services: ["api", "worker", "scheduler"]
+        selector:                       # Доп. ограничение через K8s-метки
+          matchLabels:
+            app.kubernetes.io/name: "chronowatch-core"
+      traffic_policy:
+        # Режим управления трафиком: drain|block|degrade
+        mode: "drain"
+        drain:
+          pre_drain_seconds: 60
+          connection_drain_timeout_seconds: 600
+          lb_targets: ["ingress/chronowatch-public", "gateway/api"]
+      db_policy:
+        state: "read-only"              # normal|read-only|offline
+        allow_statements: ["SELECT"]
+        migration:
+          allowed: true
+          require_precheck: true
+          transactional: true
+      feature_flags:
+        read_only_flag: "chronowatch.read_only"
+        banner_flag: "chronowatch.maintenance_banner"
+      rate_limits:
+        enabled: true
+        global_qps: 5
+      slo_impact:
+        expected_availability: "99.0%"
+        error_budget_burn_expected: "2%"
+
+    - name: "EU2 follow-up window"
+      start: "2025-09-08T22:00:00"
+      end:   "2025-09-08T23:30:00"
+      freeze: true
+      scope:
+        clusters: ["prod-eu2"]
+        namespaces: ["chronowatch"]
+        services: ["api"]
+      traffic_policy:
+        mode: "degrade"
+
+controls:
+  approvals:
+    required: 2
+    approvers:
+      - "sre-lead@company.local"
+      - "product-owner@company.local"
+  change_types_allowed:
+    - "config"
+    - "db_migration"
+    - "deployment"
+  # Технические гейты, исполняемые пайплайнами и операторами.
+  gates:
+    cicd:
+      block_deployments: true
+      enforce_in_branches: ["main", "release/*"]
+      required_pr_labels: ["approved-for-maintenance"]
+    kubernetes:
+      add_labels:
+        maintenance.window: "true"
+      add_annotations:
+        maintenance.window/id: "{{ metadata.id }}"
+        maintenance.window/name: "{{ metadata.name }}"
+        maintenance.window/active: "true"
+      pod_disruption_budget:
+        min_available: "50%"           # Ограничить одновременные эвакуации
+    observability:
+      silence_alerts: true
+      silence_scope:
+        providers: ["prometheus", "alertmanager", "grafana"]
+        matchers:
+          - label: "service"
+            value: "chronowatch-core"
+          - label: "env"
+            value: "prod"
+      tracing_sampling: 0.01
+  # Предусловия — должны пройти до начала окна (автопроверки).
+  prechecks:
+    - name: "Error budget has room"
+      type: "slo"
+      slo: "chronowatch-api-availability"
+      operator: ">="
+      threshold: "95%"
+      timeout_seconds: 60
+      must_pass: true
+    - name: "5xx below threshold"
+      type: "promql"
+      query: 'sum(rate(http_requests_total{service="chronowatch-core",status=~"5.."}[5m])) < 1'
+      timeout_seconds: 60
+      must_pass: true
+    - name: "DB replication healthy"
+      type: "sql"
+      dsn: "env:DB_DSN_RO"
+      query: "SELECT 1"
+      timeout_seconds: 30
+      must_pass: true
+  # Постпроверки — подтверждают стабильность после окна.
+  postchecks:
+    - name: "No 5xx spikes after rollout"
+      type: "promql"
+      query: 'max_over_time(rate(http_requests_total{service="chronowatch-core",status=~"5.."}[5m])[30m:]) < 0.1'
+      timeout_seconds: 120
+      must_pass: true
+    - name: "Latency p95 within SLO"
+      type: "promql"
+      query: 'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service="chronowatch-core"}[5m]))) < 0.400'
+      timeout_seconds: 120
+      must_pass: true
+
+notifications:
+  channels:
+    - type: "slack"
+      webhook: "env:SLACK_WEBHOOK_CHRONO"
+      rooms: ["#ops", "#status"]
+    - type: "email"
+      recipients: ["status@company.local", "oncall@company.local"]
+    - type: "telegram"
+      bot_token: "env:TELEGRAM_BOT_TOKEN"
+      chat_ids: ["-1001234567890"]
+    - type: "statuspage"
+      provider: "statuspage"
+      page_id: "YOUR_STATUSPAGE_ID"
+      components: ["API", "Worker"]
+  templates:
+    start:   "Maintenance '{{ metadata.name }}' started, ends at {{ window.end }} {{ schedule.timezone }}. Scope: {{ window.scope.clusters }} {{ window.scope.services }}"
+    remind:  "Maintenance ongoing ({{ status.elapsed }} elapsed, {{ status.remaining }} remaining)."
+    success: "Maintenance '{{ metadata.name }}' completed successfully."
+    failed:  "Maintenance '{{ metadata.name }}' failed. Backout plan initiated."
+    cancel:  "Maintenance '{{ metadata.name }}' canceled."
+  cadence:
+    start: true
+    reminders_every_minutes: 30
+    end: true
+
+risk:
+  level: "medium"                          # low|medium|high
+  impact_summary: "Short read-only DB period and API drain"
+  backout_plan:
+    max_duration_seconds: 900
+    steps:
+      - "Rollback to previous image tag"
+      - "Unset read-only mode"
+      - "Re-enable traffic on LB"
+      - "Unsilence alerts"
+  approvals_reference: "OPS-1234"          # Ссылка на Change/CRQ/Jira
+
+dependencies:
+  upstream_services: ["payments", "identity"]
+  downstream_services: ["analytics"]
+  freeze_windows:                          # Интервалы, когда любые изменения запрещены
+    - "2025-12-20T00:00:00Z/2026-01-05T23:59:59Z"
+  exceptions:
+    - date: "2025-10-31"
+      reason: "Black Friday freeze"
+      allow_emergency_only: true
+
+audit:
+  enabled: true
+  destination: "s3://org-logs/chronowatch/maintenance/"
+  redact_fields:
+    - "notifications.channels[].webhook"
+    - "notifications.channels[].bot_token"
+
+status:
+  result: "planned"                        # planned|active|succeeded|failed|canceled
+  last_transition_time: null
+
+validators:
+  schema_version: ">=1.0.0"
+  # Необязательная ссылка на внешнюю схему для валидации
+  schema_ref: "https://schemas.company.local/chronowatch/maintenance-window.schema.json"

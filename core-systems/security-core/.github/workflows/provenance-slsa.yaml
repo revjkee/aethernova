@@ -1,0 +1,225 @@
+name: provenance-slsa
+
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+# Минимально необходимые права (principle of least privilege)
+permissions:
+  contents: write         # для релиза и загрузки артефактов
+  attestations: write     # для публикации attestations (SLSA provenance)
+  id-token: write         # для OIDC в Sigstore / GitHub Attestations
+  packages: write         # для ghcr, если собираем контейнер
+  actions: read
+  security-events: write  # для загрузки результатов сканирования (SARIF), если потребуется
+
+env:
+  PYTHON_VERSION: "3.12"
+  WORKDIR: "core-systems/security-core"
+  DISTDIR: "dist"
+  SBOM_FILE: "sbom.spdx.json"
+  ARTIFACT_NAME: "security-core-dist"
+  DOCKER_CONTEXT: "."
+  DOCKERFILE: "ops/docker/Dockerfile"
+  IMAGE_NAME: "ghcr.io/${{ github.repository }}/security-core"
+  # Воспроизводимая сборка: фиксируем SOURCE_DATE_EPOCH для детерминизма архива/метаданных
+  SOURCE_DATE_EPOCH: "1234567890"
+
+jobs:
+  build-and-attest-python:
+    name: Build & Attest (Python)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.WORKDIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # нужно для корректного вычисления версии и in-toto материалов
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Enable deterministic build environment
+        run: |
+          export TZ=UTC
+          echo "PYTHONHASHSEED=0" >> $GITHUB_ENV
+          echo "TZ=UTC" >> $GITHUB_ENV
+
+      - name: Upgrade pip tooling
+        run: |
+          python -m pip install --upgrade pip wheel build twine pip-audit
+
+      - name: Install project build deps (PEP 517/518)
+        run: |
+          if [ -f "pyproject.toml" ]; then
+            echo "pyproject.toml detected"
+          else
+            echo "pyproject.toml not found" && exit 1
+          fi
+
+      - name: Dependency security audit (pip-audit)
+        run: |
+          pip-audit -r requirements.txt || true
+        if: hashFiles(format('{0}/requirements.txt', env.WORKDIR)) != ''
+
+      - name: Build sdist & wheel (reproducible)
+        run: |
+          rm -rf ${{ env.DISTDIR }}
+          # SOURCE_DATE_EPOCH обеспечивает стабильные метки времени в архивах
+          export SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+          python -m build --sdist --wheel --outdir ${{ env.DISTDIR }}
+
+      - name: Twine check
+        run: |
+          python -m twine check ${{ env.DISTDIR }}/*
+
+      - name: Generate SBOM (SPDX JSON) with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ env.WORKDIR }}
+          format: spdx-json
+          output-file: ${{ env.SBOM_FILE }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          if-no-files-found: error
+          path: |
+            ${{ env.WORKDIR }}/${{ env.DISTDIR }}/*.whl
+            ${{ env.WORKDIR }}/${{ env.DISTDIR }}/*.tar.gz
+            ${{ env.WORKDIR }}/${{ env.SBOM_FILE }}
+
+      - name: Attest build provenance for Python artifacts (SLSA)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            ${{ env.WORKDIR }}/${{ env.DISTDIR }}/*.whl
+            ${{ env.WORKDIR }}/${{ env.DISTDIR }}/*.tar.gz
+
+  build-and-attest-container:
+    name: Build & Attest (Container)
+    runs-on: ubuntu-latest
+    needs: [ build-and-attest-python ]
+    if: ${{ hashFiles(format('{0}/{1}', env.WORKDIR, env.DOCKERFILE)) != '' }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: vars
+        run: |
+          REF="${GITHUB_REF#refs/}"
+          if [[ "$REF" == tags/* ]]; then
+            TAG="${REF#tags/}"
+          else
+            TAG="sha-${GITHUB_SHA:0:12}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build and push with in-toto provenance & SBOM
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKDIR }}/${{ env.DOCKER_CONTEXT }}
+          file: ${{ env.WORKDIR }}/${{ env.DOCKERFILE }}
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.tag }}
+            ${{ env.IMAGE_NAME }}:latest
+          provenance: true        # GH provenance (in-toto SLSA v1)
+          sbom: true              # Включить SBOM для образа
+
+      - name: Attest build provenance for container (GitHub Attestations)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            /home/runner/work/${{ github.event.repository.name }}/${{ github.event.repository.name }}/**/*.sig
+          # subject-path можно опустить, если rely на buildx provenance
+
+  release:
+    name: Create Release & Upload Assets
+    runs-on: ubuntu-latest
+    needs: [ build-and-attest-python, build-and-attest-container ]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: artifacts
+
+      - name: Generate Release Notes (conventional)
+        id: notes
+        uses: release-drafter/release-drafter@v6
+        with:
+          disable-autolabeler: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          body: ${{ steps.notes.outputs.body || 'Security-core release with SLSA provenance and SPDX SBOM.' }}
+          files: |
+            artifacts/*.whl
+            artifacts/*.tar.gz
+            artifacts/${{ env.SBOM_FILE }}
+
+      - name: Attach provenance attestation to Release
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            artifacts/*.whl
+            artifacts/*.tar.gz
+
+  verify:
+    name: Post-Release Verification (Dry-run)
+    runs-on: ubuntu-latest
+    needs: [ release ]
+    steps:
+      - name: Verify artifacts exist
+        run: |
+          test -f artifacts/${{ env.SBOM_FILE }} || (echo "SBOM missing" && exit 1)
+      - name: Print attestation info
+        run: |
+          echo "Attestations are available via GitHub Attestations API for this run."

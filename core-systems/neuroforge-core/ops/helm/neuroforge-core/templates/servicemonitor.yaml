@@ -1,0 +1,185 @@
+# neuroforge-core/ops/helm/neuroforge-core/templates/servicemonitor.yaml
+{{- /*
+ServiceMonitor for neuroforge-core (Prometheus Operator)
+Values (пример):
+monitoring:
+  enabled: true
+  prometheus:
+    releaseLabel: kube-prometheus-stack
+  namespaceSelector:
+    enabled: false               # по умолчанию тот же namespace
+    any: false                   # если true — {} (любой ns)
+    matchNames: []               # явный список ns
+  commonLabels: {}               # добавочные метки на все ServiceMonitor
+  commonAnnotations: {}          # добавочные аннотации
+  api:
+    enabled: true
+    selector:
+      extraMatchLabels: {}       # доп. метки для matchLabels
+    portName: metrics
+    path: /metrics
+    scheme: http                 # или https
+    interval: 15s
+    scrapeTimeout: 10s
+    honorLabels: true
+    sampleLimit: 0
+    tlsConfig:
+      insecureSkipVerify: false
+      serverName: ""
+    bearerTokenSecret: {}        # { name: ..., key: token }
+    basicAuth: {}                # { secretName: ..., usernameKey: ..., passwordKey: ... }
+    proxyUrl: ""                 # http://user:pass@proxy:port
+    followRedirects: true
+    relabelings: []              # список map
+    metricRelabelings: []        # список map
+    targetLabels: []             # перенос label'ов сервиса в target
+  worker:
+    enabled: false
+    portName: metrics
+    path: /metrics
+    scheme: http
+    interval: 30s
+*/ -}}
+{{- if and (default false .Values.monitoring.enabled) (has "monitoring.coreos.com/v1" .Capabilities.APIVersions) }}
+
+{{- $fullname := include "neuroforge-core.fullname" . | default (printf "%s-%s" .Release.Name .Chart.Name) -}}
+{{- $name := include "neuroforge-core.name" . | default .Chart.Name -}}
+{{- $labels := dict
+      "app.kubernetes.io/name" $name
+      "app.kubernetes.io/instance" .Release.Name
+      "app.kubernetes.io/managed-by" .Release.Service
+      "app.kubernetes.io/version" .Chart.AppVersion
+      "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version)
+-}}
+{{- $promRel := default "kube-prometheus-stack" .Values.monitoring.prometheus.releaseLabel -}}
+{{- $nsSel := .Values.monitoring.namespaceSelector -}}
+{{- $commonLabels := (default dict .Values.monitoring.commonLabels) -}}
+{{- $commonAnn := (default dict .Values.monitoring.commonAnnotations) -}}
+
+{{- define "nf.sm.namespaceselector" -}}
+{{- $nsSel := . -}}
+{{- if and $nsSel $nsSel.enabled -}}
+  {{- if $nsSel.any -}}
+namespaceSelector: {}
+  {{- else if $nsSel.matchNames -}}
+namespaceSelector:
+  matchNames:
+  {{- range $nsSel.matchNames }}
+    - {{ . | quote }}
+  {{- end }}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "nf.sm.endpoint" -}}
+{{- $root := index . 0 -}}
+{{- $cfg := index . 1 -}}
+endpoints:
+  - port: {{ default "metrics" $cfg.portName | quote }}
+    path: {{ default "/metrics" $cfg.path | quote }}
+    scheme: {{ default "http" $cfg.scheme | quote }}
+    interval: {{ default "15s" $cfg.interval | quote }}
+    scrapeTimeout: {{ default "10s" $cfg.scrapeTimeout | quote }}
+    honorLabels: {{ default true $cfg.honorLabels }}
+    {{- if $cfg.sampleLimit }}
+    sampleLimit: {{ $cfg.sampleLimit }}
+    {{- end }}
+    {{- if $cfg.proxyUrl }}
+    proxyUrl: {{ $cfg.proxyUrl | quote }}
+    {{- end }}
+    followRedirects: {{ default true $cfg.followRedirects }}
+    {{- if $cfg.tlsConfig }}
+    tlsConfig:
+      {{- if hasKey $cfg.tlsConfig "insecureSkipVerify" }}
+      insecureSkipVerify: {{ $cfg.tlsConfig.insecureSkipVerify }}
+      {{- end }}
+      {{- if $cfg.tlsConfig.serverName }}
+      serverName: {{ $cfg.tlsConfig.serverName | quote }}
+      {{- end }}
+    {{- end }}
+    {{- if $cfg.bearerTokenSecret }}
+    bearerTokenSecret:
+      name: {{ $cfg.bearerTokenSecret.name | quote }}
+      key:  {{ $cfg.bearerTokenSecret.key  | default "token" | quote }}
+    {{- end }}
+    {{- if $cfg.basicAuth }}
+    basicAuth:
+      username:
+        name: {{ $cfg.basicAuth.secretName | quote }}
+        key:  {{ $cfg.basicAuth.usernameKey | default "username" | quote }}
+      password:
+        name: {{ $cfg.basicAuth.secretName | quote }}
+        key:  {{ $cfg.basicAuth.passwordKey | default "password" | quote }}
+    {{- end }}
+    {{- if $cfg.relabelings }}
+    relabelings:
+{{ toYaml $cfg.relabelings | indent 6 }}
+    {{- end }}
+    {{- if $cfg.metricRelabelings }}
+    metricRelabelings:
+{{ toYaml $cfg.metricRelabelings | indent 6 }}
+    {{- end }}
+{{- end -}}
+
+{{- define "nf.sm.targetlabels" -}}
+{{- $cfg := . -}}
+{{- if $cfg.targetLabels }}
+targetLabels:
+{{- range $cfg.targetLabels }}
+  - {{ . | quote }}
+{{- end }}
+{{- end -}}
+{{- end -}}
+
+{{- /* ===================== API ServiceMonitor ===================== */ -}}
+{{- if (default true .Values.monitoring.api.enabled) }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ printf "%s-api" $fullname | trunc 63 | trimSuffix "-" }}
+  labels:
+{{- toYaml (merge (dict "release" $promRel) $labels $commonLabels) | nindent 4 }}
+  annotations:
+{{- toYaml $commonAnn | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      app.kubernetes.io/name: {{ $name | quote }}
+      app.kubernetes.io/component: "api"
+{{- with .Values.monitoring.api.selector.extraMatchLabels }}
+{{ toYaml . | indent 6 }}
+{{- end }}
+{{- include "nf.sm.namespaceselector" $nsSel | nindent 2 }}
+{{- include "nf.sm.endpoint" (list . .Values.monitoring.api) | nindent 2 }}
+{{- include "nf.sm.targetlabels" .Values.monitoring.api | nindent 2 }}
+---
+{{- end }}
+
+{{- /* ===================== Worker ServiceMonitor ===================== */ -}}
+{{- if (default false .Values.monitoring.worker.enabled) }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ printf "%s-worker" $fullname | trunc 63 | trimSuffix "-" }}
+  labels:
+{{- toYaml (merge (dict "release" $promRel) $labels $commonLabels) | nindent 4 }}
+  annotations:
+{{- toYaml $commonAnn | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      app.kubernetes.io/name: {{ $name | quote }}
+      app.kubernetes.io/component: "worker"
+{{- with .Values.monitoring.worker.selector.extraMatchLabels }}
+{{ toYaml . | indent 6 }}
+{{- end }}
+{{- include "nf.sm.namespaceselector" $nsSel | nindent 2 }}
+{{- include "nf.sm.endpoint" (list . .Values.monitoring.worker) | nindent 2 }}
+{{- include "nf.sm.targetlabels" .Values.monitoring.worker | nindent 2 }}
+{{- end }}
+
+{{- else }}
+{{- /* CRD monitoring.coreos.com/v1 not present or monitoring disabled — ресурсы не создаются */ -}}
+{{- end }}

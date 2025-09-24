@@ -1,0 +1,155 @@
+{{/*
+Helm template for HorizontalPodAutoscaler (multi-component).
+Values contract (examples):
+global:
+  fullnameOverride: ""
+  nameOverride: ""
+components:
+  api:
+    enabled: true
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 10
+      targetRef:
+        apiVersion: "apps/v1"
+        kind: "Deployment"
+        name: "" # if empty -> {{ include "ztc.fullname" . }}-api
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          selectPolicy: Max
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 30
+            - type: Percent
+              value: 100
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          selectPolicy: Min
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 60
+      labels: {}
+      annotations: {}
+  scheduler:
+    enabled: true
+    hpa:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 5
+      metrics:
+        - type: External
+          external:
+            metric:
+              name: queue_length
+              selector:
+                matchLabels:
+                  queue: jobs
+            target:
+              type: AverageValue
+              averageValue: "100"
+*/}}
+
+{{- define "ztc.name" -}}
+{{- default .Chart.Name .Values.global.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ztc.fullname" -}}
+{{- if .Values.global.fullnameOverride -}}
+{{- .Values.global.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := include "ztc.name" . -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ztc.labels.common" -}}
+app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/part-of: {{ include "ztc.fullname" . | quote }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
+{{- end -}}
+
+{{- $hasV2 := .Capabilities.APIVersions.Has "autoscaling/v2" -}}
+{{- $hpaApiVersion := ternary "autoscaling/v2" "autoscaling/v2beta2" $hasV2 -}}
+
+{{- $root := . -}}
+{{- range $compName, $comp := .Values.components }}
+{{- if and $comp.enabled $comp.hpa $comp.hpa.enabled }}
+{{- $min := default 2 $comp.hpa.minReplicas -}}
+{{- $max := default 10 $comp.hpa.maxReplicas -}}
+{{- $tref := default (dict) $comp.hpa.targetRef -}}
+{{- $tapi := default "apps/v1" ($tref.apiVersion | default "") -}}
+{{- $tkind := default "Deployment" ($tref.kind | default "") -}}
+{{- $tname := $tref.name | default (printf "%s-%s" (include "ztc.fullname" $root) $compName) -}}
+{{- $labels := default (dict) $comp.hpa.labels -}}
+{{- $ann := default (dict) $comp.hpa.annotations -}}
+{{- $metrics := default (list (dict "type" "Resource" "resource" (dict "name" "cpu" "target" (dict "type" "Utilization" "averageUtilization" 70)))) $comp.hpa.metrics -}}
+{{- $behavior := $comp.hpa.behavior -}}
+apiVersion: {{ $hpaApiVersion }}
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ printf "%s-%s" (include "ztc.fullname" $root) $compName | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $root.Release.Namespace | quote }}
+  labels:
+    {{- include "ztc.labels.common" $root | nindent 4 }}
+    app.kubernetes.io/name: {{ printf "%s-%s" (include "ztc.fullname" $root) $compName | quote }}
+    app.kubernetes.io/component: {{ $compName | quote }}
+    {{- range $k, $v := $labels }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+  annotations:
+    {{- range $k, $v := $ann }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+spec:
+  minReplicas: {{ $min }}
+  maxReplicas: {{ $max }}
+  scaleTargetRef:
+    apiVersion: {{ $tapi | quote }}
+    kind: {{ $tkind | quote }}
+    name: {{ $tname | quote }}
+  metrics:
+    {{- toYaml $metrics | nindent 4 }}
+  {{- if $behavior }}
+  behavior:
+    {{- toYaml $behavior | nindent 4 }}
+  {{- else }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+  {{- end }}
+---
+{{- end }}
+{{- end }}

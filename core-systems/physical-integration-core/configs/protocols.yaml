@@ -1,0 +1,530 @@
+# physical-integration-core/configs/protocols.yaml
+# Версия формата конфигурации
+apiVersion: integration.aethernova.io/v1
+kind: ProtocolsConfig
+metadata:
+  system: physical-integration-core
+  revision: 1
+  labels:
+    domain: "iiot"
+    component: "edge-gateway"
+  # Контроль совместимости
+  compatibility:
+    minCoreVersion: "1.8.0"
+    maxCoreVersion: "2.x"
+
+# ==========
+# Глобальные пресеты (DRY через якоря)
+# ==========
+presets:
+  retry_backoff_defaults: &retry_backoff_defaults
+    maxAttempts: 8
+    policy: exponential           # exponential|linear|none
+    baseDelayMs: 200
+    maxDelayMs: 15000
+    jitter: full                  # none|equal|full
+    retryableErrors:
+      - TIMEOUT
+      - TEMPORARY_NETWORK
+      - BROKER_OVERLOADED
+      - THROTTLED
+
+  circuit_breaker_strict: &circuit_breaker_strict
+    enabled: true
+    windowSeconds: 60
+    failureRateThreshold: 50      # %
+    slowCallRateThreshold: 50     # %
+    slowCallDurationMs: 5000
+    permittedCallsInHalfOpen: 5
+    slidingWindowType: time
+    waitDurationInOpenStateSeconds: 30
+
+  rate_limits_std: &rate_limits_std
+    enabled: true
+    rps: 200                      # requests/messages per second
+    burst: 400
+    concurrent: 500
+
+  tls_required: &tls_required
+    tls:
+      enabled: true
+      minVersion: TLS1_2
+      ciphers:
+        - TLS_AES_256_GCM_SHA384
+        - TLS_AES_128_GCM_SHA256
+        - TLS_CHACHA20_POLY1305_SHA256
+      verifyPeer: true
+      clientAuth: required        # none|required|optional
+      caBundleRef: secret://pki/roots-ca-bundle
+      certRef: secret://pki/pic-edge-cert
+      keyRef: secret://pki/pic-edge-key
+
+  auth_zero_trust: &auth_zero_trust
+    auth:
+      mode: oauth2_jwt             # none|basic|apikey|mtls|oauth2_jwt
+      jwt:
+        issuer: "https://auth.neurocity.local"
+        audience: "pic.edge"
+        jwksUri: "https://auth.neurocity.local/.well-known/jwks.json"
+        requiredClaims:
+          - sub
+          - exp
+          - iat
+        leewaySeconds: 30
+      acl:
+        default: deny              # deny by default
+        rules:
+          - subject: "svc:edge-ingestor"
+            allow:
+              topics: ["sensors.*", "telemetry.*", "opcua.*", "modbus.*"]
+              operations: ["publish","subscribe","read","write"]
+          - subject: "svc:ops"
+            allow:
+              topics: ["admin.*"]
+              operations: ["subscribe"]
+
+  observability_defaults: &observability_defaults
+    metrics:
+      enabled: true
+      intervalSeconds: 15
+      labels:
+        service: physical-integration-core
+    tracing:
+      enabled: true
+      sampler: parentbased_traceidratio
+      ratio: 0.1
+      exporter: otlp
+      endpoint: "otel-collector.monitoring.svc:4317"
+    logging:
+      level: INFO                  # TRACE|DEBUG|INFO|WARN|ERROR
+      json: true
+      redaction:
+        enabled: true
+        patterns:
+          - '(?i)authorization:\s*bearer\s+[A-Za-z0-9\.\-_]+'
+          - '(?i)apikey[=:]\s*[A-Za-z0-9\-_]{16,}'
+
+  message_policies_defaults: &message_policies_defaults
+    qos: at_least_once            # at_most_once|at_least_once|exactly_once (если поддерживается)
+    compression: auto             # auto|none|gzip|zstd
+    encryption:
+      enabled: true
+      algo: AES256_GCM
+      keyRef: secret://kms/edge-msg-key
+    validation:
+      enabled: true
+      schemaRegistry: "http://schemaregistry.core.svc:8081"
+      failOnUnknownFields: true
+      mode: strict                # strict|lenient
+    idempotency:
+      enabled: true
+      keyStrategy: composite      # messageId|payloadHash|composite
+      fields: ["deviceId","ts","seq"]
+      ttlSeconds: 86400
+    deduplication:
+      enabled: true
+      windowSeconds: 300
+    dlq:
+      enabled: true
+      target: "dlq.protocols"
+      retentionHours: 168
+    transform:
+      enabled: true
+      pipeline:
+        - type: "unwrap"
+          field: "payload"
+        - type: "timestampNormalize"
+          field: "ts"
+          to: "RFC3339"
+        - type: "unitConvert"
+          mappings:
+            - field: "temperature"
+              from: "C"
+              to: "K"
+        - type: "rename"
+          renames: {"device_id":"deviceId","temperature_c":"temperature"}
+        - type: "enrich"
+          source: "kv://assets/registry"
+          keyField: "deviceId"
+          targetField: "asset"
+
+# ==========
+# Профили сред
+# ==========
+profiles:
+  prod:
+    <<: *observability_defaults
+    security:
+      <<: *tls_required
+      <<: *auth_zero_trust
+    runtime:
+      <<: *rate_limits_std
+      <<: *circuit_breaker_strict
+      retries: *retry_backoff_defaults
+      messages: *message_policies_defaults
+  stage:
+    <<: *observability_defaults
+    security:
+      <<: *tls_required
+      <<: *auth_zero_trust
+    runtime:
+      <<: *rate_limits_std
+      retries:
+        <<: *retry_backoff_defaults
+        maxAttempts: 5
+      messages:
+        <<: *message_policies_defaults
+        encryption:
+          enabled: false
+  dev:
+    <<: *observability_defaults
+    security:
+      tls:
+        enabled: false
+      auth:
+        mode: none
+    runtime:
+      rate_limits:
+        enabled: false
+      retries:
+        policy: exponential
+        maxAttempts: 3
+        baseDelayMs: 100
+        maxDelayMs: 2000
+      messages:
+        <<: *message_policies_defaults
+        validation:
+          enabled: true
+          mode: lenient
+        encryption:
+          enabled: false
+
+# ==========
+# Протоколы
+# ==========
+protocols:
+
+  mqtt:
+    enabled: true
+    broker:
+      hosts:
+        - "mqtt-broker.edge.svc:8883"
+      connectTimeoutMs: 5000
+      keepAliveSeconds: 30
+      sessionExpirySeconds: 3600
+      clientIdPrefix: "pic-edge"
+    security:
+      <<: *tls_required
+      auth:
+        mode: oauth2_jwt
+        tokenProvider: "http://token-broker.svc:8080/token"
+        scopes: ["mqtt:publish","mqtt:subscribe"]
+    qos: 1
+    topics:
+      subscriptions:
+        - topic: "sensors/+/telemetry"
+          qos: 1
+          schemaRef: "sr://telemetry.v1.json"
+          routeTo: "bus.telemetry.raw"
+        - topic: "alerts/#"
+          qos: 1
+          schemaRef: "sr://alerts.v1.json"
+          routeTo: "bus.alerts.raw"
+      publications:
+        - topic: "commands/{deviceId}"
+          qos: 1
+          schemaRef: "sr://command.v1.json"
+          sourceFrom: "bus.commands"
+    runtime:
+      <<: *rate_limits_std
+      retries: *retry_backoff_defaults
+      messages: *message_policies_defaults
+
+  amqp:
+    enabled: true
+    broker:
+      uri: "amqps://rabbitmq.core.svc:5671/pic"
+      vhost: "/pic"
+      prefetch: 200
+    security:
+      <<: *tls_required
+      auth:
+        mode: mtls
+    exchanges:
+      - name: "pic.telemetry"
+        type: topic
+        durable: true
+        bindings:
+          - queue: "telemetry.ingest"
+            key: "telemetry.*"
+          - queue: "alerts.ingest"
+            key: "alerts.*"
+    runtime:
+      <<: *rate_limits_std
+      retries: *retry_backoff_defaults
+      messages: *message_policies_defaults
+
+  kafka:
+    enabled: true
+    bootstrapServers:
+      - "kafka-0.kafka.svc:9093"
+      - "kafka-1.kafka.svc:9093"
+    security:
+      sasl:
+        enabled: true
+        mechanism: OAUTHBEARER
+        tokenEndpoint: "https://auth.neurocity.local/oauth/token"
+        clientIdRef: secret://kafka/oauth-client
+        clientSecretRef: secret://kafka/oauth-secret
+      tls:
+        enabled: true
+        verifyPeer: true
+        caBundleRef: secret://pki/roots-ca-bundle
+    topics:
+      produce:
+        - name: "bus.telemetry.raw"
+          acks: all
+          partitions: 12
+          replicationFactor: 3
+          schemaRef: "sr://telemetry.v1.avsc"
+        - name: "bus.alerts.raw"
+          acks: all
+          partitions: 6
+          replicationFactor: 3
+          schemaRef: "sr://alerts.v1.avsc"
+      consume:
+        - name: "bus.commands"
+          groupId: "pic-edge-commands"
+          initialOffset: latest
+          schemaRef: "sr://command.v1.avsc"
+    runtime:
+      <<: *rate_limits_std
+      retries: *retry_backoff_defaults
+      messages:
+        <<: *message_policies_defaults
+        qos: exactly_once               # для Kafka — идемпотентный продюсер + EOS, если поддерживается
+
+  opcua:
+    enabled: true
+    servers:
+      - endpoint: "opc.tcp://opcua-gateway.edge.svc:4840"
+        securityPolicy: "Basic256Sha256"
+        messageSecurityMode: "SignAndEncrypt"
+        userToken:
+          type: "username"
+          usernameRef: secret://opcua/user
+          passwordRef: secret://opcua/pass
+        subscriptions:
+          - name: "lineA"
+            publishingIntervalMs: 500
+            keepAliveCount: 20
+            lifetimeCount: 60
+            nodes:
+              - nodeId: "ns=2;s=LineA.Temperature"
+                samplingIntervalMs: 200
+                schemaRef: "sr://opcua.temperature.v1.json"
+                routeTo: "bus.telemetry.raw"
+              - nodeId: "ns=2;s=LineA.Pressure"
+                samplingIntervalMs: 200
+                schemaRef: "sr://opcua.pressure.v1.json"
+                routeTo: "bus.telemetry.raw"
+    runtime:
+      <<: *rate_limits_std
+      retries: *retry_backoff_defaults
+      messages: *message_policies_defaults
+
+  modbus:
+    enabled: true
+    adapters:
+      - name: "modbus-tcp-1"
+        type: "tcp"
+        host: "modbus.edge.svc"
+        port: 502
+        unitId: 1
+        timeoutMs: 1000
+        pollingMs: 500
+        maps:
+          - register: "holding"
+            address: 40001
+            length: 2
+            codec: "int32_be"
+            field: "temperature"
+            schemaRef: "sr://modbus.temperature.v1.json"
+            routeTo: "bus.telemetry.raw"
+      - name: "modbus-rtu-1"
+        type: "rtu"
+        serial:
+          device: "/dev/ttyUSB0"
+          baudrate: 19200
+          dataBits: 8
+          parity: "E"
+          stopBits: 1
+        unitId: 3
+        timeoutMs: 1500
+        pollingMs: 1000
+        maps:
+          - register: "input"
+            address: 30005
+            length: 2
+            codec: "uint32_le"
+            field: "energyWh"
+            schemaRef: "sr://modbus.energy.v1.json"
+            routeTo: "bus.telemetry.raw"
+    runtime:
+      retries:
+        <<: *retry_backoff_defaults
+        maxAttempts: 12
+        baseDelayMs: 500
+      messages: *message_policies_defaults
+
+  http_webhook:
+    enabled: true
+    server:
+      bind: "0.0.0.0"
+      port: 8443
+      maxBodySizeMb: 16
+      timeouts:
+        readMs: 10000
+        writeMs: 10000
+        idleMs: 60000
+    security:
+      <<: *tls_required
+      auth:
+        mode: oauth2_jwt
+    routes:
+      - path: "/ingest/telemetry"
+        methods: ["POST"]
+        schemaRef: "sr://telemetry.v1.json"
+        routeTo: "bus.telemetry.raw"
+      - path: "/ingest/alerts"
+        methods: ["POST"]
+        schemaRef: "sr://alerts.v1.json"
+        routeTo: "bus.alerts.raw"
+    runtime:
+      <<: *rate_limits_std
+      retries: *retry_backoff_defaults
+      messages: *message_policies_defaults
+
+  grpc:
+    enabled: true
+    server:
+      bind: "0.0.0.0"
+      port: 9443
+      reflection: true
+      maxRecvMb: 32
+    security:
+      <<: *tls_required
+      auth:
+        mode: mtls
+    services:
+      - name: "TelemetryIngest"
+        proto: "sr://proto/telemetry.v1.proto"
+        method: "Ingest"
+        routeTo: "bus.telemetry.raw"
+        schemaRef: "sr://telemetry.v1.json"
+    runtime:
+      retries:
+        <<: *retry_backoff_defaults
+        maxAttempts: 6
+      messages: *message_policies_defaults
+
+  coap:
+    enabled: false
+    note: "Включить при необходимости. Требует DTLS."
+    server:
+      bind: "0.0.0.0"
+      port: 5684
+    security:
+      dtls:
+        psk:
+          enabled: true
+          identityRef: secret://coap/psk-identity
+          keyRef: secret://coap/psk-key
+    paths:
+      - path: "/t"
+        method: "POST"
+        schemaRef: "sr://telemetry.v1.json"
+        routeTo: "bus.telemetry.raw"
+
+  websocket:
+    enabled: true
+    server:
+      bind: "0.0.0.0"
+      port: 9444
+      idleTimeoutMs: 60000
+      maxFrameSizeKb: 256
+    security:
+      <<: *tls_required
+      auth:
+        mode: oauth2_jwt
+    streams:
+      - path: "/ws/telemetry"
+        direction: "ingress"
+        schemaRef: "sr://telemetry.v1.json"
+        routeTo: "bus.telemetry.raw"
+      - path: "/ws/commands"
+        direction: "egress"
+        sourceFrom: "bus.commands"
+        schemaRef: "sr://command.v1.json"
+    runtime:
+      <<: *rate_limits_std
+      retries: *retry_backoff_defaults
+      messages: *message_policies_defaults
+
+# ==========
+# Маршруты и нормализация (шина событий)
+# ==========
+routing:
+  # Нормализованные топики внутренней шины
+  topics:
+    - name: "bus.telemetry.raw"
+      retentionHours: 72
+      partitionsHint: 6
+      schemaRef: "sr://telemetry.v1.avsc"
+    - name: "bus.alerts.raw"
+      retentionHours: 168
+      partitionsHint: 3
+      schemaRef: "sr://alerts.v1.avsc"
+    - name: "bus.commands"
+      retentionHours: 24
+      partitionsHint: 3
+      schemaRef: "sr://command.v1.avsc"
+    - name: "dlq.protocols"
+      retentionHours: 720
+      partitionsHint: 3
+      schemaRef: "sr://error.v1.json"
+
+  # Правила маршрутизации, фильтры, обогащение
+  rules:
+    - from:
+        anyOf:
+          - "bus.telemetry.raw"
+          - "bus.alerts.raw"
+      filters:
+        - type: "schemaValidate"
+        - type: "fieldPresence"
+          required: ["deviceId","ts"]
+      enrich:
+        - type: "lookup"
+          source: "kv://assets/registry"
+          on: "deviceId"
+          as: "asset"
+      to:
+        - topic: "kafka://normalized.telemetry"
+          partitionKey: "deviceId"
+        - topic: "amqp://telemetry.normalized"
+          routingKey: "telemetry.normalized"
+
+# ==========
+# Контроль целостности конфигурации
+# ==========
+constraints:
+  requireTlsInProd: true
+  requireAuthNonDev: true
+  maxQosAtMostOnceInProd: false
+  forbidPlaintextPasswords: true
+
+# ==========
+# Активный профиль (prod|stage|dev)
+# ==========
+activeProfile: "prod"

@@ -1,0 +1,94 @@
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: teslaai-backend-gateway
+  namespace: backend
+  labels:
+    app: teslaai-backend
+    zero-trust: enforced
+    version: v20x-industrial
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      hosts:
+        - "api.teslaai.io"
+      tls:
+        mode: SIMPLE
+        credentialName: tls-backend-cert
+        minProtocolVersion: TLSV1_3
+        httpsRedirect: true
+
+---
+
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: teslaai-backend-vs
+  namespace: backend
+spec:
+  hosts:
+    - "api.teslaai.io"
+  gateways:
+    - teslaai-backend-gateway
+  http:
+    - name: "api-core-route"
+      match:
+        - uri:
+            prefix: /api/v1/
+      route:
+        - destination:
+            host: backend-service.backend.svc.cluster.local
+            port:
+              number: 80
+      retries:
+        attempts: 3
+        perTryTimeout: 2s
+        retryOn: connect-failure,refused-stream
+      fault:
+        abort:
+          percentage:
+            value: 0.5
+          httpStatus: 503
+      timeout: 10s
+      corsPolicy:
+        allowOrigins:
+          - exact: "https://frontend.teslaai.io"
+        allowMethods:
+          - GET
+          - POST
+        allowCredentials: true
+        maxAge: "24h"
+      headers:
+        request:
+          add:
+            X-TeslaAI-Gateway: secure-core
+        response:
+          remove:
+            - Server
+
+---
+
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: backend-ingress-policy
+  namespace: backend
+spec:
+  selector:
+    matchLabels:
+      app: teslaai-backend
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            requestPrincipals: ["*"]
+      when:
+        - key: request.auth.claims[aud]
+          values: ["teslaai-api"]
+        - key: request.auth.claims[iss]
+          values: ["https://auth.teslaai.io"]

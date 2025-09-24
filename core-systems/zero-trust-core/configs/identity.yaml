@@ -1,0 +1,330 @@
+# zero-trust-core/configs/identity.yaml
+# Версия схемы и метаданные
+apiVersion: zerotrust.aethernova/v1
+kind: IdentityConfig
+schema_version: "1.0"
+metadata:
+  name: core-identity
+  tenant: "aethernova"
+  region: "eu-north-1"
+  environment: "${ENV:prod}"          # dev|stage|prod (по умолчанию prod)
+  revision: 1
+  owner: "platform-security@aethernova.example"
+
+# Глобальные параметры безопасности и криптографии
+security:
+  jwt_validation:
+    allowed_algs: ["RS256","ES256","EdDSA"]   # запрет на иные алгоритмы (в т.ч. none)
+    require_jwt_typ: true                     # header.typ == "JWT"
+    forbid_zip: true                          # запрет JWE zip в JWS header
+    forbid_crit: true                         # неизвестные crit => отказ
+    issuer:
+      accepted: ["https://auth.aethernova.example"]  # список доверенных iss
+      allow_sub_issuers: false
+    audience:
+      default: "api://core"
+      accepted: ["api://core","api://admin"]
+      require: true
+    subject:
+      require: false
+      pattern: ""                              # опционально: ^user-|^svc-
+    time:
+      leeway_seconds: 60                       # общий допуск на exp/nbf/iat
+      require_iat: true
+      max_age_seconds: null                    # опционально ограничить «свежесть» iat
+    cnf:                                       # RFC 8705 — привязка к клиентскому сертификату
+      require: false
+      accept_x5t_s256: true
+      accept_x5t: false
+    jwks:
+      cache_ttl_seconds: 300
+      refresh_on_kid_miss: true
+      fail_fast_on_conflict: true              # два разных JWK с одинаковым kid => отказ
+      sources:
+        - id: idp-primary
+          issuer: "https://auth.aethernova.example"
+          jwks_uri: "https://auth.aethernova.example/.well-known/jwks.json"
+          allowed_algs: ["RS256","ES256","EdDSA"]
+          prefer_use_sig: true
+          tls:
+            verify: true
+            ca_bundle: "file:///etc/ssl/certs/ca-bundle.crt"
+            mtls:
+              enabled: false                   # при необходимости клиентский сертификат
+              cert_ref: null                   # vault://pki/client/cert
+              key_ref: null                    # vault://pki/client/key
+        # Дополнительные источники (партнёры/федерации)
+        - id: partner-1
+          issuer: "https://id.partner1.example"
+          jwks_uri: "https://id.partner1.example/.well-known/jwks.json"
+          allowed_algs: ["RS256"]
+          tls:
+            verify: true
+            ca_bundle: "file:///etc/ssl/certs/ca-bundle.crt"
+
+  paseto_validation:                           # если используете PASETO v4.public
+    enabled: false
+    allowed_versions: ["v4"]
+    allowed_purposes: ["public"]
+    keyset_refs: []                            # список ссылок на публичные ключи (vault://, file://)
+
+  mtls:                                        # параметры mTLS / SPIFFE привязки (см. security-core/security/mtls)
+    mode: "proxy"                              # proxy|direct
+    proxy_headers:
+      nginx_cert_header: "ssl-client-cert"
+      nginx_verify_header: "ssl-client-verify"
+      envoy_xfcc_header: "x-forwarded-client-cert"
+      haproxy_cert_header: "x-ssl-client-cert"
+      nginx_cert_is_escaped: true
+      allow_unverified_proxy_flag: false
+      header_prefixes_to_strip: ["http_"]
+    trust:
+      use_system_trust: true
+      extra_ca_pem_path: "/etc/ssl/aethernova/extra-ca.pem"
+      require_chain_validation: true
+      check_eku_client_auth: true
+      require_digital_signature_ku: true
+      require_san: false
+      allow_spiffe: true
+      allowed_spiffe_trust_domains: ["prod.example.com","stage.example.com"]
+      not_before_leeway_sec: 0
+      not_after_leeway_sec: 0
+    binding_policy:
+      verify_cnf: true
+      cnf_field: "cnf"
+      accept_x5t_s256: true
+      accept_x5t: false
+      required_san_dns_suffixes: []
+      required_san_uris_prefixes: []
+      required_subject_regex: ""
+
+# Провайдеры идентичности и федерации
+identity_providers:
+  oidc:
+    - id: okta-primary
+      display_name: "Okta (Primary)"
+      issuer: "https://aethernova.okta.com"
+      client_id: "${OIDC_CLIENT_ID}"
+      client_secret_ref: "vault://kv/zero-trust/okta/client_secret"
+      redirect_uris:
+        - "https://login.aethernova.example/callback/oidc/okta"
+      scopes: ["openid","profile","email","offline_access","groups"]
+      auth_params:
+        prompt: "select_account"
+        response_type: "code"
+        pkce: "S256"
+      jwks:
+        jwks_uri: "https://aethernova.okta.com/oauth2/v1/keys"
+        cache_ttl_seconds: 300
+      backchannel_logout:
+        enabled: true
+        endpoint: "/oidc/backchannel-logout"
+      userinfo:
+        enabled: true
+        required: false
+        attributes_map:                       # сопоставление атрибутов из userinfo
+          email: "$.email"
+          name: "$.name"
+          groups: "$.groups[*]"
+  saml:
+    - id: adfs
+      display_name: "ADFS"
+      entity_id: "urn:aethernova:sp"
+      metadata_url: "https://adfs.aethernova.example/federationmetadata/2007-06/federationmetadata.xml"
+      acs_url: "https://login.aethernova.example/callback/saml/adfs"
+      binding: "POST"                         # POST|Redirect
+      signature:
+        require_signed_assertions: true
+        require_signed_response: true
+        algorithms: ["rsa-sha256"]
+      nameid_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified"
+      attribute_map:
+        email: "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"
+        upn:   "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"
+        groups:"http://schemas.xmlsoap.org/claims/Group"
+  ldap:
+    - id: corp-ldap
+      url: "ldaps://ldap.aethernova.example:636"
+      bind_dn_ref: "vault://kv/zero-trust/ldap/bind_dn"
+      bind_password_ref: "vault://kv/zero-trust/ldap/bind_password"
+      base_dn: "dc=aethernova,dc=example"
+      user_filter: "(&(objectClass=person)(|(uid={input})(mail={input})))"
+      group_filter: "(member={dn})"
+  scim:
+    - id: okta-scim
+      base_url: "https://aethernova.okta.com/api/v1/scim/v2"
+      token_ref: "vault://kv/zero-trust/okta/scim_token"
+      provisioning:
+        users: true
+        groups: true
+        deprovision_on_delete: true
+
+# Сопоставление атрибутов и управление доступом
+attributes:
+  user_mapping:
+    id: "$.sub ?? $.uid ?? $.upn"
+    email: "$.email ?? $.upn"
+    upn: "$.preferred_username ?? $.upn"
+    display_name: "$.name ?? $.cn"
+    groups: "$.groups[*] ?? $.realm_access.roles[*]"
+    device_id: "$.device.id"
+    mfa:
+      methods: "$.amr[*]"                    # OTP/WEBAUTHN/etc.
+  role_mappings:
+    rules:
+      - id: "admin-sre"
+        when:
+          any_group: ["sre-admins","ops-root"]
+        then_roles: ["role:admin","role:sre"]
+        scope: "tenant:aethernova"
+      - id: "readers"
+        when:
+          any_group: ["readers"]
+        then_roles: ["role:read"]
+        scope: "project:*"
+  policy_language: "CEL"                      # для condition выражений в выдаче токенов/решениях
+
+# Политики риска и сигналов устройства
+risk_engine:
+  enabled: true
+  signals:
+    - name: "device_posture"
+      provider: "microsoft_defender"
+      min_score: 0.7
+    - name: "geovelocity"
+      provider: "builtin"
+      max_km_per_min: 50
+    - name: "impossible_travel"
+      provider: "builtin"
+      enabled: true
+  actions:
+    on_high_risk:
+      require_step_up_mfa: true
+      deny_issue_refresh: true
+
+device_posture:
+  attestations:
+    - provider: "google_chrome_enterprise"
+      require_verified_os: true
+      allow_jailbreak: false
+    - provider: "windows_attestation"
+      require_secure_boot: true
+  compliance:
+    os_min_versions:
+      darwin: "13.6.0"
+      windows: "10.0.19045"
+      linux: "5.15.0"
+    required_controls: ["disk_encryption","screen_lock","av_running"]
+
+# Сессии и отзыв токенов
+sessions:
+  access_token_ttl: "15m"
+  id_token_ttl: "5m"
+  refresh_token_ttl: "30d"
+  absolute_session_lifetime: "90d"
+  reuse_detection:
+    enabled: true
+    action: "revoke_family"                   # revoke_one|revoke_family
+revocation:
+  backend: "redis"                            # redis|postgres|memory
+  redis:
+    url: "${REDIS_URL:redis://localhost:6379/0}"
+    namespace: "rev"
+  postgres:
+    dsn: "${REVOCATION_PG_DSN:}"
+  policy:
+    default_ttl_seconds: 2592000              # 30d
+    emit_events: true
+    event_stream: "revocation-events"
+
+# Ограничения/лимиты API логина/выдачи
+limits:
+  request_body_max_bytes: 1048576
+  rate_limit:
+    enabled: true
+    window: "1m"
+    requests: 300
+    per_key: "ip"                             # ip|user|client_id
+
+# Аудит, телеметрия и приватность
+audit:
+  sink: "otlp"                                # otlp|kafka|file
+  otlp:
+    endpoint: "${OTLP_ENDPOINT:https://otlp.aethernova.example:4318}"
+    insecure: false
+  redact:
+    fields:                                   # маскирование PII в логах/событиях
+      - "$.claims.email"
+      - "$.claims.ssn"
+      - "$.subject"
+telemetry:
+  tracing:
+    enabled: true
+    sample_ratio: 0.05
+  metrics:
+    enabled: true
+    exporter: "otlp"
+privacy:
+  pii_minimization:
+    strip_unnecessary_claims: true
+    allowed_claims: ["sub","iss","aud","exp","iat","nbf","jti","sid","amr","cnf"]
+    drop_userinfo_from_id_token: true
+
+# Секреты и интеграция с секрет-менеджером
+secrets:
+  provider: "vault"                           # vault|aws-kms|gcp-kms|azure-kv|file
+  vault:
+    address: "${VAULT_ADDR:https://vault.aethernova.example}"
+    role: "zt-core"
+    path_prefix: "kv/zero-trust"
+    token_ref: "env://VAULT_TOKEN"            # где брать токен (env://, file://, k8s://)
+  kms:                                        # опционально для локального шифрования конфигов
+    enabled: false
+    key_uri: "aws-kms://arn:aws:kms:eu-north-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Профили окружений (оверлеи значений)
+profiles:
+  dev:
+    security:
+      jwt_validation:
+        issuer:
+          accepted: ["https://auth.dev.aethernova.example"]
+        audience:
+          accepted: ["api://core-dev"]
+      jwks:
+        cache_ttl_seconds: 30
+    sessions:
+      access_token_ttl: "30m"
+    audit:
+      sink: "file"
+      file:
+        path: "/var/log/zero-trust/audit-dev.log"
+  stage:
+    security:
+      jwt_validation:
+        issuer:
+          accepted: ["https://auth.stage.aethernova.example"]
+    telemetry:
+      tracing:
+        sample_ratio: 0.1
+  prod:
+    limits:
+      rate_limit:
+        requests: 600
+    telemetry:
+      tracing:
+        sample_ratio: 0.02
+
+# Проверки живости/готовности
+health:
+  readiness_checks:
+    - name: "jwks_reachable"
+      type: "http"
+      url: "https://auth.aethernova.example/.well-known/jwks.json"
+      timeout: "2s"
+    - name: "secrets_backend"
+      type: "vault_token"
+  liveness_checks:
+    - name: "clock_skew"
+      type: "ntp"
+      max_skew_seconds: 2

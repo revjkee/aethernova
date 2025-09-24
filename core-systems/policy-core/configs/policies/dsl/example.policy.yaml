@@ -1,0 +1,373 @@
+# =============================================================================
+# policy-core DSL Policy Bundle (example, industrial)
+# =============================================================================
+apiVersion: policy.aethernova.io/v1alpha3
+kind: PolicyBundle
+metadata:
+  id: "policy-core.bundle.default"
+  name: "Policy Core Default Controls"
+  version: "1.0.0"
+  labels:
+    app.kubernetes.io/part-of: policy-core
+    policy.aethernova.io/profile: strict
+  owners:
+    - team: "devsecops"
+      contact: "security@aethernova.dev"
+  references:
+    risk_profile: "configs/risk.yaml"
+    docs: "docs/policy-core/policies.md"
+
+spec:
+  schema:
+    dsl_version: "1.2"
+    compatibility:
+      min_engine: "0.9.0"
+      max_engine: "2.x"
+
+  # -------------------------
+  # Профили исполнения по окружениям
+  # -------------------------
+  enforcement:
+    default_mode: deny      # deny | warn | dryrun
+    per_environment:
+      dev:     { mode: warn,   explain: true }
+      staging: { mode: warn,   explain: true }
+      prod:    { mode: deny,   explain: true }
+
+  # -------------------------
+  # Источники данных и маппинг полей
+  # -------------------------
+  inputs:
+    k8s:
+      source: "kubernetes.admissionreview.v1"
+      field_map:
+        kind:        "request.kind.kind"
+        namespace:   "request.namespace"
+        object:      "request.object"
+        oldObject:   "request.oldObject"
+        user:        "request.userInfo.username"
+    images:
+      source: "kubernetes.pod.containers[]"
+      field_map:
+        name:        "name"
+        image:       "image"
+        tag:         "image.tag"
+        repo:        "image.repository"
+        digest:      "image.digest"
+        signatures:  "image.signatures[]"   # нормализовано загрузчиком
+    cluster:
+      source: "kubernetes.cluster.snapshot"
+      field_map:
+        np_in_namespace: "networkpolicies.byNamespace[namespace]"
+        limitranges:     "limitranges.byNamespace[namespace]"
+        resourcequotas:  "resourcequotas.byNamespace[namespace]"
+
+  # -------------------------
+  # Общие переменные/утилиты (CEL-подобные выражения)
+  # -------------------------
+  variables:
+    ns: "inputs.k8s.namespace"
+    is_system_ns: "['kube-system','kube-public','kube-node-lease'].contains(ns)"
+    is_nodeport: "inputs.k8s.object.spec.type == 'NodePort'"
+    containers: "inputs.images"
+    has_default_deny_egress: >
+      inputs.cluster.np_in_namespace.exists(np, np.spec.policyTypes.contains('Egress') && np.spec.egress.size() == 0)
+    has_default_deny_ingress: >
+      inputs.cluster.np_in_namespace.exists(np, np.spec.policyTypes.contains('Ingress') && np.spec.ingress.size() == 0)
+
+  # -------------------------
+  # Ссылочные каталоги/константы
+  # -------------------------
+  catalogs:
+    standards:
+      iso27001: ["A.8.16","A.8.28","A.8.34","A.8.35"]
+      nist80053: ["AC-*","AU-*","CM-*","RA-*","SC-*","SI-*"]
+      cis_k8s: ["5.*","6.*"]
+    severities: ["low","medium","high","critical"]
+
+  # -------------------------
+  # Правила
+  # -------------------------
+  rules:
+
+    # 1) Supply chain: подписанные образы и отсутствие :latest
+    - id: "POL-SUP-001"
+      title: "Образы должны быть подписаны. Тег :latest запрещен."
+      category: "supply-chain"
+      severity: "high"
+      references:
+        standards: ["nist80053:CM-*","iso27001:A.8.28"]
+        risks: ["RISK-0002"]
+      match:
+        kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+        namespaces:
+          exclude: ["kube-system"]
+      when: >
+        containers.any(c, c.tag == 'latest' || !(c.signatures.any(s, s.valid == true)))
+      then:
+        deny:
+          code: "IMG_SIGNATURE_REQUIRED"
+          message: "Контейнерные образы должны быть подписаны, тег :latest запрещен."
+          fields:
+            - "spec.template.spec.containers[].image"
+        suggest:
+          - "Замените тег на иммутабельный (sha256 или фиксированный семвер)."
+          - "Подпишите образ (cosign sign) и публикуйте аттестации."
+        patch:
+          strategy: "jsonpatch"
+          ops:
+            - op: "replace"
+              path: "/spec/template/spec/containers/0/image"
+              valueFrom: "containers[0].image.withPinnedDigest()"   # хелпер рантайма
+      examples:
+        good:
+          - name: "svc-api:1.4.2@sha256:deadbeef"
+            signatures: [{issuer: "sigstore", valid: true}]
+        bad:
+          - name: "svc-api:latest"
+            signatures: []
+
+    # 2) Контейнерный рантайм: non-root, readOnlyRootFS, drop caps
+    - id: "POL-CRT-001"
+      title: "Контейнеры должны быть non-root, readOnlyRootFS, с минимальными capabilities."
+      category: "runtime-security"
+      severity: "high"
+      references:
+        standards: ["cis_k8s:5.*","nist80053:CM-*","iso27001:A.8.16"]
+      match:
+        kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+      when: >
+        inputs.k8s.object.spec.template.spec.containers.any(c,
+          !(c.securityContext.runAsNonRoot == true) ||
+          !(c.securityContext.readOnlyRootFilesystem == true) ||
+          !((c.securityContext.capabilities.drop != null) && c.securityContext.capabilities.drop.contains('ALL'))
+        )
+      then:
+        deny:
+          code: "SEC_CTX_HARDENING_REQUIRED"
+          message: "Требуются runAsNonRoot, readOnlyRootFilesystem и drop: ALL."
+          fields:
+            - "spec.template.spec.containers[].securityContext"
+        patch:
+          strategy: "mergepatch"
+          ops:
+            - path: "/spec/template/spec/containers"
+              valueTemplate: |
+                {{ range .object.spec.template.spec.containers -}}
+                - name: {{ .name }}
+                  securityContext:
+                    runAsNonRoot: true
+                    readOnlyRootFilesystem: true
+                    allowPrivilegeEscalation: false
+                    capabilities: { drop: ["ALL"] }
+                {{ end -}}
+
+    # 3) Сеть: в namespace должны быть политики default-deny ingress/egress
+    - id: "POL-NET-001"
+      title: "Включён строгий сетевой периметр (default-deny ingress/egress)."
+      category: "network"
+      severity: "high"
+      references:
+        standards: ["cis_k8s:5.*","nist80053:SC-*"]
+        risks: ["RISK-0001"]
+      match:
+        kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+      when: >
+        !(variables.has_default_deny_ingress) || !(variables.has_default_deny_egress)
+      then:
+        deny:
+          code: "NET_DEFAULT_DENY_REQUIRED"
+          message: "В namespace отсутствуют NetworkPolicy с default-deny для ingress/egress."
+        suggest:
+          - "Примените ops/k8s/base/networkpolicy.yaml для профиля strict."
+
+    # 4) Анти-SSRF: egress только публичный HTTPS, без внутренних диапазонов
+    - id: "POL-NET-002"
+      title: "Egress ограничен публичным HTTPS; внутренние диапазоны запрещены."
+      category: "network"
+      severity: "high"
+      references:
+        standards: ["nist80053:SC-*"]
+        risks: ["RISK-0001"]
+      match:
+        kinds: ["Pod","Deployment","StatefulSet"]
+      when: >
+        inputs.k8s.object.metadata.labels['policy.aethernova.io/egress-profile'] != 'public-https'
+      then:
+        warn:
+          code: "EGRESS_PROFILE_REQUIRED"
+          message: "Установите метку policy.aethernova.io/egress-profile=public-https."
+        patch:
+          strategy: "mergepatch"
+          ops:
+            - path: "/spec/template/metadata/labels"
+              value:
+                policy.aethernova.io/egress-profile: "public-https"
+
+    # 5) Запрет NodePort вне системных пространств
+    - id: "POL-SVC-001"
+      title: "Service типа NodePort запрещён вне системных namespace."
+      category: "exposure"
+      severity: "medium"
+      references:
+        standards: ["cis_k8s:6.*"]
+      match:
+        kinds: ["Service"]
+      when: "variables.is_nodeport && !variables.is_system_ns"
+      then:
+        deny:
+          code: "NODEPORT_FORBIDDEN"
+          message: "Service.type=NodePort запрещён. Используйте Ingress/LoadBalancer с контролем источников."
+
+    # 6) Ресурсы: лимиты и запросы обязательны
+    - id: "POL-RES-001"
+      title: "requests/limits обязательны для всех контейнеров."
+      category: "resources"
+      severity: "medium"
+      references:
+        standards: ["nist80053:CM-*"]
+      match:
+        kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+      when: >
+        inputs.k8s.object.spec.template.spec.containers.any(c,
+          c.resources == null ||
+          c.resources.requests == null ||
+          c.resources.limits == null ||
+          !(c.resources.requests.cpu) || !(c.resources.requests.memory) ||
+          !(c.resources.limits.cpu)   || !(c.resources.limits.memory)
+        )
+      then:
+        deny:
+          code: "RES_LIMITS_REQUIRED"
+          message: "Укажите resources.requests/limits для cpu и memory у всех контейнеров."
+
+  # -------------------------
+  # Исключения (waivers) с жёстким TTL и связью с реестром рисков
+  # -------------------------
+  exceptions:
+    policy:
+      max_days: 90
+      require_links:
+        - "risk.id"
+        - "ticket.url"
+      approvers: ["CISO","CTO","GRC-lead"]
+    waivers:
+      - id: "EXC-1001"
+        rule: "POL-SUP-001"
+        scope:
+          kind: "Deployment"
+          namespace: "payments"
+          name: "policy-api"
+        reason: "Временная несовместимость cosign-verify в admission."
+        risk:
+          id: "RISK-0002"
+          residual_severity: "medium"
+        ticket:
+          url: "https://tracker.local/SEC-4321"
+        granted_by: "CISO"
+        granted_at: "2025-08-28T00:00:00Z"
+        expires_at: "2025-10-31T23:59:59Z"
+
+  # -------------------------
+  # Тест-векторы (исполняются в CI)
+  # -------------------------
+  tests:
+    engine: "policy-core:test-runner@>=1.0"
+    cases:
+
+      - name: "deny latest + unsigned"
+        input:
+          admission:
+            kind: { kind: "Deployment" }
+            namespace: "default"
+            object:
+              metadata: { name: "svc-api" }
+              spec:
+                template:
+                  spec:
+                    containers:
+                      - name: "svc-api"
+                        image: "registry.local/svc-api:latest"
+                        securityContext:
+                          runAsNonRoot: true
+                          readOnlyRootFilesystem: true
+                          capabilities: { drop: ["ALL"] }
+        expect:
+          decision: "deny"
+          rule: "POL-SUP-001"
+          code: "IMG_SIGNATURE_REQUIRED"
+
+      - name: "deny missing securityContext"
+        input:
+          admission:
+            kind: { kind: "Deployment" }
+            namespace: "default"
+            object:
+              metadata: { name: "svc-bad" }
+              spec:
+                template:
+                  spec:
+                    containers:
+                      - name: "svc-bad"
+                        image: "registry/svc-bad:1.2.3@sha256:abc"
+        expect:
+          decision: "deny"
+          rule: "POL-CRT-001"
+          code: "SEC_CTX_HARDENING_REQUIRED"
+
+      - name: "warn set egress profile"
+        input:
+          admission:
+            kind: { kind: "Deployment" }
+            namespace: "default"
+            object:
+              metadata: { name: "svc-net" }
+              spec:
+                template:
+                  metadata:
+                    labels: {}
+                  spec:
+                    containers:
+                      - name: "svc-net"
+                        image: "ok@sha256:abc"
+                        securityContext:
+                          runAsNonRoot: true
+                          readOnlyRootFilesystem: true
+                          capabilities: { drop: ["ALL"] }
+        expect:
+          decision: "warn"
+          rule: "POL-NET-002"
+          patch:
+            contains:
+              - path: "/spec/template/metadata/labels/policy.aethernova.io~1egress-profile"
+                value: "public-https"
+
+      - name: "deny NodePort in user ns"
+        input:
+          admission:
+            kind: { kind: "Service" }
+            namespace: "default"
+            object:
+              metadata: { name: "svc-nodeport" }
+              spec:
+                type: "NodePort"
+                ports: [{ port: 80, targetPort: 8080, nodePort: 30080 }]
+        expect:
+          decision: "deny"
+          rule: "POL-SVC-001"
+          code: "NODEPORT_FORBIDDEN"
+
+  # -------------------------
+  # Генерация целевых артефактов (опционально)
+  # -------------------------
+  generate:
+    targets:
+      - type: "rego"
+        outDir: "generated/policies/rego"
+        modulePrefix: "aethernova/policy-core"
+        naming: "byRuleId"
+      - type: "cel"
+        outDir: "generated/policies/cel"
+    metadata:
+      includeReferences: true
+      embedSeverities: true

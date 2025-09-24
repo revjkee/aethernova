@@ -1,0 +1,320 @@
+# mythos-core/configs/timeline.yaml
+# Schema: declarative release & ML timeline configuration (no secrets).
+# All times are in Europe/Stockholm unless an absolute UTC timestamp is provided.
+
+apiVersion: mythos.timeline/v1
+kind: Timeline
+metadata:
+  name: mythos-core
+  owner: platform@sre.mythos
+  generatedAt: "2025-08-27T00:00:00Z"
+spec:
+  timezone: "Europe/Stockholm"
+
+  defaults:
+    workCalendar:
+      businessDays: ["Mon","Tue","Wed","Thu","Fri"]
+      businessHours: "09:00-18:00"       # local time
+      # Optional examples; replace with your real calendar if нужно.
+      holidays: []                        # e.g. ["2025-01-01","2025-12-25"]
+    sla:
+      ackMinutes: 15
+      resolveHours: 4
+    approvals:
+      required: true
+      minApprovers: 2
+      approverGroups: ["owners", "sre"]
+      changeTicket:
+        system: "jira"
+        projectKey: "MYTH"
+        required: true
+    rollout:
+      waves:
+        - name: "wave-1"
+          percent: 10
+          holdMinutes: 30
+          gates: ["no_5xx_spike","no_latency_regression"]
+        - name: "wave-2"
+          percent: 50
+          holdMinutes: 30
+          gates: ["no_5xx_spike","no_latency_regression"]
+        - name: "wave-3"
+          percent: 100
+          holdMinutes: 0
+          gates: ["no_critical_alerts"]
+    notificationPolicy:
+      # Where generic notifications go if event-level routing is not set
+      channels:
+        - kind: "slack"
+          target: "#mythos-deploys"
+        - kind: "email"
+          target: "ops@mythos"
+      onEvents: ["scheduled","started","hold","resumed","succeeded","failed","canceled"]
+    observability:
+      prometheus:
+        jobSelector: 'job=~"mythos-.*"'
+        # Useful default queries to be reused by gates:
+        queries:
+          errorRate5m: 'sum(increase(llm_demo_http_errors_total[5m]))/clamp_min(sum(increase(llm_demo_http_requests_total[5m])),1)'
+          serveLocalErrors5m: 'sum(increase(serve_local_http_errors_total[5m]))/clamp_min(sum(increase(serve_local_http_requests_total[5m])),1)'
+          workerFailRatio10m: 'sum(increase(neuroforge_jobs_failed_total[10m]))/clamp_min(sum(increase(neuroforge_jobs_total[10m])),1)'
+          workerLoopLatency5m: 'avg_over_time(neuroforge_loop_iteration_seconds[5m])'
+      grafana:
+        dashboards:
+          - name: "Platform Overview"
+            uid: "plat-overview"
+          - name: "LLM Chat"
+            uid: "llm-chat"
+          - name: "Serve Local"
+            uid: "serve-local"
+          - name: "Training Worker"
+            uid: "train-worker"
+    changeFreeze:
+      # Global freeze windows (do not deploy); per-env overrides can add more.
+      windows: []   # e.g. ["2025-12-24T00:00:00+01:00..2025-12-26T23:59:59+01:00"]
+      exceptions:
+        # label-based exceptions: allow only hotfixes with label "hotfix"
+        - allowIfLabelsAnyOf: ["hotfix"]
+
+  profiles:
+    dev:
+      approvals:
+        required: false
+        minApprovers: 0
+      changeFreeze:
+        windows: []
+      rollout:
+        waves:
+          - name: "dev-100"
+            percent: 100
+            holdMinutes: 0
+            gates: []
+    stage:
+      approvals:
+        required: true
+        minApprovers: 1
+      changeFreeze:
+        windows: []
+      rollout:
+        waves:
+          - name: "stage-50"
+            percent: 50
+            holdMinutes: 10
+            gates: ["no_5xx_spike"]
+          - name: "stage-100"
+            percent: 100
+            holdMinutes: 0
+            gates: ["no_critical_alerts"]
+    prod:
+      approvals:
+        required: true
+        minApprovers: 2
+        approverGroups: ["owners","sre","security"]
+      changeFreeze:
+        windows: []
+      rollout:
+        waves:
+          - name: "prod-10"
+            percent: 10
+            holdMinutes: 30
+            gates: ["no_5xx_spike","no_latency_regression"]
+          - name: "prod-50"
+            percent: 50
+            holdMinutes: 30
+            gates: ["no_5xx_spike","no_latency_regression"]
+          - name: "prod-100"
+            percent: 100
+            holdMinutes: 0
+            gates: ["no_critical_alerts"]
+
+  # Reusable templates for event types
+  templates:
+    release.deploy:
+      kind: "release"
+      requiredLabels: ["service","version"]
+      steps:
+        - id: "prechecks"
+          description: "Lint, unit, vuln scan"
+          runbook: "confluence:release-prechecks"
+        - id: "deploy"
+          description: "Apply helm chart"
+          runbook: "runbook://helm/deploy"
+        - id: "postchecks"
+          description: "Smoke, canary checks"
+          runbook: "runbook://qa/smoke"
+      gates:
+        - id: "no_5xx_spike"
+          expr: '({{ .defaults.observability.prometheus.queries.errorRate5m }}) < 0.05'
+          severity: "block"
+        - id: "no_latency_regression"
+          expr: 'avg_over_time(llm_demo_open_connections[5m]) < 1500'
+          severity: "warn"
+        - id: "no_critical_alerts"
+          expr: 'sum(ALERTS{severity="critical",alertstate="firing"}) == 0'
+          severity: "block"
+      notifications:
+        channels:
+          - kind: "slack"
+            target: "#mythos-releases"
+          - kind: "webhook"
+            target: "https://deploy-hooks.internal/mythos"
+            method: "POST"
+            headers:
+              X-Source: "timeline"
+    ml.train:
+      kind: "ml-training"
+      requiredLabels: ["model","dataset"]
+      steps:
+        - id: "queue-job"
+          description: "Create job file in /data/jobs/ready"
+          runbook: "runbook://ml/queue"
+        - id: "monitor"
+          description: "Monitor worker metrics"
+          runbook: "runbook://ml/monitor"
+      gates:
+        - id: "worker_failure_ratio_ok"
+          expr: '({{ .defaults.observability.prometheus.queries.workerFailRatio10m }}) < 0.3'
+          severity: "block"
+        - id: "worker_loop_latency_ok"
+          expr: '({{ .defaults.observability.prometheus.queries.workerLoopLatency5m }}) < 1.5'
+          severity: "warn"
+      notifications:
+        channels:
+          - kind: "slack"
+            target: "#mythos-ml"
+    data.backfill:
+      kind: "data"
+      requiredLabels: ["table"]
+      steps:
+        - id: "pause_writes"
+          description: "Gate producers"
+          runbook: "runbook://data/pause"
+        - id: "backfill"
+          description: "Run backfill job"
+          runbook: "runbook://data/backfill"
+        - id: "resume_writes"
+          description: "Ungate producers"
+          runbook: "runbook://data/resume"
+      gates:
+        - id: "serve_local_error_ok"
+          expr: '({{ .defaults.observability.prometheus.queries.serveLocalErrors5m }}) < 0.05'
+          severity: "warn"
+
+  # Concrete scheduled and ad-hoc events (examples)
+  events:
+    - id: "rel-llm-chat-2025-09-01"
+      usingTemplate: "release.deploy"
+      profile: "prod"
+      name: "Release LLM Chat Demo 1.4.0"
+      labels:
+        service: "llm-chat-demo"
+        version: "1.4.0"
+        jira: "MYTH-1023"
+      when:
+        kind: "window"                       # executes within nextMatchingWindow
+        nextMatchingWindow:
+          cron: "0 10 * * 1-4"               # Mon-Thu at 10:00 local
+          duration: "2h"
+          respectBusinessHours: true
+      rollout:
+        wavesRef: "defaults"                  # use defaults for the profile
+      owners:
+        dri: ["anna@mythos","peter@mythos"]
+        backups: ["sre-oncall@mythos"]
+      dependsOn: []                           # no dependencies
+      notifications:
+        channels:
+          - kind: "slack"
+            target: "#mythos-releases"
+      successCriteria:
+        - "Smoke tests pass"
+        - "Error ratio < 5% for 30m"
+      cancelPolicy:
+        onGateFailure: "auto-hold"            # auto-hold, auto-cancel, continue
+
+    - id: "train-model-emb-2025w36"
+      usingTemplate: "ml.train"
+      profile: "stage"
+      name: "Train embeddings v3 on dataset D2025.08"
+      labels:
+        model: "embeddings-v3"
+        dataset: "D2025_08"
+      when:
+        kind: "schedule"
+        cron: "30 21 * * 1"                   # Mondays 21:30 local
+      owners:
+        dri: ["ml@mythos"]
+      dependsOn:
+        - "rel-llm-chat-2025-09-01"           # example dependency
+      artifacts:
+        output:
+          - "s3://mythos-stage-artifacts/models/emb-v3/{date}"
+      successCriteria:
+        - "Final MSE <= 0.02"
+        - "No worker failures > 30% over 10m"
+
+    - id: "backfill-user-events-2025Q3"
+      usingTemplate: "data.backfill"
+      profile: "prod"
+      name: "Backfill user_events Q3"
+      labels:
+        table: "user_events"
+      when:
+        kind: "timebox"
+        start: "2025-09-15T20:00:00+02:00"
+        end:   "2025-09-16T02:00:00+02:00"
+      owners:
+        dri: ["data-eng@mythos"]
+      dependsOn: []
+      risk:
+        level: "medium"
+        notes: "Requires brief write pause; notify product."
+      successCriteria:
+        - "Backfill completes within 6h"
+        - "Serve Local error ratio < 5% throughout"
+
+  # Optional: global routing and integrations
+  notifications:
+    routes:
+      - match:
+          labels:
+            service: "llm-chat-demo"
+        channels:
+          - kind: "slack"
+            target: "#svc-llm-chat"
+      - match:
+          kind: "ml-training"
+        channels:
+          - kind: "slack"
+            target: "#svc-ml"
+          - kind: "email"
+            target: "ml@mythos"
+
+  integrations:
+    jira:
+      baseUrl: "https://jira.internal"
+      projectKey: "MYTH"
+    webhooks:
+      - name: "deploy-audit"
+        target: "https://audit.internal/hooks/deploy"
+        method: "POST"
+        timeoutSeconds: 5
+        headers:
+          X-Source: "mythos-timeline"
+    # Secrets for integrations are not stored here. Use Kubernetes Secret/CI vault.
+
+  # Validation hints (for CI linters)
+  validation:
+    schemaVersion: "1.0"
+    requiredFields:
+      - "spec.defaults"
+      - "spec.templates"
+      - "spec.events[*].id"
+      - "spec.events[*].usingTemplate"
+      - "spec.events[*].when"
+      - "spec.events[*].owners.dri"
+    constraints:
+      - name: "no-freeze-violations"
+        description: "Events must not overlap freeze windows (unless labeled hotfix)."
+      - name: "approvals-in-prod"
+        description: "prod profile must have minApprovers >= 2"

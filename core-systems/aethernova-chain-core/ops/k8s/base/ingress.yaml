@@ -1,0 +1,183 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aethernova-public-http
+  namespace: aethernova
+  labels:
+    app.kubernetes.io/name: aethernova
+    app.kubernetes.io/part-of: chain-core
+    app.kubernetes.io/component: ingress
+    app.kubernetes.io/tier: edge
+  annotations:
+    # --- Controller / Class ---
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/from-to-www-redirect: "true"
+
+    # --- Timeouts / Buffers ---
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "75s"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "75s"
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "8"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+
+    # --- Rate limiting (per client IP) ---
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    nginx.ingress.kubernetes.io/limit-rate-after: "10m"
+    # Set a separate key for rate limiting (e.g. header for API keys) if needed
+    # nginx.ingress.kubernetes.io/limit-whitelist: "10.0.0.0/8"
+
+    # --- CORS for public APIs (tighten in prod to your domains) ---
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://explorer.dev.aethernova.local, https://explorer.staging.aethernova.local"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "accept, content-type, authorization"
+    nginx.ingress.kubernetes.io/cors-max-age: "86400"
+
+    # --- Security headers & hardening ---
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "63072000"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+    nginx.ingress.kubernetes.io/server-snippet: |
+      # Hide nginx version
+      server_tokens off;
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      # Referrer policy
+      add_header Referrer-Policy "no-referrer" always;
+      # Frame / XSS protections
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header X-XSS-Protection "1; mode=block" always;
+      # Content Security Policy (relax or extend as you expose UI)
+      add_header Content-Security-Policy "default-src 'none'; connect-src 'self' https:; img-src 'self' data:; script-src 'none'; style-src 'none'; base-uri 'none'; frame-ancestors 'none'" always;
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - rpc.dev.aethernova.local
+        - explorer.dev.aethernova.local
+      secretName: aethernova-tls # Provide a TLS secret in the same namespace
+  rules:
+    - host: rpc.dev.aethernova.local
+      http:
+        paths:
+          # JSON-RPC (HTTP)
+          - path: /rpc
+            pathType: Prefix
+            backend:
+              service:
+                name: node-rpc
+                port:
+                  number: 8545
+          # REST API (Explorer/API)
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: explorer-api
+                port:
+                  number: 8080
+    - host: explorer.dev.aethernova.local
+      http:
+        paths:
+          # UI static
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: explorer-ui
+                port:
+                  number: 80
+---
+# Separate Ingress for gRPC to ensure correct backend protocol handling
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aethernova-public-grpc
+  namespace: aethernova
+  labels:
+    app.kubernetes.io/name: aethernova
+    app.kubernetes.io/part-of: chain-core
+    app.kubernetes.io/component: ingress
+    app.kubernetes.io/tier: edge
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180s"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180s"
+    # Optional gRPC keepalive tuning
+    nginx.ingress.kubernetes.io/server-snippet: |
+      grpc_read_timeout 180s;
+      grpc_send_timeout 180s;
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - grpc.dev.aethernova.local
+      secretName: aethernova-tls
+  rules:
+    - host: grpc.dev.aethernova.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: node-grpc
+                port:
+                  number: 9090
+---
+# Internal/admin ingress: metrics, pprof, debug (lock down by IP and class)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aethernova-internal-admin
+  namespace: aethernova
+  labels:
+    app.kubernetes.io/name: aethernova
+    app.kubernetes.io/part-of: chain-core
+    app.kubernetes.io/component: ingress
+    app.kubernetes.io/tier: internal
+  annotations:
+    kubernetes.io/ingress.class: "nginx-internal"
+    # Restrict by source ranges (set to your VPN/NAT)
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30s"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30s"
+    # Optional: mTLS between client and ingress for admin
+    # nginx.ingress.kubernetes.io/auth-tls-secret: "aethernova/admin-ca"
+    # nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    # nginx.ingress.kubernetes.io/auth-tls-verify-depth: "2"
+    # nginx.ingress.kubernetes.io/auth-tls-error-page: "https://httpstatuses.com/403"
+spec:
+  ingressClassName: nginx-internal
+  tls:
+    - hosts:
+        - admin.dev.aethernova.local
+      secretName: aethernova-internal-tls
+  rules:
+    - host: admin.dev.aethernova.local
+      http:
+        paths:
+          # Node metrics (Prometheus scrape)
+          - path: /metrics
+            pathType: Prefix
+            backend:
+              service:
+                name: node-telemetry
+                port:
+                  number: 9100
+          # Optional pprof/debug endpoints (protect with IP/mTLS above)
+          - path: /debug
+            pathType: Prefix
+            backend:
+              service:
+                name: node-debug
+                port:
+                  number: 6060

@@ -1,0 +1,234 @@
+{{- /*
+Ingress шаблон для ledger-core.
+Ожидаемые values (пример):
+ingress:
+  enabled: true
+  className: "nginx"   # или "traefik", или оставить пустым для контроллера по умолчанию
+  annotations: {}
+  hosts:
+    - host: api.ledger.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: {{ include "ledger-core.fullname" . }}-api
+            port: 8080
+          # optional:
+          backendProtocol: http      # http|https|grpc|grpcs
+          websocket: true
+          rewriteTarget: ""          # например: /$1
+        - path: /metrics
+          pathType: Prefix
+          service:
+            name: {{ include "ledger-core.fullname" . }}-api
+            port: 9090
+          backendProtocol: http
+    - host: worker.ledger.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: {{ include "ledger-core.fullname" . }}-worker
+            port: 8081
+          backendProtocol: http
+  tls:
+    - secretName: ledger-core-api-tls
+      hosts: [ "api.ledger.example.com" ]
+  nginx:
+    enableSecurityHeaders: true
+    hstsMaxAge: 31536000
+    enableRateLimit: true
+    rateLimitRPS: 50
+    rateLimitBurst: 100
+    bodySize: 10m
+    proxyReadTimeout: 60s
+    proxySendTimeout: 60s
+    enableStickyCookie: false
+    canary:
+      enabled: false
+      weight: 10
+      header: ""
+      headerValue: ""
+  traefik:
+    entryPoints: [ "websecure" ]
+    kubernetesIngressRoute: false
+  certManager:
+    enabled: true
+    clusterIssuer: "letsencrypt-prod"
+  externalDNS:
+    enabled: true
+    ttl: 300
+  extraAnnotations: {}
+  extraLabels: {}
+  extraRules: []         # список правил IngressRule в сыром виде
+  extraPaths: []         # добавочные paths к первому host'у
+*/ -}}
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "ledger-core.fullname" . }}-ingress
+  labels:
+    app.kubernetes.io/name: {{ include "ledger-core.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/part-of: {{ include "ledger-core.name" . }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    {{- with .Values.ingress.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- /* Базовые аннотации из values */}}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+    {{- /* cert-manager интеграция */}}
+    {{- if and .Values.ingress.certManager.enabled .Values.ingress.certManager.clusterIssuer }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.certManager.clusterIssuer | quote }}
+    {{- end }}
+
+    {{- /* external-dns интеграция */}}
+    {{- if .Values.ingress.externalDNS.enabled }}
+    external-dns.alpha.kubernetes.io/ttl: {{ default 300 .Values.ingress.externalDNS.ttl | quote }}
+    {{- end }}
+
+    {{- /* NGINX-specific безоп. заголовки и настройки */}}
+    {{- if eq (default "" .Values.ingress.className) "nginx" -}}
+      {{- if .Values.ingress.nginx.enableSecurityHeaders }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "{{ default 31536000 .Values.ingress.nginx.hstsMaxAge }}"
+    nginx.ingress.kubernetes.io/server-snippet: |
+      add_header X-Content-Type-Options nosniff always;
+      add_header X-Frame-Options DENY always;
+      add_header Referrer-Policy strict-origin-when-cross-origin always;
+      add_header X-XSS-Protection "1; mode=block" always;
+      add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none';" always;
+      proxy_hide_header Server;
+      more_clear_headers "Server";
+      more_clear_headers "X-Powered-By";
+      more_clear_headers "X-AspNet-Version";
+      more_clear_headers "X-AspNetMvc-Version";
+      more_clear_headers "X-Varnish";
+      more_clear_headers "X-Drupal-Cache";
+      more_clear_headers "X-Generator";
+      more_clear_headers "X-Served-By";
+      more_clear_headers "X-Cache";
+      more_clear_headers "X-Cache-Hits";
+      more_clear_headers "Via";
+      more_clear_headers "X-Turbo-Charged-By";
+      more_clear_headers "X-Runtime";
+      more_clear_headers "X-Request-Id";
+      more_clear_headers "X-Backend";
+      more_clear_headers "X-Hostname";
+      more_clear_headers "X-Php-Version";
+      more_clear_headers "X-Envoy-Upstream-Service-Time";
+      more_clear_headers "X-Kong-Upstream-Latency";
+      more_clear_headers "X-Kong-Proxy-Latency";
+      more_clear_headers "X-Nginx-Upstream-Cache-Status";
+      more_clear_headers "Strict-Transport-Security";
+      more_clear_headers "CF-Cache-Status";
+      more_clear_headers "X-EdgeConnect-Cache-Status";
+      more_clear_headers "X-Proxy-Cache";
+      more_clear_headers "X-Amz-Cf-Id";
+      more_clear_headers "X-Amz-Cf-Pop";
+      more_clear_headers "X-Amzn-Trace-Id";
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ default "10m" .Values.ingress.nginx.bodySize | quote }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ default "60s" .Values.ingress.nginx.proxyReadTimeout | quote }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ default "60s" .Values.ingress.nginx.proxySendTimeout | quote }}
+      {{- end }}
+
+      {{- if .Values.ingress.nginx.enableRateLimit }}
+    nginx.ingress.kubernetes.io/limit-rps: {{ default 50 .Values.ingress.nginx.rateLimitRPS | quote }}
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: {{ default 2 (div (mul (default 100 .Values.ingress.nginx.rateLimitBurst) 1) (default 50 .Values.ingress.nginx.rateLimitRPS)) | quote }}
+      {{- end }}
+
+      {{- if .Values.ingress.nginx.enableStickyCookie }}
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "ledger_affinity"
+    nginx.ingress.kubernetes.io/session-cookie-samesite: "Lax"
+    nginx.ingress.kubernetes.io/session-cookie-secure: "true"
+      {{- end }}
+
+      {{- if .Values.ingress.nginx.canary.enabled }}
+    nginx.ingress.kubernetes.io/canary: "true"
+        {{- if .Values.ingress.nginx.canary.weight }}
+    nginx.ingress.kubernetes.io/canary-weight: "{{ .Values.ingress.nginx.canary.weight }}"
+        {{- end }}
+        {{- if and .Values.ingress.nginx.canary.header .Values.ingress.nginx.canary.headerValue }}
+    nginx.ingress.kubernetes.io/canary-by-header: "{{ .Values.ingress.nginx.canary.header }}"
+    nginx.ingress.kubernetes.io/canary-by-header-value: "{{ .Values.ingress.nginx.canary.headerValue }}"
+        {{- end }}
+      {{- end }}
+    {{- end }}
+
+    {{- /* Traefik-specific: entrypoints через аннотации, если нужно */}}
+    {{- if and (eq (default "" .Values.ingress.className) "traefik") .Values.ingress.traefik.entryPoints }}
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ join "," .Values.ingress.traefik.entryPoints | quote }}
+    {{- end }}
+
+    {{- /* Пользовательские дополнительные аннотации */}}
+    {{- with .Values.ingress.extraAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+
+  {{- /* TLS секции */}}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- range .Values.ingress.tls }}
+    - secretName: {{ .secretName | quote }}
+      hosts:
+        {{- range .hosts }}
+        - {{ . | quote }}
+        {{- end }}
+    {{- end }}
+  {{- end }}
+
+  rules:
+    {{- /* Основные hosts с путями */}}
+    {{- range $host := .Values.ingress.hosts }}
+    - host: {{ $host.host | quote }}
+      http:
+        paths:
+          {{- range $p := $host.paths }}
+          - path: {{ default "/" $p.path | quote }}
+            pathType: {{ default "Prefix" $p.pathType | quote }}
+            {{- /* Для NGINX: поддержки gRPC/WebSocket/Rewrite */}}
+            {{- if eq (default "" $.Values.ingress.className) "nginx" }}
+            {{- $rewrite := $p.rewriteTarget | default "" }}
+            {{- $proto := $p.backendProtocol | default "http" | lower }}
+            {{- $ws := ternary "true" "false" ($p.websocket | default false) }}
+            backend:
+              service:
+                name: {{ $p.service.name | quote }}
+                port:
+                  number: {{ $p.service.port }}
+            {{- if $rewrite }}
+            {{- /* Индивидуальная аннотация на уровень path недоступна; оставляем общий rewrite через map для отдельных ingress'ов при необходимости */}}
+            {{- end }}
+            {{- else }}
+            backend:
+              service:
+                name: {{ $p.service.name | quote }}
+                port:
+                  number: {{ $p.service.port }}
+            {{- end }}
+          {{- end }}
+
+          {{- /* Дополнительные пути, если заданы глобально */}}
+          {{- with $.Values.ingress.extraPaths }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+    {{- end }}
+
+    {{- /* Сырые дополнительные правила IngressRule */}}
+    {{- with .Values.ingress.extraRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

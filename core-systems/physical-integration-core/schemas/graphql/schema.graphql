@@ -1,0 +1,522 @@
+"""===============================
+  physical-integration-core GraphQL API (v1)
+  Промышленный контракт для телеметрии/событий, устройств и пайплайнов.
+==============================="""
+
+"Строгие скаляры для промышленного домена"
+scalar DateTime   # RFC3339, UTC
+scalar UUID
+scalar JSON
+scalar BigInt
+scalar Decimal
+
+"Директивы безопасности и контроля нагрузки"
+directive @auth(
+  requires: [Role!]! = [VIEWER]
+) on OBJECT | FIELD_DEFINITION
+
+directive @rateLimit(
+  window: Int! = 60,      # секунд
+  max: Int! = 120,        # запросов в окно
+  burst: Int! = 60        # мгновенный запас
+) on FIELD_DEFINITION
+
+"Опционально: совместимость с Apollo Federation v2"
+directive @key(fields: String!) repeatable on OBJECT | INTERFACE
+directive @shareable on OBJECT | FIELD_DEFINITION
+directive @external on FIELD_DEFINITION
+directive @provides(fields: String!) on FIELD_DEFINITION
+directive @requires(fields: String!) on FIELD_DEFINITION
+
+"Роли доступа"
+enum Role {
+  VIEWER
+  OPERATOR
+  MAINTAINER
+  ADMIN
+}
+
+"Уровни серьёзности событий"
+enum Severity {
+  TRACE
+  DEBUG
+  INFO
+  WARN
+  ERROR
+  FATAL
+}
+
+"Типы событий"
+enum EventType {
+  TELEMETRY
+  ALERT
+  STATE
+  COMMAND
+  AUDIT
+  DIAGNOSTIC
+}
+
+"Порядок сортировки"
+enum SortOrder {
+  ASC
+  DESC
+}
+
+"Коды ошибок верхнего уровня"
+enum ErrorCode {
+  UNAUTHORIZED
+  FORBIDDEN
+  NOT_FOUND
+  CONFLICT
+  INVALID_INPUT
+  RATE_LIMITED
+  INTERNAL
+  UNAVAILABLE
+  TIMEOUT
+}
+
+"Интерфейс ошибки для унификации ответов"
+interface Error {
+  code: ErrorCode!
+  message: String!
+  details: JSON
+  traceId: String
+}
+
+type FieldError implements Error {
+  code: ErrorCode!
+  message: String!
+  details: JSON
+  traceId: String
+  field: String
+}
+
+"Трасс‑контекст"
+type TraceContext {
+  traceId: String!
+  spanId: String
+  parentSpanId: String
+  sampled: Boolean
+  baggage: JSON
+}
+
+"Аудит и многоарендность"
+type AuditInfo {
+  tenantId: String
+  createdBy: String
+  sourceIp: String
+  labels: JSON
+}
+
+"Качество измерения"
+type Quality {
+  valid: Boolean!
+  flags: [String!]!
+  uncertainty: Float
+}
+
+"Типизированное значение метрики"
+type MetricValue {
+  double: Float
+  int: BigInt
+  bool: Boolean
+  string: String
+  bytesBase64: String
+}
+
+"Метрика"
+type Metric {
+  name: String!
+  unit: String
+  valueType: String!
+  value: MetricValue!
+  status: String
+  labels: JSON
+  sampleTime: DateTime
+  quality: Quality
+}
+
+"Устройство/агрегат"
+type Device @key(fields: "id") {
+  id: ID!
+  model: String
+  firmware: String
+  site: String
+  line: String
+  tags: JSON
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  lastSeenAt: DateTime
+  status: DeviceStatus!
+}
+
+enum DeviceStatus {
+  UNKNOWN
+  ONLINE
+  OFFLINE
+  DEGRADED
+  MAINTENANCE
+}
+
+"Нормализованное событие"
+type Event {
+  id: ID!
+  type: EventType!
+  source: String
+  subject: String
+  device: Device
+  metrics: [Metric!]!
+  attributes: JSON
+  normalizedPayload: JSON
+  eventTime: DateTime!
+  observedTime: DateTime!
+  severity: Severity
+  schemaVersion: String
+  revision: Int
+  parentEventId: ID
+  contentHash: String
+}
+
+"Транспортный конверт (включает trace/audit/raw)"
+type Envelope {
+  id: ID!
+  partitionKey: String
+  ingestTime: DateTime!
+  correlationId: String
+  trace: TraceContext
+  audit: AuditInfo
+  event: Event
+  payloadBase64: String
+  payloadContentType: String
+  payloadEncoding: String
+  payloadCompression: String
+  payloadHash: String
+  dlq: Boolean!
+  dlqReason: Error
+  routing: JSON
+}
+
+"Описатель конвейера"
+type Pipeline {
+  id: ID!
+  name: String!
+  version: String!
+  spec: JSON!          # исходная конфигурация (JSON/YAML)
+  enabled: Boolean!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+"==========================================
+ Relay‑совместимые соединения и пагинация
+==========================================="
+interface Node { id: ID! }
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+type DeviceEdge { node: Device! cursor: String! }
+type DeviceConnection {
+  edges: [DeviceEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type EventEdge { node: Event! cursor: String! }
+type EventConnection {
+  edges: [EventEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type EnvelopeEdge { node: Envelope! cursor: String! }
+type EnvelopeConnection {
+  edges: [EnvelopeEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+"==========================================
+ Фильтры и сортировки
+==========================================="
+input TimeRange {
+  from: DateTime!
+  to: DateTime!
+}
+
+input DeviceFilter {
+  ids: [ID!]
+  site: String
+  line: String
+  model: String
+  tagQuery: JSON     # структура или выражение для сопоставления тегов
+  statusIn: [DeviceStatus!]
+  q: String         # полнотекстовый поиск по id/model/firmware
+}
+
+enum DeviceOrderBy {
+  ID
+  MODEL
+  SITE
+  LINE
+  CREATED_AT
+  UPDATED_AT
+  LAST_SEEN_AT
+  STATUS
+}
+
+input EventFilter {
+  types: [EventType!]
+  deviceIds: [ID!]
+  severityIn: [Severity!]
+  attributes: JSON          # ключ/значение или выражение сопоставления
+  metricName: String
+  metricOp: String          # gt|gte|lt|lte|eq|neq|between
+  metricValue: Decimal
+  time: TimeRange
+  q: String                 # полнотекстовый поиск по source/subject
+}
+
+enum EventOrderBy {
+  EVENT_TIME
+  OBSERVED_TIME
+  SEVERITY
+  TYPE
+}
+
+"==========================================
+ Результаты мутаций с унификацией ошибок
+==========================================="
+type DeviceResult {
+  ok: Boolean!
+  error: Error
+  device: Device
+}
+
+type PipelineResult {
+  ok: Boolean!
+  error: Error
+  pipeline: Pipeline
+}
+
+type IngestResult {
+  ok: Boolean!
+  error: Error
+  envelopeId: ID
+  eventId: ID
+}
+
+"==========================================
+ Query
+==========================================="
+type Query {
+  "Версия/состояние сервиса"
+  serviceInfo: ServiceInfo! @auth(requires: [VIEWER])
+
+  "Получить устройство по ID"
+  device(id: ID!): Device @auth(requires: [VIEWER, OPERATOR])
+
+  "Список устройств с Relay‑пагинацией"
+  devices(
+    filter: DeviceFilter
+    orderBy: DeviceOrderBy = UPDATED_AT
+    order: SortOrder = DESC
+    first: Int = 50
+    after: String
+  ): DeviceConnection! @auth(requires: [VIEWER, OPERATOR])
+
+  "Событие по ID"
+  event(id: ID!): Event @auth(requires: [VIEWER, OPERATOR])
+
+  "Список событий (Relay‑пагинация + фильтры)"
+  events(
+    filter: EventFilter!
+    orderBy: EventOrderBy = EVENT_TIME
+    order: SortOrder = DESC
+    first: Int = 200
+    after: String
+  ): EventConnection! @auth(requires: [VIEWER, OPERATOR]) @rateLimit(window: 60, max: 240, burst: 120)
+
+  "История конвертов (сырые/нормализованные)"
+  envelopes(
+    filter: EventFilter!
+    first: Int = 200
+    after: String
+  ): EnvelopeConnection! @auth(requires: [MAINTAINER, ADMIN]) @rateLimit(window: 60, max: 120, burst: 60)
+
+  "Конвейер по ID"
+  pipeline(id: ID!): Pipeline @auth(requires: [OPERATOR, MAINTAINER])
+
+  "Список конвейеров"
+  pipelines(first: Int = 100, after: String): PipelineConnection! @auth(requires: [OPERATOR, MAINTAINER])
+}
+
+type PipelineEdge { node: Pipeline! cursor: String! }
+type PipelineConnection {
+  edges: [PipelineEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type ServiceInfo {
+  name: String!
+  version: String!
+  gitCommit: String
+  buildDate: DateTime
+  uptimeSec: Int!
+  environment: String!
+  region: String
+  ready: Boolean!
+}
+
+"==========================================
+ Mutation
+==========================================="
+input DeviceInput {
+  id: ID!
+  model: String
+  firmware: String
+  site: String
+  line: String
+  tags: JSON
+}
+
+input DeviceTagPatch {
+  set: JSON
+  removeKeys: [String!]
+}
+
+"Инжест нормализованного события"
+input EventIngestInput {
+  type: EventType!
+  deviceId: ID
+  source: String
+  subject: String
+  metrics: [MetricInput!]
+  attributes: JSON
+  normalizedPayload: JSON
+  eventTime: DateTime!
+  severity: Severity
+  correlationId: String
+  trace: TraceInput
+  audit: AuditInput
+}
+
+input MetricInput {
+  name: String!
+  unit: String
+  value: MetricValueInput!
+  status: String
+  labels: JSON
+  sampleTime: DateTime
+  quality: QualityInput
+}
+
+input MetricValueInput {
+  double: Float
+  int: BigInt
+  bool: Boolean
+  string: String
+  bytesBase64: String
+}
+
+input QualityInput {
+  valid: Boolean = true
+  flags: [String!]
+  uncertainty: Float
+}
+
+input TraceInput {
+  traceId: String!
+  spanId: String
+  parentSpanId: String
+  sampled: Boolean
+  baggage: JSON
+}
+
+input AuditInput {
+  tenantId: String
+  createdBy: String
+  sourceIp: String
+  labels: JSON
+}
+
+"Инжест сырого сообщения (Envelope)"
+input EnvelopeIngestInput {
+  partitionKey: String
+  ingestTime: DateTime
+  correlationId: String
+  trace: TraceInput
+  audit: AuditInput
+  payloadBase64: String!
+  payloadContentType: String!
+  payloadEncoding: String
+  payloadCompression: String
+  routing: JSON
+}
+
+"Управление пайплайнами (видео/телеметрия и др.)"
+input PipelineInput {
+  name: String!
+  version: String!   # версия пользовательского конфига
+  spec: JSON!        # валидированная JSON‑конфигурация (например, по JSON Schema)
+  enabled: Boolean = true
+}
+
+type Mutation {
+  upsertDevice(input: DeviceInput!): DeviceResult!
+    @auth(requires: [OPERATOR, MAINTAINER])
+
+  patchDeviceTags(id: ID!, patch: DeviceTagPatch!): DeviceResult!
+    @auth(requires: [OPERATOR, MAINTAINER])
+
+  ingestEvent(input: EventIngestInput!): IngestResult!
+    @auth(requires: [OPERATOR, MAINTAINER]) @rateLimit(window: 60, max: 600, burst: 200)
+
+  ingestEnvelope(input: EnvelopeIngestInput!): IngestResult!
+    @auth(requires: [OPERATOR, MAINTAINER]) @rateLimit(window: 60, max: 600, burst: 200)
+
+  createPipeline(input: PipelineInput!): PipelineResult!
+    @auth(requires: [MAINTAINER, ADMIN])
+
+  updatePipeline(id: ID!, input: PipelineInput!): PipelineResult!
+    @auth(requires: [MAINTAINER, ADMIN])
+
+  enablePipeline(id: ID!, enabled: Boolean!): PipelineResult!
+    @auth(requires: [MAINTAINER, ADMIN])
+}
+
+"==========================================
+ Subscription (потоковые обновления)
+==========================================="
+input EventStreamFilter {
+  types: [EventType!]
+  deviceIds: [ID!]
+  severityIn: [Severity!]
+  attributes: JSON
+}
+
+type Subscription {
+  "Поток событий с фильтром"
+  eventStream(filter: EventStreamFilter): Event!
+    @auth(requires: [VIEWER, OPERATOR]) @rateLimit(window: 60, max: 300, burst: 150)
+
+  "Изменения статуса устройств"
+  deviceStatus(deviceIds: [ID!]): Device!
+    @auth(requires: [VIEWER, OPERATOR])
+}
+
+"==========================================
+ Депрекейшены и совместимость
+==========================================="
+# Пример: оставляем старое поле для обратной совместимости
+extend type Event {
+  """
+  УСТАРЕВШЕЕ: используйте field 'attributes'.
+  """
+  props: JSON @deprecated(reason: "Use 'attributes' instead")
+}
