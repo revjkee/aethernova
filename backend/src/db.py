@@ -19,6 +19,7 @@ import os
 import sqlalchemy
 from typing import Optional
 from databases import Database
+from .models import metadata
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///app/data/dev.db")
@@ -49,25 +50,18 @@ async def init_db() -> None:
         connected_here = True
 
     try:
-        if DATABASE_URL.startswith("sqlite"):
-            ddl = """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        else:
-            # Postgres-compatible DDL
-            ddl = """
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
-            )
-            """
+        # Prefer migrations (Alembic). As a fallback create tables from
+        # SQLAlchemy metadata using a synchronous engine so DDL is emitted
+        # in a portable way.
+        sync_url = DATABASE_URL
+        # strip async driver suffixes like +aiosqlite or +asyncpg
+        if "+aiosqlite" in sync_url:
+            sync_url = sync_url.replace("+aiosqlite", "")
+        if "+asyncpg" in sync_url:
+            sync_url = sync_url.replace("+asyncpg", "")
 
-        await database.execute(query=sqlalchemy.text(ddl))
+        engine = sqlalchemy.create_engine(sync_url)
+        metadata.create_all(engine)
     finally:
         if connected_here:
             await database.disconnect()
