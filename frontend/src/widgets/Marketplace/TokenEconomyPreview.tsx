@@ -1,3 +1,164 @@
+import React, { useEffect, useState, useRef } from "react";
+
+export type TokenMetric = {
+  id: string;
+  label: string;
+  value: number;
+  history?: { ts: string; value: number }[];
+};
+
+export type TokenEconomyData = {
+  marketCap?: number;
+  circulatingSupply?: number;
+  price?: number;
+  metrics: TokenMetric[];
+  generatedAt?: string;
+};
+
+type UseOpts = {
+  endpoint?: string;
+  pollingIntervalMs?: number | null;
+  retries?: number;
+  timeoutMs?: number;
+};
+
+async function fetchWithTimeout(input: RequestInfo, init: RequestInit = {}, timeout = 8000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const res = await fetch(input, { ...init, signal: controller.signal });
+    clearTimeout(id);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+function useTokenEconomyData(opts: UseOpts = {}) {
+  const { endpoint = "/api/marketplace/token-economy", pollingIntervalMs = null, retries = 2, timeoutMs = 8000 } = opts;
+  const [data, setData] = useState<TokenEconomyData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    let cancelled = false;
+
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+      for (let attempt = 0; attempt <= retries && !cancelled; attempt++) {
+        try {
+          const json = await fetchWithTimeout(endpoint, {}, timeoutMs);
+          if (cancelled) return;
+          setData(json as TokenEconomyData);
+          setLoading(false);
+          return;
+        } catch (err: any) {
+          if (attempt === retries) {
+            setError(err?.message || "fetch_error");
+            setLoading(false);
+          } else {
+            await new Promise((r) => setTimeout(r, 200 * Math.pow(2, attempt)));
+          }
+        }
+      }
+    };
+
+    load();
+
+    let intervalId: number | undefined;
+    if (pollingIntervalMs) {
+      intervalId = window.setInterval(() => void load(), pollingIntervalMs);
+    }
+
+    return () => {
+      cancelled = true;
+      mounted.current = false;
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [endpoint, pollingIntervalMs, retries, timeoutMs]);
+
+  return { data, loading, error };
+}
+
+function Sparkline({ points, width = 120, height = 30, stroke = "#2563eb" }: { points: number[]; width?: number; height?: number; stroke?: string }) {
+  if (!points || points.length === 0) return <svg width={width} height={height} aria-hidden />;
+  const min = Math.min(...points);
+  const max = Math.max(...points);
+  const range = max - min || 1;
+  const step = width / Math.max(points.length - 1, 1);
+  const path = points
+    .map((v, i) => {
+      const x = i * step;
+      const y = height - ((v - min) / range) * height;
+      return `${i === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(" ");
+  return (
+    <svg width={width} height={height} role="img" aria-label="sparkline">
+      <path d={path} fill="none" stroke={stroke} strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+export function TokenEconomyPreview({ endpoint, pollingIntervalMs, className }: { endpoint?: string; pollingIntervalMs?: number | null; className?: string }) {
+  const { data, loading, error } = useTokenEconomyData({ endpoint, pollingIntervalMs, retries: 2, timeoutMs: 8000 });
+
+  return (
+    <section className={className ?? "token-economy-preview"} aria-live="polite">
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <h3 style={{ margin: 0, fontSize: 16 }}>Token Economy</h3>
+        <small style={{ color: "#6b7280" }}>{data?.generatedAt ? new Date(data.generatedAt).toLocaleString() : ""}</small>
+      </header>
+
+      {loading && <div>Loading…</div>}
+      {error && (
+        <div role="alert" style={{ color: "crimson" }}>
+          Error: {error}
+        </div>
+      )}
+
+      {data && (
+        <div>
+          <div style={{ display: "flex", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontSize: 12, color: "#6b7280" }}>Price</div>
+              <div style={{ fontWeight: 600 }}>{data.price ?? "—"}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 12, color: "#6b7280" }}>Market Cap</div>
+              <div style={{ fontWeight: 600 }}>{data.marketCap ?? "—"}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 12, color: "#6b7280" }}>Circulating</div>
+              <div style={{ fontWeight: 600 }}>{data.circulatingSupply ?? "—"}</div>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gap: 8 }}>
+            {data.metrics?.map((m) => {
+              const history = (m.history || []).slice(-20).map((p) => p.value);
+              return (
+                <article key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 12, color: "#6b7280" }}>{m.label}</div>
+                    <div style={{ fontWeight: 600 }}>{m.value}</div>
+                  </div>
+                  <Sparkline points={history} />
+                </article>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+export default TokenEconomyPreview;
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 export type TokenMetric = {
