@@ -1,3 +1,7 @@
 import React from 'react';
-const EthicsRadarChart = () => <div>Ethics Radar Chart</div>;
+
+export const EthicsRadarChart: React.FC = () => {
+	return <div>Ethics Radar Chart</div>;
+};
+
 export default EthicsRadarChart;

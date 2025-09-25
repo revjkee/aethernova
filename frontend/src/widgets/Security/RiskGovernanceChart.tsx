@@ -1,3 +1,7 @@
 import React from 'react';
-const RiskGovernanceChart = () => <div>Risk Governance Chart</div>;
+
+export const RiskGovernanceChart: React.FC = () => {
+	return <div>Risk Governance Chart</div>;
+};
+
 export default RiskGovernanceChart;
