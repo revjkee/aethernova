@@ -1,3 +1,7 @@
 import React from 'react';
-const ProposalTimeline = () => <div>Proposal Timeline</div>;
+
+export const ProposalTimeline: React.FC = () => {
+	return <div>Proposal Timeline</div>;
+};
+
 export default ProposalTimeline;

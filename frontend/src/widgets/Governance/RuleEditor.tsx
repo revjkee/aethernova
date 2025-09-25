@@ -1,3 +1,7 @@
 import React from 'react';
-const RuleEditor = () => <div>Rule Editor</div>;
+
+export const RuleEditor: React.FC = () => {
+	return <div>Rule Editor</div>;
+};
+
 export default RuleEditor;

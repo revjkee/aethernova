@@ -1,3 +1,7 @@
 import React from 'react';
-const PolicyMatrix = () => <div>Policy Matrix</div>;
+
+export const PolicyMatrix: React.FC = () => {
+	return <div>Policy Matrix</div>;
+};
+
 export default PolicyMatrix;
