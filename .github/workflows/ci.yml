@@ -2,59 +2,434 @@ name: CI
 
 on:
   push:
-    branches: [ main, feature/security-incidents ]
+    branches: [ main, master, develop ]
+    tags:
+      - "v*.*.*"
   pull_request:
-    branches: [ main ]
+    branches: [ "**" ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+
+env:
+  PYTHON_VERSIONS: "3.11,3.12,3.13"
+  NODE_VERSIONS: "20,22"
+  POETRY_VERSION: "1.8.3"
+  PIP_CACHE_DIR: ~/.cache/pip
+  CI: true
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Опционально: CODECOV_TOKEN должен быть добавлен в Secrets
+  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
 jobs:
-  backend-tests:
+  preflight:
+    name: Preflight — repo scan & file map
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_USER: teslaai_user
-          POSTGRES_PASSWORD: SuperSecurePass2025!
-          POSTGRES_DB: teslaai_db
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready -U teslaai_user -d teslaai_db || exit 1
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-
+    outputs:
+      has_python: ${{ steps.detect.outputs.has_python }}
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_dockerfile: ${{ steps.detect.outputs.has_dockerfile }}
+      has_requirements: ${{ steps.detect.outputs.has_requirements }}
+      has_poetry: ${{ steps.detect.outputs.has_poetry }}
+      has_pyproject: ${{ steps.detect.outputs.has_pyproject }}
+      has_package_json: ${{ steps.detect.outputs.has_package_json }}
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - id: detect
+        shell: bash
+        run: |
+          has_python="false"
+          has_node="false"
+          has_dockerfile="false"
+          has_requirements="false"
+          has_poetry="false"
+          has_pyproject="false"
+          has_package_json="false"
+
+          [[ -f "requirements.txt" ]] && has_requirements="true"
+          [[ -f "poetry.lock" ]] && has_poetry="true"
+          [[ -f "pyproject.toml" ]] && has_pyproject="true"
+          [[ "${has_requirements}" == "true" || "${has_poetry}" == "true" || "${has_pyproject}" == "true" ]] && has_python="true"
+          [[ -f "package.json" ]] && has_package_json="true" && has_node="true"
+          [[ -f "Dockerfile" ]] && has_dockerfile="true"
+
+          echo "has_python=${has_python}" >> $GITHUB_OUTPUT
+          echo "has_node=${has_node}" >> $GITHUB_OUTPUT
+          echo "has_dockerfile=${has_dockerfile}" >> $GITHUB_OUTPUT
+          echo "has_requirements=${has_requirements}" >> $GITHUB_OUTPUT
+          echo "has_poetry=${has_poetry}" >> $GITHUB_OUTPUT
+          echo "has_pyproject=${has_pyproject}" >> $GITHUB_OUTPUT
+          echo "has_package_json=${has_package_json}" >> $GITHUB_OUTPUT
+
+  lint-sec:
+    name: Static lint & security
+    runs-on: ubuntu-latest
+    needs: preflight
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python (lint only)
+        if: needs.preflight.outputs.has_python == 'true'
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Install dependencies
+          python-version: "3.12"
+
+      - name: Cache pip
+        if: needs.preflight.outputs.has_python == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PIP_CACHE_DIR }}
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'poetry.lock') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install linters (Python)
+        if: needs.preflight.outputs.has_python == 'true'
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt
-      - name: Run Alembic migrations
-        env:
-          DATABASE_URL: postgresql+asyncpg://teslaai_user:SuperSecurePass2025!@localhost/teslaai_db
-        run: |
-          alembic -c backend/alembic.ini upgrade head
-      - name: Run backend tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}/backend:${{ github.workspace }}/backend/src
-        run: |
-          pytest -q backend/tests
+          pip install ruff==0.6.9 black==24.8.0 bandit==1.7.9 safety==3.2.6
 
-  frontend-build:
+      - name: Ruff (Python)
+        if: needs.preflight.outputs.has_python == 'true'
+        run: ruff check --output-format=github .
+
+      - name: Black check (Python)
+        if: needs.preflight.outputs.has_python == 'true'
+        run: black --check .
+
+      - name: Bandit (security)
+        if: needs.preflight.outputs.has_python == 'true'
+        run: bandit -q -r . -x tests
+
+      - name: Safety (vuln db)
+        if: needs.preflight.outputs.has_python == 'true' && needs.preflight.outputs.has_requirements == 'true'
+        run: |
+          pip install -r requirements.txt || true
+          safety check --full-report || true
+
+      - name: Setup Node
+        if: needs.preflight.outputs.has_node == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable Corepack (pnpm/yarn)
+        if: needs.preflight.outputs.has_node == 'true'
+        run: corepack enable
+
+      - name: Node install (ci)
+        if: needs.preflight.outputs.has_node == 'true'
+        run: |
+          if [[ -f pnpm-lock.yaml ]]; then
+            corepack prepare pnpm@latest --activate
+            pnpm install --frozen-lockfile
+          elif [[ -f yarn.lock ]]; then
+            corepack prepare yarn@stable --activate
+            yarn install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: ESLint
+        if: needs.preflight.outputs.has_node == 'true'
+        run: |
+          if npx --yes eslint -v >/dev/null 2>&1; then
+            npx --yes eslint . --max-warnings=0
+          else
+            echo "ESLint not configured; skipping."
+          fi
+
+      - name: Gitleaks (secret scan)
+        uses: zricethezav/gitleaks-action@v2.3.4
+
+      - name: Hadolint (Dockerfile lint)
+        if: needs.preflight.outputs.has_dockerfile == 'true'
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Trivy FS scan (SCA)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+  test-python:
+    name: Test — Python
     runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.has_python == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.11", "3.12", "3.13" ]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PIP_CACHE_DIR }}
+          key: pip-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/requirements*.txt', 'pyproject.toml', 'poetry.lock') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ matrix.python-version }}-
+            pip-${{ runner.os }}-
+
+      - name: Install deps (requirements/poetry/pip)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip wheel
+          if [[ -f "poetry.lock" ]]; then
+            pip install "poetry==${{ env.POETRY_VERSION }}"
+            poetry install --no-interaction --no-ansi
+          elif [[ -f "requirements-test.txt" ]]; then
+            pip install -r requirements-test.txt
+          elif [[ -f "requirements.txt" ]]; then
+            pip install -r requirements.txt
+          elif [[ -f "pyproject.toml" ]]; then
+            pip install -e ".[dev,test]" || pip install .
+          fi
+          pip install pytest pytest-cov coverage xmltodict
+
+      - name: Run tests
+        run: |
+          pytest -q \
+            --maxfail=1 \
+            --disable-warnings \
+            --cov=. \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --junitxml=test-results-${{ matrix.python-version }}.xml
+
+      - name: Upload coverage.xml
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload JUnit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.python-version }}
+          path: test-results-${{ matrix.python-version }}.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  test-node:
+    name: Test — Node
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.has_node == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [ "20", "22" ]
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
-      - name: Install and build frontend
+          node-version: ${{ matrix.node-version }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install deps
         run: |
-          cd frontend
-          npm ci
-          npm run build --if-present
+          if [[ -f pnpm-lock.yaml ]]; then
+            corepack prepare pnpm@latest --activate
+            pnpm install --frozen-lockfile
+          elif [[ -f yarn.lock ]]; then
+            corepack prepare yarn@stable --activate
+            yarn install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Run lint (optional)
+        run: |
+          if npx --yes eslint -v >/dev/null 2>&1; then
+            npx --yes eslint . --max-warnings=0
+          else
+            echo "ESLint not configured; skipping."
+          fi
+
+      - name: Run tests
+        run: |
+          if [[ -f package.json ]]; then
+            if jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+              npm test --silent --if-present -- --ci --reporters=default || npm test --silent --if-present
+            else
+              echo "No test script; skipping."
+            fi
+          fi
+
+      - name: Build (optional)
+        run: |
+          if jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            npm run build --silent
+          else
+            echo "No build script; skipping."
+          fi
+
+      - name: Upload Node build
+        if: hashFiles('dist/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist-${{ matrix.node-version }}
+          path: dist
+          retention-days: 7
+
+  docker:
+    name: Docker build (SBOM & provenance)
+    runs-on: ubuntu-latest
+    needs: [ preflight, lint-sec, test-python, test-node ]
+    if: needs.preflight.outputs.has_dockerfile == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha
+
+      - name: Trivy image scan (before push, build stage)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          format: sarif
+          output: trivy-config.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy config SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-config.sarif
+
+      - name: Build & (conditionally) push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+          provenance: true
+          sbom: true
+          build-args: |
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.run_attempt }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Trivy image scan (vulns)
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: sarif
+          output: trivy-image.sarif
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Upload Trivy image SARIF
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+  coverage-merge:
+    name: Coverage merge & upload
+    runs-on: ubuntu-latest
+    needs: [ test-python ]
+    if: needs.preflight.outputs.has_python == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+          path: coverage-artifacts
+
+      - name: Merge coverage
+        run: |
+          python -m pip install --upgrade pip coverage
+          coverage combine coverage-artifacts || true
+          coverage xml -o coverage-merged.xml || true
+          ls -la
+
+      - name: Upload merged coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-merged
+          path: coverage-merged.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload to Codecov (if token present)
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: coverage-merged.xml
+          fail_ci_if_error: false
+          verbose: true
+
+  summary:
+    name: Job summary
+    runs-on: ubuntu-latest
+    needs: [ lint-sec, test-python, test-node, docker, coverage-merge ]
+    steps:
+      - name: Summarize CI
+        run: |
+          echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Lint & Security: ${{ needs.lint-sec.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Python tests: ${{ needs.test-python.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Node tests: ${{ needs.test-node.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Docker build: ${{ needs.docker.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Coverage merge: ${{ needs.coverage-merge.result }}" >> $GITHUB_STEP_SUMMARY

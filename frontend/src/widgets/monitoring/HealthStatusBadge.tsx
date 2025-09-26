@@ -43,7 +43,7 @@ export const HealthStatusBadge: React.FC<Props> = ({ subsystemId, size = 'md' })
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
 
   const socket = useWebSocket(`/ws/health/${subsystemId}`, {
-    onMessage: (raw) => {
+    onMessage: (raw: string) => {
       try {
         const data: SubsystemHealth = JSON.parse(raw)
         if (data?.status) {
@@ -111,5 +111,3 @@ export const HealthStatusBadge: React.FC<Props> = ({ subsystemId, size = 'md' })
     </TooltipProvider>
   )
 }
-
-export

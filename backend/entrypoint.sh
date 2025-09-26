@@ -1,82 +1,291 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# backend/entrypoint.sh
+#
+# Промышленная обертка для контейнера backend:
+# - Безопасные флаги bash: немедленный выход на ошибках
+# - Ожидание зависимостей: PostgreSQL, Redis, RabbitMQ (опционально)
+# - Prestart hook: scripts/prestart.sh (если существует и исполняемый)
+# - Миграции БД через Alembic (включаются флагом)
+# - Запуск API (gunicorn с uvicorn worker) или uvicorn в DEV
+# - Запуск фоновых воркеров/планировщиков (пример на Celery — опционально)
+# - Корректное завершение по сигналам SIGTERM/SIGINT
+#
+# Требуемые/опциональные переменные окружения (с дефолтами):
+#   APP_MODULE="app.main:app"     # путь к ASGI приложению
+#   HOST="0.0.0.0"
+#   PORT="8000"
+#   WORKERS="2"                   # кол-во воркеров gunicorn
+#   LOG_LEVEL="info"              # debug|info|warning|error|critical
+#   DEV_MODE="0"                  # 1 => uvicorn --reload
+#   RUN_DB_MIGRATIONS="1"         # 1 => alembic upgrade head при запуске API
+#   WAIT_FOR_DB="1"               # ждать ли БД (Postgres)
+#   DB_HOST, DB_PORT              # например: DB_HOST=postgres, DB_PORT=5432
+#   WAIT_FOR_REDIS="0"            # ждать ли Redis
+#   REDIS_HOST, REDIS_PORT
+#   WAIT_FOR_RABBIT="0"           # ждать ли RabbitMQ
+#   RABBIT_HOST, RABBIT_PORT
+#   ALEMBIC_CONFIG="alembic.ini"  # путь к ini
+#   CELERY_APP="app.worker:celery_app"  # модуль Celery (если используется)
+#   CELERY_CONCURRENCY="1"
+#   PRESTART_HOOK="scripts/prestart.sh" # путь к хук-скрипту
+#
+# Примеры:
+#   ./entrypoint.sh api
+#   ./entrypoint.sh migrate
+#   ./entrypoint.sh worker
+#   ./entrypoint.sh scheduler
+#   ./entrypoint.sh healthcheck
 
-cd /app || exit 1
+set -Eeuo pipefail
 
-# Wait for Postgres to be ready (if DATABASE_URL points to Postgres)
-DB_URL=${DATABASE_URL:-}
-# If DATABASE_URL is not provided via compose interpolation, try to build it
-# from POSTGRES_* env vars that are loaded via env_file. This makes the
-# container robust when compose variable substitution didn't occur.
-if [[ -z "$DB_URL" && -n "${POSTGRES_USER:-}" ]]; then
-  POSTGRES_HOST=${POSTGRES_HOST:-db}
-  POSTGRES_PORT=${POSTGRES_PORT:-5432}
-  DB_URL="postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}/${POSTGRES_DB}"
-  export DATABASE_URL="$DB_URL"
-  echo "Constructed DATABASE_URL from POSTGRES_*: $DB_URL"
-fi
+#####################################
+# Логи и сигналы
+#####################################
+log()  { printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${1}" "${*:2}"; }
+info() { log "INFO" "$@"; }
+warn() { log "WARN" "$@"; }
+err()  { log "ERROR" "$@" >&2; }
 
-if [[ -z "$DB_URL" ]]; then
-  echo "DATABASE_URL not set and POSTGRES_USER missing; falling back to db:5432 for readiness checks"
-  host=db
-  port=5432
-  check_db=true
-else
-  check_db=false
-fi
+child_pid=""
 
-if [[ "$DB_URL" != "" && "$DB_URL" == postgresql* ]]; then
-  echo "Waiting for Postgres to be ready..."
-  # Extract host and port robustly from URL like user:pass@host:port/db
-  tail=${DB_URL#*@}
-  host_port=${tail%%/*}
-  host=${host_port%%:*}
-  if [[ "$host_port" == *":"* ]]; then
-    port=${host_port#*:}
-  else
-    port=5432
+graceful_shutdown() {
+  warn "Получен сигнал. Корректное завершение (PID=${child_pid:-none})..."
+  if [[ -n "${child_pid}" ]] && ps -p "${child_pid}" >/dev/null 2>&1; then
+    kill -TERM "${child_pid}" || true
+    # Даем времени завершиться дочерним процессам:
+    for i in {1..30}; do
+      if ! ps -p "${child_pid}" >/dev/null 2>&1; then
+        info "Дочерний процесс завершен."
+        break
+      fi
+      sleep 1
+    done
+    # Форс, если не завершился:
+    if ps -p "${child_pid}" >/dev/null 2>&1; then
+      warn "Форс-завершение дочернего процесса..."
+      kill -KILL "${child_pid}" || true
+    fi
   fi
-  # sanity: default host if empty
-  host=${host:-db}
-  attempts=0
-  max_attempts=120
-  until pg_isready -h "$host" -p "$port" >/dev/null 2>&1; do
-    attempts=$((attempts+1))
-    echo "Postgres not ready yet (attempt $attempts/$max_attempts), sleeping 2s..."
-    sleep 2
-    if [ "$attempts" -gt "$max_attempts" ]; then
-      echo "Postgres did not become ready in time" >&2
-      break
+  exit 0
+}
+
+trap graceful_shutdown SIGINT SIGTERM
+
+#####################################
+# Конфигурация по умолчанию
+#####################################
+APP_MODULE="${APP_MODULE:-app.main:app}"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"
+WORKERS="${WORKERS:-2}"
+LOG_LEVEL="${LOG_LEVEL:-info}"
+DEV_MODE="${DEV_MODE:-0}"
+
+RUN_DB_MIGRATIONS="${RUN_DB_MIGRATIONS:-1}"
+WAIT_FOR_DB="${WAIT_FOR_DB:-1}"
+DB_HOST="${DB_HOST:-postgres}"
+DB_PORT="${DB_PORT:-5432}"
+
+WAIT_FOR_REDIS="${WAIT_FOR_REDIS:-0}"
+REDIS_HOST="${REDIS_HOST:-redis}"
+REDIS_PORT="${REDIS_PORT:-6379}"
+
+WAIT_FOR_RABBIT="${WAIT_FOR_RABBIT:-0}"
+RABBIT_HOST="${RABBIT_HOST:-rabbitmq}"
+RABBIT_PORT="${RABBIT_PORT:-5672}"
+
+ALEMBIC_CONFIG="${ALEMBIC_CONFIG:-alembic.ini}"
+
+CELERY_APP="${CELERY_APP:-app.worker:celery_app}"
+CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-1}"
+
+PRESTART_HOOK="${PRESTART_HOOK:-scripts/prestart.sh}"
+
+#####################################
+# Утилиты
+#####################################
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Ожидание TCP-порта (nc или bash /dev/tcp)
+wait_for_host_port() {
+  local host="$1"
+  local port="$2"
+  local timeout="${3:-60}"
+  local start_ts
+  start_ts=$(date +%s)
+
+  info "Ожидание ${host}:${port} (таймаут ${timeout}s)..."
+  while true; do
+    if have_cmd nc; then
+      if nc -z "${host}" "${port}" >/dev/null 2>&1; then
+        info "Доступен ${host}:${port}"
+        return 0
+      fi
+    else
+      # fallback через bash tcp
+      if (echo >/dev/tcp/"${host}"/"${port}") >/dev/null 2>&1; then
+        info "Доступен ${host}:${port}"
+        return 0
+      fi
+    fi
+    sleep 1
+    local now_ts
+    now_ts=$(date +%s)
+    if (( now_ts - start_ts >= timeout )); then
+      err "Таймаут ожидания ${host}:${port} (${timeout}s)."
+      return 1
     fi
   done
-  echo "Postgres readiness check finished (host=$host port=$port)"
-fi
+}
 
-if [ "${check_db}" = true ]; then
-  echo "Waiting for Postgres to be ready (fallback db:5432)..."
-  attempts=0
-  max_attempts=120
-  until pg_isready -h "db" -p "5432" >/dev/null 2>&1; do
-    attempts=$((attempts+1))
-    echo "Postgres (db:5432) not ready yet (attempt $attempts/$max_attempts), sleeping 2s..."
-    sleep 2
-    if [ "$attempts" -gt "$max_attempts" ]; then
-      echo "Postgres did not become ready in time" >&2
-      break
+wait_dependencies() {
+  local timeout="${1:-90}"
+
+  if [[ "${WAIT_FOR_DB}" == "1" ]]; then
+    wait_for_host_port "${DB_HOST}" "${DB_PORT}" "${timeout}"
+  fi
+
+  if [[ "${WAIT_FOR_REDIS}" == "1" ]]; then
+    wait_for_host_port "${REDIS_HOST}" "${REDIS_PORT}" "${timeout}"
+  fi
+
+  if [[ "${WAIT_FOR_RABBIT}" == "1" ]]; then
+    wait_for_host_port "${RABBIT_HOST}" "${RABBIT_PORT}" "${timeout}"
+  fi
+}
+
+run_prestart_hook() {
+  if [[ -f "${PRESTART_HOOK}" ]]; then
+    if [[ -x "${PRESTART_HOOK}" ]]; then
+      info "Выполняю prestart hook: ${PRESTART_HOOK}"
+      "${PRESTART_HOOK}"
+    else
+      warn "Prestart hook найден, но не исполняемый. Запуск через интерпретатор bash."
+      bash "${PRESTART_HOOK}"
     fi
-  done
-fi
+  else
+    info "Prestart hook не найден (${PRESTART_HOOK}), пропускаю."
+  fi
+}
 
-# Diagnostic listing to help debug mounted files inside the container
-echo "Contents of /app:" 
-ls -la /app || true
+alembic_upgrade() {
+  if [[ -f "${ALEMBIC_CONFIG}" ]]; then
+    info "Выполняю миграции: alembic upgrade head"
+    alembic -c "${ALEMBIC_CONFIG}" upgrade head
+  else
+    warn "Файл Alembic не найден (${ALEMBIC_CONFIG}). Пропускаю миграции."
+  fi
+}
 
-# Run migrations (use absolute path to config inside container)
-ALEMBIC_CONFIG=/app/alembic.ini
-if command -v alembic >/dev/null 2>&1; then
-  echo "Running alembic upgrade head with config $ALEMBIC_CONFIG..."
-  alembic -c "$ALEMBIC_CONFIG" upgrade head || echo "alembic failed, continuing"
-fi
+#####################################
+# Команды запуска
+#####################################
+cmd_api() {
+  wait_dependencies "120"
+  run_prestart_hook
+  if [[ "${RUN_DB_MIGRATIONS}" == "1" ]]; then
+    alembic_upgrade
+  fi
 
-# Start production server with Gunicorn + Uvicorn workers
-exec gunicorn -k uvicorn.workers.UvicornWorker "src.main:app" -b 0.0.0.0:8000 --workers 2
+  if [[ "${DEV_MODE}" == "1" ]]; then
+    info "DEV_MODE=1 — запускаю uvicorn с авто-перезагрузкой."
+    uvicorn "${APP_MODULE}" --host "${HOST}" --port "${PORT}" --log-level "${LOG_LEVEL}" --reload &
+    child_pid=$!
+  else
+    info "Запускаю gunicorn (uvicorn workers)."
+    # Примечание: при необходимости добавьте --graceful-timeout/--timeout по вашим SLO/SLA.
+    gunicorn "${APP_MODULE}" \
+      --worker-class uvicorn.workers.UvicornWorker \
+      --bind "${HOST}:${PORT}" \
+      --workers "${WORKERS}" \
+      --log-level "${LOG_LEVEL}" \
+      --access-logfile "-" \
+      --error-logfile "-" &
+    child_pid=$!
+  fi
+
+  wait "${child_pid}"
+}
+
+cmd_migrate() {
+  wait_dependencies "120"
+  alembic_upgrade
+}
+
+cmd_worker() {
+  wait_dependencies "120"
+  run_prestart_hook
+
+  if ! have_cmd celery; then
+    err "Celery не установлен, команда worker недоступна."
+    exit 1
+  fi
+
+  info "Запускаю Celery worker (app=${CELERY_APP}, concurrency=${CELERY_CONCURRENCY})"
+  celery -A "${CELERY_APP}" worker \
+    --concurrency "${CELERY_CONCURRENCY}" \
+    --loglevel "${LOG_LEVEL}" &
+  child_pid=$!
+  wait "${child_pid}"
+}
+
+cmd_scheduler() {
+  wait_dependencies "120"
+  run_prestart_hook
+
+  if ! have_cmd celery; then
+    err "Celery не установлен, команда scheduler недоступна."
+    exit 1
+  fi
+
+  info "Запускаю Celery beat (app=${CELERY_APP})"
+  celery -A "${CELERY_APP}" beat --loglevel "${LOG_LEVEL}" &
+  child_pid=$!
+  wait "${child_pid}"
+}
+
+cmd_healthcheck() {
+  # Простой healthcheck: наличие процесса python/gunicorn не проверяем — скрипт вызывается самостоятельной командой.
+  # Здесь можно дополнить проверку доступности зависимостей/миграций/версий.
+  info "HEALTHCHECK OK"
+}
+
+cmd_shell() {
+  info "Открываю интерактивную оболочку bash."
+  exec bash
+}
+
+#####################################
+# Разбор аргумента
+#####################################
+main() {
+  local cmd="${1:-api}"
+
+  case "${cmd}" in
+    api)
+      cmd_api
+      ;;
+    migrate|migration|migrations)
+      cmd_migrate
+      ;;
+    worker)
+      cmd_worker
+      ;;
+    scheduler|beat)
+      cmd_scheduler
+      ;;
+    healthcheck)
+      cmd_healthcheck
+      ;;
+    shell)
+      cmd_shell
+      ;;
+    *)
+      err "Неизвестная команда: ${cmd}
+Доступные команды: api | migrate | worker | scheduler | healthcheck | shell"
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

@@ -17,10 +17,10 @@ interface ExplanationEvent {
   critical: boolean
 }
 
-const explanationColor = {
+const explanationColor: Record<string, string> = {
   default: 'border-muted',
   bias: 'border-yellow-500',
-  non-transparent: 'border-blue-500',
+  'non-transparent': 'border-blue-500',
   risk: 'border-red-500',
   error: 'border-destructive',
 }

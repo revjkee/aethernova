@@ -1,209 +1,538 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from "react";
+import {
+  Radar,
+  RadarChart,
+  PolarGrid,
+  PolarAngleAxis,
+  PolarRadiusAxis,
+  ResponsiveContainer,
+  Tooltip as ReTooltip,
+  Legend,
+} from "recharts";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Download, RefreshCw, AlertTriangle, Info } from "lucide-react";
 
-export type ComplianceMetric = {
-  id: string;
-  label: string;
-  score: number; // 0..100
+/**
+ * Тип отдельного домена соответствия.
+ * score: текущая оценка в диапазоне 0–100
+ * target: целевой порог (0–100), по умолчанию 85
+ * weight: вес домена при расчете интегрального индекса (0..1), по умолчанию равномерно
+ */
+export interface ComplianceDomain {
+  key: string;          // уникальный ключ, например "gdpr"
+  label: string;        // человекочитаемое имя, например "GDPR"
+  score: number;        // 0..100
+  target?: number;      // 0..100
+  weight?: number;      // 0..1
+  description?: string; // краткое описание домена
+}
+
+/**
+ * Настройки визуализации.
+ */
+export interface ComplianceRadarProps {
+  title?: string;
+  subtitle?: string;
+  domains: ComplianceDomain[];
+  /** Если true — показываем скелетон/лоадер поверх контента */
+  loading?: boolean;
+  /** Включить экспорт PNG/CSV */
+  enableExport?: boolean;
+  /** Вызывать при клике по сектору/точке */
+  onPointClick?: (domain: ComplianceDomain) => void;
+  /** Высота чарта в px (адаптивная ширина остается) */
+  height?: number;
+  /** Жесткая нормализация пределов радиуса (по умолчанию 0..100) */
+  radiusDomain?: [number, number];
+  /** Порог для подсветки высокого риска (если score < riskThreshold) */
+  riskThreshold?: number; // по умолчанию 60
+  /** Включить легенду и тултип */
+  showLegend?: boolean;
+  showTooltip?: boolean;
+  /** Пользовательский класс контейнера */
+  className?: string;
+}
+
+/** Значения по умолчанию */
+const DEFAULT_TARGET = 85;
+const DEFAULT_RISK_THRESHOLD = 60;
+
+type RadarDatum = {
+  subject: string;
+  key: string;
+  score: number;
+  target: number;
 };
 
-export type ComplianceReport = {
-  generatedAt?: string;
-  metrics: ComplianceMetric[];
-};
+/** Нормализация чисел в пределах 0..100 */
+function clamp01(x: number): number {
+  if (Number.isNaN(x) || !Number.isFinite(x)) return 0;
+  return Math.max(0, Math.min(100, x));
+}
 
-type Props = {
-  baseUrl?: string;
-  modelId?: string;
-  pollingInterval?: number; // ms
-  retries?: number;
-};
+/** Вычисление интегрального взвешенного индекса соответствия */
+function computeWeightedIndex(domains: ComplianceDomain[]): number {
+  if (!domains.length) return 0;
+  const weightsProvided = domains.some((d) => typeof d.weight === "number");
+  const weightSum = weightsProvided
+    ? domains.reduce((acc, d) => acc + (d.weight ?? 0), 0)
+    : domains.length;
 
-const DEFAULT_RETRIES = 2;
+  if (weightSum <= 0) return 0;
 
-async function fetchWithRetries<T>(url: string, retries = DEFAULT_RETRIES, signal?: AbortSignal): Promise<T> {
-  let attempt = 0;
-  let lastErr: any = null;
-  while (attempt <= retries) {
-    try {
-      const res = await fetch(url, { signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-      const json = (await res.json()) as T;
-      return json;
-    } catch (err: any) {
-      if (err?.name === 'AbortError') throw err;
-      lastErr = err;
-      attempt += 1;
-      const delay = 150 * Math.pow(2, attempt);
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => setTimeout(r, delay));
-    }
+  const total = domains.reduce((acc, d) => {
+    const w = weightsProvided ? (d.weight ?? 0) : 1;
+    return acc + clamp01(d.score) * (w / weightSum);
+  }, 0);
+
+  return Math.round(total * 100) / 100;
+}
+
+/** Цветовая зона риска: красный < порога, желтый между порогом и target, зеленый >= target */
+function zoneForScore(score: number, target: number, risk: number): "low" | "medium" | "high" {
+  if (score < risk) return "low";
+  if (score < target) return "medium";
+  return "high";
+}
+
+/** Классы Tailwind для бейджей зоны */
+function badgeClass(zone: "low" | "medium" | "high"): string {
+  switch (zone) {
+    case "low":
+      return "bg-red-600/10 text-red-700 dark:text-red-300 border border-red-600/30";
+    case "medium":
+      return "bg-yellow-600/10 text-yellow-700 dark:text-yellow-300 border border-yellow-600/30";
+    default:
+      return "bg-emerald-600/10 text-emerald-700 dark:text-emerald-300 border border-emerald-600/30";
   }
-  throw lastErr;
 }
 
-function RadarSvg({ metrics }: { metrics: ComplianceMetric[] }) {
-  if (!metrics || metrics.length === 0) return <svg width="240" height="240" />;
-  const size = 220;
-  const cx = size / 2;
-  const cy = size / 2;
-  const radius = Math.min(cx, cy) - 20;
-  const n = metrics.length;
-  const step = (Math.PI * 2) / n;
-
-  const points = metrics.map((m, i) => {
-    const angle = -Math.PI / 2 + i * step; // start at top
-    const r = (m.score / 100) * radius;
-    const x = cx + r * Math.cos(angle);
-    const y = cy + r * Math.sin(angle);
-    return `${x.toFixed(2)},${y.toFixed(2)}`;
-  });
-
-  const outer = metrics.map((m, i) => {
-    const angle = -Math.PI / 2 + i * step;
-    const x = cx + radius * Math.cos(angle);
-    const y = cy + radius * Math.sin(angle);
-    return `${x.toFixed(2)},${y.toFixed(2)}`;
-  });
-
-  const grid = [0.25, 0.5, 0.75, 1].map((f) =>
-    metrics
-      .map((_, i) => {
-        const angle = -Math.PI / 2 + i * step;
-        const r = radius * f;
-        const x = cx + r * Math.cos(angle);
-        const y = cy + r * Math.sin(angle);
-        return `${x.toFixed(2)},${y.toFixed(2)}`;
-      })
-      .join(' ')
-  );
-
-  // labels positions (slightly outside outer polygon)
-  const labels = metrics.map((m, i) => {
-    const angle = -Math.PI / 2 + i * step;
-    const x = cx + (radius + 16) * Math.cos(angle);
-    const y = cy + (radius + 16) * Math.sin(angle);
-    return { x, y, label: m.label };
-  });
-
-  return (
-    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden>
-      <defs>
-        <linearGradient id="rgrad" x1="0" x2="1">
-          <stop offset="0%" stopColor="#0ea5e9" stopOpacity="0.85" />
-          <stop offset="100%" stopColor="#34d399" stopOpacity="0.7" />
-        </linearGradient>
-      </defs>
-
-      {/* grid */}
-      <g stroke="#e6edf3" fill="none">
-        {grid.map((g, idx) => (
-          <polygon key={idx} points={g} />
-        ))}
-      </g>
-
-      {/* axes */}
-      <g stroke="#e6edf3">
-        {metrics.map((_, i) => {
-          const outerPt = outer[i].split(',').map(Number);
-          return <line key={i} x1={cx} y1={cy} x2={outerPt[0]} y2={outerPt[1]} />;
-        })}
-      </g>
-
-      {/* outer polygon border */}
-      <polygon points={outer.join(' ')} fill="none" stroke="#cbd5e1" />
-
-      {/* metric polygon */}
-      <polygon points={points.join(' ')} fill="url(#rgrad)" fillOpacity={0.25} stroke="#0ea5e9" strokeWidth={1.5} />
-
-      {/* labels */}
-      <g fontSize={11} fill="#0f172a">
-        {labels.map((l, i) => (
-          <text key={i} x={l.x} y={l.y} textAnchor={Math.abs(l.x - cx) < 6 ? 'middle' : l.x > cx ? 'start' : 'end'} dominantBaseline={l.y > cy ? 'hanging' : 'auto'}>
-            {l.label}
-          </text>
-        ))}
-      </g>
-    </svg>
-  );
+/** Цвет для линий на радаре по зоне риска */
+function strokeFillByZone(zone: "low" | "medium" | "high") {
+  switch (zone) {
+    case "low":
+      return { stroke: "currentColor", fill: "rgba(220,38,38,0.25)" }; // red-600
+    case "medium":
+      return { stroke: "currentColor", fill: "rgba(234,179,8,0.25)" }; // yellow-500
+    default:
+      return { stroke: "currentColor", fill: "rgba(16,185,129,0.25)" }; // emerald-500
+  }
 }
 
-export function ComplianceRadar({ baseUrl = '', modelId, pollingInterval = 0, retries = DEFAULT_RETRIES }: Props) {
-  const apiUrl = `${baseUrl}/api/privacy/compliance${modelId ? `?model=${encodeURIComponent(modelId)}` : ''}`;
-  const [report, setReport] = useState<ComplianceReport | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<any>(null);
+/** Утилита экспорта SVG Recharts в PNG */
+async function exportChartAsPNG(svgEl: SVGSVGElement, fileName = "compliance-radar.png") {
+  const serializer = new XMLSerializer();
+  const svgString = serializer.serializeToString(svgEl);
 
-  const abortRef = useRef<AbortController | null>(null);
-  const mountedRef = useRef(true);
-  const timerRef = useRef<number | null>(null);
+  // Создаем Blob из SVG
+  const svgBlob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+  const url = URL.createObjectURL(svgBlob);
 
-  const load = useCallback(async () => {
-    abortRef.current?.abort();
-    const ac = new AbortController();
-    abortRef.current = ac;
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await fetchWithRetries<ComplianceReport>(apiUrl, retries, ac.signal);
-      if (!mountedRef.current) return;
-      // sanitize/normalize
-      const metrics = Array.isArray(data?.metrics) ? data.metrics.map((m) => ({ id: m.id, label: m.label, score: Math.max(0, Math.min(100, Number(m.score) || 0) ) })) : [];
-      setReport({ generatedAt: data?.generatedAt, metrics });
-      setLoading(false);
-    } catch (err: any) {
-      if (err?.name === 'AbortError') return;
-      if (!mountedRef.current) return;
-      setError(err?.message ?? String(err));
-      setLoading(false);
-    }
-  }, [apiUrl, retries]);
+  // Загружаем в Image и рисуем на canvas
+  const img = new Image();
+  const devicePixelRatio = window.devicePixelRatio || 1;
+  const width = svgEl.viewBox.baseVal.width || svgEl.getBoundingClientRect().width || 800;
+  const height = svgEl.viewBox.baseVal.height || svgEl.getBoundingClientRect().height || 600;
 
-  useEffect(() => {
-    mountedRef.current = true;
-    load();
-    if (pollingInterval && pollingInterval > 0) {
-      timerRef.current = window.setInterval(() => load(), pollingInterval);
-    }
-    return () => {
-      mountedRef.current = false;
-      abortRef.current?.abort();
-      if (timerRef.current) clearInterval(timerRef.current);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(width * devicePixelRatio);
+  canvas.height = Math.ceil(height * devicePixelRatio);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  // Масштаб для четкости на HiDPI
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => {
+      ctx.clearRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      URL.revokeObjectURL(url);
+      resolve();
     };
-  }, [load, pollingInterval]);
+    img.onerror = (e) => reject(e);
+    img.src = url;
+  });
+
+  // Скачиваем PNG
+  const a = document.createElement("a");
+  a.download = fileName;
+  a.href = canvas.toDataURL("image/png");
+  a.click();
+}
+
+/** Экспорт CSV */
+function exportCSV(domains: ComplianceDomain[], fileName = "compliance-radar.csv") {
+  const header = ["key", "label", "score", "target", "weight", "description"];
+  const rows = domains.map((d) => [
+    d.key,
+    d.label.replace(/"/g, '""'),
+    String(clamp01(d.score)),
+    String(typeof d.target === "number" ? clamp01(d.target) : DEFAULT_TARGET),
+    String(typeof d.weight === "number" ? d.weight : ""),
+    d.description ? `"${d.description.replace(/"/g, '""')}"` : "",
+  ]);
+  const csv = [header.join(","), ...rows.map((r) => r.join(","))].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** Кастомный тултип Recharts */
+const CustomTooltip: React.FC<{
+  active?: boolean;
+  payload?: any[];
+  label?: string;
+}> = ({ active, payload, label }) => {
+  if (!active || !payload || !payload.length) return null;
+  const datum = payload[0]?.payload as RadarDatum | undefined;
+  if (!datum) return null;
 
   return (
-    <section style={{ padding: 12, borderRadius: 8, border: '1px solid #e5e7eb', background: '#fff' }} aria-live="polite">
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 12 }}>
-        <h3 style={{ margin: 0, fontSize: 16 }}>Compliance Radar</h3>
-        <div style={{ fontSize: 12, color: '#6b7280' }}>{loading ? 'Loading…' : report?.generatedAt ? new Date(report.generatedAt).toLocaleString() : ''}</div>
-      </header>
+    <div
+      role="dialog"
+      aria-label={`Детали домена ${label}`}
+      className="rounded-xl border bg-background/95 backdrop-blur px-3 py-2 shadow-lg text-sm"
+    >
+      <div className="font-medium">{label}</div>
+      <div className="mt-1 grid grid-cols-2 gap-x-6 gap-y-1">
+        <div className="text-muted-foreground">Текущий</div>
+        <div>{datum.score}</div>
+        <div className="text-muted-foreground">Целевой</div>
+        <div>{datum.target}</div>
+        <div className="text-muted-foreground">Дельта</div>
+        <div>{Math.round((datum.score - datum.target) * 100) / 100}</div>
+      </div>
+    </div>
+  );
+};
 
-      {error && (
-        <div style={{ color: '#b91c1c', marginBottom: 8 }} role="alert">
-          Ошибка: {String(error)} <button onClick={() => load()} style={{ marginLeft: 8 }}>Повторить</button>
-        </div>
-      )}
+export const ComplianceRadar: React.FC<ComplianceRadarProps> = ({
+  title = "Compliance Radar",
+  subtitle = "Обзор доменов соответствия",
+  domains,
+  loading = false,
+  enableExport = true,
+  onPointClick,
+  height = 420,
+  radiusDomain = [0, 100],
+  riskThreshold = DEFAULT_RISK_THRESHOLD,
+  showLegend = true,
+  showTooltip = true,
+  className,
+}) => {
+  const [chartKey, setChartKey] = useState<number>(0);
+  const svgRef = useRef<SVGSVGElement | null>(null);
 
-      {!report || report.metrics.length === 0 ? (
-        <div style={{ color: '#6b7280' }}>{loading ? 'Загрузка…' : 'Нет данных для отображения'}</div>
-      ) : (
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-          <RadarSvg metrics={report.metrics} />
-          <div style={{ minWidth: 160 }}>
-            <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: 8 }}>
-              {report.metrics.map((m) => (
-                <li key={m.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
-                  <div style={{ fontSize: 13 }}>{m.label}</div>
-                  <div style={{ fontSize: 13, fontWeight: 700 }}>{Math.round(m.score)}%</div>
-                </li>
-              ))}
-            </ul>
+  const cleaned = useMemo<ComplianceDomain[]>(
+    () =>
+      domains
+        .filter(
+          (d) =>
+            d &&
+            typeof d.key === "string" &&
+            typeof d.label === "string" &&
+            Number.isFinite(d.score)
+        )
+        .map((d) => ({
+          ...d,
+          score: clamp01(d.score),
+          target: typeof d.target === "number" ? clamp01(d.target) : DEFAULT_TARGET,
+          weight: typeof d.weight === "number" ? d.weight : undefined,
+        })),
+    [domains]
+  );
+
+  const weightedIndex = useMemo(() => computeWeightedIndex(cleaned), [cleaned]);
+
+  const data = useMemo<RadarDatum[]>(
+    () =>
+      cleaned.map((d) => ({
+        subject: d.label,
+        key: d.key,
+        score: d.score,
+        target: d.target ?? DEFAULT_TARGET,
+      })),
+    [cleaned]
+  );
+
+  const hasData = cleaned.length > 0;
+
+  const handleRefresh = useCallback(() => {
+    // Перерисовка чарта без смены данных, полезно при глитчах ресайза
+    setChartKey((k) => k + 1);
+  }, []);
+
+  const handleExportPNG = useCallback(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    exportChartAsPNG(svg, "compliance-radar.png");
+  }, []);
+
+  const handleExportCSV = useCallback(() => {
+    exportCSV(cleaned, "compliance-radar.csv");
+  }, [cleaned]);
+
+  const riskZones = useMemo(() => {
+    const zones = cleaned.map((d) => ({
+      key: d.key,
+      label: d.label,
+      zone: zoneForScore(d.score, d.target ?? DEFAULT_TARGET, riskThreshold),
+    }));
+    const counts = zones.reduce(
+      (acc, z) => {
+        acc[z.zone]++;
+        return acc;
+      },
+      { low: 0, medium: 0, high: 0 } as Record<"low" | "medium" | "high", number>
+    );
+    return { zones, counts };
+  }, [cleaned, riskThreshold]);
+
+  return (
+    <Card
+      className={[
+        "w-full border-muted/50 shadow-sm",
+        "rounded-2xl",
+        "bg-background",
+        className ?? "",
+      ].join(" ")}
+      aria-busy={loading ? "true" : "false"}
+      aria-live="polite"
+      aria-label="Радар соответствия"
+    >
+      <CardHeader className="space-y-2">
+        <div className="flex items-center justify-between gap-3">
+          <CardTitle className="text-xl md:text-2xl">{title}</CardTitle>
+          <div className="flex items-center gap-2">
+            {enableExport && (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleExportCSV}
+                  aria-label="Экспорт в CSV"
+                >
+                  <Download className="mr-2 h-4 w-4" />
+                  CSV
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleExportPNG}
+                  aria-label="Экспорт в PNG"
+                >
+                  <Download className="mr-2 h-4 w-4" />
+                  PNG
+                </Button>
+              </>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleRefresh}
+              aria-label="Обновить визуализацию"
+            >
+              <RefreshCw className="h-4 w-4" />
+            </Button>
           </div>
         </div>
-      )}
-    </section>
+        <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+          <span>{subtitle}</span>
+          <span className="inline-flex items-center gap-2">
+            <Info className="h-4 w-4" />
+            Интегральный индекс:
+            <Badge className="ml-1 bg-primary/10 text-primary border border-primary/20">
+              {weightedIndex}
+            </Badge>
+          </span>
+          <span className="inline-flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4" />
+            Риск-порог:
+            <Badge variant="outline" className="ml-1">
+              {riskThreshold}
+            </Badge>
+          </span>
+          <div className="ml-auto flex items-center gap-2">
+            <Badge className={badgeClass("low")}>Высокий риск</Badge>
+            <Badge className={badgeClass("medium")}>Средний риск</Badge>
+            <Badge className={badgeClass("high")}>Низкий риск</Badge>
+          </div>
+        </div>
+      </CardHeader>
+
+      <CardContent className="pt-0">
+        {!hasData && !loading && (
+          <div
+            className="flex h-64 items-center justify-center rounded-xl border border-dashed"
+            role="status"
+            aria-label="Нет данных"
+          >
+            Нет данных для отображения
+          </div>
+        )}
+
+        {loading && (
+          <div className="animate-pulse rounded-xl border p-4">
+            <div className="mb-4 h-6 w-40 rounded bg-muted" />
+            <div className="h-[360px] rounded bg-muted" />
+          </div>
+        )}
+
+        {hasData && !loading && (
+          <div className="w-full">
+            <div className="relative">
+              <div className="absolute left-2 top-2 z-[1] text-xs text-muted-foreground">
+                Диапазон: {radiusDomain[0]}–{radiusDomain[1]}
+              </div>
+              <ResponsiveContainer width="100%" height={height}>
+                {/* Обертка для получения ссылки на SVG */}
+                <RadarChart
+                  key={chartKey}
+                  data={data}
+                  cx="50%"
+                  cy="50%"
+                  outerRadius="70%"
+                  onClick={(e) => {
+                    // Recharts onClick для всей области; достанем активный payload
+                    const payload = (e && (e as any).activePayload?.[0]?.payload) as
+                      | RadarDatum
+                      | undefined;
+                    if (payload && onPointClick) {
+                      const domain = cleaned.find((d) => d.key === payload.key);
+                      if (domain) onPointClick(domain);
+                    }
+                  }}
+                  // Пробросим ref до вложенного svg через callback после монтирования
+                  ref={
+                    // @ts-expect-error — типы Recharts не экспонируют внутренний svg,
+                    // поэтому достанем его по селектору на следующем тике.
+                    (node: any) => {
+                      if (!node) return;
+                      // небольшой timeout чтобы DOM построился
+                      setTimeout(() => {
+                        const svg = (node.container?.querySelector?.("svg") ??
+                          node?.container) as SVGSVGElement | null;
+                        if (svg) {
+                          svgRef.current = svg;
+                        }
+                      }, 0);
+                    }
+                  }
+                >
+                  <PolarGrid className="text-muted-foreground/40" />
+                  <PolarAngleAxis
+                    dataKey="subject"
+                    tick={{ fontSize: 12 }}
+                    className="fill-foreground"
+                  />
+                  <PolarRadiusAxis
+                    angle={30}
+                    domain={radiusDomain}
+                    tick={{ fontSize: 10 }}
+                  />
+                  {/* Текущий скор */}
+                  <Radar
+                    name="Текущий"
+                    dataKey="score"
+                    stroke="currentColor"
+                    fillOpacity={0.3}
+                    className="text-primary"
+                  />
+                  {/* Целевой контур */}
+                  <Radar
+                    name="Целевой"
+                    dataKey="target"
+                    stroke="currentColor"
+                    fillOpacity={0.1}
+                    className="text-muted-foreground"
+                  />
+
+                  {showTooltip && <ReTooltip content={<CustomTooltip />} />}
+                  {showLegend && <Legend verticalAlign="bottom" height={36} />}
+                </RadarChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* Сводка рисков */}
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+              <div className="rounded-xl border p-3">
+                <div className="text-sm text-muted-foreground">Высокий риск</div>
+                <div className="mt-1 text-lg font-semibold">{riskZones.counts.low}</div>
+              </div>
+              <div className="rounded-xl border p-3">
+                <div className="text-sm text-muted-foreground">Средний риск</div>
+                <div className="mt-1 text-lg font-semibold">{riskZones.counts.medium}</div>
+              </div>
+              <div className="rounded-xl border p-3">
+                <div className="text-sm text-muted-foreground">Низкий риск</div>
+                <div className="mt-1 text-lg font-semibold">{riskZones.counts.high}</div>
+              </div>
+            </div>
+
+            {/* Таблица доменов */}
+            <div className="mt-4 overflow-x-auto">
+              <table
+                className="w-full text-sm"
+                aria-label="Таблица доменов соответствия"
+              >
+                <thead>
+                  <tr className="text-left text-muted-foreground">
+                    <th className="px-2 py-2">Домен</th>
+                    <th className="px-2 py-2">Скор</th>
+                    <th className="px-2 py-2">Цель</th>
+                    <th className="px-2 py-2">Дельта</th>
+                    <th className="px-2 py-2">Вес</th>
+                    <th className="px-2 py-2">Зона</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {cleaned.map((d) => {
+                    const z = zoneForScore(d.score, d.target ?? DEFAULT_TARGET, riskThreshold);
+                    const delta = Math.round((d.score - (d.target ?? DEFAULT_TARGET)) * 100) / 100;
+                    const sf = strokeFillByZone(z);
+                    return (
+                      <tr key={d.key} className="border-t">
+                        <td className="px-2 py-2">
+                          <div className="flex flex-col">
+                            <span className="font-medium">{d.label}</span>
+                            {d.description && (
+                              <span className="text-xs text-muted-foreground">
+                                {d.description}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-2 py-2">{d.score}</td>
+                        <td className="px-2 py-2">{d.target ?? DEFAULT_TARGET}</td>
+                        <td className="px-2 py-2">{delta}</td>
+                        <td className="px-2 py-2">{d.weight ?? "—"}</td>
+                        <td className="px-2 py-2">
+                          <Badge className={badgeClass(z)}>{z === "low" ? "Высокий" : z === "medium" ? "Средний" : "Низкий"}</Badge>
+                          <span
+                            className="ml-2 inline-block h-3 w-3 rounded-full align-middle"
+                            style={{ background: sf.fill }}
+                            aria-hidden="true"
+                          />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
-}
+};
 
-export default ComplianceRadar
-
+export default ComplianceRadar;

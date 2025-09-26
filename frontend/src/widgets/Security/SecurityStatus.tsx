@@ -1,83 +1,20 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-
-export type SecurityStatusData = {
-  id?: string;
-  overall?: 'ok' | 'degraded' | 'down' | string;
-  incidents?: { id: string; title: string; severity?: string; ts?: string }[];
-  lastChecked?: string;
-};
+import React, { useEffect } from 'react';
+import { useSecurityStatus } from './hooks/useSecurityStatus';
 
 type Props = {
-  baseUrl?: string;
-  pollingInterval?: number; // ms, 0 disables
-  retries?: number;
+  // legacy/compat prop tests use
+  pollIntervalMs?: number;
 };
 
-const DEFAULT_RETRIES = 2;
+/**
+ * SecurityStatus component — thin presentation layer driven by useSecurityStatus hook.
+ * Exposes stable data-testid attributes and ARIA so tests can target it.
+ */
+export function SecurityStatus(props: Props) {
+  const { pollIntervalMs } = props;
+  const { loading, status, score, issues, lastChecked, refresh, error, polling } = useSecurityStatus();
 
-async function fetchWithRetries<T>(url: string, retries = DEFAULT_RETRIES, signal?: AbortSignal): Promise<T> {
-  let attempt = 0;
-  let lastErr: any = null;
-  while (attempt <= retries) {
-    try {
-      const res = await fetch(url, { signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-      const json = (await res.json()) as T;
-      return json;
-    } catch (err: any) {
-      if (err?.name === 'AbortError') throw err;
-      lastErr = err;
-      attempt += 1;
-      const delay = 150 * Math.pow(2, attempt);
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
-  throw lastErr;
-}
-
-export function SecurityStatus({ baseUrl = '', pollingInterval = 0, retries = DEFAULT_RETRIES }: Props) {
-  // Default to versioned API for stability; baseUrl can be used to override
-  const apiUrl = `${baseUrl}/api/v1/security/status`;
-  const [data, setData] = useState<SecurityStatusData | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<any>(null);
-
-  const abortRef = useRef<AbortController | null>(null);
-  const mountedRef = useRef(true);
-  const timerRef = useRef<number | null>(null);
-
-  const load = useCallback(async () => {
-    abortRef.current?.abort();
-    const ac = new AbortController();
-    abortRef.current = ac;
-    setLoading(true);
-    setError(null);
-    try {
-      const json = await fetchWithRetries<SecurityStatusData>(apiUrl, retries, ac.signal);
-      if (!mountedRef.current) return;
-      setData(json);
-      setLoading(false);
-    } catch (err: any) {
-      if (err?.name === 'AbortError') return;
-      if (!mountedRef.current) return;
-      setError(err?.message ?? String(err));
-      setLoading(false);
-    }
-  }, [apiUrl, retries]);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    load();
-    if (pollingInterval && pollingInterval > 0) {
-      timerRef.current = window.setInterval(() => load(), pollingInterval) as unknown as number;
-    }
-    return () => {
-      mountedRef.current = false;
-      abortRef.current?.abort();
-      if (timerRef.current) clearInterval(timerRef.current as number);
-    };
-  }, [load, pollingInterval]);
+  // no-op debug removed
 
   const overallColor = (s?: string) => {
     switch (s) {
@@ -92,64 +29,108 @@ export function SecurityStatus({ baseUrl = '', pollingInterval = 0, retries = DE
     }
   };
 
+  useEffect(() => {
+    if (!polling) return;
+    const intervalMs = typeof pollIntervalMs === 'number' ? pollIntervalMs : 30000;
+    const iv = setInterval(() => {
+      try {
+        refresh();
+      } catch {
+        // swallow
+      }
+    }, intervalMs);
+    return () => clearInterval(iv);
+  }, [polling, refresh, pollIntervalMs]);
+
   return (
-    <section style={{ padding: 12, borderRadius: 8, border: '1px solid #e5e7eb', background: '#fff' }} aria-live="polite">
+    <section
+      role="status"
+      aria-label="Security Status"
+      aria-live="polite"
+      style={{ padding: 12, borderRadius: 8, border: '1px solid #e5e7eb', background: '#fff' }}
+    >
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <h3 style={{ margin: 0, fontSize: 16 }}>Security Status</h3>
-        <div style={{ fontSize: 12, color: '#6b7280' }}>
-          {loading ? 'Checking…' : data?.lastChecked ? (() => {
-            try {
-              return new Date(data.lastChecked).toLocaleString();
-            } catch (_) {
-              return String(data.lastChecked);
-            }
+        <div style={{ fontSize: 12, color: '#6b7280' }} data-testid="security-last-checked">
+          {loading ? 'Checking…' : lastChecked ? (() => {
+            try { return `Last checked: ${new Date(lastChecked).toLocaleString()}`; } catch { return String(lastChecked); }
           })() : ''}
         </div>
       </header>
 
-      {error && (
+      {(status === 'error' || error) && (
         <div style={{ color: '#b91c1c', marginBottom: 8 }} role="alert">
-          Ошибка загрузки статуса: {String(error)}
-          <button onClick={() => load()} style={{ marginLeft: 12 }}>Повторить</button>
+          Ошибка загрузки статуса: {String(error ?? 'ошибка')}
+          <button onClick={() => refresh()} style={{ marginLeft: 12 }}>Повторить</button>
         </div>
       )}
 
-      {!data ? (
-        <div style={{ color: '#6b7280' }}>{loading ? 'Проверка…' : 'Нет данных'}</div>
-      ) : (
-        <div style={{ display: 'grid', gap: 10 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div style={{ width: 12, height: 12, borderRadius: 99, background: overallColor(data.overall) }} aria-hidden />
-            <div style={{ fontSize: 14, fontWeight: 700, color: '#0f172a' }}>{data.overall ?? 'unknown'}</div>
+      <div style={{ display: 'grid', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{ width: 12, height: 12, borderRadius: 99, background: overallColor(status) }} aria-hidden />
+          <div
+            data-testid="security-status-badge"
+            data-status={status}
+            aria-label={status ?? 'unknown'}
+            style={{ fontSize: 14, fontWeight: 700, color: '#0f172a' }}
+          >
+            {status ?? 'unknown'}
           </div>
+          <div style={{ marginLeft: 'auto' }}>
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  // call refresh but don't await to avoid test hangs with fake timers
+                  // (tests mock the hook and control loading state separately)
+                  // eslint-disable-next-line @typescript-eslint/no-floating-promises
+                  refresh();
+                  // debug log for test investigation
+                  // console.log('SecurityStatus: refresh called');
+                } catch {
+                  // ignore
+                }
+              }}
+              disabled={loading}
+              aria-label="Refresh"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
 
-          {data.incidents && data.incidents.length > 0 ? (
-            <div style={{ display: 'grid', gap: 8 }}>
-              {data.incidents.map((it) => (
-                <article key={it.id} style={{ padding: 8, borderRadius: 6, background: '#fafafa', border: '1px solid #f3f4f6' }}>
+        <div data-testid="security-score" style={{ fontWeight: 700 }}>{typeof score === 'number' && !Number.isNaN(score) ? String(score) : 'N/A'}</div>
+
+        {issues && issues.length > 0 ? (
+          <ul role="list" aria-label="Security Issues" style={{ display: 'grid', gap: 8, paddingLeft: 0, listStyle: 'none' }}>
+            {issues.map((it) => (
+              <li key={it.id} role="listitem">
+                <article style={{ padding: 8, borderRadius: 6, background: '#fafafa', border: '1px solid #f3f4f6' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
                     <div style={{ fontWeight: 600 }}>{it.title}</div>
-                    <div style={{ fontSize: 12, color: '#6b7280' }}>{it.ts ? new Date(it.ts).toLocaleString() : ''}</div>
+                    <div style={{ fontSize: 12, color: '#6b7280' }}>{(it as any).details ?? ''}</div>
                   </div>
-                  {it.severity && <div style={{ fontSize: 12, color: '#6b7280' }}>Severity: {it.severity}</div>}
+                  {(it as any).severity && <div style={{ fontSize: 12, color: '#6b7280' }}>Severity: {(it as any).severity}</div>}
                 </article>
-              ))}
-            </div>
-          ) : (
-            <div style={{ color: '#6b7280' }}>Инцидентов не зафиксировано</div>
-          )}
-        </div>
-      )}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div style={{ color: '#6b7280' }}>Инцидентов не зафиксировано</div>
+        )}
+
+        {loading && <div data-testid="security-loading" aria-hidden>loading</div>}
+      </div>
     </section>
   );
 }
 
-export default SecurityStatus
+export default SecurityStatus;
 
-// Lazy wrapper to be used where needed (keeps original import semantics)
-const LazyInner = React.lazy(() => Promise.resolve({ default: SecurityStatus }))
+// Lazy wrapper to preserve previous import semantics where used
+const LazyInner = React.lazy(() => Promise.resolve({ default: SecurityStatus }));
 export const LazySecurityStatus: React.FC<Props & { fallback?: React.ReactNode }> = (props) => (
   <React.Suspense fallback={props.fallback ?? null}>
     <LazyInner {...props} />
   </React.Suspense>
-)
+);
