@@ -37,7 +37,8 @@ async function fetchWithRetries<T>(url: string, retries = DEFAULT_RETRIES, signa
 }
 
 export function SecurityStatus({ baseUrl = '', pollingInterval = 0, retries = DEFAULT_RETRIES }: Props) {
-  const apiUrl = `${baseUrl}/api/security/status`;
+  // Default to versioned API for stability; baseUrl can be used to override
+  const apiUrl = `${baseUrl}/api/v1/security/status`;
   const [data, setData] = useState<SecurityStatusData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<any>(null);
@@ -95,7 +96,15 @@ export function SecurityStatus({ baseUrl = '', pollingInterval = 0, retries = DE
     <section style={{ padding: 12, borderRadius: 8, border: '1px solid #e5e7eb', background: '#fff' }} aria-live="polite">
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <h3 style={{ margin: 0, fontSize: 16 }}>Security Status</h3>
-        <div style={{ fontSize: 12, color: '#6b7280' }}>{loading ? 'Checking…' : data?.lastChecked ? new Date(data.lastChecked).toLocaleString() : ''}</div>
+        <div style={{ fontSize: 12, color: '#6b7280' }}>
+          {loading ? 'Checking…' : data?.lastChecked ? (() => {
+            try {
+              return new Date(data.lastChecked).toLocaleString();
+            } catch (_) {
+              return String(data.lastChecked);
+            }
+          })() : ''}
+        </div>
       </header>
 
       {error && (
@@ -138,10 +147,9 @@ export function SecurityStatus({ baseUrl = '', pollingInterval = 0, retries = DE
 export default SecurityStatus
 
 // Lazy wrapper to be used where needed (keeps original import semantics)
-import React, { Suspense } from 'react'
 const LazyInner = React.lazy(() => Promise.resolve({ default: SecurityStatus }))
 export const LazySecurityStatus: React.FC<Props & { fallback?: React.ReactNode }> = (props) => (
-  <Suspense fallback={props.fallback ?? null}>
+  <React.Suspense fallback={props.fallback ?? null}>
     <LazyInner {...props} />
-  </Suspense>
+  </React.Suspense>
 )
