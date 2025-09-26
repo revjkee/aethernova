@@ -10,8 +10,15 @@ from alembic import context
 # access to the values within the .ini file in use.
 config = context.config
 
-# Interpret the config file for Python logging.
-fileConfig(config.config_file_name)
+# Interpret the config file for Python logging. Wrap in try/except because
+# some minimal alembic.ini files may omit expected keys and fileConfig will
+# raise KeyError which would prevent migrations from running.
+try:
+    if config.config_file_name:
+        fileConfig(config.config_file_name)
+except Exception:
+    # Logging config is optional for migration runtime; proceed without it.
+    pass
 
 # add your model's MetaData object here
 import sys
@@ -28,9 +35,17 @@ def run_migrations_offline():
 
 def run_migrations_online():
     database_url = os.getenv('DATABASE_URL') or config.get_main_option("sqlalchemy.url")
+    # Alembic should use a synchronous engine for DDL. If an async driver
+    # (e.g. +asyncpg or +aiosqlite) is present in DATABASE_URL, strip it.
+    sync_url = database_url
+    if "+asyncpg" in sync_url:
+        sync_url = sync_url.replace("+asyncpg", "")
+    if "+aiosqlite" in sync_url:
+        sync_url = sync_url.replace("+aiosqlite", "")
+
     connectable = engine_from_config(
         {
-            'sqlalchemy.url': database_url
+            'sqlalchemy.url': sync_url
         },
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
