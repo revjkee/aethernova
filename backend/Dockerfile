@@ -13,7 +13,10 @@ WORKDIR /app
 
 # Копируем requirements и устанавливаем зависимости
 COPY backend/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+COPY backend/requirements.txt ./requirements.txt
+COPY backend/requirements-dev.txt ./requirements-dev.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && if [ "${BUILD_DEV:-0}" = "1" ]; then pip install --no-cache-dir -r requirements-dev.txt; fi
 
 # Копируем исходный код, alembic и скрипты миграций
 COPY backend/src/ ./src/
