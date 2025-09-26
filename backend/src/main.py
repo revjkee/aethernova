@@ -34,6 +34,8 @@ async def shutdown_event():
 
 # Подключение маршрутов API
 app.include_router(api_router, prefix="/api/v1")
+# Also include without version prefix for older frontend compatibility
+app.include_router(api_router, prefix="/api")
 
 # Пример корневого маршрута
 @app.get("/")
