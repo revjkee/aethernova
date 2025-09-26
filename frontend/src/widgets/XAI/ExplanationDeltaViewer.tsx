@@ -1,5 +1,4 @@
-// src/widgets/XAI/ExplanationDeltaViewer.tsx
-
+// Clean ExplanationDeltaViewer component
 import React, { useEffect, useMemo, useState } from 'react'
 import { Panel } from '@/shared/ui/Panel'
 import { useXAIContext } from '@/shared/context/XAIContext'
@@ -78,17 +77,15 @@ export const ExplanationDeltaViewer: React.FC<Props> = ({ currentVersion, previo
           <FeedbackTimeline feedback={delta.feedbackTimeline} />
 
           {delta.deltaScore > 0.7 && (
-            <Alert type="warning">
-              Значительное изменение объяснения (>70%): возможна деградация reasoning.
-            </Alert>
+            <Alert type="warning">{">70%"} значительное изменение объяснения: возможна деградация reasoning.</Alert>
           )}
+
           {delta.deltaScore < 0.1 && (
-            <Alert type="success">
-              Объяснения стабильны между версиями (разница менее 10%).
-            </Alert>
+            <Alert type="success">Объяснения стабильны между версиями (разница менее 10%).</Alert>
           )}
         </div>
       )}
     </Panel>
   )
 }
+
