@@ -50,18 +50,20 @@ async def init_db() -> None:
         connected_here = True
 
     try:
-        # Prefer migrations (Alembic). As a fallback create tables from
-        # SQLAlchemy metadata using a synchronous engine so DDL is emitted
-        # in a portable way.
-        sync_url = DATABASE_URL
-        # strip async driver suffixes like +aiosqlite or +asyncpg
-        if "+aiosqlite" in sync_url:
-            sync_url = sync_url.replace("+aiosqlite", "")
-        if "+asyncpg" in sync_url:
-            sync_url = sync_url.replace("+asyncpg", "")
-
-        engine = sqlalchemy.create_engine(sync_url)
-        metadata.create_all(engine)
+        # Prefer migrations (Alembic) for production databases. As a
+        # development convenience, if using the local sqlite file we will
+        # create tables from SQLAlchemy metadata so the dev experience is
+        # smooth without requiring running migrations.
+        if DATABASE_URL.startswith("sqlite"):
+            sync_url = DATABASE_URL
+            if "+aiosqlite" in sync_url:
+                sync_url = sync_url.replace("+aiosqlite", "")
+            engine = sqlalchemy.create_engine(sync_url)
+            metadata.create_all(engine)
+        else:
+            # For non-sqlite databases rely on Alembic migrations. Do not
+            # attempt to create tables automatically in production.
+            pass
     finally:
         if connected_here:
             await database.disconnect()
