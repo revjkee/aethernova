@@ -201,6 +201,86 @@ async def lifespan(app: FastAPI):
 
 
 # -----------------------------
+# Routes Registration
+# -----------------------------
+def register_routes(app: FastAPI) -> None:
+    # Placeholder for domain routers, e.g.:
+    # from .api.v1.users import router as users_router
+    # app.include_router(users_router, prefix="/api/v1/users", tags=["users"])
+    pass
+
+
+# -----------------------------
+# Exception Handlers
+# -----------------------------
+def _problem_json(
+    title: str,
+    detail: str,
+    status_code: int,
+    request: Optional[Request] = None,
+    extra: Optional[dict] = None,
+) -> dict:
+    payload = {
+        "title": title,
+        "detail": detail,
+        "status": status_code,
+        "type": "about:blank",
+    }
+    if request is not None:
+        payload["instance"] = str(request.url.path)
+        payload["request_id"] = getattr(request.state, "request_id", None)
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        logger.warning(f"Validation error: {exc.errors()}")
+        payload = _problem_json(
+            title="Validation Error",
+            detail=f"Request validation failed: {len(exc.errors())} error(s)",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            request=request,
+            extra={"errors": exc.errors()},
+        )
+        return JSONResponse(payload, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+    @app.exception_handler(ValidationError)
+    async def pydantic_exception_handler(request: Request, exc: ValidationError) -> JSONResponse:
+        logger.warning(f"Pydantic validation error: {exc}")
+        payload = _problem_json(
+            title="Data Validation Error",
+            detail=str(exc),
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            request=request,
+        )
+        return JSONResponse(payload, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        payload = _problem_json(
+            title="HTTP Error",
+            detail=exc.detail,
+            status_code=exc.status_code,
+            request=request,
+        )
+        return JSONResponse(payload, status_code=exc.status_code)
+
+    @app.exception_handler(Exception)
+    async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception("Unhandled exception occurred")
+        payload = _problem_json(
+            title="Internal Server Error",
+            detail="An unexpected error occurred",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            request=request,
+        )
+        return JSONResponse(payload, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# -----------------------------
 # App Factory
 # -----------------------------
 def create_app() -> FastAPI:
@@ -284,72 +364,6 @@ async def ready() -> str:
         # In production, readiness should fail hard to avoid routing traffic
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="not ready")
     return "ready"
-
-
-def register_routes(app: FastAPI) -> None:
-    # Placeholder for domain routers, e.g.:
-    # from .api.v1.users import router as users_router
-    # app.include_router(users_router, prefix="/api/v1/users", tags=["users"])
-    pass
-
-
-# -----------------------------
-# Exception Handlers
-# -----------------------------
-def _problem_json(
-    title: str,
-    detail: str,
-    status_code: int,
-    request: Optional[Request] = None,
-    extra: Optional[dict] = None,
-) -> dict:
-    payload = {
-        "title": title,
-        "detail": detail,
-        "status": status_code,
-        "type": "about:blank",
-    }
-    if request is not None:
-        payload["instance"] = str(request.url.path)
-        payload["request_id"] = getattr(request.state, "request_id", None)
-    if extra:
-        payload.update(extra)
-    return payload
-
-
-def register_exception_handlers(app: FastAPI) -> None:
-    @app.exception_handler(HTTPException)
-    async def http_exc_handler(request: Request, exc: HTTPException) -> JSONResponse:
-        payload = _problem_json(
-            title="HTTPException",
-            detail=exc.detail if isinstance(exc.detail, str) else "HTTP error",
-            status_code=exc.status_code,
-            request=request,
-        )
-        return JSONResponse(payload, status_code=exc.status_code)
-
-    @app.exception_handler(RequestValidationError)
-    async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-        payload = _problem_json(
-            title="ValidationError",
-            detail="Request validation failed",
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            request=request,
-            extra={"errors": exc.errors()},
-        )
-        return JSONResponse(payload, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
-
-    @app.exception_handler(Exception)
-    async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
-        # Log with request-id
-        logger.exception("Unhandled error", extra={"request_id": getattr(request.state, "request_id", None)})
-        payload = _problem_json(
-            title="InternalServerError",
-            detail="An unexpected error occurred",
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            request=request,
-        )
-        return JSONResponse(payload, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # -----------------------------

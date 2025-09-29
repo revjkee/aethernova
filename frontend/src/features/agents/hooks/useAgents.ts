@@ -239,13 +239,13 @@ async function httpJSON<T>(url: string, options: RequestOptions = {}, retryable 
     // Not Modified: return a typed signal to caller (no new data)
     const respEtag = res.headers.get("ETag") || undefined;
     if (method === "GET" && res.status === 304) {
-      // @ts-expect-error Using undefined to signal cache use
+      // Using undefined to signal cache use
       return { data: undefined as T, etag: respEtag };
     }
 
     if (res.ok) {
       if (res.status === 204) {
-        // @ts-expect-error empty body
+        // Empty body for No Content response
         return { data: undefined as T, etag: respEtag };
       }
       const json = await res.json().catch(() => {

@@ -505,7 +505,7 @@ const IntentDebugger: React.FC<IntentDebuggerProps> = ({
                 min={0}
                 max={1}
                 step={0.01}
-                onValueChange={(v) => setMinConf(clamp01(v[0] ?? 0))}
+                onValueChange={(v: number[]) => setMinConf(clamp01(v[0] ?? 0))}
               />
             </div>
           </div>
@@ -664,7 +664,7 @@ const IntentDebugger: React.FC<IntentDebuggerProps> = ({
         </div>
 
         {/* Detail sheet */}
-        <Sheet open={!!selected} onOpenChange={(v) => !v && setSelected(null)}>
+        <Sheet open={!!selected} onOpenChange={(v: boolean) => !v && setSelected(null)}>
           <SheetContent side="right" className="w-full sm:max-w-2xl">
             <SheetHeader>
               <SheetTitle>Детали намерения</SheetTitle>

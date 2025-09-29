@@ -34,7 +34,7 @@ from fastapi import (
     Response,
     status,
 )
-from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt, constr, validator
+from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt, field_validator
 
 # ---------------------------
 # Utilities & constants
@@ -115,7 +115,7 @@ class Meta(BaseModel):
     timestamp: str = Field(..., description="Response UTC ISO-8601 timestamp")
 
 class HealthResponse(BaseModel):
-    status: constr(regex="^(ok|degraded|fail)$") = "ok"
+    status: Annotated[str, Field(pattern="^(ok|degraded|fail)$")] = "ok"
     service: str = Field(default_factory=_service_name_default)
     version: str = Field(default_factory=_service_version_default)
     hostname: str = Field(default_factory=_hostname)
@@ -157,7 +157,8 @@ class Sha256Response(BaseModel):
 class PaginatedParams(BaseModel):
     page: PositiveInt = Field(1, ge=1)
     size: PositiveInt = Field(20, ge=1, le=int(os.getenv("PAGE_SIZE_MAX", "200")))
-    @validator("size")
+    @field_validator("size")
+    @classmethod
     def _ensure_bounds(cls, v: int) -> int:
         # Explicitly cap size at PAGE_SIZE_MAX to prevent abuse.
         cap = int(os.getenv("PAGE_SIZE_MAX", "200"))

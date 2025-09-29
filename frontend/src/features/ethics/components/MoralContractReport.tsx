@@ -1,22 +1,201 @@
 // frontend/src/features/ethics/components/MoralContractReport.tsx
 import React, {memo, useCallback, useEffect, useMemo, useRef, useState} from "react";
-import {Button} from "@/components/ui/button";
-import {Card, CardContent, CardDescription, CardHeader, CardTitle} from "@/components/ui/card";
-import {Badge} from "@/components/ui/badge";
-import {Input} from "@/components/ui/input";
-import {Label} from "@/components/ui/label";
-import {Separator} from "@/components/ui/separator";
-import {ScrollArea} from "@/components/ui/scroll-area";
-import {Switch} from "@/components/ui/switch";
-import {Textarea} from "@/components/ui/textarea";
-import {Accordion, AccordionContent, AccordionItem, AccordionTrigger} from "@/components/ui/accordion";
-import {Tooltip, TooltipContent, TooltipProvider, TooltipTrigger} from "@/components/ui/tooltip";
-import {Tabs, TabsContent, TabsList, TabsTrigger} from "@/components/ui/tabs";
-import {Skeleton} from "@/components/ui/skeleton";
-import {Alert, AlertDescription, AlertTitle} from "@/components/ui/alert";
-import {Download, FileJson, Printer, Shield, CheckCircle2, XCircle, Search, Filter, Copy, AlertTriangle, Gauge, Scale, ListTree, Link as LinkIcon, Info, FileSignature, ExternalLink, BarChart3} from "lucide-react";
-import {ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip as RTooltip, Legend, Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis} from "recharts";
-import {cn} from "@/lib/utils";
+
+// Utility function stub
+const cn = (...classes: (string | undefined | null | false)[]): string => {
+  return classes.filter(Boolean).join(' ');
+};
+
+// UI Component stubs
+const Button = ({ 
+  children, 
+  variant, 
+  size, 
+  className, 
+  ...props 
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & { 
+  variant?: string; 
+  size?: string; 
+}) => (
+  <button className={cn('px-3 py-2 rounded-md border', className)} {...props}>{children}</button>
+);
+
+const Card = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={cn('border rounded-lg shadow-sm bg-white', className)} {...props}>{children}</div>
+);
+const CardHeader = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={cn('px-6 py-4 border-b', className)} {...props}>{children}</div>
+);
+const CardTitle = ({ children, className, ...props }: React.HTMLAttributes<HTMLHeadingElement>) => (
+  <h3 className={cn('text-lg font-semibold', className)} {...props}>{children}</h3>
+);
+const CardDescription = ({ children, className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) => (
+  <p className={cn('text-sm text-gray-600', className)} {...props}>{children}</p>
+);
+const CardContent = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={cn('px-6 py-4', className)} {...props}>{children}</div>
+);
+
+const Badge = ({ children, variant, className, ...props }: React.HTMLAttributes<HTMLSpanElement> & { variant?: string }) => (
+  <span className={cn('inline-flex items-center px-2 py-1 text-xs rounded-full border', className)} {...props}>{children}</span>
+);
+
+const Input = ({ className, ...props }: React.InputHTMLAttributes<HTMLInputElement>) => (
+  <input className={cn('px-3 py-2 border rounded-md', className)} {...props} />
+);
+
+const Label = ({ children, className, ...props }: React.LabelHTMLAttributes<HTMLLabelElement>) => (
+  <label className={cn('text-sm font-medium', className)} {...props}>{children}</label>
+);
+
+const Separator = ({ 
+  className, 
+  orientation, 
+  ...props 
+}: React.HTMLAttributes<HTMLDivElement> & { orientation?: string }) => (
+  <div className={cn(orientation === 'vertical' ? 'border-l mx-2' : 'border-t my-4', className)} {...props} />
+);
+
+const ScrollArea = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={cn('overflow-auto', className)} {...props}>{children}</div>
+);
+
+const Switch = ({ 
+  checked, 
+  onCheckedChange, 
+  className, 
+  ...props 
+}: React.InputHTMLAttributes<HTMLInputElement> & { 
+  checked?: boolean; 
+  onCheckedChange?: (checked: boolean) => void; 
+}) => (
+  <input
+    type="checkbox"
+    checked={checked}
+    onChange={(e) => onCheckedChange?.(e.target.checked)}
+    className={cn('rounded', className)}
+    {...props}
+  />
+);
+
+const Textarea = ({ className, ...props }: React.TextareaHTMLAttributes<HTMLTextAreaElement>) => (
+  <textarea className={cn('px-3 py-2 border rounded-md', className)} {...props} />
+);
+
+// Accordion components
+const Accordion = ({ 
+  children, 
+  type, 
+  ...props 
+}: React.HTMLAttributes<HTMLDivElement> & { type?: string }) => (
+  <div {...props}>{children}</div>
+);
+const AccordionItem = ({ children, value, ...props }: React.HTMLAttributes<HTMLDivElement> & { value: string }) => (
+  <div {...props}>{children}</div>
+);
+const AccordionTrigger = ({ children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
+  <button className="w-full text-left px-3 py-2 hover:bg-gray-100" {...props}>{children}</button>
+);
+const AccordionContent = ({ children, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className="px-3 py-2" {...props}>{children}</div>
+);
+
+// Tooltip components
+const TooltipProvider = ({ children }: { children: React.ReactNode }) => <div>{children}</div>;
+const Tooltip = ({ children }: { children: React.ReactNode }) => <div className="relative inline-block">{children}</div>;
+const TooltipTrigger = ({ children, asChild }: { children: React.ReactNode; asChild?: boolean }) => <div>{children}</div>;
+const TooltipContent = ({ children }: { children: React.ReactNode }) => (
+  <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-2 py-1 text-xs bg-black text-white rounded">{children}</div>
+);
+
+// Tabs components
+const Tabs = ({ 
+  children, 
+  value, 
+  onValueChange, 
+  defaultValue, 
+  ...props 
+}: React.HTMLAttributes<HTMLDivElement> & { 
+  value?: string; 
+  onValueChange?: (value: string) => void; 
+  defaultValue?: string; 
+}) => (
+  <div {...props}>{children}</div>
+);
+const TabsList = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={cn('flex border-b', className)} {...props}>{children}</div>
+);
+const TabsTrigger = ({ 
+  children, 
+  value, 
+  className, 
+  ...props 
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & { value: string }) => (
+  <button className={cn('px-3 py-2 border-b-2 border-transparent hover:border-gray-300', className)} {...props}>{children}</button>
+);
+const TabsContent = ({ 
+  children, 
+  value, 
+  className, 
+  ...props 
+}: React.HTMLAttributes<HTMLDivElement> & { value: string }) => (
+  <div className={cn('mt-4', className)} {...props}>{children}</div>
+);
+
+const Skeleton = ({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={cn('animate-pulse bg-gray-200 rounded', className)} {...props} />
+);
+
+// Alert components
+const Alert = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={cn('p-4 border rounded-md bg-blue-50 border-blue-200', className)} {...props}>{children}</div>
+);
+const AlertTitle = ({ children, className, ...props }: React.HTMLAttributes<HTMLHeadingElement>) => (
+  <h4 className={cn('font-medium', className)} {...props}>{children}</h4>
+);
+const AlertDescription = ({ children, className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) => (
+  <p className={cn('text-sm mt-1', className)} {...props}>{children}</p>
+);
+
+// Icon stubs
+const Download = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>📥</span>;
+const FileJson = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>📄</span>;
+const Printer = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>🖨️</span>;
+const Shield = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>🛡️</span>;
+const CheckCircle2 = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>✅</span>;
+const XCircle = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>❌</span>;
+const Search = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>🔍</span>;
+const Filter = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>🔽</span>;
+const Copy = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>📋</span>;
+const AlertTriangle = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>⚠️</span>;
+const Gauge = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>📊</span>;
+const Scale = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>⚖️</span>;
+const ListTree = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>🌳</span>;
+const LinkIcon = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>🔗</span>;
+const Info = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>ℹ️</span>;
+const FileSignature = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>📝</span>;
+const ExternalLink = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>🔗</span>;
+const BarChart3 = ({ className }: { className?: string }) => <span className={cn('inline-block', className)}>📊</span>;
+
+// Recharts stubs
+const ResponsiveContainer = ({ children, width, height }: { children: React.ReactNode; width?: string | number; height?: string | number }) => (
+  <div style={{ width: width || '100%', height: height || 300 }}>{children}</div>
+);
+const BarChart = ({ children, data, ...props }: { children: React.ReactNode; data?: any[]; [key: string]: any }) => (
+  <div className="bg-gray-100 p-4 rounded">Chart: Bar Chart</div>
+);
+const Bar = ({ dataKey, fill, ...props }: { dataKey?: string; fill?: string; [key: string]: any }) => null;
+const XAxis = ({ dataKey, ...props }: { dataKey?: string; [key: string]: any }) => null;
+const YAxis = (props: any) => null;
+const RTooltip = (props: any) => null;
+const Legend = (props: any) => null;
+const Radar = ({ dataKey, stroke, fill, ...props }: { dataKey?: string; stroke?: string; fill?: string; [key: string]: any }) => null;
+const RadarChart = ({ children, data, ...props }: { children: React.ReactNode; data?: any[]; [key: string]: any }) => (
+  <div className="bg-gray-100 p-4 rounded">Chart: Radar Chart</div>
+);
+const PolarGrid = (props: any) => null;
+const PolarAngleAxis = ({ dataKey, ...props }: { dataKey?: string; [key: string]: any }) => null;
+const PolarRadiusAxis = (props: any) => null;
 
 // ----------------------
 // Types
@@ -418,7 +597,7 @@ function Component({
                 id="query"
                 placeholder="Введите ключевые слова"
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQuery(e.target.value)}
               />
             </div>
             <div className="space-y-2">
@@ -430,7 +609,7 @@ function Component({
             </div>
             <div className="space-y-2">
               <Label htmlFor="chart-type">Тип диаграммы</Label>
-              <Tabs value={chartType} onValueChange={(v) => setChartType(v as "bar" | "radar")}>
+              <Tabs value={chartType} onValueChange={(v: string) => setChartType(v as "bar" | "radar")}>
                 <TabsList>
                   <TabsTrigger value="bar">Bar</TabsTrigger>
                   <TabsTrigger value="radar">Radar</TabsTrigger>

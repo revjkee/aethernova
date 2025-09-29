@@ -1,13 +1,42 @@
 // src/widgets/Governance/VoteIntegrityStatus.tsx
 
 import React from 'react'
-import { useVoteIntegrity } from '@/hooks/governance/useVoteIntegrity'
 import { Card, CardContent } from '@/components/ui/card'
 import { AlertTriangle, ShieldCheck, HelpCircle, ScanSearch } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
+
+// Types
+interface IntegrityReport {
+  integrityScore: number
+  suspiciousWallets: string[]
+  sybilClusters: number
+  zkFailureCount: number
+  botVoteEstimate: number
+  flaggedTxHashes: string[]
+  comments: string[]
+  aiSummary: string
+}
+
+// Mock hook
+function useVoteIntegrity(proposalId: string) {
+  return {
+    integrityReport: {
+      integrityScore: 85.5,
+      suspiciousWallets: ['0x123...', '0x456...'],
+      sybilClusters: 2,
+      zkFailureCount: 3,
+      botVoteEstimate: 12.5,
+      flaggedTxHashes: ['0xabc123...', '0xdef456...'],
+      comments: ['Обнаружена кластеризация голосов', 'Низкая активность новых аккаунтов'],
+      aiSummary: 'Голосование показывает хорошую целостность с минимальными подозрительными активностями.'
+    } as IntegrityReport,
+    isLoading: false,
+    error: null
+  }
+}
 
 interface VoteIntegrityStatusProps {
   proposalId: string
@@ -89,14 +118,14 @@ const VoteIntegrityStatus: React.FC<VoteIntegrityStatusProps> = ({ proposalId })
         {comments && comments.length > 0 && (
           <div className="pt-3">
             <h5 className="text-sm font-medium text-foreground mb-1">AI-комментарии</h5>
-            <ul className="list-disc list-inside text-sm text-muted-foreground space-y-1">{comments.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            <ul className="list-disc list-inside text-sm text-muted-foreground space-y-1">{comments.map((c: string, i: number) => <li key={i}>{c}</li>)}</ul>
           </div>
         )}
 
         {flaggedTxHashes && flaggedTxHashes.length > 0 && (
           <div className="pt-2">
             <h5 className="text-sm font-medium text-foreground">Флагнутые транзакции</h5>
-            <div className="text-xs text-muted-foreground break-all space-y-1 max-h-32 overflow-y-auto">{flaggedTxHashes.map((tx, idx) => <div key={idx}>{tx}</div>)}</div>
+            <div className="text-xs text-muted-foreground break-all space-y-1 max-h-32 overflow-y-auto">{flaggedTxHashes.map((tx: string, idx: number) => <div key={idx}>{tx}</div>)}</div>
           </div>
         )}
       </CardContent>

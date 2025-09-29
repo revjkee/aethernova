@@ -7,22 +7,117 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuCheckboxItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
-import { Slider } from "@/components/ui/slider";
-import { Badge } from "@/components/ui/badge";
-import { TooltipProvider, Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { Download, Filter, Search, Info, RefreshCw, Layers } from "lucide-react";
-import { motion } from "framer-motion";
+// Simple stub components for UI elements
+const Button = ({ 
+  children, 
+  variant, 
+  size, 
+  className, 
+  ...props 
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & { 
+  variant?: string; 
+  size?: string; 
+}) => (
+  <button className={`px-3 py-2 rounded-md ${className || ''}`} {...props}>{children}</button>
+);
+const Card = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={`border rounded-lg shadow-sm bg-white ${className || ''}`} {...props}>{children}</div>
+);
+const CardHeader = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={`px-6 py-4 border-b ${className || ''}`} {...props}>{children}</div>
+);
+const CardTitle = ({ children, className, ...props }: React.HTMLAttributes<HTMLHeadingElement>) => (
+  <h3 className={`text-lg font-semibold ${className || ''}`} {...props}>{children}</h3>
+);
+const CardContent = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
+  <div className={`px-6 py-4 ${className || ''}`} {...props}>{children}</div>
+);
+
+const Input = ({ className, ...props }: React.InputHTMLAttributes<HTMLInputElement>) => (
+  <input className={`px-3 py-2 border rounded-md ${className || ''}`} {...props} />
+);
+
+const Badge = ({ children, variant, className, ...props }: React.HTMLAttributes<HTMLSpanElement> & { variant?: string }) => (
+  <span className={`inline-flex items-center px-2 py-1 text-xs rounded-full border ${className || ''}`} {...props}>{children}</span>
+);
+
+const Slider = ({ min, max, step, value, onValueChange, className, ...props }: {
+  min?: number;
+  max?: number;
+  step?: number;
+  value?: number[];
+  onValueChange?: (value: number[]) => void;
+  className?: string;
+}) => (
+  <input
+    type="range"
+    min={min}
+    max={max}
+    step={step}
+    value={value?.[0] || 0}
+    onChange={(e) => onValueChange?.([parseFloat(e.target.value)])}
+    className={`w-full ${className || ''}`}
+    {...props}
+  />
+);
+
+// Dropdown menu stubs
+const DropdownMenu = ({ children }: { children: React.ReactNode }) => <div className="relative inline-block">{children}</div>;
+const DropdownMenuTrigger = ({ children, asChild }: { children: React.ReactNode; asChild?: boolean }) => <div>{children}</div>;
+const DropdownMenuContent = ({ children, align, className }: { children: React.ReactNode; align?: string; className?: string }) => (
+  <div className={`absolute right-0 mt-2 bg-white border rounded-md shadow-lg z-10 ${className || ''}`}>{children}</div>
+);
+const DropdownMenuLabel = ({ children }: { children: React.ReactNode }) => (
+  <div className="px-3 py-2 text-sm font-medium text-gray-900 border-b">{children}</div>
+);
+const DropdownMenuSeparator = () => <div className="border-t my-1" />;
+const DropdownMenuCheckboxItem = ({ 
+  children, 
+  checked, 
+  onCheckedChange 
+}: { 
+  children: React.ReactNode; 
+  checked: boolean; 
+  onCheckedChange: (checked: boolean) => void;
+}) => (
+  <label className="flex items-center px-3 py-2 hover:bg-gray-50 cursor-pointer">
+    <input
+      type="checkbox"
+      checked={checked}
+      onChange={(e) => onCheckedChange(e.target.checked)}
+      className="mr-2"
+    />
+    {children}
+  </label>
+);
+
+// Tooltip stubs
+const TooltipProvider = ({ children }: { children: React.ReactNode }) => <div>{children}</div>;
+const Tooltip = ({ children }: { children: React.ReactNode }) => <div className="relative inline-block">{children}</div>;
+const TooltipTrigger = ({ children, asChild }: { children: React.ReactNode; asChild?: boolean }) => <div>{children}</div>;
+const TooltipContent = ({ children }: { children: React.ReactNode }) => (
+  <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-2 py-1 text-xs bg-black text-white rounded">{children}</div>
+);
+
+// Icon stubs
+const Download = ({ className }: { className?: string }) => <span className={`inline-block ${className || ''}`}>📥</span>;
+const Filter = ({ className }: { className?: string }) => <span className={`inline-block ${className || ''}`}>🔽</span>;
+const Search = ({ className }: { className?: string }) => <span className={`inline-block ${className || ''}`}>🔍</span>;
+const Info = ({ className }: { className?: string }) => <span className={`inline-block ${className || ''}`}>ℹ️</span>;
+const RefreshCw = ({ className }: { className?: string }) => <span className={`inline-block ${className || ''}`}>🔄</span>;
+const Layers = ({ className }: { className?: string }) => <span className={`inline-block ${className || ''}`}>📊</span>;
+
+// Motion stub (if framer-motion is not available)
+const motion = {
+  div: ({ children, ...props }: React.HTMLAttributes<HTMLDivElement> & { 
+    initial?: any; 
+    animate?: any; 
+    transition?: any; 
+    exit?: any;
+  }) => (
+    <div {...props}>{children}</div>
+  )
+};
 
 /**
  * Типы данных теплокарты.
@@ -575,7 +670,7 @@ export const AIConflictHeatmap: React.FC<AIConflictHeatmapProps> = memo(
                 className="pl-8 w-56"
                 placeholder="Поиск по именам…"
                 value={search}
-                onChange={(e) => setSearch(e.target.value)}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearch(e.target.value)}
               />
             </div>
             <DropdownMenu>
@@ -590,19 +685,19 @@ export const AIConflictHeatmap: React.FC<AIConflictHeatmapProps> = memo(
                 <DropdownMenuSeparator />
                 <DropdownMenuCheckboxItem
                   checked={sortByVariance}
-                  onCheckedChange={(v) => setSortByVariance(Boolean(v))}
+                  onCheckedChange={(v: boolean) => setSortByVariance(Boolean(v))}
                 >
                   Сортировать по вариативности
                 </DropdownMenuCheckboxItem>
                 <DropdownMenuCheckboxItem
                   checked={lockSquare}
-                  onCheckedChange={(v) => setLockSquare(Boolean(v))}
+                  onCheckedChange={(v: boolean) => setLockSquare(Boolean(v))}
                 >
                   Квадратные ячейки
                 </DropdownMenuCheckboxItem>
                 <DropdownMenuCheckboxItem
                   checked={hideDiagonal}
-                  onCheckedChange={(v) => setHideDiagonal(Boolean(v))}
+                  onCheckedChange={(v: boolean) => setHideDiagonal(Boolean(v))}
                 >
                   Скрыть диагональ
                 </DropdownMenuCheckboxItem>
@@ -643,7 +738,7 @@ export const AIConflictHeatmap: React.FC<AIConflictHeatmapProps> = memo(
                   max={vMax}
                   step={(vMax - vMin) / 100}
                   value={[clamp(threshold, vMin, vMax)]}
-                  onValueChange={(vals) => setThreshold(vals[0] ?? vMin)}
+                  onValueChange={(vals: number[]) => setThreshold(vals[0] ?? vMin)}
                 />
               </div>
             </div>

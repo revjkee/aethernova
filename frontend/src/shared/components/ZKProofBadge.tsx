@@ -143,7 +143,7 @@ export interface ZkProofBadgeProps extends Omit<ComponentPropsWithoutRef<"div">,
 const STATUS_MAP: Record<
   ZkProofStatus,
   {
-    icon: React.ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
+    icon: React.ComponentType<any>;
     label: string;
     tone: {
       ring: string;
