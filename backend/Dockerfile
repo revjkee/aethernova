@@ -33,11 +33,11 @@ WORKDIR /tmp/deps
 # Copy dependency manifests if present
 # (Both styles supported; the RUN step will detect what's available)
 # Pip style
-COPY requirements.txt requirements.txt 2>/dev/null || true
-COPY requirements/ requirements/ 2>/dev/null || true
+COPY requirements.txt ./requirements.txt
+COPY requirements/ ./requirements/
 # Poetry style
-COPY pyproject.toml pyproject.toml 2>/dev/null || true
-COPY poetry.lock poetry.lock 2>/dev/null || true
+COPY pyproject.toml ./pyproject.toml
+COPY poetry.lock ./poetry.lock
 
 # Prepare wheels directory
 RUN mkdir -p /wheels
@@ -104,9 +104,9 @@ COPY --from=builder /wheels /wheels
 # If your app also ships local packages, installing from wheels ensures reproducibility.
 # In case extra runtime deps are needed, you can copy a frozen req file and pip install from /wheels.
 # Try installing via a discovered manifest to avoid rebuilding wheels in runtime:
-COPY requirements.txt /tmp/requirements.txt 2>/dev/null || true
-COPY pyproject.toml /tmp/pyproject.toml 2>/dev/null || true
-COPY poetry.lock /tmp/poetry.lock 2>/dev/null || true
+COPY requirements.txt /tmp/requirements.txt
+COPY pyproject.toml /tmp/pyproject.toml
+COPY poetry.lock /tmp/poetry.lock
 
 RUN set -eux; \
     if [ -f /tmp/requirements.txt ]; then \
@@ -147,26 +147,24 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 ENV MODULE_PATH="backend.app.main:app,app.main:app,main:app"
 
 # Small launcher that selects the first existing module
-ENTRYPOINT ["/bin/sh","-lc"]
-CMD <<'EOF'
-set -e
-IFS=',' read -r -a CANDIDATES <<<'$MODULE_PATH'
-APP_MODULE=""
-for m in "${CANDIDATES[@]}"; do
-  python -c "import importlib; import sys; sys.exit(0) if (lambda x: importlib.import_module(x.split(':')[0]))('$m') else sys.exit(1)" 2>/dev/null && { APP_MODULE="$m"; break; }
-done
-if [ -z "$APP_MODULE" ]; then
-  echo "No viable app module found in MODULE_PATH='$MODULE_PATH'." >&2
-  exit 1
-fi
-
-exec gunicorn "$APP_MODULE" \
-  --worker-class="$GUNICORN_WORKER_CLASS" \
-  --workers="${UVICORN_WORKERS}" \
-  --bind="${UVICORN_HOST}:${UVICORN_PORT}" \
-  --timeout="${GUNICORN_TIMEOUT}" \
-  --keep-alive="${GUNICORN_KEEPALIVE}" \
-  --log-level="info" \
-  --access-logfile="-" \
-  --error-logfile="-"
-EOF
+CMD ["/bin/sh", "-c", "\
+set -e; \
+IFS=',' read -r -a CANDIDATES <<<\"$MODULE_PATH\"; \
+APP_MODULE=\"\"; \
+for m in \"${CANDIDATES[@]}\"; do \
+  python -c \"import importlib; import sys; sys.exit(0) if (lambda x: importlib.import_module(x.split(':')[0]))('$m') else sys.exit(1)\" 2>/dev/null && { APP_MODULE=\"$m\"; break; }; \
+done; \
+if [ -z \"$APP_MODULE\" ]; then \
+  echo \"No viable app module found in MODULE_PATH='$MODULE_PATH'.\" >&2; \
+  exit 1; \
+fi; \
+exec gunicorn \"$APP_MODULE\" \
+  --worker-class=\"$GUNICORN_WORKER_CLASS\" \
+  --workers=\"${UVICORN_WORKERS}\" \
+  --bind=\"${UVICORN_HOST}:${UVICORN_PORT}\" \
+  --timeout=\"${GUNICORN_TIMEOUT}\" \
+  --keep-alive=\"${GUNICORN_KEEPALIVE}\" \
+  --log-level=\"info\" \
+  --access-logfile=\"-\" \
+  --error-logfile=\"-\"\
+"]

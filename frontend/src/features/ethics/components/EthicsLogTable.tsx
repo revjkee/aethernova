@@ -622,8 +622,8 @@ export function EthicsLogTable({
                         <TableRow
                           role="row"
                           tabIndex={0}
-                          ref={(el) => rowRefs.current.set(r.id, el)}
-                          onKeyDown={(e) => handleKeyDown(e, idx, r.id)}
+                          ref={(el: HTMLTableRowElement | null) => rowRefs.current.set(r.id, el)}
+                          onKeyDown={(e: React.KeyboardEvent<HTMLTableRowElement>) => handleKeyDown(e, idx, r.id)}
                           className={classNames(isOpen && "bg-muted/30")}
                         >
                           <TableCell title={r.timestamp}>{formatDate(r.timestamp)}</TableCell>

@@ -100,6 +100,7 @@ const PolicySchema = z.object({
         description: z.string().optional(),
       })
     )
+    .optional()
     .default([]),
 });
 
@@ -117,7 +118,7 @@ const EvaluateTextRequestSchema = z.object({
 const EvaluationSchema = z.object({
   score: z.number().min(0).max(1),
   label: z.enum(["allow", "review", "block"]),
-  reasons: z.array(z.string()).default([]),
+  reasons: z.array(z.string()).optional().default([]),
 });
 
 const EvaluateTextResponseSchema = z.object({
@@ -185,13 +186,36 @@ const AuditResponseSchema = z.object({
   meta: MetaSchema,
 });
 
-// Exported TS types
-export type Policy = z.infer<typeof PolicySchema>;
-export type PolicyList = z.infer<typeof PolicyListSchema>;
+// Exported TS types - applying .default() values manually for proper inference
+export type Policy = z.infer<typeof PolicySchema> & {
+  rules: Array<{
+    code: string;
+    title: string;
+    severity: "low" | "medium" | "high" | "critical";
+    description?: string;
+  }>;
+};
+
+export type PolicyList = z.infer<typeof PolicyListSchema> & {
+  items: Policy[];
+};
+
 export type EvaluateTextRequest = z.infer<typeof EvaluateTextRequestSchema>;
-export type EvaluateTextResponse = z.infer<typeof EvaluateTextResponseSchema>;
+
+export type EvaluateTextResponse = z.infer<typeof EvaluateTextResponseSchema> & {
+  evaluation: z.infer<typeof EvaluationSchema> & {
+    reasons: string[];
+  };
+};
+
 export type AssessmentRequest = z.infer<typeof AssessmentRequestSchema>;
-export type AssessmentResponse = z.infer<typeof AssessmentResponseSchema>;
+
+export type AssessmentResponse = z.infer<typeof AssessmentResponseSchema> & {
+  evaluation: z.infer<typeof EvaluationSchema> & {
+    reasons: string[];
+  };
+};
+
 export type Decision = z.infer<typeof DecisionSchema>;
 export type IncidentLogRequest = z.infer<typeof IncidentLogRequestSchema>;
 export type IncidentLogResponse = z.infer<typeof IncidentLogResponseSchema>;
@@ -397,7 +421,14 @@ export class EthicsAPI {
       path: "/policies",
       schema: PolicyListSchema,
     });
-    return data;
+    // Apply default values at runtime to match type expectations
+    return {
+      ...data,
+      items: data.items.map(item => ({
+        ...item,
+        rules: item.rules ?? []
+      }))
+    } as PolicyList;
   }
 
   // GET /ethics/policies/:id
@@ -406,14 +437,14 @@ export class EthicsAPI {
       op: "getPolicy",
       method: "GET",
       path: `/policies/${encodeURIComponent(id)}`,
-      schema: PolicySchema.extend({ meta: MetaSchema }).transform((v) => {
-        // strip meta for consumer convenience
-        // @ts-expect-error meta is intentionally dropped
-        const { meta, ...rest } = v;
-        return rest as Policy;
-      }),
+      schema: PolicySchema.extend({ meta: MetaSchema }),
     });
-    return data;
+    // Strip meta and apply defaults for consumer convenience
+    const { meta, ...rest } = data;
+    return {
+      ...rest,
+      rules: rest.rules ?? []
+    } as Policy;
   }
 
   // POST /ethics/evaluate/text
@@ -427,7 +458,18 @@ export class EthicsAPI {
       schema: EvaluateTextResponseSchema,
       signal,
     });
-    return data;
+    // Apply default values to match type expectations
+    return {
+      ...data,
+      evaluation: {
+        ...data.evaluation,
+        reasons: data.evaluation.reasons ?? []
+      },
+      policy: data.policy ? {
+        ...data.policy,
+        rules: data.policy.rules ?? []
+      } : undefined
+    } as EvaluateTextResponse;
   }
 
   // POST /ethics/assessments
@@ -443,7 +485,14 @@ export class EthicsAPI {
       idempotencyKey: idem,
       schema: AssessmentResponseSchema,
     });
-    return data;
+    // Apply default values to match type expectations
+    return {
+      ...data,
+      evaluation: {
+        ...data.evaluation,
+        reasons: data.evaluation.reasons ?? []
+      }
+    } as AssessmentResponse;
   }
 
   // GET /ethics/assessments/:id/decision

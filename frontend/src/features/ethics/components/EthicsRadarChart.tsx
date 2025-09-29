@@ -12,7 +12,7 @@ import {
   Tooltip,
   Legend,
 } from "recharts";
-import { cn } from "@/shared/lib/cn"; // если у вас нет cn, замените на свою утилиту или удалите
+import { cn } from "@/lib/utils";
 import {
   Card,
   CardHeader,
@@ -134,7 +134,7 @@ const DefaultTooltip = memo(function DefaultTooltip({
 }: {
   active?: boolean;
   payload?: any[];
-  label?: string;
+  label?: string | number;
   valueFormatter: (v: number) => string;
 }) {
   if (!active || !payload || payload.length === 0) return null;
@@ -144,9 +144,9 @@ const DefaultTooltip = memo(function DefaultTooltip({
     <div
       className="rounded-xl border bg-background p-3 shadow-md text-sm"
       role="dialog"
-      aria-label={`Показатели для ${label}`}
+      aria-label={`Показатели для ${String(label)}`}
     >
-      <div className="font-medium mb-1">{label}</div>
+      <div className="font-medium mb-1">{String(label)}</div>
       <ul className="space-y-1">
         {payload.map((p, i) => {
           const name = p.name as string;

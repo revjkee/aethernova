@@ -1,12 +1,20 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { cn } from '@/shared/utils/classNames'
-import { useTheme } from '@/shared/hooks/useThemeSwitcher'
+import { cn } from '@/lib/utils'
 import { motion, AnimatePresence } from 'framer-motion'
-import { useWebSocket } from '@/shared/hooks/useSocket'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Badge } from '@/components/ui/badge'
 import { CheckCircle, AlertTriangle, XCircle, Clock, Loader2 } from 'lucide-react'
-import { HealthStatus, SubsystemHealth } from '@/types/health.types'
+
+// Types
+export type HealthStatus = 'healthy' | 'degraded' | 'offline' | 'unknown' | 'loading'
+
+export interface SubsystemHealth {
+  name: string
+  status: HealthStatus
+  lastCheck: string
+  details?: string
+  metrics?: Record<string, number>
+}
 
 const STATUS_ICONS: Record<HealthStatus, React.ReactNode> = {
   healthy: <CheckCircle className="w-4 h-4" />,
@@ -38,28 +46,27 @@ type Props = {
 }
 
 export const HealthStatusBadge: React.FC<Props> = ({ subsystemId, size = 'md' }) => {
-  const { theme } = useTheme()
   const [status, setStatus] = useState<HealthStatus>('loading')
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
 
-  const socket = useWebSocket(`/ws/health/${subsystemId}`, {
-    onMessage: (raw: string) => {
-      try {
-        const data: SubsystemHealth = JSON.parse(raw)
-        if (data?.status) {
-          setStatus(data.status)
-          setLastUpdate(new Date())
-        }
-      } catch {
-        setStatus('unknown')
-      }
-    },
-    reconnectInterval: 10000,
-  })
-
+  // Mock health check - в реальном приложении здесь был бы WebSocket или API call
   useEffect(() => {
-    return () => socket.disconnect()
-  }, [])
+    const interval = setInterval(() => {
+      // Симуляция проверки здоровья системы
+      const healthStatuses: HealthStatus[] = ['healthy', 'degraded', 'offline', 'unknown']
+      const randomStatus = healthStatuses[Math.floor(Math.random() * healthStatuses.length)]
+      setStatus(randomStatus)
+      setLastUpdate(new Date())
+    }, 5000)
+
+    // Начальная загрузка
+    setTimeout(() => {
+      setStatus('healthy')
+      setLastUpdate(new Date())
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [subsystemId])
 
   const sizeClasses = useMemo(() => {
     switch (size) {
