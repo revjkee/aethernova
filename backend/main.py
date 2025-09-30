@@ -14,7 +14,8 @@ from typing import Any, AsyncGenerator, Iterable, Optional
 
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, BaseSettings, Field, AnyUrl
+from pydantic import BaseModel, Field, AnyUrl
+from pydantic_settings import BaseSettings
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
