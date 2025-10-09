@@ -1,0 +1,386 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'backend/ai_core/agents/**/*.py'
+      - 'docs/**'
+      - '**/*.md'
+      - 'mkdocs.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'backend/ai_core/agents/**/*.py'
+      - 'docs/**'
+      - '**/*.md'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # Генерация API документации
+  generate-api-docs:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+          pip install pdoc3 sphinx sphinx-rtd-theme
+
+      - name: Generate API documentation with pdoc
+        run: |
+          pdoc --html --output-dir docs/api backend.ai_core.agents \
+            --force --config show_source_code=False
+
+      - name: Generate OpenAPI schema
+        run: |
+          python -c "
+          import asyncio
+          import json
+          from backend.ai_core.agents.api.management import APIManagementSystem
+          from backend.ai_core.agents import agent_registry, agent_monitor, workflow_engine
+          
+          async def generate_schema():
+              try:
+                  # Создание API системы для генерации схемы
+                  api_system = APIManagementSystem(
+                      agent_registry=agent_registry,
+                      agent_monitor=agent_monitor, 
+                      workflow_engine=None,  # Не инициализируем для генерации схемы
+                      redis_url='redis://localhost:6379'
+                  )
+                  
+                  app = api_system.get_app()
+                  schema = app.openapi()
+                  
+                  with open('docs/api/openapi.json', 'w') as f:
+                      json.dump(schema, f, indent=2)
+                  
+                  print('✅ OpenAPI schema generated')
+              except Exception as e:
+                  print(f'⚠️ Could not generate OpenAPI schema: {e}')
+          
+          asyncio.run(generate_schema())
+          "
+
+      - name: Build documentation with MkDocs
+        run: |
+          pip install mkdocs mkdocs-material mkdocs-mermaid2-plugin
+          
+          # Создание базовой структуры документации если не существует
+          if [ ! -f "mkdocs.yml" ]; then
+            cat > mkdocs.yml << EOF
+          site_name: AI Agents Documentation
+          site_description: Comprehensive documentation for AI Agents system
+          
+          theme:
+            name: material
+            features:
+              - navigation.tabs
+              - navigation.sections
+              - toc.integrate
+              - search.highlight
+            palette:
+              - scheme: default
+                primary: blue
+                accent: blue
+          
+          nav:
+            - Home: index.md
+            - Getting Started: getting-started.md
+            - Architecture: architecture.md
+            - API Reference: api/
+            - Integration: integration/
+            - Examples: examples/
+            - Contributing: contributing.md
+          
+          plugins:
+            - search
+            - mermaid2
+          
+          markdown_extensions:
+            - admonition
+            - codehilite
+            - pymdownx.superfences:
+                custom_fences:
+                  - name: mermaid
+                    class: mermaid
+                    format: !!python/name:mermaid2.fence_mermaid
+          EOF
+          fi
+          
+          mkdocs build
+
+      - name: Upload documentation artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: documentation
+          path: |
+            site/
+            docs/api/
+
+  # Проверка качества документации
+  docs-quality-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for broken links
+        run: |
+          # Установка linkchecker
+          sudo apt-get update && sudo apt-get install -y linkchecker
+          
+          # Проверка ссылок в markdown файлах
+          find . -name "*.md" -exec grep -l "http" {} \; | while read file; do
+            echo "Checking links in $file"
+            grep -oE 'https?://[^)]+' "$file" | while read url; do
+              if ! curl -sf "$url" > /dev/null 2>&1; then
+                echo "⚠️ Broken link in $file: $url"
+              fi
+            done
+          done
+
+      - name: Check documentation coverage
+        run: |
+          python -c "
+          import os
+          import ast
+          import glob
+          
+          def check_docstrings(file_path):
+              with open(file_path, 'r', encoding='utf-8') as f:
+                  try:
+                      tree = ast.parse(f.read())
+                  except:
+                      return 0, 0
+              
+              total = 0
+              documented = 0
+              
+              for node in ast.walk(tree):
+                  if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)):
+                      total += 1
+                      if ast.get_docstring(node):
+                          documented += 1
+              
+              return documented, total
+          
+          # Проверка покрытия документации
+          total_funcs = 0
+          documented_funcs = 0
+          
+          for py_file in glob.glob('backend/ai_core/agents/**/*.py', recursive=True):
+              if '__pycache__' not in py_file and 'test' not in py_file:
+                  doc, tot = check_docstrings(py_file)
+                  documented_funcs += doc
+                  total_funcs += tot
+          
+          coverage = (documented_funcs / total_funcs * 100) if total_funcs > 0 else 0
+          print(f'Documentation coverage: {coverage:.1f}% ({documented_funcs}/{total_funcs})')
+          
+          if coverage < 70:
+              print('⚠️ Documentation coverage is below 70%')
+          else:
+              print('✅ Documentation coverage is good')
+          "
+
+      - name: Spell check documentation
+        run: |
+          sudo apt-get install -y aspell aspell-en
+          
+          # Проверка орфографии в markdown файлах
+          find . -name "*.md" | while read file; do
+            echo "Spell checking $file"
+            aspell --mode=markdown --personal=/dev/null list < "$file" | head -10
+          done
+
+  # Деплой документации
+  deploy-docs:
+    runs-on: ubuntu-latest
+    needs: [generate-api-docs, docs-quality-check]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download documentation artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: documentation
+          path: site/
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          cname: docs.ai-agents.aethernova.com
+
+      - name: Deploy API docs to external hosting
+        run: |
+          # Деплой API документации на внешний хостинг (например, Vercel, Netlify)
+          echo "Deploying API documentation to external hosting..."
+          
+          # Пример для Vercel
+          if [ -n "${{ secrets.VERCEL_TOKEN }}" ]; then
+            npx vercel --token ${{ secrets.VERCEL_TOKEN }} --prod ./docs/api/
+          fi
+
+      - name: Update documentation search index
+        run: |
+          # Обновление поискового индекса документации
+          echo "Updating documentation search index..."
+          
+          # Можно интегрировать с Algolia DocSearch или другими поисковыми системами
+          curl -X POST "${{ secrets.DOCS_SEARCH_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d '{"action": "reindex", "source": "github_actions"}' || true
+
+      - name: Notify documentation deployment
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          text: |
+            📚 Documentation deployment ${{ job.status }}
+            
+            **URL:** https://docs.ai-agents.aethernova.com
+            **API Docs:** https://docs.ai-agents.aethernova.com/api/
+            **Commit:** ${{ github.sha }}
+
+  # Проверка примеров кода
+  validate-examples:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Validate code examples in documentation
+        run: |
+          # Извлечение и проверка примеров кода из markdown файлов
+          python -c "
+          import re
+          import ast
+          import glob
+          import tempfile
+          import subprocess
+          
+          def extract_python_code(md_file):
+              with open(md_file, 'r') as f:
+                  content = f.read()
+              
+              # Поиск блоков кода Python
+              pattern = r'```python\n(.*?)\n```'
+              matches = re.findall(pattern, content, re.DOTALL)
+              return matches
+          
+          print('Validating Python code examples...')
+          
+          for md_file in glob.glob('**/*.md', recursive=True):
+              examples = extract_python_code(md_file)
+              
+              for i, code in enumerate(examples):
+                  try:
+                      # Проверка синтаксиса
+                      ast.parse(code)
+                      print(f'✅ {md_file} example {i+1}: syntax OK')
+                  except SyntaxError as e:
+                      print(f'❌ {md_file} example {i+1}: syntax error - {e}')
+          "
+
+      - name: Test example scripts
+        run: |
+          # Запуск примеров скриптов
+          if [ -d "backend/ai_core/agents/examples" ]; then
+            for example in backend/ai_core/agents/examples/*.py; do
+              echo "Testing example: $example"
+              python -m py_compile "$example"
+              echo "✅ $example compiles successfully"
+            done
+          fi
+
+  # Генерация changelog
+  generate-changelog:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        run: |
+          # Генерация changelog на основе коммитов
+          echo "# Changelog" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "All notable changes to the AI Agents project will be documented in this file." >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          
+          # Получение версий из тегов
+          tags=$(git tag --sort=-version:refname | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+" | head -10)
+          
+          for tag in $tags; do
+            echo "## [$tag] - $(git log -1 --format=%ai $tag | cut -d' ' -f1)" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            
+            # Получение коммитов для версии
+            if [ "$tag" = "$(echo "$tags" | head -1)" ]; then
+              # Для последней версии - коммиты от предыдущего тега
+              prev_tag=$(echo "$tags" | sed -n '2p')
+              if [ -n "$prev_tag" ]; then
+                git log --pretty=format:"- %s (%h)" $prev_tag..$tag >> CHANGELOG.md
+              else
+                git log --pretty=format:"- %s (%h)" $tag >> CHANGELOG.md
+              fi
+            fi
+            
+            echo "" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+          done
+
+      - name: Commit changelog
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          git add CHANGELOG.md
+          if git diff --staged --quiet; then
+            echo "No changes to changelog"
+          else
+            git commit -m "chore: update changelog [skip ci]"
+            git push
+          fi

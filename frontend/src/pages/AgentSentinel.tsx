@@ -1,7 +1,9 @@
 // path: src/pages/AgentSentinel.tsx
 
 import { useEffect, useMemo, useState } from "react";
-import { Helmet } from "react-helmet";
+// import { Helmet } from "react-helmet";
+// Temporary stub for Helmet to avoid import errors
+const Helmet = ({ children }: { children?: React.ReactNode }) => <>{children}</>;
 import { toast } from "react-toastify";
 
 import { useAuth } from "@/features/auth/hooks/useAuth";
@@ -57,7 +59,7 @@ const AgentSentinel = () => {
   const agentStats = useMemo(() => {
     if (!agents) return { active: 0, inactive: 0, quarantined: 0, rogue: 0 };
     return agents.reduce(
-      (acc, agent) => {
+      (acc: { active: number; inactive: number; quarantined: number; rogue: number }, agent: any) => {
         switch (agent.status) {
           case "ACTIVE": acc.active++; break;
           case "INACTIVE": acc.inactive++; break;
@@ -99,7 +101,7 @@ const AgentSentinel = () => {
             <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 mb-10">
               <div className="bg-white dark:bg-zinc-900 p-6 rounded-lg shadow">
                 <h3 className="text-lg font-semibold mb-2">ZK Подпись агентов</h3>
-                <ZKProofBadge verified={zkVerified} />
+                <ZKProofBadge status={zkVerified ? "verified" : "pending"} />
               </div>
 
               <div className="bg-white dark:bg-zinc-900 p-6 rounded-lg shadow">
@@ -125,7 +127,7 @@ const AgentSentinel = () => {
           </>
         )}
 
-        <Modal open={!!selectedAgentId} onClose={() => setSelectedAgentId(null)}>
+        <Modal open={!!selectedAgentId} onOpenChange={(open) => !open && setSelectedAgentId(null)}>
           {selectedAgentId && <SentinelAgentModal agentId={selectedAgentId} />}
         </Modal>
       </div>

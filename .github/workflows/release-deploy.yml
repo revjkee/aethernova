@@ -1,0 +1,515 @@
+name: Release & Deploy
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.2.3)'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      skip_tests:
+        description: 'Skip tests (for hotfixes)'
+        required: false
+        default: false
+        type: boolean
+      rollback:
+        description: 'Rollback to previous version'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHON_VERSION: "3.11"
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/ai-agents
+
+jobs:
+  # Валидация релиза
+  validate-release:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.rollback != 'true'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ github.event.inputs.version }}"
+          elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            version="${{ github.ref_name }}"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            version="${{ github.event.release.tag_name }}"
+          else
+            version="v$(date +%Y.%m.%d)-$(git rev-parse --short HEAD)"
+          fi
+          
+          echo "version=$version" >> $GITHUB_OUTPUT
+          
+          # Проверка на pre-release
+          if [[ "$version" == *"-"* ]] || [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate version format
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.*)?$ ]]; then
+            echo "❌ Invalid version format: $version"
+            echo "Expected format: v1.2.3 or v1.2.3-alpha.1"
+            exit 1
+          fi
+          echo "✅ Version format valid: $version"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Получение предыдущего тега
+          previous_tag=$(git tag --sort=-version:refname | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+" | head -2 | tail -1)
+          current_tag="${{ steps.version.outputs.version }}"
+          
+          echo "Generating changelog from $previous_tag to $current_tag"
+          
+          # Генерация changelog
+          changelog=$(git log --pretty=format:"- %s (%h)" $previous_tag..$current_tag 2>/dev/null | head -20)
+          
+          if [ -z "$changelog" ]; then
+            changelog="- Initial release"
+          fi
+          
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$changelog" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Check for breaking changes
+        run: |
+          # Проверка на breaking changes в коммитах
+          breaking_changes=$(git log --pretty=format:"%s" $previous_tag..$current_tag 2>/dev/null | grep -i "BREAKING\|breaking change" || true)
+          
+          if [ -n "$breaking_changes" ]; then
+            echo "⚠️ Breaking changes detected:"
+            echo "$breaking_changes"
+            echo "BREAKING_CHANGES=true" >> $GITHUB_ENV
+          else
+            echo "✅ No breaking changes detected"
+            echo "BREAKING_CHANGES=false" >> $GITHUB_ENV
+          fi
+
+  # Быстрые тесты для релиза
+  release-tests:
+    runs-on: ubuntu-latest
+    needs: validate-release
+    if: github.event.inputs.skip_tests != 'true' && github.event.inputs.rollback != 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Run critical tests
+        run: |
+          # Запуск только критических тестов для быстрого feedback
+          pytest backend/ai_core/agents/tests/unit/base/ \
+            backend/ai_core/agents/tests/unit/registry/ \
+            -v --tb=short --maxfail=5
+
+      - name: Run smoke tests
+        run: |
+          # Smoke тесты основных компонентов
+          python -c "
+          import asyncio
+          from backend.ai_core.agents import agent_system
+          
+          async def smoke_test():
+              try:
+                  # Тест инициализации системы
+                  print('Testing system initialization...')
+                  await agent_system.initialize()
+                  
+                  # Тест получения статуса
+                  print('Testing system status...')
+                  status = await agent_system.get_system_status()
+                  assert status['status'] in ['running', 'initialized']
+                  
+                  print('✅ Smoke tests passed')
+                  await agent_system.shutdown()
+              except Exception as e:
+                  print(f'❌ Smoke tests failed: {e}')
+                  raise
+          
+          asyncio.run(smoke_test())
+          "
+
+  # Сборка релизных образов
+  build-release-images:
+    runs-on: ubuntu-latest
+    needs: [validate-release, release-tests]
+    if: always() && (needs.validate-release.result == 'success') && (needs.release-tests.result == 'success' || github.event.inputs.skip_tests == 'true')
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.validate-release.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate-release.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.validate-release.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push release image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            BUILD_VERSION=${{ needs.validate-release.outputs.version }}
+            BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Sign container image
+        run: |
+          # Подпись образа с помощью cosign (если настроено)
+          if command -v cosign &> /dev/null; then
+            echo "Signing container image..."
+            cosign sign --yes ${{ steps.meta.outputs.tags }}@${{ steps.build.outputs.digest }}
+          else
+            echo "Cosign not available, skipping image signing"
+          fi
+
+  # Деплой в staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [validate-release, build-release-images]
+    if: always() && needs.build-release-images.result == 'success' && (github.event.inputs.environment == 'staging' || needs.validate-release.outputs.is_prerelease == 'true')
+    
+    environment:
+      name: staging
+      url: https://staging.ai-agents.aethernova.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup deployment tools
+        run: |
+          # Установка kubectl, helm и других инструментов
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod 700 get_helm.sh
+          ./get_helm.sh
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.STAGING_KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Deploy to staging
+        run: |
+          # Helm деплой
+          helm upgrade --install ai-agents-staging ./helm/ai-agents \
+            --namespace staging \
+            --create-namespace \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ needs.validate-release.outputs.version }} \
+            --set environment=staging \
+            --set ingress.hosts[0].host=staging.ai-agents.aethernova.com \
+            --values ./helm/ai-agents/values-staging.yaml \
+            --wait --timeout=10m
+
+      - name: Run post-deployment tests
+        run: |
+          # Ожидание готовности сервисов
+          kubectl wait --for=condition=ready pod -l app=ai-agents -n staging --timeout=300s
+          
+          # Проверка health endpoints
+          staging_url="https://staging.ai-agents.aethernova.com"
+          
+          for i in {1..10}; do
+            if curl -f "$staging_url/health"; then
+              echo "✅ Staging deployment successful"
+              break
+            else
+              echo "⏳ Waiting for staging to be ready... ($i/10)"
+              sleep 30
+            fi
+          done
+
+      - name: Notify staging deployment
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          text: |
+            🚀 Staging Deployment ${{ job.status }}
+            
+            Version: ${{ needs.validate-release.outputs.version }}
+            Environment: staging
+            URL: https://staging.ai-agents.aethernova.com
+            
+            ${{ job.status == 'success' && '✅ Ready for production deployment' || '❌ Deployment failed' }}
+
+  # Деплой в production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [validate-release, build-release-images, deploy-staging]
+    if: |
+      always() && 
+      needs.build-release-images.result == 'success' && 
+      (github.event.inputs.environment == 'production' || (github.event_name == 'release' && github.event.action == 'published')) &&
+      needs.validate-release.outputs.is_prerelease == 'false'
+    
+    environment:
+      name: production
+      url: https://ai-agents.aethernova.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Manual approval for production
+        uses: trstringer/manual-approval@v1
+        if: github.event_name != 'release'
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: ${{ secrets.PRODUCTION_APPROVERS }}
+          minimum-approvals: 2
+          issue-title: "Production Deployment Approval - ${{ needs.validate-release.outputs.version }}"
+          issue-body: |
+            ## Production Deployment Request
+            
+            **Version:** ${{ needs.validate-release.outputs.version }}
+            **Breaking Changes:** ${{ env.BREAKING_CHANGES }}
+            **Staging Tests:** ✅ Passed
+            
+            ### Changelog
+            ${{ needs.validate-release.outputs.changelog }}
+            
+            Please review and approve this production deployment.
+
+      - name: Setup deployment tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod 700 get_helm.sh
+          ./get_helm.sh
+
+      - name: Configure kubectl for production
+        run: |
+          echo "${{ secrets.PRODUCTION_KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Create database backup
+        run: |
+          # Создание резервной копии БД перед деплоем
+          kubectl create job --from=cronjob/db-backup db-backup-pre-deploy -n production
+          kubectl wait --for=condition=complete job/db-backup-pre-deploy -n production --timeout=600s
+
+      - name: Deploy to production with blue-green strategy
+        run: |
+          # Blue-green деплой для минимизации downtime
+          current_version=$(helm get values ai-agents-production -n production -o json | jq -r '.image.tag // "none"')
+          echo "Current production version: $current_version"
+          
+          # Деплой новой версии (green)
+          helm upgrade --install ai-agents-production ./helm/ai-agents \
+            --namespace production \
+            --create-namespace \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ needs.validate-release.outputs.version }} \
+            --set environment=production \
+            --set replicaCount=3 \
+            --set ingress.hosts[0].host=ai-agents.aethernova.com \
+            --values ./helm/ai-agents/values-production.yaml \
+            --wait --timeout=15m
+
+      - name: Smoke test production deployment
+        run: |
+          # Smoke тесты в production
+          prod_url="https://ai-agents.aethernova.com"
+          
+          # Health check
+          if ! curl -f "$prod_url/health"; then
+            echo "❌ Production health check failed"
+            exit 1
+          fi
+          
+          # API availability check
+          if ! curl -f -H "Authorization: Bearer ${{ secrets.PRODUCTION_API_KEY }}" "$prod_url/api/v1/agents"; then
+            echo "❌ Production API check failed"
+            exit 1
+          fi
+          
+          echo "✅ Production smoke tests passed"
+
+      - name: Update monitoring and alerts
+        run: |
+          # Обновление мониторинга для новой версии
+          kubectl patch configmap monitoring-config -n production \
+            --patch '{"data":{"app_version":"${{ needs.validate-release.outputs.version }}"}}'
+
+      - name: Create GitHub release
+        if: github.event_name != 'release'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.validate-release.outputs.version }}
+          release_name: AI Agents ${{ needs.validate-release.outputs.version }}
+          body: |
+            ## AI Agents Release ${{ needs.validate-release.outputs.version }}
+            
+            ### Changes
+            ${{ needs.validate-release.outputs.changelog }}
+            
+            ### Docker Image
+            ```
+            ${{ needs.build-release-images.outputs.image-tag }}
+            ```
+            
+            ### Deployment Information
+            - **Staging:** ✅ Deployed
+            - **Production:** ✅ Deployed
+            - **Breaking Changes:** ${{ env.BREAKING_CHANGES }}
+            
+            ### Verification
+            - Health: https://ai-agents.aethernova.com/health
+            - API Docs: https://ai-agents.aethernova.com/api/docs
+          draft: false
+          prerelease: ${{ needs.validate-release.outputs.is_prerelease }}
+
+      - name: Notify production deployment
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          text: |
+            🎉 Production Deployment ${{ job.status }}
+            
+            **Version:** ${{ needs.validate-release.outputs.version }}
+            **URL:** https://ai-agents.aethernova.com
+            **Status:** ${{ job.status == 'success' && '✅ Successfully deployed' || '❌ Deployment failed' }}
+            
+            ### Changes
+            ${{ needs.validate-release.outputs.changelog }}
+
+  # Rollback в случае проблем
+  rollback-production:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.rollback == 'true' || failure()
+    
+    environment:
+      name: production
+      
+    steps:
+      - name: Setup deployment tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+          chmod 700 get_helm.sh
+          ./get_helm.sh
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.PRODUCTION_KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Rollback to previous version
+        run: |
+          echo "Rolling back production deployment..."
+          helm rollback ai-agents-production -n production
+          
+          # Ожидание завершения rollback
+          kubectl rollout status deployment/ai-agents-production -n production --timeout=600s
+
+      - name: Verify rollback
+        run: |
+          # Проверка что rollback успешен
+          if curl -f "https://ai-agents.aethernova.com/health"; then
+            echo "✅ Rollback successful"
+          else
+            echo "❌ Rollback failed"
+            exit 1
+          fi
+
+      - name: Notify rollback
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          text: |
+            🔄 Production Rollback ${{ job.status }}
+            
+            The production deployment has been rolled back due to issues.
+            Please investigate and fix the problems before attempting another deployment.

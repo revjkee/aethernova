@@ -1,0 +1,479 @@
+name: AI Agents CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'backend/ai_core/agents/**'
+      - 'requirements*.txt'
+      - 'pyproject.toml'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'backend/ai_core/agents/**'
+      - 'requirements*.txt'
+      - 'pyproject.toml'
+      - 'Dockerfile'
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      run_integration_tests:
+        description: 'Run integration tests'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/ai-agents
+
+jobs:
+  # Анализ изменений для оптимизации pipeline
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      agents: ${{ steps.changes.outputs.agents }}
+      api: ${{ steps.changes.outputs.api }}
+      integration: ${{ steps.changes.outputs.integration }}
+      workflows: ${{ steps.changes.outputs.workflows }}
+      monitoring: ${{ steps.changes.outputs.monitoring }}
+      docs: ${{ steps.changes.outputs.docs }}
+      docker: ${{ steps.changes.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            agents:
+              - 'backend/ai_core/agents/base/**'
+              - 'backend/ai_core/agents/registry/**'
+              - 'backend/ai_core/agents/roles/**'
+              - 'backend/ai_core/agents/metagenerals/**'
+            api:
+              - 'backend/ai_core/agents/api/**'
+            integration:
+              - 'backend/ai_core/agents/integration/**'
+            workflows:
+              - 'backend/ai_core/agents/workflows/**'
+            monitoring:
+              - 'backend/ai_core/agents/monitoring/**'
+            docs:
+              - 'backend/ai_core/agents/docs/**'
+              - '**/*.md'
+            docker:
+              - 'Dockerfile'
+              - 'docker-compose*.yml'
+              - 'requirements*.txt'
+              - 'pyproject.toml'
+
+  # Проверка качества кода
+  code-quality:
+    runs-on: ubuntu-latest
+    needs: changes
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Run Black formatter check
+        run: |
+          black --check backend/ai_core/agents/
+
+      - name: Run isort import sorting check
+        run: |
+          isort --check-only backend/ai_core/agents/
+
+      - name: Run flake8 linting
+        run: |
+          flake8 backend/ai_core/agents/ --max-line-length=100 --ignore=E203,W503
+
+      - name: Run mypy type checking
+        run: |
+          mypy backend/ai_core/agents/ --ignore-missing-imports
+
+      - name: Run bandit security check
+        run: |
+          bandit -r backend/ai_core/agents/ -f json -o bandit-report.json
+        continue-on-error: true
+
+      - name: Upload bandit report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: bandit-security-report
+          path: bandit-report.json
+
+  # Юнит тесты
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: [changes, code-quality]
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        test-group: [base, registry, roles, api, integration, monitoring]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Run unit tests for ${{ matrix.test-group }}
+        run: |
+          pytest backend/ai_core/agents/tests/unit/${{ matrix.test-group }}/ \
+            --cov=backend.ai_core.agents \
+            --cov-report=xml \
+            --cov-report=html \
+            --junitxml=test-results-${{ matrix.test-group }}-${{ matrix.python-version }}.xml \
+            -v
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ matrix.test-group }}-${{ matrix.python-version }}
+          path: test-results-*.xml
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: coverage-${{ matrix.test-group }}-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+
+  # Интеграционные тесты
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    if: ${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.api == 'true' || github.event.inputs.run_integration_tests == 'true' }}
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_USER: test_user
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        ports:
+          - 5672:5672
+          - 15672:15672
+        env:
+          RABBITMQ_DEFAULT_USER: test
+          RABBITMQ_DEFAULT_PASS: test
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 30s
+          --health-timeout 30s
+          --health-retries 3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Wait for services
+        run: |
+          sleep 30
+
+      - name: Run integration tests
+        env:
+          REDIS_URL: redis://localhost:6379
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+          RABBITMQ_URL: amqp://test:test@localhost:5672/
+          OMNIMIND_CORE_URL: http://localhost:8080/api/v1
+          API_SECRET_KEY: test-secret-key
+        run: |
+          pytest backend/ai_core/agents/tests/integration/ \
+            --cov=backend.ai_core.agents \
+            --cov-report=xml \
+            --junitxml=integration-test-results.xml \
+            -v --tb=short
+
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: integration-test-results
+          path: integration-test-results.xml
+
+  # Тесты производительности
+  performance-tests:
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+          pip install locust
+
+      - name: Run performance tests
+        run: |
+          pytest backend/ai_core/agents/tests/performance/ \
+            --benchmark-json=benchmark-results.json \
+            -v
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-results
+          path: benchmark-results.json
+
+  # Сборка Docker образа
+  build-docker:
+    runs-on: ubuntu-latest
+    needs: [code-quality, unit-tests]
+    if: needs.changes.outputs.docker == 'true' || github.event_name == 'push'
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+
+  # Сканирование безопасности Docker образа
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: [build-docker]
+    if: needs.build-docker.result == 'success'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-docker.outputs.image-tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Деплой в staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [integration-tests, build-docker, security-scan]
+    if: |
+      github.event_name == 'push' && 
+      github.ref == 'refs/heads/develop' &&
+      needs.integration-tests.result == 'success' &&
+      needs.build-docker.result == 'success'
+    
+    environment:
+      name: staging
+      url: https://staging.ai-agents.aethernova.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          # Здесь будет реальный деплой в staging
+          echo "Image: ${{ needs.build-docker.outputs.image-tag }}"
+
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests on staging..."
+          # Здесь будут smoke тесты
+
+      - name: Notify deployment
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          text: |
+            Staging deployment ${{ job.status }}
+            Image: ${{ needs.build-docker.outputs.image-tag }}
+
+  # Деплой в production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [integration-tests, build-docker, security-scan, deploy-staging]
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment == 'production')
+    
+    environment:
+      name: production
+      url: https://ai-agents.aethernova.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production environment..."
+          # Здесь будет реальный деплой в production
+          echo "Image: ${{ needs.build-docker.outputs.image-tag }}"
+
+      - name: Run health checks
+        run: |
+          echo "Running health checks on production..."
+          # Здесь будут health checks
+
+      - name: Create GitHub release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            Automated release of AI Agents system
+            
+            Docker image: ${{ needs.build-docker.outputs.image-tag }}
+            Commit: ${{ github.sha }}
+          draft: false
+          prerelease: false
+
+      - name: Notify production deployment
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          text: |
+            🚀 Production deployment ${{ job.status }}
+            Release: v${{ github.run_number }}
+            Image: ${{ needs.build-docker.outputs.image-tag }}
+
+  # Cleanup старых артефактов
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    
+    steps:
+      - name: Delete old container images
+        uses: actions/delete-package-versions@v4
+        with:
+          package-name: ai-agents
+          package-type: container
+          min-versions-to-keep: 10
+          delete-only-untagged-versions: true

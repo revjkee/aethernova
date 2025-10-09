@@ -1,0 +1,449 @@
+name: Automated Testing
+
+on:
+  schedule:
+    # Запуск каждый день в 2:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Type of tests to run'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - unit
+          - integration
+          - performance
+          - security
+      agent_type:
+        description: 'Specific agent type to test'
+        required: false
+        type: choice
+        options:
+          - all
+          - base
+          - metagenerals
+          - roles
+          - monitoring
+          - integration
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # Матричное тестирование различных конфигураций
+  matrix-tests:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'unit' || github.event_name == 'schedule'
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        agent-config: [minimal, standard, full]
+        exclude:
+          # Исключаем некоторые комбинации для экономии ресурсов
+          - os: windows-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: "3.10"
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Configure agent system
+        run: |
+          case "${{ matrix.agent-config }}" in
+            "minimal")
+              echo "Using minimal agent configuration"
+              export AGENT_CONFIG_PRESET=minimal
+              ;;
+            "standard") 
+              echo "Using standard agent configuration"
+              export AGENT_CONFIG_PRESET=standard
+              ;;
+            "full")
+              echo "Using full agent configuration"
+              export AGENT_CONFIG_PRESET=full
+              ;;
+          esac
+
+      - name: Run tests with specific agent type
+        if: github.event.inputs.agent_type != 'all' && github.event.inputs.agent_type != ''
+        run: |
+          pytest backend/ai_core/agents/tests/unit/${{ github.event.inputs.agent_type }}/ \
+            --cov=backend.ai_core.agents \
+            --cov-report=xml \
+            --junitxml=test-results-${{ matrix.os }}-${{ matrix.python-version }}-${{ matrix.agent-config }}.xml \
+            -v
+
+      - name: Run all unit tests
+        if: github.event.inputs.agent_type == 'all' || github.event.inputs.agent_type == '' || github.event_name == 'schedule'
+        run: |
+          pytest backend/ai_core/agents/tests/unit/ \
+            --cov=backend.ai_core.agents \
+            --cov-report=xml \
+            --cov-report=html \
+            --junitxml=test-results-${{ matrix.os }}-${{ matrix.python-version }}-${{ matrix.agent-config }}.xml \
+            -v
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: matrix-test-results-${{ matrix.os }}-${{ matrix.python-version }}-${{ matrix.agent-config }}
+          path: |
+            test-results-*.xml
+            coverage.xml
+            htmlcov/
+
+  # Тесты нагрузки
+  load-tests:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'performance' || github.event_name == 'schedule'
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+      
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        ports:
+          - 5672:5672
+        env:
+          RABBITMQ_DEFAULT_USER: test
+          RABBITMQ_DEFAULT_PASS: test
+    
+    strategy:
+      matrix:
+        load-scenario: [light, medium, heavy]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+          pip install locust pytest-benchmark
+
+      - name: Configure load scenario
+        run: |
+          case "${{ matrix.load-scenario }}" in
+            "light")
+              echo "CONCURRENT_AGENTS=5" >> $GITHUB_ENV
+              echo "TASKS_PER_AGENT=10" >> $GITHUB_ENV
+              echo "TEST_DURATION=30" >> $GITHUB_ENV
+              ;;
+            "medium")
+              echo "CONCURRENT_AGENTS=20" >> $GITHUB_ENV
+              echo "TASKS_PER_AGENT=50" >> $GITHUB_ENV
+              echo "TEST_DURATION=60" >> $GITHUB_ENV
+              ;;
+            "heavy")
+              echo "CONCURRENT_AGENTS=50" >> $GITHUB_ENV
+              echo "TASKS_PER_AGENT=100" >> $GITHUB_ENV
+              echo "TEST_DURATION=120" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Run load tests
+        env:
+          REDIS_URL: redis://localhost:6379
+          RABBITMQ_URL: amqp://test:test@localhost:5672/
+        run: |
+          pytest backend/ai_core/agents/tests/performance/test_load.py \
+            --benchmark-json=load-test-${{ matrix.load-scenario }}.json \
+            -v -s
+
+      - name: Run Locust performance tests
+        env:
+          REDIS_URL: redis://localhost:6379
+        run: |
+          cd backend/ai_core/agents/tests/performance
+          locust --headless --users ${{ env.CONCURRENT_AGENTS }} \
+            --spawn-rate 2 \
+            --run-time ${{ env.TEST_DURATION }}s \
+            --host http://localhost:8000 \
+            --html load-report-${{ matrix.load-scenario }}.html \
+            --csv load-stats-${{ matrix.load-scenario }}
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results-${{ matrix.load-scenario }}
+          path: |
+            load-test-*.json
+            backend/ai_core/agents/tests/performance/load-report-*.html
+            backend/ai_core/agents/tests/performance/load-stats-*.csv
+
+  # Тесты безопасности
+  security-tests:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'security' || github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install security tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+          pip install bandit safety semgrep
+
+      - name: Run Bandit security scanner
+        run: |
+          bandit -r backend/ai_core/agents/ \
+            -f json -o bandit-report.json \
+            -ll -i
+
+      - name: Run Safety vulnerability scanner
+        run: |
+          safety check --json --output safety-report.json
+        continue-on-error: true
+
+      - name: Run Semgrep security scanner
+        run: |
+          semgrep --config=auto backend/ai_core/agents/ \
+            --json --output=semgrep-report.json
+        continue-on-error: true
+
+      - name: Check for hardcoded secrets
+        run: |
+          grep -r -E "(password|secret|key|token).*=" backend/ai_core/agents/ \
+            --include="*.py" || true
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+            semgrep-report.json
+
+  # Длительные интеграционные тесты
+  extended-integration-tests:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'integration' || github.event_name == 'schedule'
+    timeout-minutes: 60
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_USER: test_user
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        ports:
+          - 5672:5672
+          - 15672:15672
+        env:
+          RABBITMQ_DEFAULT_USER: test
+          RABBITMQ_DEFAULT_PASS: test
+
+      # Мок omnimind-core сервиса
+      mock-omnimind:
+        image: wiremock/wiremock:latest
+        ports:
+          - 8080:8080
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Wait for services
+        run: |
+          sleep 30
+
+      - name: Setup mock services
+        run: |
+          # Настройка mock omnimind-core API
+          curl -X POST http://localhost:8080/__admin/mappings \
+            -H "Content-Type: application/json" \
+            -d '{
+              "request": {
+                "method": "POST",
+                "url": "/api/v1/tasks/schedule"
+              },
+              "response": {
+                "status": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": "{\"task_id\": \"mock_task_123\", \"status\": \"scheduled\"}"
+              }
+            }'
+
+      - name: Run extended integration tests
+        env:
+          REDIS_URL: redis://localhost:6379
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+          RABBITMQ_URL: amqp://test:test@localhost:5672/
+          OMNIMIND_CORE_URL: http://localhost:8080/api/v1
+          API_SECRET_KEY: test-secret-key-for-extended-tests
+          TEST_TIMEOUT: 3600
+        run: |
+          pytest backend/ai_core/agents/tests/integration/extended/ \
+            --cov=backend.ai_core.agents \
+            --cov-report=xml \
+            --junitxml=extended-integration-results.xml \
+            -v --tb=long --timeout=3600
+
+      - name: Upload extended test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: extended-integration-results
+          path: |
+            extended-integration-results.xml
+            coverage.xml
+
+  # Генерация отчета о тестировании
+  test-report:
+    runs-on: ubuntu-latest
+    needs: [matrix-tests, load-tests, security-tests, extended-integration-tests]
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all test artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install reporting tools
+        run: |
+          pip install jinja2 pytest-html coverage
+
+      - name: Generate comprehensive test report
+        run: |
+          python -c "
+          import json
+          import glob
+          from datetime import datetime
+          
+          # Сбор всех результатов тестов
+          test_files = glob.glob('**/test-results-*.xml', recursive=True)
+          security_files = glob.glob('**/security-reports/*.json', recursive=True)
+          performance_files = glob.glob('**/performance-results-*/*.json', recursive=True)
+          
+          report = {
+              'timestamp': datetime.now().isoformat(),
+              'test_files_count': len(test_files),
+              'security_files_count': len(security_files),
+              'performance_files_count': len(performance_files),
+              'status': 'Generated'
+          }
+          
+          with open('test-summary.json', 'w') as f:
+              json.dump(report, f, indent=2)
+          
+          print(f'Generated test report: {report}')
+          "
+
+      - name: Create test report
+        run: |
+          echo "# AI Agents Test Report" > test-report.md
+          echo "" >> test-report.md
+          echo "Generated: $(date)" >> test-report.md
+          echo "" >> test-report.md
+          echo "## Test Results Summary" >> test-report.md
+          cat test-summary.json >> test-report.md
+
+      - name: Upload test report
+        uses: actions/upload-artifact@v3
+        with:
+          name: comprehensive-test-report
+          path: |
+            test-report.md
+            test-summary.json
+
+      - name: Comment on PR with test results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('test-report.md', 'utf8');
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+
+      - name: Notify on test completion
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+          text: |
+            🧪 Automated testing completed
+            
+            Matrix tests: ${{ needs.matrix-tests.result }}
+            Load tests: ${{ needs.load-tests.result }}
+            Security tests: ${{ needs.security-tests.result }}
+            Extended integration: ${{ needs.extended-integration-tests.result }}
