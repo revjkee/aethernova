@@ -522,6 +522,28 @@ async def db_health(session: AsyncSession = Depends(get_session)) -> dict:
     return {"db": "ok"}
 
 
+# =========================
+# API Routers
+# =========================
+
+# Import and include agent API routers
+try:
+    # Ensure src directory is in path
+    base_dir = os.path.dirname(__file__)
+    src_dir = os.path.join(base_dir, "src")
+    if os.path.isdir(src_dir) and src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    
+    from agents_api import router as agents_router
+    from websocket_api import router as websocket_router
+    
+    app.include_router(agents_router)
+    app.include_router(websocket_router)
+    logger.info("Agent API routers loaded successfully")
+    
+except Exception as e:
+    logger.warning(f"Failed to load agent API routers: {e}")
+
 # Global error handlers
 @app.exception_handler(Exception)
 async def unhandled_exc(request: Request, exc: Exception):

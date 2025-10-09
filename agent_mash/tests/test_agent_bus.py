@@ -1,9 +1,9 @@
 # agent-mesh/tests/test_agent_bus.py
 
 import pytest
-from agent_mesh.agent_bus import AgentBus
-from agent_mesh.core.agent_message import AgentMessage
-from agent_mesh.schema.message_types import MessageType
+from agent_mash.agent_bus import AgentBus
+from agent_mash.core.agent_message import AgentMessage
+from agent_mash.schema.message_types import MessageType
 
 
 class MockAgent:
