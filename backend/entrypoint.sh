@@ -138,6 +138,27 @@ wait_for_host_port() {
   done
 }
 
+build_sync_alembic_url() {
+  local url="${1:-}"
+
+  if [[ -z "${url}" ]]; then
+    echo ""
+    return 0
+  fi
+
+  case "${url}" in
+    postgresql+asyncpg://*)
+      echo "${url/postgresql+asyncpg/postgresql}"
+      ;;
+    postgresql+psycopg://*)
+      echo "${url/postgresql+psycopg/postgresql}"
+      ;;
+    *)
+      echo "${url}"
+      ;;
+  esac
+}
+
 wait_dependencies() {
   local timeout="${1:-90}"
 
@@ -171,7 +192,21 @@ run_prestart_hook() {
 alembic_upgrade() {
   if [[ -f "${ALEMBIC_CONFIG}" ]]; then
     info "Выполняю миграции: alembic upgrade head"
-    alembic -c "${ALEMBIC_CONFIG}" upgrade head
+    local alembic_url="${ALEMBIC_DATABASE_URL:-}"
+    if [[ -z "${alembic_url}" ]]; then
+      # DATABASE_URL предпочтительно используется приложением (async).
+      # Для Alembic требуется синхронный драйвер, поэтому преобразуем при необходимости.
+      alembic_url="$(build_sync_alembic_url "${DATABASE_URL:-}")"
+    fi
+
+    if [[ -n "${alembic_url}" ]]; then
+      info "Использую Alembic URL с синхронным драйвером"
+      DATABASE_URL="${alembic_url}" \
+      SQLALCHEMY_DATABASE_URI="${alembic_url}" \
+        alembic -c "${ALEMBIC_CONFIG}" upgrade head
+    else
+      alembic -c "${ALEMBIC_CONFIG}" upgrade head
+    fi
   else
     warn "Файл Alembic не найден (${ALEMBIC_CONFIG}). Пропускаю миграции."
   fi
