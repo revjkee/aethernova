@@ -1,5 +1,13 @@
 # mythos-core/mythos/bootstrap.py
 from __future__ import annotations
+"""
+Bootstrap module
+"""
+
+"""
+Bootstrap module
+"""
+
 
 import asyncio
 import contextlib

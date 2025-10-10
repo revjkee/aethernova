@@ -1,3 +1,4 @@
+import asyncio
 # security-core/api/http/server.py
 # Промышленный HTTP-сервер авторизации и управления политиками (Zero-Trust RBAC+ABAC)
 # Зависимости: fastapi, uvicorn, pydantic, prometheus_client, (опционально) PyJWT

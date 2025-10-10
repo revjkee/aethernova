@@ -1,3 +1,4 @@
+import asyncio
 # SPDX-License-Identifier: Apache-2.0
 """
 Industrial HTTP error utilities with RFC 7807 (application/problem+json) support.

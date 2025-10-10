@@ -6,6 +6,14 @@
 # - Deterministic seeding, atomic writes, SHA256 checksums
 # - Size/latency report, JSON metadata, dry-run
 # - YAML/JSON config + CLI flags; graceful degradation when deps are missing
+"""
+Quantize module
+"""
+
+"""
+Quantize module
+"""
+
 
 from __future__ import annotations
 import argparse

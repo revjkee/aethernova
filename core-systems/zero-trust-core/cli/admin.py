@@ -9,6 +9,14 @@
 # - Audit logging and context propagation via zero_trust.telemetry.logging if available; graceful fallback otherwise
 # - Machine-friendly JSON output, --quiet/--verbose controls
 # - File HMAC signing/verification for operational integrity
+"""
+Admin module
+"""
+
+"""
+Admin module
+"""
+
 
 from __future__ import annotations
 

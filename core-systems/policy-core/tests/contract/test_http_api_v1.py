@@ -29,6 +29,14 @@
 #   BASE_URL=https://api.example.com API_TOKEN=... AUTH_STYLE=bearer pytest -q ...
 #
 from __future__ import annotations
+"""
+Test Http Api V1 module
+"""
+
+"""
+Test Http Api V1 module
+"""
+
 
 import asyncio
 import json

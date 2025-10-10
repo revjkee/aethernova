@@ -1,3 +1,4 @@
+import asyncio
 # security-core/api/http/routers/v1/introspect.py
 # Промышленный роутер introspection V1 для Aethernova Security Core (FastAPI)
 # Совместим с server.py (settings, POLICIES, Principal, auth_dependency, generate_latest).

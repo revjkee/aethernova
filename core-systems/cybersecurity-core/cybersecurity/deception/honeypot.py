@@ -1,5 +1,13 @@
 # cybersecurity-core/cybersecurity/deception/honeypot.py
 from __future__ import annotations
+"""
+Honeypot module
+"""
+
+"""
+Honeypot module
+"""
+
 
 import asyncio
 import base64

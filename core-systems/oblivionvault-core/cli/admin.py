@@ -2,6 +2,14 @@
 # Unified administrative CLI for OblivionVault
 # Python 3.10+
 from __future__ import annotations
+"""
+Admin module
+"""
+
+"""
+Admin module
+"""
+
 
 import argparse
 import base64

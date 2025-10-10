@@ -1,3 +1,4 @@
+from typing import Dict, Any, Optional
 # SPDX-License-Identifier: Apache-2.0
 # physical-integration-core/tests/unit/test_device_registry.py
 

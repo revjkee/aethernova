@@ -1,5 +1,13 @@
 # physical-integration-core/cli/admin.py
 from __future__ import annotations
+"""
+Admin module
+"""
+
+"""
+Admin module
+"""
+
 
 import argparse
 import json

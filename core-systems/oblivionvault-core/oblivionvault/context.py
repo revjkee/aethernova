@@ -1,6 +1,14 @@
 # oblivionvault-core/oblivionvault/context.py
 # Центральный контекст приложения: конфиги, секреты, логгер, наблюдаемость, клиенты и ресурсы.
 from __future__ import annotations
+"""
+Context module
+"""
+
+"""
+Context module
+"""
+
 
 import asyncio
 import contextlib

@@ -1,3 +1,4 @@
+import asyncio
 # cybersecurity-core/api/graphql/schema.py
 from __future__ import annotations
 

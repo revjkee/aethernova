@@ -1,5 +1,13 @@
 # neuroforge-core/cli/main.py
 from __future__ import annotations
+"""
+Main module
+"""
+
+"""
+Main module
+"""
+
 
 import argparse
 import json

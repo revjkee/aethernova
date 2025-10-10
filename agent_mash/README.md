@@ -1,32 +1,90 @@
 
----
+# 🤖 Система улучшенных AI агентов
 
-## 📦 Подмодули
+Продвинутая система управления множеством AI агентов с возможностями обработки данных, принятия решений, внешних интеграций и полным мониторингом.
 
-### core/
-- `base_bus.py` — Базовый класс для всех транспортных шин
-- `agent_message.py` — Унифицированный формат сообщений
+## 🚀 Основные возможности
 
-### protocols/
-- Redis, Kafka, gRPC, ZeroMQ транспорт
-- Конфигурация приоритетов и fallback'ов: `protocol_config.yaml`
+### ✨ Продвинутые компоненты
+- **Обработка данных**: Валидация схем, конвейеры обработки, кэширование
+- **Принятие решений**: Множественные стратегии (правила, ML, консенсус)
+- **Внешние API**: Интеграция с rate limiting, circuit breakers, аутентификация
+- **Обучение**: Адаптация на основе обратной связи, система памяти
+- **Оркестрация**: Управление множеством агентов, балансировка нагрузки
 
-### strategies/
-- Обработка входящих задач из Telegram, CLI, WebApp, внешнего API
+### 📊 Мониторинг и аналитика
+- **Веб-dashboard**: Реалтайм мониторинг через веб-интерфейс
+- **Метрики**: Сбор и анализ производительности агентов
+- **Алерты**: Автоматические уведомления о проблемах
+- **Отчеты**: Детальная аналитика и рекомендации
 
-### planner/
-- `rl_planner.py` — выбор действий на основе RL
-- `goal_orchestrator.py` — управление целями между агентами
+### 🧪 Типы агентов
+- **Чатботы**: Обработка естественного языка, диалоги
+- **Аналитики данных**: Статистический анализ, поиск паттернов
+- **Кастомные агенты**: Легкое создание специализированных агентов
 
-### registry/
-- Реестр зарегистрированных агентов, их возможностей и статуса
+## 📦 Установка и настройка
 
-### utils/
-- `message_schema.py` — валидация/сериализация сообщений
-- `retry_policy.py` — backoff и приоритетные повторы
+### Требования
+- Python 3.8+
+- asyncio
+- Опционально: Flask (для веб-dashboard), psutil (для системных метрик)
 
-### schema/
-- Типы сообщений: TASK, EVENT, RESULT, ERROR
+### Быстрый старт
+
+1. **Установка зависимостей**:
+```bash
+make install
+# или
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+```
+
+2. **Запуск демонстрации**:
+```bash
+make demo
+# или
+python agent_mash/scripts/run_enhanced_agents.py demo
+```
+
+3. **Запуск с мониторингом**:
+```bash
+python agent_mash/scripts/run_with_monitoring.py demo
+```
+
+4. **Веб-dashboard** (если установлен Flask):
+```bash
+python agent_mash/scripts/run_with_monitoring.py dashboard
+# Откройте http://localhost:5000
+```
+
+## 🎯 Режимы работы
+
+### 1. Демонстрация (Demo)
+```bash
+make demo
+python agent_mash/scripts/run_enhanced_agents.py demo
+```
+
+### 2. Продакшн режим
+```bash
+python agent_mash/scripts/run_enhanced_agents.py production --config config.json
+```
+
+### 3. Мониторинг
+```bash
+python agent_mash/scripts/run_with_monitoring.py tasks --duration 15
+python agent_mash/scripts/run_with_monitoring.py dashboard --port 8080
+```
+
+## 🛠️ Использование Makefile
+
+```bash
+make help              # Все команды
+make demo             # Полная демонстрация  
+make test             # Запуск тестов
+make benchmark        # Бенчмарк производительности
+make clean            # Очистка
 
 ---
 
