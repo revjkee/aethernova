@@ -1,92 +1,90 @@
 """
-Квантовые вычисления и криптографические протоколы
-ЭКСТРЕННОЕ ВОССТАНОВЛЕНИЕ для quantum-core
-Критическая система категории: Quantum Computing
+Quantum-Resistant Cryptography Core - Main System
+Post-quantum cryptographic primitives and blockchain integration
+ВОССТАНОВЛЕНО для quantum-core
+Критическая система категории: Quantum Cryptography
 """
 
 import asyncio
-import logging
-from typing import Optional, Dict, Any, List, Union
-from datetime import datetime, timedelta
+import json
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from datetime import datetime
 from loguru import logger
-from .config import config
-import hashlib
-import secrets
-import jwt
-import bcrypt
 
-class QuantumCoreCore:
+from config import config
+from src.kyber_kem import KyberKEM
+from src.sphincs_plus import SphincsPlus
+from src.quantum_crypto import QuantumCrypto, QuantumKeypair
+
+
+class QuantumResistantCryptoCore:
     """
-    КРИТИЧЕСКАЯ СИСТЕМА: Квантовые вычисления и криптографические протоколы
+    КРИТИЧЕСКАЯ СИСТЕМА: Quantum-Resistant Cryptography
     
-    Категория: Quantum Computing
-    Критические функции: Quantum algorithms, Quantum cryptography, Post-quantum security, Quantum random generators
-    
-    ЭКСТРЕННОЕ ВОССТАНОВЛЕНИЕ - полная функциональность
+    Категория: Quantum Cryptography
+    Критические функции: Post-quantum encryption, Quantum-safe signatures, Blockchain integration
     """
     
     def __init__(self):
         self.config = config
         self.is_running = False
-        self.emergency_mode = True  # Флаг экстренного режима
+        self.emergency_mode = True
         self.components: Dict[str, Any] = {}
         self.metrics: Dict[str, Any] = {}
-        self.security_context: Dict[str, Any] = {}
         
-        # Критические компоненты для Quantum Computing
-        self._initialize_critical_components()
+        # Криптографические компоненты
+        self.quantum_crypto: Optional[QuantumCrypto] = None
+        self.kyber_kem: Optional[KyberKEM] = None
+        self.sphincs_plus: Optional[SphincsPlus] = None
         
-        # Экстренное логирование
-        logger.configure(
-            handlers=[
-                {
-                    "sink": f"logs/quantum-core.emergency.log",
-                    "format": "{time:YYYY-MM-DD HH:mm:ss} | EMERGENCY | {level} | {message}",
-                    "level": "INFO",
-                    "rotation": "1 day",
-                    "retention": "30 days"
-                },
-                {
-                    "sink": "logs/critical_systems.log", 
-                    "format": "{time} | QUANTUM-CORE | {level} | {message}",
-                    "level": "WARNING"
-                }
-            ]
+        # Хранилище ключей
+        self.keypairs: Dict[str, QuantumKeypair] = {}
+        
+        # Логирование
+        logger.add(
+            f"logs/quantum-crypto.emergency.log",
+            format="{time:YYYY-MM-DD HH:mm:ss} | EMERGENCY | {level} | {message}",
+            level="INFO",
+            rotation="1 day",
+            retention="30 days"
         )
         
-        logger.critical(f"🚨 ЭКСТРЕННОЕ ВОССТАНОВЛЕНИЕ QUANTUM-CORE АКТИВИРОВАНО")
-        
-    def _initialize_critical_components(self) -> None:
-        """Инициализирует критические компоненты"""
+        logger.critical(f"🚨 ВОССТАНОВЛЕНИЕ QUANTUM-RESISTANT-CRYPTO-CORE АКТИВИРОВАНО")
+    
+    async def _initialize_critical_components(self) -> None:
+        """Инициализирует критические криптографические компоненты"""
+        try:
+            # Инициализация Quantum Crypto (unified API)
+            self.quantum_crypto = QuantumCrypto(
+                security_level=128,  # SPHINCS+-128
+                kyber_level=512      # Kyber-512
+            )
+            
+            # Инициализация отдельных компонентов
+            self.kyber_kem = KyberKEM(security_level=512)
+            self.sphincs_plus = SphincsPlus(security_level=128, variant="simple")
+            
+            # Регистрация компонентов
+            self.components["quantum_crypto"] = self.quantum_crypto
+            self.components["kyber_kem"] = self.kyber_kem
+            self.components["sphincs_plus"] = self.sphincs_plus
+            
+            logger.critical("⚛️ Quantum-resistant криптографические компоненты инициализированы")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации компонентов: {e}")
+            raise
 
-        # QUANTUM COMPUTING - КРИТИЧЕСКИЕ компоненты
-        self.quantum_processor = None
-        self.quantum_random_generator = None
-        self.quantum_key_distribution = {}
-        self.post_quantum_crypto = None
-        self.quantum_algorithms = {}
-        self.entanglement_manager = None
-        
-        logger.critical("⚛️ Quantum критические компоненты инициализированы")
-
-        
     async def emergency_initialize(self) -> bool:
         """ЭКСТРЕННАЯ инициализация системы"""
         try:
             logger.critical(f"🚨 ЭКСТРЕННАЯ ИНИЦИАЛИЗАЦИЯ {self.config.system_name} начата")
             
-            # Проверка критических зависимостей
-            if not await self._emergency_dependency_check():
-                logger.error("💥 КРИТИЧЕСКИЕ ЗАВИСИМОСТИ НЕДОСТУПНЫ")
-                return False
+            # Инициализация компонентов
+            await self._initialize_critical_components()
             
-            # Экстренная инициализация компонентов  
-            await self._emergency_component_initialization()
-            
-            # Настройка безопасности
-            await self._emergency_security_setup()
-            
-            # Активация мониторинга
+            # Настройка мониторинга
             await self._emergency_monitoring_setup()
             
             logger.critical(f"✅ ЭКСТРЕННАЯ ИНИЦИАЛИЗАЦИЯ {self.config.system_name} ЗАВЕРШЕНА")
@@ -99,7 +97,7 @@ class QuantumCoreCore:
     async def emergency_start(self) -> None:
         """ЭКСТРЕННЫЙ запуск системы"""
         if not await self.emergency_initialize():
-            raise RuntimeError("💀 ЭКСТРЕННАЯ ИНИЦИАЛИЗАЦИЯ ПРОВАЛЕНА - СИСТЕМА НЕ МОЖЕТ БЫТЬ ЗАПУЩЕНА")
+            raise RuntimeError("💀 ЭКСТРЕННАЯ ИНИЦИАЛИЗАЦИЯ ПРОВАЛЕНА")
         
         self.is_running = True
         self.emergency_mode = True
@@ -107,10 +105,9 @@ class QuantumCoreCore:
         logger.critical(f"🚨 {self.config.system_name} ЗАПУЩЕНА В ЭКСТРЕННОМ РЕЖИМЕ")
         
         try:
-            # Основной цикл экстренной работы
             while self.is_running:
                 await self._emergency_processing_loop()
-                await asyncio.sleep(0.1)  # Высокочастотная обработка для критических систем
+                await asyncio.sleep(1.0)
                 
         except KeyboardInterrupt:
             logger.critical("⚠️ ПОЛУЧЕН СИГНАЛ ЭКСТРЕННОЙ ОСТАНОВКИ")
@@ -122,78 +119,21 @@ class QuantumCoreCore:
         logger.critical("🛑 ЭКСТРЕННАЯ ОСТАНОВКА СИСТЕМЫ...")
         self.is_running = False
         
-        # Сохранение критических данных
-        await self._emergency_data_backup()
-        
-        # Безопасная остановка компонентов
-        await self._emergency_shutdown_components()
+        # Сохранение ключей
+        await self._save_keypairs()
         
         logger.critical(f"🔒 {self.config.system_name} ЭКСТРЕННО ОСТАНОВЛЕНА")
-    
-    async def _emergency_dependency_check(self) -> bool:
-        """Экстренная проверка критических зависимостей"""
-        # Проверка базовых системных зависимостей
-        required_systems = ["identity-access-core"]  # Минимальная зависимость
-        
-        for system in required_systems:
-            if not await self._check_system_availability(system):
-                logger.warning(f"⚠️ Система {{system}} недоступна - продолжаем в аварийном режиме")
-                
-        return True  # Продолжаем работу даже при недоступности зависимостей
-
-    
-    async def _check_system_availability(self, system_name: str) -> bool:
-        """Проверка доступности системы"""
-        try:
-            system_path = Path(self.config.core_systems_path) / system_name
-            return system_path.exists() and (system_path / "main.py").exists()
-        except Exception:
-            return False
-            
-    async def _emergency_component_initialization(self) -> None:
-        """Экстренная инициализация компонентов"""
-        # Quantum Computing Emergency Components
-        self.components["main_service"] = await self._init_emergency_service()
-        self.components["backup_handler"] = await self._init_emergency_backup()
-        
-        logger.critical(f"🔧 {self.__class__.__name__} критические сервисы активированы")
-        
-    async def _init_emergency_service(self) -> Dict[str, Any]:
-        """Экстренный основной сервис"""
-        return {
-            "status": "emergency_active",
-            "mode": "minimal_functionality",
-            "features": ['Quantum algorithms', 'Quantum cryptography', 'Post-quantum security'],
-            "startup_time": datetime.now().isoformat()
-        }
-        
-    async def _init_emergency_backup(self) -> Dict[str, Any]:
-        """Экстренное резервное копирование"""
-        return {
-            "backup_enabled": True,
-            "backup_interval": 300,  # 5 минут
-            "last_backup": None
-        }
-
-    
-    async def _emergency_security_setup(self) -> None:
-        """Настройка экстренной безопасности"""
-        self.security_context = {
-            "emergency_mode": True,
-            "security_level": "HIGH",
-            "encryption_required": True,
-            "audit_all_actions": True,
-            "emergency_access_granted": datetime.now().isoformat()
-        }
-        
-        logger.critical("🔒 Экстренная безопасность настроена")
     
     async def _emergency_monitoring_setup(self) -> None:
         """Настройка экстренного мониторинга"""
         self.metrics = {
             "start_time": datetime.now().isoformat(),
             "emergency_mode": True,
-            "processed_requests": 0,
+            "generated_keypairs": 0,
+            "encryption_operations": 0,
+            "decryption_operations": 0,
+            "signing_operations": 0,
+            "verification_operations": 0,
             "error_count": 0,
             "last_health_check": datetime.now().isoformat(),
             "uptime_seconds": 0
@@ -203,143 +143,245 @@ class QuantumCoreCore:
     
     async def _emergency_processing_loop(self) -> None:
         """Основной цикл экстренной обработки"""
-        # Quantum Computing обработка
-        await self._process_critical_tasks()
-        await self._monitor_system_health()
-        await self._backup_critical_data()
-
-        
-        # Обновление общих метрик
-        self.metrics["processed_requests"] += 1
+        # Обновление метрик
         self.metrics["last_health_check"] = datetime.now().isoformat()
-        self.metrics["uptime_seconds"] = (datetime.now() - datetime.fromisoformat(self.metrics["start_time"])).total_seconds()
+        start_time = datetime.fromisoformat(self.metrics["start_time"])
+        self.metrics["uptime_seconds"] = (datetime.now() - start_time).total_seconds()
     
-    async def _process_critical_tasks(self) -> None:
-        """Обработка критических задач"""
-        # Базовая обработка для всех систем
-        pass
+    # Public API
     
-    async def _monitor_system_health(self) -> None:
-        """Мониторинг здоровья системы"""
-        # Проверка критических компонентов
-        for component_name, component in self.components.items():
-            if isinstance(component, dict) and component.get("status") != "active":
-                logger.warning(f"⚠️ Компонент {{component_name}} не активен: {{component.get('status')}}")
+    async def generate_keypair(self, keypair_id: str) -> QuantumKeypair:
+        """Генерирует quantum-resistant keypair"""
+        if not self.quantum_crypto:
+            raise RuntimeError("Quantum crypto not initialized")
+        
+        keypair = self.quantum_crypto.generate_keypair()
+        self.keypairs[keypair_id] = keypair
+        
+        self.metrics["generated_keypairs"] += 1
+        
+        logger.info(f"Generated keypair: {keypair_id}")
+        
+        return keypair
     
-    async def _backup_critical_data(self) -> None:
-        """Резервное копирование критических данных"""
-        # Экстренное резервное копирование каждые 5 минут
-        if "backup_handler" in self.components:
-            backup_service = self.components["backup_handler"]
-            if backup_service.get("backup_enabled", False):
-                # Логика резервного копирования
-                backup_service["last_backup"] = datetime.now().isoformat()
+    async def encrypt_data(self, data: bytes, recipient_public_key: bytes) -> Dict[str, Any]:
+        """Шифрует данные quantum-resistant алгоритмом"""
+        if not self.quantum_crypto:
+            raise RuntimeError("Quantum crypto not initialized")
+        
+        encrypted = self.quantum_crypto.encrypt(data, recipient_public_key)
+        
+        self.metrics["encryption_operations"] += 1
+        
+        logger.info(f"Encrypted data ({len(data)} bytes)")
+        
+        return encrypted
     
-    async def _emergency_data_backup(self) -> None:
-        """Экстренное сохранение данных при остановке"""
+    async def decrypt_data(self, encrypted_data: Dict[str, bytes], secret_key: bytes) -> bytes:
+        """Расшифровывает данные"""
+        if not self.quantum_crypto:
+            raise RuntimeError("Quantum crypto not initialized")
+        
+        decrypted = self.quantum_crypto.decrypt(encrypted_data, secret_key)
+        
+        self.metrics["decryption_operations"] += 1
+        
+        logger.info(f"Decrypted data ({len(decrypted)} bytes)")
+        
+        return decrypted
+    
+    async def sign_message(self, message: bytes, secret_key: bytes) -> bytes:
+        """Подписывает сообщение quantum-resistant подписью"""
+        if not self.quantum_crypto:
+            raise RuntimeError("Quantum crypto not initialized")
+        
+        signature = self.quantum_crypto.sign(message, secret_key)
+        
+        self.metrics["signing_operations"] += 1
+        
+        logger.info(f"Signed message ({len(message)} bytes)")
+        
+        return signature.signature
+    
+    async def verify_signature(self, message: bytes, signature: bytes, public_key: bytes) -> bool:
+        """Верифицирует quantum-resistant подпись"""
+        if not self.quantum_crypto:
+            raise RuntimeError("Quantum crypto not initialized")
+        
+        valid = self.quantum_crypto.verify(message, signature, public_key)
+        
+        self.metrics["verification_operations"] += 1
+        
+        logger.info(f"Verified signature: {valid}")
+        
+        return valid
+    
+    # Blockchain Integration
+    
+    async def sign_transaction(self, transaction_data: Dict[str, Any], keypair_id: str) -> Dict[str, Any]:
+        """Подписывает blockchain транзакцию"""
+        if keypair_id not in self.keypairs:
+            raise ValueError(f"Keypair {keypair_id} not found")
+        
+        keypair = self.keypairs[keypair_id]
+        
+        signed_tx = self.quantum_crypto.sign_transaction(
+            transaction_data,
+            keypair.sig_secret_key
+        )
+        
+        logger.info(f"Signed transaction with keypair: {keypair_id}")
+        
+        return signed_tx
+    
+    async def verify_transaction(self, transaction_data: Dict[str, Any], public_key: bytes) -> bool:
+        """Верифицирует quantum-resistant подпись транзакции"""
+        valid = self.quantum_crypto.verify_transaction(transaction_data, public_key)
+        
+        logger.info(f"Verified transaction: {valid}")
+        
+        return valid
+    
+    async def encrypt_smart_contract(self, contract_code: str, recipient_public_key: bytes) -> Dict[str, Any]:
+        """Шифрует смарт-контракт"""
+        encrypted = self.quantum_crypto.encrypt_smart_contract(
+            contract_code,
+            recipient_public_key
+        )
+        
+        logger.info(f"Encrypted smart contract")
+        
+        return encrypted
+    
+    async def decrypt_smart_contract(self, encrypted_contract: Dict[str, Any], keypair_id: str) -> str:
+        """Расшифровывает смарт-контракт"""
+        if keypair_id not in self.keypairs:
+            raise ValueError(f"Keypair {keypair_id} not found")
+        
+        keypair = self.keypairs[keypair_id]
+        
+        contract_code = self.quantum_crypto.decrypt_smart_contract(
+            encrypted_contract,
+            keypair.kem_secret_key
+        )
+        
+        logger.info(f"Decrypted smart contract")
+        
+        return contract_code
+    
+    # Key Management
+    
+    async def _save_keypairs(self) -> None:
+        """Сохраняет keypairs в файл"""
         try:
-            backup_data = {
-                "system_state": self.get_status(),
-                "emergency_context": self.security_context,
-                "component_states": {name: comp for name, comp in self.components.items() if isinstance(comp, dict)},
-                "backup_timestamp": datetime.now().isoformat()
-            }
+            Path("data").mkdir(exist_ok=True)
             
-            backup_file = Path(f"emergency_backup_{self.config.system_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-            with open(backup_file, 'w') as f:
-                json.dump(backup_data, f, indent=2, default=str)
-                
-            logger.critical(f"💾 Экстренный бэкап сохранен: {{backup_file}}")
+            keypairs_data = {}
+            for keypair_id, keypair in self.keypairs.items():
+                keypairs_data[keypair_id] = {
+                    "kem_public_key": keypair.kem_public_key.hex(),
+                    "kem_secret_key": keypair.kem_secret_key.hex(),
+                    "sig_public_key": keypair.sig_public_key.hex(),
+                    "sig_secret_key": keypair.sig_secret_key.hex(),
+                    "security_level": keypair.security_level,
+                    "algorithm": keypair.algorithm
+                }
+            
+            with open("data/quantum_keypairs.json", "w") as f:
+                json.dump(keypairs_data, f, indent=2)
+            
+            logger.info(f"Saved {len(self.keypairs)} keypairs")
             
         except Exception as e:
-            logger.error(f"❌ Ошибка экстренного бэкапа: {{e}}")
+            logger.error(f"Failed to save keypairs: {e}")
     
-    async def _emergency_shutdown_components(self) -> None:
-        """Экстренная остановка всех компонентов"""
-        for component_name, component in list(self.components.items()):
-            try:
-                if hasattr(component, 'emergency_stop'):
-                    await component.emergency_stop()
-                elif isinstance(component, dict):
-                    component["status"] = "emergency_stopped"
-                    
-                logger.info(f"🔒 Компонент {{component_name}} экстренно остановлен")
-            except Exception as e:
-                logger.error(f"❌ Ошибка остановки {{component_name}}: {{e}}")
+    async def load_keypairs(self) -> None:
+        """Загружает keypairs из файла"""
+        try:
+            with open("data/quantum_keypairs.json", "r") as f:
+                keypairs_data = json.load(f)
+            
+            for keypair_id, data in keypairs_data.items():
+                keypair = QuantumKeypair(
+                    kem_public_key=bytes.fromhex(data["kem_public_key"]),
+                    kem_secret_key=bytes.fromhex(data["kem_secret_key"]),
+                    sig_public_key=bytes.fromhex(data["sig_public_key"]),
+                    sig_secret_key=bytes.fromhex(data["sig_secret_key"]),
+                    security_level=data["security_level"],
+                    algorithm=data["algorithm"]
+                )
+                self.keypairs[keypair_id] = keypair
+            
+            logger.info(f"Loaded {len(self.keypairs)} keypairs")
+            
+        except FileNotFoundError:
+            logger.info("No existing keypairs file")
+        except Exception as e:
+            logger.error(f"Failed to load keypairs: {e}")
     
     def get_status(self) -> Dict[str, Any]:
         """Получение статуса системы"""
-        return {
+        status = {
             "system_name": self.config.system_name,
             "version": self.config.version,
-            "category": "{category}",
+            "category": "Quantum Cryptography",
             "emergency_mode": self.emergency_mode,
             "is_running": self.is_running,
             "components": list(self.components.keys()),
             "metrics": self.metrics,
-            "security_context": self.security_context,
             "uptime": self.metrics.get("uptime_seconds", 0),
-            "config": self.config.dict()
-        }}
+            "keypairs_count": len(self.keypairs)
+        }
+        
+        return status
     
     async def emergency_health_check(self) -> Dict[str, Any]:
         """ЭКСТРЕННАЯ проверка работоспособности"""
-        checks = {{
+        checks = {
             "system_running": self.is_running,
             "emergency_mode_active": self.emergency_mode,
             "components_initialized": len(self.components) > 0,
-            "security_context_valid": bool(self.security_context),
-            "config_loaded": bool(self.config)
-        }}
-        
-        # Специализированные экстренные проверки
-        if self.emergency_mode:
-            checks.update(await self._emergency_specific_health_checks())
+            "quantum_crypto_initialized": self.quantum_crypto is not None,
+            "kyber_kem_initialized": self.kyber_kem is not None,
+            "sphincs_plus_initialized": self.sphincs_plus is not None,
+        }
         
         # Определяем общий статус
         if all(checks.values()):
-            if self.emergency_mode:
-                status = "emergency_operational"
-            else:
-                status = "healthy" 
+            status = "emergency_operational" if self.emergency_mode else "healthy"
         else:
             status = "critical_failure"
         
-        return {{
+        return {
             "status": status,
             "emergency_mode": self.emergency_mode,
             "timestamp": datetime.now().isoformat(),
             "checks": checks,
             "metrics": self.metrics,
             "uptime_seconds": self.metrics.get("uptime_seconds", 0)
-        }}
-    
-    async def _emergency_specific_health_checks(self) -> Dict[str, bool]:
-        """Специализированные экстренные проверки здоровья"""
-        return {
-            "main_service_active": "main_service" in self.components,
-            "backup_system_ready": "backup_handler" in self.components,
-            "emergency_protocols_loaded": True
         }
 
 
 # API для экстренного создания экземпляра
-async def create_emergency_quantum_core_instance() -> QuantumCoreCore:
+async def create_emergency_crypto_instance() -> QuantumResistantCryptoCore:
     """Создает экземпляр системы в экстренном режиме"""
-    instance = QuantumCoreCore()
+    instance = QuantumResistantCryptoCore()
     await instance.emergency_initialize()
     return instance
+
 
 # Экстренный запуск
 async def emergency_main():
     """Экстренный запуск системы"""
-    logger.critical("🚨 АКТИВАЦИЯ ЭКСТРЕННОГО РЕЖИМА QUANTUM-CORE")
-    core = QuantumCoreCore()
+    logger.critical("🚨 АКТИВАЦИЯ ЭКСТРЕННОГО РЕЖИМА QUANTUM-RESISTANT-CRYPTO-CORE")
+    core = QuantumResistantCryptoCore()
     await core.emergency_start()
+
 
 # Для прямого запуска
 async def main():
     await emergency_main()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
