@@ -25,6 +25,15 @@ class AgentType(Enum):
     RL = "rl"
     RULE = "rule"
     HYBRID = "hybrid"
+    # Дополнительные типы агентов
+    DEVELOPMENT = "development"
+    ANALYTICS = "analytics"
+    PLANNING = "planning"
+    RESEARCH = "research"
+    SECURITY = "security"
+    SUPPORT = "support"
+    AUTOMATION = "automation"
+    GENERAL = "general"
 
 @dataclass
 class AgentCapability:

@@ -303,13 +303,17 @@ class CoreIntegratedOrchestra:
         
         # Настройки из core-систем
         self.concurrency_config = core_adapter.get_concurrency_config()
-        self.max_concurrent_tasks = self.concurrency_config["max_workers"]
+        # Максимальные работники будут установлены равными количеству агентов
+        self.max_concurrent_tasks = self.concurrency_config["max_workers"]  # временно, обновится после регистрации агентов
         
     async def register_agent(self, agent: CoreIntegratedAgent):
         """Регистрация агента в оркестраторе"""
         self.agents.append(agent)
         await agent.initialize()
+        # Обновляем максимальное количество работников равным количеству агентов
+        self.max_concurrent_tasks = len(self.agents)
         logging.info(f"📝 Интегрированный агент {agent.agent_id} зарегистрирован")
+        logging.info(f"⚙️  Максимальные работники обновлены: {self.max_concurrent_tasks}")
         
     async def submit_task(self, task_name: str, task_data: dict = None):
         """Отправка задачи с учетом ограничений core-систем"""
@@ -362,10 +366,11 @@ class CoreIntegratedOrchestra:
                 
             # Ожидание завершения хотя бы одной задачи
             if active_tasks:
-                done, active_tasks = await asyncio.wait(
+                done, pending = await asyncio.wait(
                     active_tasks, 
                     return_when=asyncio.FIRST_COMPLETED
                 )
+                active_tasks = list(pending)  # Преобразуем set обратно в list
                 
                 # Обработка завершенных задач
                 for task_future in done:
@@ -528,8 +533,9 @@ async def main():
         
         # Настройки concurrency
         concurrency = stats['concurrency_config']
-        logger.info(f"\n⚙️  Настройки производительности (из core-систем):")
-        logger.info(f"  Макс. работников: {concurrency['max_workers']}")
+        logger.info(f"\n⚙️  Настройки производительности:")
+        logger.info(f"  Активных работников: {stats['total_agents']} (все подключенные агенты)")
+        logger.info(f"  Макс. из core-систем: {concurrency['max_workers']}")
         logger.info(f"  Размер очереди: {concurrency['queue_size']}")
         
         # Детальная статистика по агентам
