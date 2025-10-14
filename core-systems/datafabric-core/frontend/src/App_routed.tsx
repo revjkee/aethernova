@@ -7,11 +7,8 @@ import { DataQualityPage } from './pages/DataQualityPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
 import { MonitoringPage } from './pages/MonitoringPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { useDefaultLanguage } from './hooks/useDefaultLanguage';
 
 function App() {
-  useDefaultLanguage();
-
   return (
     <Router>
       <Layout>
