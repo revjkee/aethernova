@@ -1,0 +1,179 @@
+# File: .github/workflows/provenance-slsa.yaml
+name: SLSA L3 Provenance & Artifact Attestations
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+    branches:
+      - main
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write          # required for SLSA generator signing
+  attestations: write      # required for GitHub Artifact Attestations
+  packages: write          # needed to push to GHCR (container)
+
+concurrency:
+  group: provenance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_TAG: ${{ github.sha }}
+  DIST_DIR: dist
+
+jobs:
+  build-artifacts:
+    name: Build & publish artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      subjects_b64: ${{ steps.hash.outputs.subjects_b64 }}
+      image_digest: ${{ steps.buildx.outputs.digest }}
+      image_ref: ${{ steps.meta.outputs.image_ref }}
+    steps:
+      - name: Harden runner (egress audit)
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Здесь разместите установку зависимостей проекта (toolchains) — при необходимости.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Собираем проектные артефакты (бинарники/архивы) в $DIST_DIR
+      - name: Build artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIST_DIR"
+          # Пример: сборка; замените на реальные команды сборки проекта
+          echo "placeholder" > "$DIST_DIR/BUILD_OK.txt"
+          tar -czf "$DIST_DIR/aethernova-chain-core_${{ github.sha }}.tar.gz" "$DIST_DIR/BUILD_OK.txt"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: ${{ env.DIST_DIR }}/
+          if-no-files-found: error
+          retention-days: 7
+
+      # Строим и пушим контейнер-образ, чтобы затем аттестовать и сгенерировать SLSA-провенанс (container)
+      - name: Docker metadata (ref)
+        id: meta
+        run: |
+          set -euo pipefail
+          echo "image_ref=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push container image
+        id: buildx
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image_ref }}
+          provenance: false   # provenance для контейнера будет создаваться отдельно официальным SLSA generator + attestations
+
+      # Вычисляем sha256 всех файлов в DIST_DIR и кодируем list в base64 — потребуется для SLSA generic generator
+      - name: Hash subjects (SHA-256, base64 list)
+        id: hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          : > subjects.txt
+          for f in "${{ env.DIST_DIR }}"/**/* "${{ env.DIST_DIR }}"/*; do
+            [[ -f "$f" ]] || continue
+            d=$(sha256sum "$f" | awk '{print $1}')
+            # Формат: <path>:sha256:<digest>
+            echo "${f}:sha256:${d}" >> subjects.txt
+          done
+          # base64 без переносов
+          if command -v base64 >/dev/null 2>&1; then
+            base64 -w0 subjects.txt > subjects.b64 || base64 subjects.txt > subjects.b64
+          else
+            python3 - << 'PY'
+import base64,sys
+sys.stdout.write(base64.b64encode(open("subjects.txt","rb").read()).decode())
+PY
+          fi
+          echo "subjects_b64=$(cat subjects.b64)" >> "$GITHUB_OUTPUT"
+
+      # GitHub Artifact Attestations: создаем build-provenance для файловых артефактов
+      - name: Attest build provenance for artifacts (GitHub Artifact Attestations)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ env.DIST_DIR }}/**/*
+
+      # GitHub Artifact Attestations: создаем build-provenance для контейнер-образа
+      - name: Attest container image (GitHub Artifact Attestations)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ steps.meta.outputs.image_ref }}
+          subject-digest: ${{ steps.buildx.outputs.digest }}
+
+  # Генерация SLSA L3 provenance для файловых артефактов (generic)
+  provenance-generic-slsa3:
+    name: Generate SLSA L3 (generic artifacts)
+    needs: [build-artifacts]
+    permissions:
+      actions: read
+      id-token: write
+      contents: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.build-artifacts.outputs.subjects_b64 }}
+
+  # Генерация SLSA L3 provenance для контейнер-образа (container)
+  provenance-container-slsa3:
+    name: Generate SLSA L3 (container image)
+    needs: [build-artifacts]
+    permissions:
+      actions: read
+      id-token: write
+      contents: read
+      packages: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.build-artifacts.outputs.image_ref }}@${{ needs.build-artifacts.outputs.image_digest }}
+
+  # Опционально: загрузить сгенерированный multiple.intoto.jsonl в релиз (если запуск по тегу/релизу)
+  attach-provenance-to-release:
+    name: Attach provenance to GitHub Release (optional)
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+    needs: [provenance-generic-slsa3]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden runner (egress audit)
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Download provenance
+        uses: actions/download-artifact@v4
+        with:
+          name: provenance
+          path: provenance/
+
+      - name: Upload provenance to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: provenance/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,158 @@
+# path: human-sovereignty-core/config/webui_bindings.yaml
+# Human Sovereignty Core - WebUI bindings policy
+# SECURITY GOAL:
+# - Default: bind only to localhost (127.0.0.1 / ::1)
+# - Public exposure is forbidden
+# - Remote access is allowed only behind a trusted proxy/sidecar using mTLS
+# - Fail-closed: any invalid/unsafe config must be rejected by the loader/validator
+
+version: 1
+policy_id: human-sovereignty-webui-bindings-v1
+
+mode:
+  # Allowed values: "local_only" | "mtls_proxy_only"
+  # "public" is intentionally not supported.
+  name: local_only
+
+network:
+  listen:
+    # Local-only safe defaults
+    host_ipv4: 127.0.0.1
+    host_ipv6: "::1"
+    port: 8443
+
+  # Explicit hard forbiddance of public binds
+  forbid_public_bind:
+    enabled: true
+    forbidden_hosts:
+      - "0.0.0.0"
+      - "::"
+    forbidden_cidrs:
+      - "0.0.0.0/0"
+      - "::/0"
+
+  # Optional allowlist for scenarios where a reverse-proxy binds locally and forwards
+  # Keep empty for local_only mode.
+  allowlist:
+    enabled: true
+    cidrs:
+      - "127.0.0.1/32"
+      - "::1/128"
+
+transport_security:
+  # WebUI should never run plaintext in production.
+  # In local_only mode, TLS is still recommended to keep a single operational profile.
+  tls:
+    enabled: true
+    min_version: "TLSv1.2"
+    prefer_server_ciphers: true
+
+    # Only file references are stored here.
+    # Secret material must be provisioned by your secrets system.
+    server_cert_file: "/etc/aethernova/human-sovereignty/tls/server.crt"
+    server_key_file:  "/etc/aethernova/human-sovereignty/tls/server.key"
+
+    # If your TLS stack supports it, lock down to modern suites.
+    # Keep empty if enforced elsewhere.
+    cipher_suites_allowlist: []
+
+  mtls:
+    # In local_only mode this must remain false.
+    # In mtls_proxy_only mode, this must be true AND clients must present valid certs.
+    enabled: false
+    client_auth: "require"   # require | verify_if_given
+    client_ca_bundle_file: "/etc/aethernova/human-sovereignty/tls/client_ca.pem"
+    verify_depth: 3
+    # Optional pinning by subject/issuer or SPKI hashes.
+    # Keep empty if not used.
+    client_identity_allowlist:
+      subjects: []
+      spki_sha256: []
+
+reverse_proxy:
+  # When mode.name = mtls_proxy_only:
+  # - WebUI itself still binds to localhost
+  # - A trusted proxy/sidecar terminates mTLS and forwards to localhost
+  enabled: false
+  trusted_proxy:
+    # Explicitly list trusted proxy source networks (loopback by default)
+    allowlist_cidrs:
+      - "127.0.0.1/32"
+      - "::1/128"
+    # If using X-Forwarded-* headers, accept them ONLY from trusted proxies
+    accept_forwarded_headers: true
+    forwarded_header_names:
+      client_ip: "X-Forwarded-For"
+      proto: "X-Forwarded-Proto"
+      host: "X-Forwarded-Host"
+
+http_security:
+  cors:
+    enabled: false
+    allowed_origins: []
+    allowed_methods: ["GET", "POST"]
+    allowed_headers: ["Content-Type", "Authorization"]
+    allow_credentials: false
+
+  csrf:
+    enabled: true
+    # Strict cookies reduce CSRF risk
+    cookie:
+      name: "__Host-aether_csrf"
+      secure: true
+      http_only: true
+      same_site: "Strict"
+
+  session_cookie:
+    name: "__Host-aether_session"
+    secure: true
+    http_only: true
+    same_site: "Strict"
+
+  headers:
+    enabled: true
+    # Conservative defaults
+    x_frame_options: "DENY"
+    x_content_type_options: "nosniff"
+    referrer_policy: "no-referrer"
+    permissions_policy: "geolocation=(), microphone=(), camera=()"
+    # If UI uses scripts/styles, you must tune CSP accordingly
+    content_security_policy: "default-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+
+rate_limits:
+  enabled: true
+  # Basic protection. Actual enforcement belongs to the web layer.
+  requests_per_minute_per_ip: 120
+  burst: 30
+  ban_seconds_on_violation: 300
+
+observability:
+  audit:
+    enabled: true
+    # Audit must not log secrets; only structural metadata.
+    redact:
+      headers:
+        - "Authorization"
+        - "Cookie"
+      json_paths:
+        - "$.password"
+        - "$.token"
+        - "$.secret"
+    include_request_id: true
+    include_context_fingerprint: true
+
+  access_logs:
+    enabled: true
+    format: "json"
+
+runtime_guards:
+  # If config is unsafe or inconsistent, the loader must refuse to start.
+  fail_closed: true
+
+  invariants:
+    # Enforced by config validator / bootstrap
+    require_local_bind_in_local_only_mode: true
+    require_mtls_in_mtls_proxy_only_mode: true
+    disallow_public_mode: true
+    disallow_forbidden_hosts: true
+    require_allowlist_enabled: true

@@ -1,0 +1,523 @@
+syntax = "proto3";
+
+package cybersecurity.v1;
+
+option go_package = "github.com/aethernova/cybersecurity-core/schemas/proto/v1/cybersecurity;cybersecurityv1";
+option java_multiple_files = true;
+option java_package = "ai.aethernova.cybersecurity.v1";
+option csharp_namespace = "Aethernova.Cybersecurity.V1";
+option objc_class_prefix = "ANCY";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
+
+// ============================== ENUMS ========================================
+
+enum ScanType {
+  SCAN_TYPE_UNSPECIFIED = 0;
+  SCAN_TYPE_SAST        = 1;  // Static Application Security Testing
+  SCAN_TYPE_DAST        = 2;  // Dynamic Application Security Testing
+  SCAN_TYPE_SCA         = 3;  // Software Composition Analysis (deps/licenses)
+  SCAN_TYPE_IAC         = 4;  // IaC / K8s / Terraform / Cloud templates
+  SCAN_TYPE_CONTAINER   = 5;  // Container image/package vulnerabilities
+  SCAN_TYPE_SECRETS     = 6;  // Secret exposure scanning
+  SCAN_TYPE_SBOM        = 7;  // SBOM generation/validation
+  SCAN_TYPE_CLOUD       = 8;  // Cloud config / posture
+  SCAN_TYPE_LICENSE     = 9;  // License compliance
+  SCAN_TYPE_MALWARE     = 10; // Malware / YARA
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO        = 1;
+  SEVERITY_LOW         = 2;
+  SEVERITY_MEDIUM      = 3;
+  SEVERITY_HIGH        = 4;
+  SEVERITY_CRITICAL    = 5;
+}
+
+enum ScanStatus {
+  SCAN_STATUS_UNSPECIFIED = 0;
+  SCAN_STATUS_QUEUED      = 1;
+  SCAN_STATUS_RUNNING     = 2;
+  SCAN_STATUS_SUCCEEDED   = 3;
+  SCAN_STATUS_FAILED      = 4;
+  SCAN_STATUS_CANCELED    = 5;
+  SCAN_STATUS_PARTIAL     = 6; // completed with partial results
+}
+
+enum FindingState {
+  FINDING_STATE_UNSPECIFIED = 0;
+  FINDING_STATE_OPEN        = 1;
+  FINDING_STATE_ACKNOWLEDGED= 2;
+  FINDING_STATE_FIXED       = 3;
+  FINDING_STATE_FALSE_POS   = 4;
+  FINDING_STATE_WONTPFIX    = 5;
+}
+
+enum ScanPriority {
+  SCAN_PRIORITY_UNSPECIFIED = 0;
+  SCAN_PRIORITY_LOW         = 1;
+  SCAN_PRIORITY_NORMAL      = 2;
+  SCAN_PRIORITY_HIGH        = 3;
+  SCAN_PRIORITY_URGENT      = 4;
+}
+
+enum Provider {
+  PROVIDER_UNSPECIFIED = 0;
+  PROVIDER_AWS         = 1;
+  PROVIDER_GCP         = 2;
+  PROVIDER_AZURE       = 3;
+  PROVIDER_OTHER       = 99;
+}
+
+enum SbomFormat {
+  SBOM_FORMAT_UNSPECIFIED = 0;
+  SBOM_FORMAT_SPDX_JSON   = 1;
+  SBOM_FORMAT_CYCLONEDX_JSON = 2;
+}
+
+enum ArtifactMediaType {
+  ARTIFACT_MEDIA_TYPE_UNSPECIFIED = 0;
+  ARTIFACT_MEDIA_TYPE_SARIF_JSON  = 1;
+  ARTIFACT_MEDIA_TYPE_SPDX_JSON   = 2;
+  ARTIFACT_MEDIA_TYPE_CYCLONEDX_JSON = 3;
+  ARTIFACT_MEDIA_TYPE_TAR_GZ      = 4;
+  ARTIFACT_MEDIA_TYPE_ZIP         = 5;
+  ARTIFACT_MEDIA_TYPE_JSON        = 6;
+  ARTIFACT_MEDIA_TYPE_PLAIN_TEXT  = 7;
+}
+
+enum HashAlgorithm {
+  HASH_ALG_UNSPECIFIED = 0;
+  HASH_ALG_SHA256      = 1;
+  HASH_ALG_SHA512      = 2;
+}
+
+// ============================== CORE TYPES ===================================
+
+message ScanRequest {
+  // Optional client-provided ID (idempotency key).
+  google.protobuf.StringValue id = 1;
+
+  // What to scan.
+  ScanTarget target = 2;
+
+  // One or more scan types to execute.
+  repeated ScanType types = 3;
+
+  // Execution/configuration knobs.
+  ScanConfig config = 4;
+
+  // CI/build/VCS/cloud context.
+  Context context = 5;
+
+  // Scheduling priority.
+  ScanPriority priority = 6;
+
+  // Arbitrary labels/tenant routing.
+  map<string, string> labels = 7;
+
+  // Dry run: validate config, estimate, no execution.
+  bool dry_run = 8;
+
+  // Reserved for future: notification preferences, routing keys, etc.
+  reserved 9 to 15;
+}
+
+message ScanTarget {
+  oneof target {
+    SourceRepo source_repo = 1;
+    LocalPath local_path   = 2;
+    ContainerImage image   = 3;
+    CloudAccount cloud     = 4;
+    UrlTarget url          = 5;
+    ArtifactBundle artifact= 6;
+  }
+}
+
+message SourceRepo {
+  string url         = 1; // git URL (https/ssh)
+  string branch      = 2;
+  string commit_sha  = 3;
+  string subdir      = 4; // optional subdirectory to scan
+  string vcs_provider= 5; // github/gitlab/bitbucket/other
+  CredentialRef credential = 6; // reference to secret manager / token, not raw secret
+}
+
+message LocalPath {
+  string path = 1; // path in agent/container filesystem
+}
+
+message ContainerImage {
+  string registry    = 1; // e.g. ghcr.io
+  string repository  = 2; // e.g. org/app
+  string tag         = 3; // e.g. v1.2.3
+  string digest      = 4; // sha256:...
+  string platform    = 5; // e.g. linux/amd64
+  CredentialRef credential = 6; // optional registry credential ref
+}
+
+message CloudAccount {
+  Provider provider = 1;
+  string account_id = 2;  // AWS account / GCP project number / Azure subscription
+  string project_id = 3;  // GCP project id (if applicable)
+  string subscription_id = 4; // Azure subscription id
+  string organization_id = 5; // optional org/tenant
+  string region = 6;
+  string role_arn = 7; // AWS IAM role to assume, etc.
+  CredentialRef credential = 8; // reference to secure credential
+}
+
+message UrlTarget {
+  string url = 1; // base URL for DAST
+}
+
+message ArtifactBundle {
+  string uri = 1; // where to fetch archive/dir (e.g., s3://..., file://..., https://...)
+  ArtifactMediaType media_type = 2; // TAR_GZ / ZIP / PLAIN_TEXT / JSON
+  repeated Hash digest = 3; // integrity for remote fetch
+}
+
+message Hash {
+  HashAlgorithm algorithm = 1;
+  string value = 2; // hex-encoded
+}
+
+message CredentialRef {
+  string name = 1; // logical reference (e.g., "dockerhub-ro")
+  string type = 2; // e.g., "aws-iam-role","registry-token","vcs-token","oidc"
+  map<string, string> hints = 3; // audience/role/namespace; no secrets
+}
+
+// ------------------------------ Config ---------------------------------------
+
+message ScanConfig {
+  // General toggles
+  Severity min_report_severity = 1; // drop findings below this severity
+  bool fail_on_threshold = 2;       // non-zero exit when >= threshold found
+  Severity fail_severity_threshold = 3;
+
+  // Performance/limits
+  int32 concurrency = 4; // workers; 0 = auto
+  google.protobuf.Duration timeout = 5;
+
+  // Include/exclude scope
+  ScanScope scope = 6;
+
+  // SBOM settings
+  SBOMConfig sbom = 7;
+
+  // Tooling hints
+  ToolchainHints toolchain = 8;
+
+  // Output formats to emit as artifacts (e.g. SARIF, SBOM)
+  OutputConfig output = 9;
+
+  // Privacy/security
+  PrivacyConfig privacy = 10;
+
+  reserved 11 to 20;
+}
+
+message ScanScope {
+  repeated string include_globs = 1;
+  repeated string exclude_globs = 2;
+  repeated string languages     = 3; // e.g., go, python, js
+  repeated string iac_frameworks= 4; // terraform, k8s, cloudformation
+  bool include_dev_dependencies = 5;
+}
+
+message SBOMConfig {
+  bool enabled = 1;
+  SbomFormat format = 2;      // SPDX_JSON / CYCLONEDX_JSON
+  bool dependencies = 3;      // include transitive deps
+  bool include_licenses = 4;
+  bool include_vulns = 5;     // enrich SBOM with known vulns if available
+}
+
+message ToolchainHints {
+  // Allow explicit tool versions, rulesets, policies; useful for reproducibility.
+  map<string, string> versions = 1; // e.g., "semgrep":"1.76.0","trivy":"0.53.0"
+  map<string, string> rulesets = 2; // e.g., "semgrep":"p/owasp-top-ten"
+  map<string, string> policies = 3; // e.g., "checkov":"CKV_*,!CKV_AWS_1"
+}
+
+message OutputConfig {
+  bool emit_sarif = 1;
+  bool emit_sbom  = 2;
+  bool emit_json  = 3;
+  // Optional destinations besides inline artifacts (e.g., S3/OCI/HTTP)
+  map<string, string> destinations = 10;
+}
+
+message PrivacyConfig {
+  bool redact_pii = 1;
+  bool hash_ips   = 2;
+  bool strip_snippets = 3; // avoid raw code payloads in findings
+}
+
+// ------------------------------ Context --------------------------------------
+
+message Context {
+  CIContext ci          = 1;
+  VCSContext vcs        = 2;
+  BuildContext build    = 3;
+  KubernetesContext k8s = 4;
+  CloudContext cloud    = 5;
+  string actor          = 6; // user/robot who requested scan
+  map<string, string> labels = 7;
+}
+
+message CIContext {
+  string system    = 1; // github-actions, gitlab-ci, jenkins
+  string run_id    = 2;
+  string job_name  = 3;
+  string pipeline  = 4;
+}
+
+message VCSContext {
+  string provider  = 1; // github/gitlab/bitbucket
+  string repo      = 2; // org/name
+  string ref       = 3; // refs/heads/main
+  string sha       = 4; // commit
+  string pr_number = 5; // if PR/MR
+}
+
+message BuildContext {
+  string build_id  = 1;
+  string artifact  = 2;
+  string image_ref = 3; // container image reference
+}
+
+message KubernetesContext {
+  string cluster   = 1;
+  string namespace = 2;
+  string workload  = 3;
+}
+
+message CloudContext {
+  Provider provider = 1;
+  string account_id = 2;
+  string region     = 3;
+}
+
+// ============================== RESULTS ======================================
+
+message ScanJob {
+  string id = 1;
+  ScanRequest request = 2;
+  ScanStatus status = 3;
+  Progress progress = 4;
+
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp started_at = 11;
+  google.protobuf.Timestamp finished_at = 12;
+
+  Summary summary = 20;
+  repeated Finding findings = 21;     // may be empty if using streaming
+  repeated Artifact artifacts = 22;   // SARIF/SBOM/JSON, etc.
+
+  string error_message = 30; // present when FAILED/PARTIAL
+
+  reserved 31 to 39;
+}
+
+message Progress {
+  int32 percent = 1; // 0..100
+  string phase  = 2; // queueing/prep/scan/post/complete
+  int64 processed_items = 3;
+  int64 total_items     = 4;
+  int64 findings_emitted= 5;
+}
+
+message Summary {
+  int64 total_findings   = 1;
+  int64 critical_count   = 2;
+  int64 high_count       = 3;
+  int64 medium_count     = 4;
+  int64 low_count        = 5;
+  int64 info_count       = 6;
+
+  map<string, int64> by_type = 10;      // e.g., "SAST": 42
+  map<string, int64> by_source = 11;    // tool/job name
+}
+
+message Finding {
+  string id            = 1;  // stable id (tool+rule+location hash)
+  string rule_id       = 2;  // tool rule identifier
+  string title         = 3;
+  string description   = 4;
+  Severity severity    = 5;
+  google.protobuf.DoubleValue confidence = 6; // 0..1
+
+  repeated string cve  = 7;  // CVE IDs
+  CVSS cvss            = 8;
+
+  FindingState state   = 9;
+
+  // Where it happened.
+  FindingLocation location = 10;
+
+  // How to fix it.
+  Remediation remediation = 11;
+
+  // Evidence/artifacts references.
+  repeated Evidence evidence = 12;
+
+  map<string, string> metadata = 13;
+
+  ScanType scan_type = 14;
+
+  google.protobuf.Timestamp detected_at = 15;
+
+  reserved 16 to 19;
+}
+
+message CVSS {
+  google.protobuf.DoubleValue base_score = 1;
+  string vector = 2;   // e.g., CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H
+  string version = 3;  // "3.1", "4.0"
+}
+
+message FindingLocation {
+  oneof kind {
+    CodeLocation code           = 1;
+    ResourceLocation resource   = 2; // IaC/k8s/cloud logical resource
+    ImageLocation image         = 3; // container/package location
+    UrlLocation url             = 4; // DAST endpoint
+    CloudLocation cloud         = 5; // cloud object
+  }
+}
+
+message CodeLocation {
+  string file     = 1;
+  int32 line      = 2;
+  int32 column    = 3;
+  // Optional snippet (respect PrivacyConfig.strip_snippets).
+  google.protobuf.StringValue snippet = 4;
+  string repo_path = 5; // monorepo subdir
+}
+
+message ResourceLocation {
+  string resource_type = 1; // e.g., k8s.deployment, terraform.aws_s3_bucket
+  string resource_name = 2;
+  string path          = 3; // file:path or logical identifier
+}
+
+message ImageLocation {
+  string image_ref    = 1; // repo:tag@sha256
+  string package_name = 2;
+  string package_version = 3;
+  string layer_digest = 4;
+  string file         = 5; // e.g., /usr/lib/libssl.so
+}
+
+message UrlLocation {
+  string url = 1;
+  int32 status_code = 2; // observed
+}
+
+message CloudLocation {
+  Provider provider = 1;
+  string service    = 2; // e.g., s3, iam, ec2
+  string resource_id= 3; // arn/uri
+  string region     = 4;
+}
+
+message Remediation {
+  string recommendation = 1;
+  string fix            = 2;
+  repeated Reference references = 3;
+}
+
+message Reference {
+  string type  = 1; // cwe, owasp, doc, link
+  string title = 2;
+  string url   = 3;
+}
+
+message Evidence {
+  string type  = 1; // log, config, payload, request, pcap, screenshot
+  // Prefer references instead of embedding large payloads.
+  repeated ArtifactRef artifacts = 2;
+  map<string, string> attributes = 3; // small structured hints
+}
+
+message ArtifactRef {
+  string id  = 1;
+  string uri = 2; // where to fetch (s3://..., oci://..., https://...)
+}
+
+message Artifact {
+  string id            = 1;
+  string name          = 2;
+  ArtifactMediaType media_type = 3;
+  bytes content        = 4; // optional inline (use sparingly)
+  string uri           = 5; // or remote location
+  int64 size_bytes     = 6;
+  repeated Hash digest = 7;
+  map<string, string> metadata = 8;
+}
+
+// ============================== SERVICE ======================================
+
+service ScanService {
+  // Submit a new scan. Returns job with initial QUEUED status.
+  rpc Submit (ScanRequest) returns (ScanJob);
+
+  // Get current job state and aggregated results (may be heavy).
+  rpc Get (GetRequest) returns (ScanJob);
+
+  // Cancel a running/queued scan.
+  rpc Cancel (CancelRequest) returns (ScanJob);
+
+  // Stream findings as they are produced.
+  rpc StreamFindings (StreamFindingsRequest) returns (stream Finding);
+
+  // List recent scans with filtering/pagination.
+  rpc List (ListRequest) returns (ListResponse);
+
+  // Export artifacts (e.g., SARIF/SBOM) for a job, optionally filtered by type.
+  rpc ExportArtifacts (ExportArtifactsRequest) returns (ExportArtifactsResponse);
+}
+
+message GetRequest {
+  string id = 1;
+}
+
+message CancelRequest {
+  string id = 1;
+  string reason = 2;
+}
+
+message StreamFindingsRequest {
+  string id = 1;
+  // Server will resume from the next index after this cursor if provided.
+  google.protobuf.Int64Value from_index = 2;
+}
+
+message ListRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  // Optional filters
+  repeated ScanStatus status = 3;
+  repeated ScanType types = 4;
+  Severity min_severity = 5;
+  string label_selector = 6; // "env=staging,team=secops"
+}
+
+message ListResponse {
+  repeated ScanJob items = 1;
+  string next_page_token = 2;
+}
+
+message ExportArtifactsRequest {
+  string id = 1;
+  repeated ArtifactMediaType media_types = 2; // if empty -> all
+}
+
+message ExportArtifactsResponse {
+  repeated Artifact artifacts = 1;
+}

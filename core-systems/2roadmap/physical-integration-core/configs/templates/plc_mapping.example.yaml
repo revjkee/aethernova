@@ -1,0 +1,441 @@
+version: 1
+kind: plc-mapping
+meta:
+  service: physical-integration-core
+  component: plc
+  site_id: ${SITE_ID:default-site}
+  node_id: ${NODE_ID:edge-01}
+  timezone: Europe/Stockholm
+  description: >
+    Единая карта тегов для интеграции PLC/RTU/OPC узлов. Поддерживает наследование параметров,
+    валидацию типов, тревоги, резервирование источников и публикацию телеметрии/событий.
+
+namespaces:
+  # Логические пространства имён для группировки сигналов и маршрутизации
+  - id: energy
+    description: Потребление/генерация энергии
+  - id: hvac
+    description: Тепло/вентиляция/климат
+  - id: safety
+    description: Безопасность/ESD/огневые тревоги
+  - id: logistics
+    description: Конвейеры/роботы/AGV
+  - id: qa
+    description: Контроль качества/веса/влажности
+
+defaults:
+  polling:
+    interval_ms: 500                 # Базовый интервал опроса
+    timeout_ms: 1500
+    retry:
+      max_retries: 3
+      backoff_ms: 200
+      jitter: true
+  quality:
+    stale_timeout_ms: 5000           # Время, после которого значение считается устаревшим
+    bad_on_comm_error: true
+  datatypes:
+    boolean_true_values: ["1", "true", "TRUE", "on", "ON"]
+    boolean_false_values: ["0", "false", "FALSE", "off", "OFF"]
+  scaling:
+    default_eu_locale: en-US
+  security:
+    redact_fields: [password, secret, token]
+  publishing:
+    enable: true
+    qos: at_least_once
+    kafka:
+      enable: true
+      topic: telem.raw
+      acks: all
+      compression: lz4
+    mqtt:
+      enable: true
+      topic_prefix: "sites/${SITE_ID}/plc"
+      retain: false
+  historian:
+    enable: true
+    write_mode: batch
+    batch_max_points: 1000
+    flush_interval_ms: 2000
+    retention_days: 365
+
+tag_classes:
+  # Повторно используемые профили тега
+  ai_kw:
+    datatype: float32
+    engineering_units: kW
+    min_eu: 0
+    max_eu: 5000
+    decimal_places: 2
+    deadband:
+      type: absolute
+      value: 0.1
+    quality_on_out_of_range: bad
+  ai_tempC:
+    datatype: float32
+    engineering_units: degC
+    min_eu: -40
+    max_eu: 120
+    decimal_places: 1
+    deadband:
+      type: relative
+      value: 0.002               # 0.2%
+  di_state:
+    datatype: bool
+    engineering_units: state
+    states: { "0": OFF, "1": ON }
+    deadband:
+      type: time
+      min_interval_ms: 50
+  do_cmd:
+    datatype: bool
+    write_allowed: true
+    write_min_interval_ms: 200
+    requires_permit: true
+    audit_write: true
+
+devices:
+  # ===== Example 1: OPC UA (основной), c резервным endpoint =====
+  - id: opcua_pwr_01
+    name: Power OPC UA Server (Primary)
+    namespace: energy
+    protocol: opcua
+    primary:
+      endpoint: "${OPCUA_PWR_01_ENDPOINT:opc.tcp://10.10.10.11:4840}"
+      security_mode: SignAndEncrypt
+      security_policy: Basic256Sha256
+      auth:
+        type: username_password
+        username: ${OPCUA_PWR_01_USER}
+        password: ${OPCUA_PWR_01_PASS}
+    secondary:
+      endpoint: "${OPCUA_PWR_01_ENDPOINT_BCP:opc.tcp://10.10.10.12:4840}"
+      health_check_node: "ns=2;s=Server/Diagnostics/ServerDiagnosticsSummary/CurrentSessionCount"
+      failover:
+        strategy: active-passive
+        promote_after_ms: 3000
+        grace_ms: 10000
+    session:
+      application_uri: "urn:${SITE_ID}:physical-integration-core"
+      keepalive_ms: 5000
+      watchdog_missed_ka: 3
+    polling:
+      interval_ms: 250
+    tags:
+      - key: energy.main_kw
+        path: "ns=4;s=Meters/Main/ActivePower"
+        class: ai_kw
+        convert:
+          scale: 1.0
+          offset: 0.0
+        metadata:
+          asset: "MCC-MAIN"
+          area: "Substation-A"
+      - key: energy.main_pf
+        path: "ns=4;s=Meters/Main/PowerFactor"
+        datatype: float32
+        engineering_units: pu
+        min_eu: 0.0
+        max_eu: 1.0
+        deadband:
+          type: relative
+          value: 0.005
+      - key: energy.grid_breaker_closed
+        path: "ns=4;s=Breakers/Grid/Q0_STATE"
+        class: di_state
+        alarms:
+          - id: brk_open_alarm
+            type: discrete
+            condition: equals
+            setpoint: 0
+            severity: 700
+            message: "Grid breaker opened"
+            delay_on_ms: 200
+            delay_off_ms: 500
+            latch: true
+    write_policies:
+      enable: true
+      mode: confirmed              # confirmed | blind | dry-run
+      requests_topic: "ops.plc.write.requests"
+      responses_topic: "ops.plc.write.responses"
+      acl:
+        - key: energy.grid_breaker_closed
+          allow: false             # чтение только
+        - key: energy.reset_counters
+          allow: true
+          max_rate_per_min: 2
+          requires_permit: true
+          permit_group: "ops-shift-A"
+    derived_tags:
+      - key: energy.main_kw_rolling_1m
+        source_keys: [energy.main_kw]
+        function: rolling_avg
+        window_ms: 60000
+        output:
+          datatype: float32
+          decimal_places: 1
+    events:
+      - id: energy_spike
+        source_keys: [energy.main_kw]
+        type: threshold_cross
+        condition: rate_of_change_gt
+        setpoint: 50.0             # kW per second
+        severity: 600
+        message: "Energy spike RoC > 50 kW/s"
+        debounce_ms: 2000
+
+  # ===== Example 2: Modbus/TCP (holding/input coils/registers) =====
+  - id: mb_hvac_01
+    name: HVAC Modbus Gateway
+    namespace: hvac
+    protocol: modbus_tcp
+    connection:
+      host: ${MB_HVAC_HOST:10.20.30.40}
+      port: 502
+      unit_id: 1
+      timeout_ms: 1200
+      reconnect_ms: 1000
+    addressing:
+      byte_order: little_endian
+      word_order: big_endian
+      register_width_bits: 16
+      float_format: ieee754
+    polling:
+      interval_ms: 500
+      # Группировка запросов по диапазонам регистров
+      coalesce:
+        max_gap: 4
+        max_registers: 120
+    tags:
+      - key: hvac.supply_temp_C
+        class: ai_tempC
+        modbus:
+          table: holding
+          address: 40001
+          length: 2           # float32 = 2 регистра
+      - key: hvac.return_temp_C
+        class: ai_tempC
+        modbus:
+          table: holding
+          address: 40003
+          length: 2
+      - key: hvac.pump_running
+        class: di_state
+        modbus:
+          table: coil
+          address: 1
+          length: 1
+        alarms:
+          - id: pump_stopped
+            type: discrete
+            condition: equals
+            setpoint: 0
+            severity: 500
+            message: "HVAC pump stopped"
+            delay_on_ms: 1000
+      - key: hvac.pump_start_cmd
+        class: do_cmd
+        modbus:
+          table: coil
+          address: 2
+          length: 1
+
+  # ===== Example 3: Siemens S7 (S7-1200/1500) =====
+  - id: s7_pack_01
+    name: Packaging Line S7-1500
+    namespace: logistics
+    protocol: s7
+    connection:
+      host: ${S7_PACK_HOST:10.30.1.10}
+      rack: 0
+      slot: 1
+      pdu_size: 960
+      iso_tsap: "0x0100"
+      timeout_ms: 1500
+    polling:
+      interval_ms: 200
+    tags:
+      - key: pack.speed_mpm
+        class: ai_kw
+        engineering_units: mpm
+        s7:
+          area: DB
+          db_number: 10
+          start: 0
+          datatype: REAL
+      - key: pack.emergency_stop
+        class: di_state
+        s7:
+          area: I
+          byte: 0
+          bit: 3
+        alarms:
+          - id: estop_active
+            type: discrete
+            condition: equals
+            setpoint: 1
+            severity: 900
+            message: "E-Stop pressed on packaging line"
+            latch: true
+
+  # ===== Example 4: EtherNet/IP (CIP) Rockwell =====
+  - id: enip_conv_01
+    name: Conveyor PLC CompactLogix
+    namespace: logistics
+    protocol: ethernet_ip
+    connection:
+      host: ${ENIP_HOST:10.40.0.20}
+      slot: 0
+      timeout_ms: 1000
+    polling:
+      interval_ms: 250
+    tags:
+      - key: conv.load_kg
+        datatype: float32
+        engineering_units: kg
+        enip:
+          tag: "Conveyor.Load"
+      - key: conv.run_cmd
+        class: do_cmd
+        enip:
+          tag: "Conveyor.RunCmd"
+
+transforms:
+  # Глобальные преобразования/нормализация значений после чтения
+  - id: clamp_negatives_to_zero
+    apply_to:
+      namespaces: [energy, hvac]
+      keys: ["*kw", "*_temp_*"]
+    rules:
+      - type: clamp
+        min: 0
+  - id: round_temps
+    apply_to:
+      namespaces: [hvac]
+      keys: ["*.temp*"]
+    rules:
+      - type: round
+        decimals: 1
+
+alarms:
+  # Глобальные правила (могут быть переопределены в устройстве/теге)
+  routing:
+    sinks:
+      - type: mqtt
+        topic: "sites/${SITE_ID}/plc/alarms"
+      - type: kafka
+        topic: "plc.alarms"
+  defaults:
+    debounce_ms: 1000
+    notify_recovery: true
+    severity_min: 100
+    severity_max: 1000
+
+historian:
+  backend: timescaledb
+  connection:
+    uri: ${TSDB_URI:postgresql://user:pass@tsdb:5432/telemetry}
+    sslmode: prefer
+  schema:
+    table: telemetry_points
+    partition_by: day
+    index:
+      - columns: [ts, key]
+        type: btree
+  write_policy:
+    ordering: ts_ascending
+    on_conflict: upsert
+    compress_after_days: 7
+
+publishing:
+  # Тонкая настройка маршрутизации сообщений телеметрии
+  routes:
+    - id: mqtt_live
+      when:
+        namespace_in: [energy, hvac, logistics]
+        key_glob: ["*.kw", "*.temp*", "pack.*", "conv.*"]
+      to:
+        type: mqtt
+        topic_template: "sites/${SITE_ID}/plc/${namespace}/${key}"
+        qos: 1
+    - id: kafka_bulk
+      when:
+        any: true
+      to:
+        type: kafka
+        topic: "plc.timeseries"
+        compression: zstd
+  schema:
+    telemetry_v1:
+      format: jsonschema
+      schema_uri: https://schemas.example.com/plc/telemetry_v1.json
+
+write_policies:
+  # Глобальные ограничения записи
+  enable: true
+  require_change_request: true
+  audit:
+    enable: true
+    sink: kafka
+    topic: plc.writes.audit
+  approval:
+    enable: true
+    approvers_groups: ["ops-supervisors"]
+    timeout_ms: 60000
+  rate_limits:
+    default_per_min: 10
+    per_key_overrides:
+      "hvac.pump_start_cmd": 2
+      "conv.run_cmd": 6
+
+simulation:
+  enable: ${SIM_ENABLE:false}
+  mode: passthrough_with_overrides      # passthrough | override_only | passthrough_with_overrides
+  sources:
+    - apply_to_keys: ["energy.*"]
+      generator: sine
+      amplitude: 150.0
+      bias: 500.0
+      period_ms: 60000
+    - apply_to_keys: ["hvac.*temp*"]
+      generator: noise
+      mean: 22.0
+      stddev: 0.4
+
+validation:
+  # Проверки консистентности при загрузке конфигурации
+  rules:
+    - id: require_datatype
+      type: required_field
+      field: datatype
+      scope: tag
+    - id: eu_bounds
+      type: range_consistency
+      fields: [min_eu, max_eu]
+      scope: tag
+    - id: modbus_length_vs_datatype
+      type: protocol_specific
+      protocol: modbus_tcp
+      check: "length_matches_datatype"    # float32 -> length=2 и т.д.
+    - id: path_required_for_opcua
+      type: protocol_specific
+      protocol: opcua
+      check: "nodeid_required"
+
+# ---------------------------------------------
+# ПРИМЕЧАНИЯ ПО ПОЛЯМ ТЕГА (унифицированная модель)
+# key                — уникальный логический ключ тега (namespace.key)
+# class              — ссылка на tag_classes (наследует поля класса)
+# datatype           — bool|int16|int32|uint16|uint32|float32|float64|string|… (перекрывает class)
+# engineering_units  — строка единиц (kW, degC, kg, mpm, pu, state)
+# min_eu/max_eu      — инженерные границы допустимых значений
+# decimal_places     — отображение/округление
+# deadband           — absolute|relative|time; value/min_interval_ms
+# convert.scale/offset — линейное преобразование сырых значений в инженерные
+# alarms[]           — правила тревог (threshold, band, discrete, roc)
+# events[]           — генераторы событий (threshold_cross, pattern, sequence)
+# modbus/opcua/s7/enip — протокол-специфичные адреса/пути
+# write_allowed      — разрешение записи (может приходить из class)
+# metadata           — произвольные метки (asset, area и т.п.)
+# ---------------------------------------------

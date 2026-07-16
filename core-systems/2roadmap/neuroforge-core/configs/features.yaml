@@ -1,0 +1,353 @@
+# neuroforge-core/configs/features.yaml
+# Единый источник правды для фича-флагов и динамических конфигов.
+# Формат ориентирован на серверные SDK/edge-посредники с детерминированным bucketing.
+
+version: 1
+updated_at: "2025-08-26T00:00:00Z"
+service: "neuroforge-core"
+schema: "https://config.neuroforge/internal/featureflags/v1"  # для валидации во внутреннем валидаторе
+
+defaults:
+  # Глобальные дефолты и параметры bucketing
+  bucketing:
+    stickiness: "user_id"     # поле для стабильного назначения варианта
+    salt: "neuroforge-core-2025-08"  # менять при рестарте эксперимента
+    algorithm: "murmur3"
+  caching:
+    ttl_seconds: 30           # TTL для клиентов/прокси
+  safety:
+    require_prerequisites: true
+    block_on_unknown_segment: true
+  audit:
+    require_change_ticket: true
+    require_owner_ack: true
+
+environments:
+  - name: prod
+    description: "Production"
+    protections:
+      require_approval: true
+      freeze_windows:
+        - "Sat 22:00..Sun 10:00 UTC"
+  - name: staging
+    description: "Staging"
+    protections:
+      require_approval: false
+  - name: dev
+    description: "Dev"
+
+segments:
+  # Сегменты для таргетинга
+  - id: premium_users
+    match:
+      any:
+        - attr: "plan"
+          op: "in"
+          values: ["pro", "enterprise"]
+  - id: eu_region
+    match:
+      all:
+        - attr: "country"
+          op: "in"
+          values: ["SE","NO","FI","DK","DE","NL","FR","ES","IT","PL","AT","BE","IE","PT","CZ","SK","HU","EE","LV","LT"]
+  - id: internal_staff
+    match:
+      any:
+        - attr: "email"
+          op: "ends_with"
+          value: "@neuroforge.local"
+        - attr: "role"
+          op: "in"
+          values: ["staff","admin","sre"]
+  - id: low_risk_accounts
+    match:
+      all:
+        - attr: "risk_score"
+          op: "<="
+          value: 20
+
+features:
+  # Глобальный аварийный выключатель. Должен быть в каждом сервисе.
+  - key: kill_switch_global
+    type: boolean
+    owner: "SRE"
+    ticket: ""
+    description: "Глобальный аварийный выключатель входящего трафика (отвечает 503/maintenance)."
+    risk_level: critical
+    server_only: true
+    default: false
+    rollout:
+      prod:
+        enabled: false
+      staging:
+        enabled: false
+      dev:
+        enabled: false
+    metadata:
+      playbook: "runbook://sre/kill-switch"
+      sla_impact: "all"
+
+  - key: api_rate_limiter
+    type: boolean
+    owner: "Platform"
+    ticket: "PLAT-2312"
+    description: "Включение нового слоистого rate-limitera (leaky+token bucket) в API."
+    risk_level: high
+    server_only: true
+    prerequisites:
+      - key: kill_switch_global
+        expected: false
+    depends_on: []
+    default: false
+    rollout:
+      prod:
+        enabled: true
+        rules:
+          - when:
+              segment: internal_staff
+            variant: "on"
+          - when:
+              segment: premium_users
+            variant: "on"
+          - percentage: 25
+            variant: "on"
+        stickiness: "api_key" # для сервисных клиентов
+      staging:
+        enabled: true
+        rules:
+          - percentage: 100
+            variant: "on"
+      dev:
+        enabled: true
+        rules:
+          - percentage: 100
+            variant: "on"
+    overrides:
+      prod:
+        # Возможность ручного включения по конкретным пользователям/клиентам
+        allowlist:
+          user_ids: ["u_123456","u_654321"]
+          api_keys: ["ak_live_example1"]
+    schedules:
+      # Плановая эскалация процента (пример)
+      - cron: "0 6 * * 1-5"     # в 06:00 UTC по будням
+        action: "increase"
+        target_percentage: 50
+      - cron: "0 6 * * 1-5"
+        at_least_days_between_steps: 1
+        action: "increase"
+        target_percentage: 100
+    metadata:
+      metrics:
+        - "nf.api.ratelimiter.rejects"
+        - "nf.api.latency.p50"
+      alerts:
+        - "nf-api-slo-latency"
+      runbook: "runbook://platform/rate-limiter"
+
+  - key: privacy_redact_logs
+    type: boolean
+    owner: "Security"
+    ticket: "SEC-1180"
+    description: "Агрессивная редакция PII в логах приложений."
+    risk_level: medium
+    default: true
+    rollout:
+      prod: { enabled: true }
+      staging: { enabled: true }
+      dev: { enabled: true }
+    metadata:
+      compliance: ["GDPR","ISO27001-A.12.4"]
+
+  - key: new_reco_engine
+    type: multivariant
+    owner: "ML"
+    ticket: "ML-907"
+    description: "Эксперимент рекомендательного движка: v1 (baseline), v2 (graph), v3 (hybrid)."
+    risk_level: medium
+    experiment:
+      hypothesis: "v3 увеличит CTR на 3% для premium в EU."
+      primary_metric: "ctr@1"
+      guardrails: ["nf.reco.latency.p95 < 120ms", "nf.errors.rate < 1%"]
+      min_sample_size: 50000
+      mde: 0.03
+      duration_days: 14
+    variants:
+      - name: v1
+        weight: 50
+      - name: v2
+        weight: 25
+      - name: v3
+        weight: 25
+    default: "v1"
+    prerequisites:
+      - key: privacy_redact_logs
+        expected: true
+    rollout:
+      prod:
+        enabled: true
+        rules:
+          - when:
+              all:
+                - segment: premium_users
+                - segment: eu_region
+            percentage: 100
+            variant_split:
+              v1: 40
+              v2: 30
+              v3: 30
+          - percentage: 10
+            variant_split:
+              v1: 60
+              v2: 20
+              v3: 20
+        stickiness: "user_id"
+      staging:
+        enabled: true
+        rules:
+          - percentage: 100
+            variant_split:
+              v1: 34
+              v2: 33
+              v3: 33
+      dev:
+        enabled: true
+        rules:
+          - percentage: 100
+            variant_split:
+              v1: 0
+              v2: 50
+              v3: 50
+    metadata:
+      metrics:
+        - "nf.reco.ctr"
+        - "nf.reco.latency.p95"
+      notebook: "mlflow://experiments/reco-2025Q3"
+
+  - key: payment_strict_3ds
+    type: boolean
+    owner: "Payments"
+    ticket: "PAY-552"
+    description: "Принудительный 3DS для транзакций из определённых стран/рисков."
+    risk_level: high
+    server_only: true
+    default: false
+    rollout:
+      prod:
+        enabled: true
+        rules:
+          - when:
+              not:
+                segment: low_risk_accounts
+            variant: "on"
+          - when:
+              segment: eu_region
+            variant: "on"
+      staging: { enabled: true, rules: [ { percentage: 100, variant: "on" } ] }
+      dev: { enabled: true, rules: [ { percentage: 100, variant: "on" } ] }
+    metadata:
+      compliance: ["PSD2","SCA"]
+
+  - key: tracing_sampler
+    type: numeric
+    owner: "Observability"
+    ticket: "OBS-330"
+    description: "Доля трассировок (0.0..1.0) для OpenTelemetry Sampler."
+    risk_level: low
+    default: 0.1
+    constraints:
+      min: 0.0
+      max: 1.0
+      step: 0.01
+    rollout:
+      prod: { enabled: true, rules: [ { percentage: 100, variant_value: 0.05 } ] }
+      staging: { enabled: true, rules: [ { percentage: 100, variant_value: 0.25 } ] }
+      dev: { enabled: true, rules: [ { percentage: 100, variant_value: 1.0 } ] }
+    server_only: true
+    metadata:
+      docs: "docs://observability/tracing-sampling"
+
+  - key: ui_theme
+    type: string
+    owner: "Frontend"
+    ticket: "FE-210"
+    description: "Тема UI по умолчанию."
+    risk_level: low
+    default: "light"
+    constraints:
+      regex: "^(light|dark)$"
+    rollout:
+      prod:
+        enabled: true
+        rules:
+          - when:
+              segment: internal_staff
+            variant_value: "dark"
+      staging: { enabled: true, rules: [ { percentage: 100, variant_value: "dark" } ] }
+      dev: { enabled: true, rules: [ { percentage: 100, variant_value: "dark" } ] }
+
+dynamic_configs:
+  # Динамические конфиги ключ-значение с валидацией схемы.
+  - key: rate_limits
+    owner: "Platform"
+    ticket: "PLAT-2312"
+    description: "Пакет лимитов по тарифам/эндпойнтам."
+    schema:
+      type: object
+      required: ["default","premium"]
+      properties:
+        default:
+          type: object
+          properties:
+            rps: { type: integer, minimum: 1, maximum: 500 }
+            burst: { type: integer, minimum: 1, maximum: 2000 }
+        premium:
+          type: object
+          properties:
+            rps: { type: integer, minimum: 1, maximum: 2000 }
+            burst: { type: integer, minimum: 1, maximum: 10000 }
+    values:
+      prod:
+        default: { rps: 50, burst: 200 }
+        premium: { rps: 200, burst: 800 }
+      staging:
+        default: { rps: 30, burst: 120 }
+        premium: { rps: 120, burst: 480 }
+      dev:
+        default: { rps: 10, burst: 40 }
+        premium: { rps: 40, burst: 160 }
+
+  - key: reco_timeouts
+    owner: "ML"
+    ticket: "ML-921"
+    description: "Таймауты и резервные стратегии для рекомендательного API."
+    schema:
+      type: object
+      properties:
+        timeout_ms: { type: integer, minimum: 10, maximum: 1000 }
+        fallback: { type: string, enum: ["baseline","popular","empty"] }
+    values:
+      prod: { timeout_ms: 120, fallback: "baseline" }
+      staging: { timeout_ms: 200, fallback: "baseline" }
+      dev: { timeout_ms: 300, fallback: "popular" }
+
+governance:
+  # Политики управления изменениями
+  approvals:
+    prod:
+      required: 2
+      roles: ["owner","sre"]
+    staging:
+      required: 1
+      roles: ["owner"]
+  audit_fields:
+    required: ["owner","ticket","description","risk_level"]
+    optional: ["metadata"]
+
+validation:
+  # Правила валидации на CI
+  rules:
+    - ensure_all_features_have_owner: true
+    - ensure_prerequisites_exist: true
+    - forbid_prod_enable_without_ticket: true
+    - forbid_changes_in_freeze_window: true

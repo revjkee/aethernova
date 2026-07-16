@@ -1,0 +1,405 @@
+---
+# roles/cybersecurity-core/tasks/main.yml
+
+- name: "Pre-flight | Validate required variables"
+  ansible.builtin.assert:
+    that:
+      - cybersecurity_core_version is defined and cybersecurity_core_version | length > 0
+      - cybersecurity_core_install_method is defined
+      - cybersecurity_core_install_method in ['binary','package','container']
+      - cybersecurity_core_service_name is defined and cybersecurity_core_service_name | length > 0
+      - cybersecurity_core_user is defined and cybersecurity_core_user | length > 0
+      - cybersecurity_core_group is defined and cybersecurity_core_group | length > 0
+      - cybersecurity_core_config is defined
+      - (cybersecurity_core_install_method != 'binary') or (cybersecurity_core_download_url is defined and cybersecurity_core_download_url | length > 0)
+      - (cybersecurity_core_install_method != 'binary') or (cybersecurity_core_download_sha256 is defined and cybersecurity_core_download_sha256 | length > 0)
+      - (cybersecurity_core_install_method != 'package') or (cybersecurity_core_package_name is defined and cybersecurity_core_package_name | length > 0)
+      - (cybersecurity_core_install_method != 'container') or (cybersecurity_core_image is defined and cybersecurity_core_image | length > 0)
+    fail_msg: "Missing or invalid mandatory variables for cybersecurity-core role."
+    success_msg: "Variables validated."
+
+- name: "Pre-flight | Derive OS-specific paths"
+  ansible.builtin.set_fact:
+    cybersecurity_core_prefix: "{{ cybersecurity_core_prefix | default('/opt/cybersecurity-core') }}"
+    cybersecurity_core_config_dir: "{{ cybersecurity_core_config_dir | default('/etc/cybersecurity-core') }}"
+    cybersecurity_core_data_dir: "{{ cybersecurity_core_data_dir | default('/var/lib/cybersecurity-core') }}"
+    cybersecurity_core_log_dir: "{{ cybersecurity_core_log_dir | default('/var/log/cybersecurity-core') }}"
+    cybersecurity_core_tmp_dir: "{{ cybersecurity_core_tmp_dir | default('/var/tmp/cybersecurity-core') }}"
+    cybersecurity_core_bin_dir: "{{ cybersecurity_core_bin_dir | default(cybersecurity_core_prefix + '/current/bin') }}"
+    cybersecurity_core_release_dir: "{{ cybersecurity_core_release_dir | default(cybersecurity_core_prefix + '/releases/' + cybersecurity_core_version) }}"
+    cybersecurity_core_current_link: "{{ cybersecurity_core_current_link | default(cybersecurity_core_prefix + '/current') }}"
+    cybersecurity_core_env_dir: "{{ (ansible_facts.os_family == 'Debian') | ternary('/etc/default','/etc/sysconfig') }}"
+    cybersecurity_core_env_file: "{{ (ansible_facts.os_family == 'Debian') | ternary('/etc/default/' + cybersecurity_core_service_name, '/etc/sysconfig/' + cybersecurity_core_service_name) }}"
+    cybersecurity_core_binary_path: "{{ cybersecurity_core_bin_dir + '/' + cybersecurity_core_service_name }}"
+    cybersecurity_core_service_port: "{{ cybersecurity_core_service_port | default(8080) | int }}"
+    cybersecurity_core_metrics_port: "{{ cybersecurity_core_metrics_port | default(9090) | int }}"
+    cybersecurity_core_user_shell: "{{ cybersecurity_core_user_shell | default('/usr/sbin/nologin') }}"
+    cybersecurity_core_restart_sec: "{{ cybersecurity_core_restart_sec | default('5s') }}"
+    cybersecurity_core_limit_nofile: "{{ cybersecurity_core_limit_nofile | default(65536) }}"
+    cybersecurity_core_container_runtime: "{{ cybersecurity_core_container_runtime | default('podman') }}"
+
+- name: "Packages | Ensure base packages are present"
+  ansible.builtin.package:
+    name:
+      - ca-certificates
+      - tar
+      - gzip
+      - coreutils
+    state: present
+  tags: ['packages']
+
+- name: "System | Create group"
+  ansible.builtin.group:
+    name: "{{ cybersecurity_core_group }}"
+    system: true
+
+- name: "System | Create user"
+  ansible.builtin.user:
+    name: "{{ cybersecurity_core_user }}"
+    group: "{{ cybersecurity_core_group }}"
+    comment: "cybersecurity-core service user"
+    system: true
+    shell: "{{ cybersecurity_core_user_shell }}"
+    create_home: false
+
+- name: "FS | Create directories"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default(cybersecurity_core_user) }}"
+    group: "{{ item.group | default(cybersecurity_core_group) }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop:
+    - { path: "{{ cybersecurity_core_prefix }}", owner: "root", group: "root", mode: "0755" }
+    - { path: "{{ cybersecurity_core_prefix }}/releases", owner: "root", group: "root", mode: "0755" }
+    - { path: "{{ cybersecurity_core_config_dir }}", owner: "root", group: "{{ cybersecurity_core_group }}", mode: "0750" }
+    - { path: "{{ cybersecurity_core_data_dir }}" }
+    - { path: "{{ cybersecurity_core_log_dir }}" }
+    - { path: "{{ cybersecurity_core_tmp_dir }}" }
+  tags: ['filesystem']
+
+- name: "Install | Binary method | Download archive"
+  when: cybersecurity_core_install_method == 'binary'
+  block:
+    - name: "Download release archive"
+      ansible.builtin.get_url:
+        url: "{{ cybersecurity_core_download_url }}"
+        dest: "{{ cybersecurity_core_tmp_dir }}/{{ cybersecurity_core_service_name }}-{{ cybersecurity_core_version }}.tar.gz"
+        mode: '0640'
+        owner: root
+        group: root
+        checksum: "sha256:{{ cybersecurity_core_download_sha256 }}"
+      register: _download
+    - name: "Prepare release directory"
+      ansible.builtin.file:
+        path: "{{ cybersecurity_core_release_dir }}"
+        state: directory
+        owner: "root"
+        group: "root"
+        mode: "0755"
+    - name: "Unarchive release"
+      ansible.builtin.unarchive:
+        src: "{{ _download.dest }}"
+        dest: "{{ cybersecurity_core_release_dir }}"
+        remote_src: true
+        extra_opts:
+          - "--no-same-owner"
+      notify: ["Restart cybersecurity-core"]
+    - name: "Ensure bin permissions"
+      ansible.builtin.file:
+        path: "{{ cybersecurity_core_release_dir }}/bin"
+        state: directory
+        owner: "root"
+        group: "root"
+        mode: "0755"
+    - name: "Symlink current -> {{ cybersecurity_core_release_dir }}"
+      ansible.builtin.file:
+        src: "{{ cybersecurity_core_release_dir }}"
+        dest: "{{ cybersecurity_core_current_link }}"
+        state: link
+        owner: "root"
+        group: "root"
+      notify: ["Restart cybersecurity-core"]
+  tags: ['install','binary']
+
+- name: "Install | Package method | Ensure package present"
+  when: cybersecurity_core_install_method == 'package'
+  ansible.builtin.package:
+    name: "{{ cybersecurity_core_package_name }}"
+    state: present
+  tags: ['install','package']
+
+- name: "Install | Container method | Pull image with Podman"
+  when:
+    - cybersecurity_core_install_method == 'container'
+    - cybersecurity_core_container_runtime == 'podman'
+  containers.podman.podman_image:
+    name: "{{ cybersecurity_core_image }}"
+    state: present
+  tags: ['install','container']
+
+- name: "Install | Container method | Pull image with Docker"
+  when:
+    - cybersecurity_core_install_method == 'container'
+    - cybersecurity_core_container_runtime == 'docker'
+  community.docker.docker_image:
+    name: "{{ cybersecurity_core_image }}"
+    source: pull
+    state: present
+  tags: ['install','container']
+
+- name: "Config | Render environment file"
+  ansible.builtin.copy:
+    dest: "{{ cybersecurity_core_env_file }}"
+    owner: "root"
+    group: "root"
+    mode: "0644"
+    content: |
+      # Managed by Ansible
+      {{ (ansible_facts.os_family == 'Debian') | ternary('', 'CYBERSECURITY_CORE_') }}APP_ENV={{ cybersecurity_core_env | default('production') }}
+      {{ (ansible_facts.os_family == 'Debian') | ternary('', 'CYBERSECURITY_CORE_') }}LOG_LEVEL={{ cybersecurity_core_log_level | default('info') }}
+      {{ (ansible_facts.os_family == 'Debian') | ternary('', 'CYBERSECURITY_CORE_') }}CONFIG_FILE={{ cybersecurity_core_config_dir }}/config.yaml
+      {{ (ansible_facts.os_family == 'Debian') | ternary('', 'CYBERSECURITY_CORE_') }}DATA_DIR={{ cybersecurity_core_data_dir }}
+      {{ (ansible_facts.os_family == 'Debian') | ternary('', 'CYBERSECURITY_CORE_') }}TMP_DIR={{ cybersecurity_core_tmp_dir }}
+      {{ (ansible_facts.os_family == 'Debian') | ternary('', 'CYBERSECURITY_CORE_') }}PORT={{ cybersecurity_core_service_port }}
+      {{ (ansible_facts.os_family == 'Debian') | ternary('', 'CYBERSECURITY_CORE_') }}METRICS_PORT={{ cybersecurity_core_metrics_port }}
+  notify: ["Restart cybersecurity-core"]
+  tags: ['config']
+
+- name: "Config | Render main config with validation (if enabled)"
+  vars:
+    _cfg_path: "{{ cybersecurity_core_config_dir }}/config.yaml"
+  block:
+    - name: "Write config.yaml"
+      ansible.builtin.copy:
+        dest: "{{ _cfg_path }}"
+        owner: "root"
+        group: "{{ cybersecurity_core_group }}"
+        mode: "0640"
+        content: "{{ cybersecurity_core_config | to_nice_yaml(indent=2) }}"
+      notify: ["Restart cybersecurity-core"]
+
+    - name: "Validate config with service binary"
+      when:
+        - cybersecurity_core_validate_config | default(true)
+        - cybersecurity_core_install_method in ['binary','package']
+      ansible.builtin.command:
+        cmd: "{{ cybersecurity_core_binary_override | default(cybersecurity_core_binary_path) }} --config-validate --config {{ _cfg_path }}"
+      register: _cfg_validate
+      changed_when: false
+  rescue:
+    - name: "Revert invalid config"
+      ansible.builtin.copy:
+        dest: "{{ _cfg_path }}"
+        content: "{{ cybersecurity_core_config_backup | default('# reverted by Ansible due to failed validation') }}"
+        owner: "root"
+        group: "{{ cybersecurity_core_group }}"
+        mode: "0640"
+      when: cybersecurity_core_config_backup is defined
+    - name: "Fail due to invalid configuration"
+      ansible.builtin.fail:
+        msg: "Configuration validation failed: {{ _cfg_validate.stderr | default(_cfg_validate.stdout) }}"
+  tags: ['config']
+
+- name: "Systemd | Install service unit (binary/package)"
+  when: cybersecurity_core_install_method in ['binary','package']
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ cybersecurity_core_service_name }}.service"
+    owner: "root"
+    group: "root"
+    mode: "0644"
+    content: |
+      # Managed by Ansible
+      [Unit]
+      Description=Cybersecurity Core Service
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      EnvironmentFile={{ cybersecurity_core_env_file }}
+      User={{ cybersecurity_core_user }}
+      Group={{ cybersecurity_core_group }}
+      ExecStart={{ cybersecurity_core_binary_override | default(cybersecurity_core_binary_path) }} --config {{ cybersecurity_core_config_dir }}/config.yaml --port {{ cybersecurity_core_service_port }} --metrics {{ cybersecurity_core_metrics_port }}
+      Restart=always
+      RestartSec={{ cybersecurity_core_restart_sec }}
+      LimitNOFILE={{ cybersecurity_core_limit_nofile }}
+      WorkingDirectory={{ cybersecurity_core_prefix }}
+      RuntimeDirectory={{ cybersecurity_core_service_name }}
+      RuntimeDirectoryMode=0750
+      LogsDirectory={{ cybersecurity_core_service_name }}
+      LogsDirectoryMode=0750
+      StateDirectory={{ cybersecurity_core_service_name }}
+      StateDirectoryMode=0750
+      # Hardening
+      NoNewPrivileges=yes
+      PrivateTmp=yes
+      PrivateDevices=yes
+      ProtectHostname=yes
+      ProtectClock=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectKernelLogs=yes
+      ProtectControlGroups=yes
+      ProtectHome=yes
+      ProtectSystem=strict
+      ReadWritePaths={{ cybersecurity_core_data_dir }} {{ cybersecurity_core_log_dir }} {{ cybersecurity_core_tmp_dir }}
+      LockPersonality=yes
+      RestrictRealtime=yes
+      RestrictSUIDSGID=yes
+      SystemCallArchitectures=native
+      SystemCallFilter=@system-service
+      CapabilityBoundingSet=
+      AmbientCapabilities=
+      IPAddressDeny=any
+      IPAddressAllow=localhost
+      # If service needs outbound, comment IPAddressDeny/Allow accordingly.
+
+      [Install]
+      WantedBy=multi-user.target
+  notify:
+    - Daemon-reload
+    - Restart cybersecurity-core
+  tags: ['service','systemd']
+
+- name: "Systemd | Install containerized unit (container)"
+  when: cybersecurity_core_install_method == 'container'
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ cybersecurity_core_service_name }}.service"
+    owner: "root"
+    group: "root"
+    mode: "0644"
+    content: |
+      # Managed by Ansible
+      [Unit]
+      Description=Cybersecurity Core (Container)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      EnvironmentFile={{ cybersecurity_core_env_file }}
+      User={{ cybersecurity_core_user }}
+      Group={{ cybersecurity_core_group }}
+      Restart=always
+      RestartSec={{ cybersecurity_core_restart_sec }}
+      LimitNOFILE={{ cybersecurity_core_limit_nofile }}
+      ExecStartPre=-/usr/bin/{{ cybersecurity_core_container_runtime }} rm -f {{ cybersecurity_core_service_name }}
+      ExecStart=/usr/bin/{{ cybersecurity_core_container_runtime }} run --rm \
+        --name {{ cybersecurity_core_service_name }} \
+        --network host \
+        --user {{ cybersecurity_core_user }}:{{ cybersecurity_core_group }} \
+        -v {{ cybersecurity_core_config_dir }}:/etc/cybersecurity-core:ro \
+        -v {{ cybersecurity_core_data_dir }}:/var/lib/cybersecurity-core:rw \
+        -v {{ cybersecurity_core_log_dir }}:/var/log/cybersecurity-core:rw \
+        -e APP_ENV={{ cybersecurity_core_env | default('production') }} \
+        -e LOG_LEVEL={{ cybersecurity_core_log_level | default('info') }} \
+        -e PORT={{ cybersecurity_core_service_port }} \
+        -e METRICS_PORT={{ cybersecurity_core_metrics_port }} \
+        {{ cybersecurity_core_image }}
+      ExecStop=/usr/bin/{{ cybersecurity_core_container_runtime }} stop {{ cybersecurity_core_service_name }}
+      # Hardening (host-level)
+      NoNewPrivileges=yes
+      PrivateTmp=yes
+      ProtectSystem=full
+      ProtectControlGroups=yes
+      ProtectKernelModules=yes
+      ProtectKernelTunables=yes
+      RestrictSUIDSGID=yes
+      LockPersonality=yes
+      RestrictRealtime=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  notify:
+    - Daemon-reload
+    - Restart cybersecurity-core
+  tags: ['service','systemd','container']
+
+- name: "Logrotate | Configure"
+  ansible.builtin.copy:
+    dest: "/etc/logrotate.d/{{ cybersecurity_core_service_name }}"
+    owner: "root"
+    group: "root"
+    mode: "0644"
+    content: |
+      {{ cybersecurity_core_log_dir }}/*.log {
+          weekly
+          rotate 12
+          compress
+          delaycompress
+          missingok
+          notifempty
+          copytruncate
+      }
+  tags: ['logrotate']
+
+- name: "Firewall | Open service port with firewalld (RHEL family)"
+  when:
+    - ansible_facts.os_family == 'RedHat'
+  ansible.posix.firewalld:
+    port: "{{ cybersecurity_core_service_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  tags: ['firewall']
+
+- name: "Firewall | Open service port with UFW (Debian family)"
+  when:
+    - ansible_facts.os_family == 'Debian'
+  community.general.ufw:
+    rule: allow
+    port: "{{ cybersecurity_core_service_port }}"
+    proto: tcp
+  tags: ['firewall']
+
+- name: "SELinux | Ensure policy tools are present (RHEL family)"
+  when:
+    - ansible_facts.os_family == 'RedHat'
+  ansible.builtin.package:
+    name:
+      - policycoreutils
+      - policycoreutils-python-utils
+    state: present
+  tags: ['selinux']
+
+- name: "SELinux | Label paths when SELinux enabled"
+  when:
+    - ansible_facts.selinux is defined
+    - ansible_facts.selinux.status == 'enabled'
+  block:
+    - name: "SELinux | fcontext for config"
+      ansible.posix.sefcontext:
+        target: "{{ cybersecurity_core_config_dir }}(/.*)?"
+        setype: etc_t
+        state: present
+    - name: "SELinux | fcontext for logs"
+      ansible.posix.sefcontext:
+        target: "{{ cybersecurity_core_log_dir }}(/.*)?"
+        setype: var_log_t
+        state: present
+    - name: "SELinux | fcontext for state"
+      ansible.posix.sefcontext:
+        target: "{{ cybersecurity_core_data_dir }}(/.*)?"
+        setype: var_lib_t
+        state: present
+    - name: "SELinux | Apply contexts"
+      ansible.builtin.command:
+        cmd: "restorecon -R {{ cybersecurity_core_config_dir }} {{ cybersecurity_core_log_dir }} {{ cybersecurity_core_data_dir }}"
+      changed_when: false
+  tags: ['selinux']
+
+- name: "Systemd | Enable and start service"
+  ansible.builtin.systemd:
+    name: "{{ cybersecurity_core_service_name }}"
+    enabled: true
+    state: started
+  tags: ['service']
+
+- name: "Post | Flush handlers"
+  ansible.builtin.meta: flush_handlers
+
+# Handlers are expected in roles/cybersecurity-core/handlers/main.yml:
+# - name: Daemon-reload -> systemd daemon_reload: true
+# - name: Restart cybersecurity-core -> systemd state: restarted
+

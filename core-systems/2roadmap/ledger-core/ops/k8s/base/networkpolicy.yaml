@@ -1,0 +1,195 @@
+# ledger-core/ops/k8s/base/networkpolicy.yaml
+# Baseline Zero-Trust NetworkPolicies for ledger-core workloads.
+# Assumes pods labeled with:
+#   app.kubernetes.io/name: ledger-core
+#   app.kubernetes.io/part-of: ledger
+#   app.kubernetes.io/component: backend
+# Adjust namespace labels where noted.
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-core-default-deny
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/part-of: ledger
+    app.kubernetes.io/component: backend
+spec:
+  podSelector: {}  # apply to all pods in the namespace (safer namespace-level default-deny)
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress/egress rules -> deny all by default
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-core-allow-dns-egress
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/part-of: ledger
+    app.kubernetes.io/component: backend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchExpressions:
+              # Supports both CoreDNS and kube-dns labelings across vendors
+              - key: k8s-app
+                operator: In
+                values: ["kube-dns", "coredns"]
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-core-allow-app-ingress
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/part-of: ledger
+    app.kubernetes.io/component: backend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+  policyTypes:
+    - Ingress
+  ingress:
+    # 1) From ingress controllers (namespace labeled networking/ingress=enabled)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              networking/ingress: "enabled"
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ingress-controller
+      ports:
+        - protocol: TCP
+          port: 8000   # HTTP API
+        - protocol: TCP
+          port: 8443   # HTTPS (if terminated at pod)
+    # 2) From same-namespace internal callers (e.g., jobs, internal services)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${NAMESPACE:-default} # replace in overlays or Kustomize
+      ports:
+        - protocol: TCP
+          port: 8000
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-core-allow-metrics-ingress
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/part-of: ledger
+    app.kubernetes.io/component: backend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              monitoring: "true"  # label your monitoring namespace with monitoring=true
+      ports:
+        - protocol: TCP
+          port: 9090  # Prometheus/metrics endpoint (adjust if different)
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-core-allow-egress-internal-services
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/part-of: ledger
+    app.kubernetes.io/component: backend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+  policyTypes:
+    - Egress
+  egress:
+    # PostgreSQL in same namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${NAMESPACE:-default}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # MinIO / S3-compatible object storage in same namespace (optional)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${NAMESPACE:-default}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9001  # console/admin (if used)
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-core-allow-egress-egress-gateway
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/part-of: ledger
+    app.kubernetes.io/component: backend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # Route external HTTP(S) only via a controlled egress-gateway namespace.
+        - namespaceSelector:
+            matchLabels:
+              egress/gateway: "true"
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: egress-gateway
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+
+# NOTE:
+# 1) This baseline intentionally DOES NOT allow arbitrary egress to the Internet.
+#    To enable direct egress, add a dedicated policy with IPBlock/CIDR allowlists per compliance.
+# 2) Replace ${NAMESPACE:-default} using Kustomize vars or overlay patches.
+# 3) If readiness/liveness probes come from node IPs (most CNIs), NetworkPolicy still applies (Pod-to-Pod).
+#    kubelet probes to Pod IP are subject to these rules; ensure ingress from same namespace covers your probes.

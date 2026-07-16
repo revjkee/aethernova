@@ -1,0 +1,342 @@
+# File: zero-trust-core/configs/session.yaml
+# Industrial Zero Trust session configuration
+# All durations accept ISO8601 (e.g., PT30M) or shorthand (e.g., 30m). All sizes in bytes unless noted.
+
+version: "1.0"
+
+env:
+  name: ${ENV_NAME:prod}
+  region: ${REGION:eu-central-1}
+  tenant_mode: ${TENANT_MODE:multi}  # single|multi
+
+identifiers:
+  session_id:
+    format: ksuid          # ksuid|uuidv7|ulid
+    entropy_bits: 128
+    prefix: "zt_"
+  device_id:
+    header: "X-Device-ID"
+    fallback_cookie: "zt_did"
+    require_on_high_risk: true
+
+model:
+  mode: hybrid              # stateless|stateful|hybrid
+  consistency: strong       # strong|eventual (for session store reads)
+  audience_strict: true     # enforce aud match on tokens
+  subject_binding:          # cnf claim and PoP enforcement
+    enabled: true
+    accepted_cnf: ["dpop+jkt", "x5t#S256", "jwk"]
+    require_on_external_networks: true
+
+ttl:
+  inactivity: PT30M         # idle timeout
+  absolute: PT8H            # max lifetime
+  refresh:
+    enabled: true
+    rotation: one_time      # one_time|sliding
+    ttl: P14D
+    reuse_interval: PT0S    # disallow reuse; if >0s then small grace to account for races
+  remember_me:
+    enabled: true
+    inactivity: PT7D
+    absolute: P30D
+    allow_scopes: ["offline_access"]
+  grace_after_key_rotation: PT24H  # accept retiring kid within window
+
+storage:
+  primary:
+    kind: redis_cluster
+    redis:
+      urls: ${REDIS_URLS:redis+tls://redis-1:6379,redis+tls://redis-2:6379,redis+tls://redis-3:6379}
+      tls: true
+      db: ${REDIS_DB:0}
+      key_prefix: "zt:sess:"
+      pool_max: 256
+      min_idle: 16
+      socket_timeout_ms: 50
+      healthcheck_interval_s: 10
+      scan_batch: 500
+  fallback:
+    kind: memory
+    capacity_sessions: 100000
+  replication:
+    cross_region: false
+    async_lag_budget_ms: 500
+  serialization:
+    codec: msgpack          # msgpack|json
+    compress: zstd          # none|zstd|lz4
+    threshold_bytes: 1024
+
+stateless_tokens:
+  enabled: true
+  format: jwt
+  signing:
+    alg: ${JWT_SIGN_ALG:ES256}  # ES256|EdDSA|RS256
+    jwks_path: ${JWKS_PATH:/etc/security/jwks.json}
+    jwks_url: ${JWKS_URL:https://auth.example.com/.well-known/jwks.json}
+    kid_selection: primary
+    allow_retiring_kids: true
+  encryption:
+    enabled: true
+    alg: ${JWE_ALG:ECDH-ES+A256KW}    # or RSA-OAEP-256
+    enc: A256GCM
+    audience_claim_required: true
+  claims:
+    iss: ${ISS:https://auth.example.com}
+    aud_default: ${AUD_DEFAULT:api://default}
+    scope_whitelist:
+      - openid
+      - profile
+      - email
+      - offline_access
+      - admin:read
+      - admin:write
+    max_custom_claims_bytes: 4096
+    include:
+      - tenant_id
+      - risk_score
+      - device_posture
+      - auth_time
+      - amr
+    redact_pi_fields: true
+
+cookies:
+  enabled: true
+  name: ${SESSION_COOKIE_NAME:zt_sid}
+  domain: ${COOKIE_DOMAIN:.example.com}
+  path: "/"
+  http_only: true
+  secure: true
+  same_site: strict         # strict|lax|none
+  partitioned: true         # CHIPS if supported
+  max_age: null             # rely on ttl.inactivity
+  rotation_on_read: true    # renew cookie on activity if >50% lifetime left
+  legacy_fallback:
+    name: "zt_sid_legacy"
+    same_site: lax
+    enabled: false
+
+csrf:
+  enabled: true
+  cookie_name: "zt_csrf"
+  header_name: "X-CSRF-Token"
+  double_submit: true
+  same_site_strict_exceptions:
+    - "POST:/oauth/token"
+
+headers:
+  authz_header: "Authorization"
+  bearer_prefix: "Bearer"
+  dpop:
+    enabled: true
+    clock_skew: PT2M
+    enforce_http_methods: ["GET", "POST", "PUT", "DELETE", "PATCH"]
+  forwarded_for_header: "X-Forwarded-For"
+  user_agent_header: "User-Agent"
+
+mtls:
+  required_for_admin: true
+  require_client_cert_on_paths:
+    - "POST:/admin/*"
+    - "GET:/internal/keys/*"
+  ca_bundle_ref: "sm://pki/mtls/ca_bundle"   # secret-manager reference
+  subject_dn_pattern: "OU=CorpVPN, O=Example Inc, CN=*"
+  pin_spki_hashes: []                         # optional SPKI pins
+
+device_posture:
+  enabled: true
+  sources:
+    mdm_attestation: true
+    edr_signal: true
+    webauthn_platform_attestation: true
+  minimum_requirements:
+    os_patch_max_age_days: 30
+    disk_encryption: true
+    firewall_enabled: true
+    screen_lock_timeout_s: 600
+  jailbreak_root_detect: enforce
+  cache_ttl: PT15M
+
+risk_engine:
+  enabled: true
+  thresholds:
+    allow: 0..29
+    step_up: 30..69
+    deny: 70..100
+  weights:
+    ip_reputation: 0.25
+    geo_anomaly: 0.20
+    device_posture: 0.25
+    velocity: 0.10
+    impossible_travel: 0.10
+    time_window: 0.10
+  actions:
+    on_step_up:
+      methods: ["webauthn", "totp"]
+      session_mark: "pending_step_up"
+      step_up_ttl: PT15M
+    on_deny:
+      revoke_session: true
+      inhibit_subject_ttl: PT30M
+
+reauth_triggers:
+  high_value_actions:
+    - "secrets.rotate"
+    - "billing.payouts"
+    - "admin.role.assign"
+  network_change: true
+  ip_reputation_drop: true
+  device_posture_degradation: true
+  idle_exceeded_half_life: true
+  ttl_near_expiry: PT10M
+
+authorization_context:
+  context_labels_from_headers:
+    X-Tenant-ID: tenant_id
+    X-Request-ID: request_id
+  propagate_claims_to_upstream:
+    - tenant_id
+    - risk_score
+    - amr
+
+revocation:
+  backchannel_logout:
+    enabled: true
+    queue:
+      kind: kafka
+      brokers: ${KAFKA_BROKERS:broker-1:9092,broker-2:9092}
+      topic: ${KAFKA_TOPIC_LOGOUT:zt.logout}
+      acks: all
+      timeout_ms: 2000
+  frontchannel_logout:
+    enabled: true
+    iframe_url: ${LOGOUT_IFRAME_URL:https://auth.example.com/logout-iframe}
+  token_replay_cache:
+    backend: redis
+    key_prefix: "zt:replay:"
+    ttl: PT15M
+
+limits:
+  login_attempts:
+    limit: 10
+    window: PT5M
+    action: inhibit
+    cooldown: PT15M
+  refresh_per_session:
+    limit: 60
+    window: PT1M
+    action: throttle
+  concurrent_sessions_per_subject:
+    limit: 5
+    eviction: oldest
+
+audit:
+  enabled: true
+  sink:
+    kind: kafka
+    brokers: ${KAFKA_BROKERS:broker-1:9092,broker-2:9092}
+    topic: ${KAFKA_TOPIC_AUDIT:zt.audit}
+    compression: zstd
+  redact_fields:
+    - ip
+    - user_agent
+    - device_fingerprint
+  events:
+    include:
+      - session.created
+      - session.refreshed
+      - session.revoked
+      - session.stepup.required
+      - session.stepup.passed
+      - token.replay.detected
+
+observability:
+  metrics:
+    backend: prometheus
+    namespace: "zt_core"
+    endpoint: "/metrics"
+  tracing:
+    backend: otel
+    exporter_otlp: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://otel-collector:4317}
+    service_name: "zt-core"
+  logs:
+    format: json
+    level: ${LOG_LEVEL:info}
+    fields:
+      include: ["trace_id", "span_id", "session_id", "subject", "tenant_id", "risk_score"]
+
+webhooks:
+  on_session_created:
+    url: ${WEBHOOK_CREATED_URL:}
+    hmac_secret_ref: "sm://webhooks/session_created_hmac"
+    timeout_s: 3
+    retry:
+      attempts: 3
+      backoff: 200ms..2s
+  on_session_revoked:
+    url: ${WEBHOOK_REVOKED_URL:}
+    hmac_secret_ref: "sm://webhooks/session_revoked_hmac"
+    timeout_s: 3
+    retry:
+      attempts: 5
+      backoff: 200ms..5s
+
+security_headers:
+  set_by_gateway: true
+  values:
+    Content-Security-Policy: "default-src 'none'; frame-ancestors 'none'; base-uri 'none';"
+    Referrer-Policy: "no-referrer"
+    X-Content-Type-Options: "nosniff"
+    Strict-Transport-Security: "max-age=63072000; includeSubDomains; preload"
+
+secrets:
+  manager: gcp                   # gcp|aws|azure|vault
+  refs:
+    redis_password: "sm://redis/password"
+    jwt_signing_keys: "file://${JWKS_PATH:/etc/security/jwks.json}"
+    jwe_recipient_jwks: "sm://jwe/recipients"
+    mtls_ca_bundle: "sm://pki/mtls/ca_bundle"
+
+rollout:
+  features:
+    dpop_required:
+      percent: 25
+      tenants: ["beta", "acme"]
+    partitioned_cookies:
+      percent: 100
+    stateless_only_for_health:
+      percent: 100
+  constraints:
+    min_client_version:
+      web: ">=1.18.0"
+      mobile: ">=3.4.0"
+
+network:
+  allow_asn: []
+  deny_countries: ["KP", "SY"]
+  require_corp_vpn_for_roles:
+    - "admin"
+    - "finance"
+  private_ingress_cidrs:
+    - "10.0.0.0/8"
+    - "192.168.0.0/16"
+
+compliance:
+  gdpr:
+    data_minimization: true
+    retention_days: 90
+    subject_export_enabled: true
+  soc2:
+    logging_immutability: true
+    access_review_interval_days: 90
+  hipaa:
+    enabled: false
+
+validation:
+  schema: "zt-session/1.0"
+  startup_checks:
+    - storage.connectivity
+    - jwks.loadable
+    - kafka.reachable
+    - redis.rw
+  fail_closed: true

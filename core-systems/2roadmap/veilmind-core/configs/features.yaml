@@ -1,0 +1,280 @@
+# Feature Flags configuration for VeilMind Core
+# Схема поддерживает:
+# - окружения (prod/stage/dev)
+# - boolean/multivariate/json флаги
+# - таргетинг по сегментам/атрибутам
+# - процентные раскатки со stickiness
+# - окна активации (scheduler)
+# - пререквизиты и зависимости
+# - аварийные килл‑свитчи
+# - аудит/治理 (policy, approvals)
+
+schemaVersion: 1
+meta:
+  service: veilmind-core
+  owner: platform-security@veilmind.example
+  lastUpdated: "2025-08-21T00:00:00Z"
+  changePolicy:
+    requireApprovals: true
+    approvers:
+      - sre-lead@veilmind.example
+      - sec-arch@veilmind.example
+    requireTicketRef: true
+    allowedChangeWindowsUTC:
+      - "Mon-Fri 08:00-18:00"
+environments:
+  - name: prod
+    description: Production
+  - name: stage
+    description: Staging
+  - name: dev
+    description: Developers playground
+
+delivery:
+  cacheTTLSeconds: 30           # TTL локального кэша клиента фич
+  pollIntervalSeconds: 20       # Как часто клиент опрашивает стор
+  stickiness:
+    attributeOrder: ["user.id", "tenant.id", "session.id"]  # для консистентного шардирования
+
+defaults:
+  # Глобальные безопасные дефолты (если нет матчей)
+  boolean: false
+  multivariateChoice: null
+  json: {}
+
+segments:
+  # Сегменты для переиспользования в правилах
+  internal_users:
+    match:
+      any:
+        - attribute: user.email
+          op: ends_with
+          value: "@veilmind.example"
+        - attribute: user.role
+          op: in
+          value: ["admin", "sre"]
+  premium_tenants:
+    match:
+      all:
+        - attribute: tenant.plan
+          op: eq
+          value: "premium"
+        - attribute: tenant.created_at
+          op: lt
+          value: "2025-06-01T00:00:00Z"
+  high_risk_regions:
+    match:
+      any:
+        - attribute: request.geo.country
+          op: in
+          value: ["RU", "IR", "KP"]
+        - attribute: request.ip_risk_score
+          op: gte
+          value: 80
+
+flags:
+  # ---------------------------------------------------------------------------
+  # 1) Критичный флаг Zero Trust: форсировать mTLS между инграэсом и сервисом
+  # ---------------------------------------------------------------------------
+  security.enforce_mtls:
+    type: boolean
+    description: "Принудительный mTLS для внутренних вызовов API."
+    prerequisites: []      # нет зависимостей
+    dependsOn: []          # нет обратных зависимостей
+    environments:
+      prod:
+        killSwitch: false
+        default: true
+        rules:
+          - name: "Исключение для health-проб stage-трафика через prod — запрещено"
+            when:
+              any:
+                - attribute: request.path
+                  op: starts_with
+                  value: "/healthz"
+                - attribute: request.header.X-Env
+                  op: eq
+                  value: "stage"
+            rollout: 0         # 0% — правило-заглушка, оставлен для ясности
+        schedules: []          # Windows не применяются
+      stage:
+        killSwitch: false
+        default: true
+        rules: []
+      dev:
+        killSwitch: false
+        default: false
+        rules:
+          - name: "Включаем для внутренних пользователей"
+            segments: ["internal_users"]
+            rollout: 100
+    audit:
+      changeTicket: "SEC-0001"
+
+  # ---------------------------------------------------------------------------
+  # 2) Веб‑защита: включение WAF правил (многоуровневое решение)
+  # ---------------------------------------------------------------------------
+  security.waf.level:
+    type: multivariate   # варианты предопределены
+    description: "Профиль WAF: off|monitor|strict."
+    variants:
+      - key: off
+        weight: 0
+      - key: monitor
+        weight: 50
+      - key: strict
+        weight: 50
+    prerequisites: []
+    environments:
+      prod:
+        killSwitch: false
+        default: monitor
+        rules:
+          - name: "Строгий профиль для high-risk регионов"
+            segments: ["high_risk_regions"]
+            choose: strict
+          - name: "Липкая 20% раскатка strict для премиум‑тенантов"
+            segments: ["premium_tenants"]
+            percentageRollout:
+              variant: strict
+              percent: 20
+              stickyBy: "tenant.id"
+      stage:
+        killSwitch: false
+        default: monitor
+        rules:
+          - name: "Всем strict на stage"
+            choose: strict
+      dev:
+        killSwitch: false
+        default: off
+        rules:
+          - name: "internal — strict"
+            segments: ["internal_users"]
+            choose: strict
+
+  # ---------------------------------------------------------------------------
+  # 3) Дросселирование API (JSON конфиг)
+  # ---------------------------------------------------------------------------
+  rate.limit:
+    type: json
+    description: "Настройки лимитов запросов на IP/токен."
+    jsonSchemaRef: "schemas/rate_limit_v1.json"   # опционально, ссылка на локальную схему в репо
+    prerequisites: []
+    environments:
+      prod:
+        killSwitch: false
+        default:
+          ip:
+            rps: 20
+            burst: 100
+          token:
+            rps: 100
+            burst: 300
+        rules:
+          - name: "Премиум‑тенанты — расширенные лимиты"
+            segments: ["premium_tenants"]
+            mergePatch:
+              token:
+                rps: 250
+                burst: 750
+      stage:
+        killSwitch: false
+        default:
+          ip: { rps: 50, burst: 200 }
+          token: { rps: 300, burst: 900 }
+      dev:
+        killSwitch: false
+        default:
+          ip: { rps: 100, burst: 400 }
+          token: { rps: 500, burst: 1500 }
+
+  # ---------------------------------------------------------------------------
+  # 4) Эксперимент A/B: новый механизм авторизации
+  # ---------------------------------------------------------------------------
+  exp.auth.next:
+    type: boolean
+    description: "Экспериментальный пайплайн авторизации."
+    prerequisites:
+      - flag: security.enforce_mtls
+        mustBe: true
+    environments:
+      prod:
+        killSwitch: false
+        default: false
+        rules:
+          - name: "5% липкий rollout по user.id, исключая high-risk регионы"
+            when:
+              not:
+                segments: ["high_risk_regions"]
+            percentageRollout:
+              percent: 5
+              stickyBy: "user.id"
+          - name: "Премиум‑тенанты 25%"
+            segments: ["premium_tenants"]
+            percentageRollout:
+              percent: 25
+              stickyBy: "tenant.id"
+        schedules:
+          - name: "Ночное окно включения"
+            activeUTC: "02:00-05:00"
+            days: ["Tue", "Wed", "Thu"]
+      stage:
+        killSwitch: false
+        default: true
+        rules: []
+      dev:
+        killSwitch: false
+        default: true
+        rules: []
+
+  # ---------------------------------------------------------------------------
+  # 5) Аварийные переключатели (kill switches)
+  # ---------------------------------------------------------------------------
+  emergency.read_only_mode:
+    type: boolean
+    description: "Принудительное «только чтение» для критических инцидентов."
+    prerequisites: []
+    environments:
+      prod: { killSwitch: false, default: false, rules: [] }
+      stage: { killSwitch: false, default: false, rules: [] }
+      dev: { killSwitch: false, default: false, rules: [] }
+
+governance:
+  # Политики совместимости и деградации
+  compatibility:
+    # Если флаг/вариант неизвестен у клиента — использовать глобальные defaults
+    onUnknownFlag: "use-defaults"
+    onUnknownVariant: "drop-to-default"
+  deprecation:
+    # расписание вывода флагов из эксплуатации
+    flags:
+      - name: exp.auth.next
+        removeAfter: "2026-01-01T00:00:00Z"
+        replacement: null
+  audit:
+    # параметры аудита операций над фичами
+    enabled: true
+    sink: "logs://feature-flags"
+    redactAttributes: ["user.email", "request.ip"]
+
+providers:
+  # Источники правды: можно подключить внешний стор (Consul/Redis/Cloud)
+  primary:
+    type: file
+    path: "configs/features.yaml"
+  # Пример зеркала
+  secondary:
+    type: redis
+    dsnEnv: "FF_REDIS_DSN"
+    keyPrefix: "ff:veilmind-core:"
+    cacheTTLSeconds: 15
+
+validation:
+  # Простейшие линтер‑правила для CI
+  rules:
+    - ensureAllFlagsHaveProdConfig: true
+    - forbidEmptyDescriptions: true
+    - requireOwners: true
+    - forbidSegmentsLoops: true
+    - checkSchedulesFormat: true

@@ -1,0 +1,526 @@
+# neuroforge-core — datasets catalog (production-grade)
+# Unverified: значения и интеграции приведены как шаблон. I cannot verify this.
+
+kind: datasets.config
+schema_version: 1
+generated_at: ${GENERATED_AT:-2025-08-26T00:00:00Z}
+environment: ${ENVIRONMENT:-staging}
+
+# ------------------------------------------------------------------------------
+# Глобальные дефолты и переиспользуемые блоки (anchors)
+# ------------------------------------------------------------------------------
+defaults: &defaults
+  storage:
+    # Универсальный абстрактный уровень — может резолвиться в S3/HDFS/DataFabric
+    backend: ${DATA_BACKEND:-datafabric}
+    location: ${DATA_LOCATION:-df://tenant/${TENANT_ID}}
+    format: parquet
+    compression: zstd
+    partition_by: [dt]        # YYYY-MM-DD
+    bucket_by: null
+    buckets: 0
+    schema_compatibility: backward # none|backward|forward|full
+    compaction:
+      enabled: true
+      max_small_files: 200
+      schedule_cron: "15 * * * *"  # ежечасно, 15-я минута
+  security:
+    encryption:
+      enabled: true
+      key_ref: ${KMS_KEY_ARN:-kms://alias/neuroforge-s3}
+    opa:
+      package: neuroforge.authz
+      rule: allow
+      timeout_s: 2.0
+    access:
+      # роли/скоупы по умолчанию; уточняются на датасетах
+      read_scopes: [df:read]
+      write_scopes: [df:write]
+      admin_scopes: [df:admin, policy:evaluate]
+    legal_hold:
+      dataset: _legal_holds
+      label: legal_hold
+  retention: &retention_defaults
+    enabled: true
+    retain_days: 365
+    action: delete         # delete|archive|tombstone|anonymize
+    anonymize:
+      fields: []
+      with_hash: true
+    worm:
+      mode: disabled       # disabled|governance|compliance
+      lock_until_ts: null  # UNIX seconds; при compliance игнорируется
+  quality: &quality_defaults
+    # Минимальный набор проверок качества
+    expectations:
+      - name: not_null_primary_key
+        type: not_null
+        columns: []        # будет заполнено из primary_key
+        severity: error
+      - name: unique_primary_key
+        type: unique
+        columns: []        # будет заполнено из primary_key
+        severity: error
+    sampling:
+      mode: full           # full|percent|rows
+      value: 1.0
+    schedule_cron: "*/30 * * * *"  # каждые 30 минут
+    alerting:
+      channel: ${ALERT_CHANNEL:-pagerduty}
+      severity_threshold: warn
+  indexes:
+    enabled: false
+    engine: opensearch
+    index_name: ${OS_INDEX_PREFIX:-nf}-${DATASET_ID}
+    fields: []
+  observability:
+    emit_metrics: true
+    metric_namespace: neuroforge.datasets
+    span_attributes:
+      service.namespace: neuroforge
+      data.tenant: ${TENANT_ID}
+
+# Общий шаблон PII-маскирования
+pii_mask_strict: &pii_mask_strict
+  classification: pii
+  policy:
+    at_rest: encrypt
+    in_use_masking:
+      strategy: hash_sha256
+      salt_ref: ${PII_SALT_SECRET_REF:-k8s://secret/pii-salt}
+      show_last: 4
+
+# ------------------------------------------------------------------------------
+# Каталог датасетов
+# ------------------------------------------------------------------------------
+datasets:
+
+  # --- USERS MASTER -----------------------------------------------------------
+  - id: users_v1
+    title: Users Master
+    owner: data.platform@neuroforge.example
+    domain: core
+    version: 1
+    primary_key: [user_id]
+    write_mode: upsert          # append|upsert|overwrite
+    <<: *defaults
+    storage:
+      <<: *defaults.storage
+      partition_by: [dt]
+      location: ${DATA_LOCATION:-df://tenant/${TENANT_ID}}/users_v1
+    security:
+      <<: *defaults.security
+      access:
+        read_scopes: [df:read, users:read]
+        write_scopes: [df:write, users:write]
+        admin_scopes: [df:admin, policy:evaluate]
+      opa:
+        package: neuroforge.authz.users
+        rule: allow
+    retention:
+      <<: *retention_defaults
+      retain_days: 3650
+      worm:
+        mode: governance
+        lock_until_ts: null
+      action: anonymize
+      anonymize:
+        fields: [email, phone, address]
+        with_hash: true
+    schema:
+      version: 1
+      fields:
+        - name: user_id
+          type: string
+          nullable: false
+          constraints: {pattern: "^[A-Za-z0-9_-]{3,64}$"}
+        - name: email
+          type: string
+          nullable: true
+          constraints: {format: email}
+          pii: *pii_mask_strict
+        - name: phone
+          type: string
+          nullable: true
+          constraints: {pattern: "^[0-9+()\\-\\s]{7,32}$"}
+          pii: *pii_mask_strict
+        - name: address
+          type: string
+          nullable: true
+          pii:
+            classification: pii
+            policy:
+              at_rest: encrypt
+              in_use_masking:
+                strategy: redact
+        - name: first_name
+          type: string
+          nullable: true
+        - name: last_name
+          type: string
+          nullable: true
+        - name: created_at
+          type: timestamp
+          nullable: false
+        - name: dt
+          type: date
+          nullable: false
+    quality:
+      <<: *quality_defaults
+      expectations:
+        - name: not_null_primary_key
+          type: not_null
+          columns: [user_id]
+          severity: error
+        - name: unique_primary_key
+          type: unique
+          columns: [user_id]
+          severity: error
+        - name: email_format
+          type: regex_match
+          column: email
+          pattern: "^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$"
+          severity: warn
+        - name: created_at_recent
+          type: max_age
+          column: created_at
+          threshold: "3650d"
+          severity: warn
+    indexes:
+      enabled: true
+      engine: opensearch
+      index_name: ${OS_INDEX_PREFIX:-nf}-users
+      fields:
+        - {name: email, type: keyword}
+        - {name: phone, type: keyword}
+        - {name: last_name, type: text}
+    authorization:
+      row_filter:
+        # Пример row-level security: tenant из контекста (OPA решает окончательно)
+        expression: "ctx.tenant_id == record.tenant_id"
+      column_masks:
+        - column: email
+          when_scope_not_in: [users:pii:view]
+          mask: "hash_sha256"
+        - column: address
+          when_scope_not_in: [users:pii:view]
+          mask: "redact"
+    sla:
+      freshness_seconds: 600
+      completeness_threshold: 0.99
+      availability_slo: 0.995
+      owner_oncall: "@oncall-data-platform"
+    lineage:
+      upstream:
+        - system: crm
+          entity: crm.users_export
+          type: batch
+      downstream:
+        - system: marketing
+          entity: mkt.email_segments
+          type: batch
+
+  # --- TRANSACTIONS -----------------------------------------------------------
+  - id: transactions_v1
+    title: Financial Transactions
+    owner: fin.platform@neuroforge.example
+    domain: finance
+    version: 1
+    primary_key: [txn_id]
+    write_mode: append
+    <<: *defaults
+    storage:
+      <<: *defaults.storage
+      location: ${DATA_LOCATION}/transactions_v1
+      partition_by: [dt, hour]   # высокая детальность партиционирования
+      format: parquet
+    retention:
+      enabled: true
+      retain_days: 2555         # ~7 лет
+      action: archive
+      archive:
+        target_dataset: transactions_archive_v1
+      worm:
+        mode: compliance
+        lock_until_ts: null
+    security:
+      <<: *defaults.security
+      access:
+        read_scopes: [df:read, finance:read]
+        write_scopes: [df:write, finance:write]
+      opa:
+        package: neuroforge.authz.transactions
+        rule: allow
+    schema:
+      version: 2
+      fields:
+        - {name: txn_id, type: string, nullable: false}
+        - {name: user_id, type: string, nullable: false}
+        - {name: amount, type: decimal(18,2), nullable: false, constraints: {min: 0}}
+        - {name: currency, type: string, nullable: false, constraints: {enum: ["USD","EUR","SEK","GBP"]}}
+        - {name: status, type: string, nullable: false, constraints: {enum: ["authorized","captured","refunded","void"]}}
+        - {name: merchant_id, type: string, nullable: false}
+        - {name: card_pan, type: string, nullable: true, pii: *pii_mask_strict}
+        - {name: created_at, type: timestamp, nullable: false}
+        - {name: dt, type: date, nullable: false}
+        - {name: hour, type: int, nullable: false, constraints: {min: 0, max: 23}}
+    quality:
+      <<: *quality_defaults
+      expectations:
+        - {name: not_null_pk, type: not_null, columns: [txn_id], severity: error}
+        - {name: unique_pk, type: unique, columns: [txn_id], severity: error}
+        - {name: amount_non_negative, type: min_value, column: amount, min: 0, severity: error}
+        - {name: status_enum, type: set_membership, column: status, allowed: ["authorized","captured","refunded","void"], severity: error}
+        - {name: currency_enum, type: set_membership, column: currency, allowed: ["USD","EUR","SEK","GBP"], severity: error}
+    authorization:
+      row_filter:
+        expression: "ctx.merchant_id in record.merchant_id_whitelist or ctx.role == 'fin_auditor'"
+      column_masks:
+        - column: card_pan
+          when_scope_not_in: [pci:view]
+          mask: "hash_sha256"
+    sla:
+      freshness_seconds: 60
+      completeness_threshold: 0.999
+      availability_slo: 0.999
+    lineage:
+      upstream:
+        - system: payments-gw
+          entity: kafka:payments.txn_captured
+          type: stream
+      downstream:
+        - system: finance
+          entity: fin.gl_ledger_daily
+          type: batch
+
+  # --- LOGS (HIGH VOLUME) ----------------------------------------------------
+  - id: logs_app_v1
+    title: Application Logs
+    owner: sre@neuroforge.example
+    domain: platform
+    version: 1
+    primary_key: [event_id]
+    write_mode: append
+    <<: *defaults
+    storage:
+      <<: *defaults.storage
+      location: ${DATA_LOCATION}/logs_app_v1
+      partition_by: [dt, hour]
+      format: jsonl
+      compression: gzip
+      compaction:
+        enabled: false
+    retention:
+      enabled: true
+      retain_days: 30
+      action: delete
+      worm:
+        mode: disabled
+    security:
+      <<: *defaults.security
+      encryption:
+        enabled: false
+      access:
+        read_scopes: [df:read, sre:read]
+        write_scopes: [df:write, sre:write]
+    schema:
+      version: 1
+      fields:
+        - {name: event_id, type: string, nullable: false}
+        - {name: ts, type: timestamp, nullable: false}
+        - {name: level, type: string, nullable: false}
+        - {name: logger, type: string, nullable: true}
+        - {name: message, type: string, nullable: true}
+        - {name: attrs, type: json, nullable: true}
+        - {name: dt, type: date, nullable: false}
+        - {name: hour, type: int, nullable: false}
+    quality:
+      <<: *quality_defaults
+      expectations:
+        - {name: not_null_pk, type: not_null, columns: [event_id], severity: warn}
+        - {name: ts_recent, type: max_age, column: ts, threshold: "7d", severity: warn}
+    indexes:
+      enabled: false
+    sla:
+      freshness_seconds: 30
+      availability_slo: 0.999
+
+  # --- FEATURES (ML) ---------------------------------------------------------
+  - id: features_user_daily_v1
+    title: User Daily Features
+    owner: ml.platform@neuroforge.example
+    domain: ml
+    version: 1
+    primary_key: [user_id, dt]
+    write_mode: upsert
+    <<: *defaults
+    storage:
+      <<: *defaults.storage
+      location: ${DATA_LOCATION}/features_user_daily_v1
+      partition_by: [dt]
+      format: parquet
+    retention:
+      enabled: true
+      retain_days: 730
+      action: delete
+    security:
+      <<: *defaults.security
+      access:
+        read_scopes: [df:read, ml:read]
+        write_scopes: [df:write, ml:write]
+    schema:
+      version: 3
+      fields:
+        - {name: user_id, type: string, nullable: false}
+        - {name: dt, type: date, nullable: false}
+        - {name: txns_last_7d, type: int, nullable: false, constraints: {min: 0}}
+        - {name: gm_last_30d, type: decimal(18,4), nullable: false}
+        - {name: last_seen_at, type: timestamp, nullable: true}
+        - {name: segment, type: string, nullable: true, constraints: {enum: ["A","B","C","VIP"]}}
+    quality:
+      <<: *quality_defaults
+      expectations:
+        - {name: not_null_pk, type: not_null, columns: [user_id, dt], severity: error}
+        - {name: unique_pk, type: unique, columns: [user_id, dt], severity: error}
+        - {name: non_negative_txns, type: min_value, column: txns_last_7d, min: 0, severity: error}
+    sla:
+      freshness_seconds: 3600
+      completeness_threshold: 0.98
+    lineage:
+      upstream:
+        - {system: finance, entity: transactions_v1, type: batch}
+        - {system: core, entity: users_v1, type: batch}
+      downstream:
+        - {system: ml, entity: model:churn_v5, type: training}
+        - {system: analytics, entity: bi.user_segments, type: warehouse}
+
+  # --- AUDIT (WORM/COMPLIANCE) ----------------------------------------------
+  - id: audit_events_v1
+    title: Security Audit Events
+    owner: secops@neuroforge.example
+    domain: security
+    version: 1
+    primary_key: [event_id]
+    write_mode: append
+    <<: *defaults
+    storage:
+      <<: *defaults.storage
+      location: ${DATA_LOCATION}/audit_events_v1
+      partition_by: [dt, hour]
+      format: parquet
+    retention:
+      enabled: true
+      retain_days: 3650
+      action: tombstone
+      worm:
+        mode: compliance
+        lock_until_ts: null
+    security:
+      <<: *defaults.security
+      access:
+        read_scopes: [df:read, secops:read, auditor:read]
+        write_scopes: [df:write, secops:write]
+      opa:
+        package: neuroforge.authz.audit
+        rule: allow
+    schema:
+      version: 1
+      fields:
+        - {name: event_id, type: string, nullable: false}
+        - {name: actor, type: string, nullable: false}
+        - {name: action, type: string, nullable: false}
+        - {name: resource, type: string, nullable: false}
+        - {name: ts, type: timestamp, nullable: false}
+        - {name: dt, type: date, nullable: false}
+        - {name: hour, type: int, nullable: false}
+    quality:
+      <<: *quality_defaults
+      expectations:
+        - {name: not_null_pk, type: not_null, columns: [event_id], severity: error}
+        - {name: ts_recent, type: max_age, column: ts, threshold: "90d", severity: warn}
+    sla:
+      freshness_seconds: 10
+      availability_slo: 0.9999
+
+# ------------------------------------------------------------------------------
+# Дополнительные сущности/каталоги (архивы, индексы и т.п.)
+# ------------------------------------------------------------------------------
+auxiliary:
+  archives:
+    - id: transactions_archive_v1
+      source: transactions_v1
+      storage:
+        backend: ${DATA_BACKEND}
+        location: ${DATA_LOCATION}/archive/transactions_v1
+        format: parquet
+        compression: zstd
+        partition_by: [dt, hour]
+      retention:
+        enabled: true
+        retain_days: 3650
+        action: delete
+      security:
+        encryption:
+          enabled: true
+          key_ref: ${KMS_KEY_ARN}
+  indexes:
+    - id: users_search_idx
+      source: users_v1
+      engine: opensearch
+      index_name: ${OS_INDEX_PREFIX:-nf}-users
+      fields:
+        - {name: email, type: keyword}
+        - {name: last_name, type: text}
+      refresh_interval: "60s"
+
+# ------------------------------------------------------------------------------
+# Интеграции и соответствия инструментам
+# ------------------------------------------------------------------------------
+integration:
+  # Соответствие полям конфигурации воркеру ретенции (oblivionvault RetentionWorker)
+  retention_worker_mapping:
+    dataset: id
+    timestamp_field_fallback: created_at
+    retain_days: retention.retain_days
+    action: retention.action
+    archive_dataset: auxiliary.archives[?source==$.id].id
+    anonymize_fields: retention.anonymize.fields
+    anonymize_with_hash: retention.anonymize.with_hash
+    worm_mode: retention.worm.mode
+    worm_lock_until_ts: retention.worm.lock_until_ts
+    legal_hold_label: security.legal_hold.label
+    batch_size_default: 500
+    max_concurrency_default: 32
+  # Соответствие для OPA (Rego) — пакет/правило берутся с датасета, input формируется на основе access/authorization
+  opa_input_template:
+    tenant: ${TENANT_ID}
+    principal_header: x-user-id
+    scopes_header: x-auth-scopes
+    dataset_attr: id
+    row_filter_attr: authorization.row_filter.expression
+    column_masks_attr: authorization.column_masks
+
+# ------------------------------------------------------------------------------
+# Валидация/схема (упрощённая декларация для локальной проверки)
+# ------------------------------------------------------------------------------
+validation:
+  required_dataset_fields:
+    - id
+    - owner
+    - domain
+    - version
+    - primary_key
+    - write_mode
+    - schema
+    - storage
+    - retention
+    - security
+  rules:
+    - name: pk_in_schema
+      description: "Все поля primary_key должны существовать в schema.fields"
+      type: custom
+      code: "set(ds.primary_key).issubset({f['name'] for f in ds.schema['fields']})"
+    - name: dt_partition_exists
+      description: "Если используется partition_by: dt — поле dt должно быть в схеме"
+      type: custom
+      code: "('dt' in (ds.storage.get('partition_by') or [])) implies any(f['name']=='dt' for f in ds.schema['fields'])"

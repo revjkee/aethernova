@@ -1,0 +1,380 @@
+// datafabric-core/schemas/proto/v1/stream/batch/tasks.proto
+// Industrial-grade batch task contract for Datafabric Core.
+//
+// Design goals:
+// - Stable IDs, idempotent submission (client-provided dedup keys).
+// - Work leasing with heartbeat/renewal to avoid duplicate processing.
+// - Strong separation of TaskSpec (desired) vs TaskStatus (observed).
+// - Rich I/O descriptors (URIs + formats + time windows) and outputs/artifacts.
+// - Retry policy with explicit non-retryable error codes.
+// - Observability: progress, metrics, per-attempt timings, error detail (see error.proto).
+// - Safe evolution: reserved tags and additive-only changes.
+
+syntax = "proto3";
+
+package datafabric.v1.stream.batch;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+// Adjust import path to your repo layout:
+import "v1/error.proto"; // package datafabric.v1.errors; file: datafabric-core/schemas/proto/v1/error.proto
+
+option go_package           = "github.com/company/datafabric-core/pkg/api/stream/batch;batchv1";
+option java_multiple_files  = true;
+option java_package         = "com.company.datafabric.v1.stream.batch";
+option java_outer_classname = "BatchTasksProto";
+option csharp_namespace     = "Company.Datafabric.V1.Stream.Batch";
+option objc_class_prefix    = "DFB";
+option php_namespace        = "Company\\Datafabric\\V1\\Stream\\Batch";
+option ruby_package         = "Company::Datafabric::V1::Stream::Batch";
+
+// ============================ Enums ============================
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  PENDING   = 1;  // accepted, waiting for scheduling
+  QUEUED    = 2;  // eligible, in queue
+  LEASED    = 3;  // leased by a worker (invisible to others)
+  RUNNING   = 4;  // executing
+  SUCCEEDED = 5;  // finished successfully
+  FAILED    = 6;  // all retries exhausted or non-retryable failure
+  CANCELLED = 7;  // cancelled by user/system
+  EXPIRED   = 8;  // lease not renewed; returned to queue or failed by policy
+}
+
+enum TaskPriority {
+  TASK_PRIORITY_UNSPECIFIED = 0;
+  LOW      = 1;
+  NORMAL   = 2;
+  HIGH     = 3;
+  CRITICAL = 4;
+}
+
+enum TaskKind {
+  TASK_KIND_UNSPECIFIED = 0;
+  CONTAINER = 1; // OCI image + command/args
+  SQL       = 2; // SQL job for supported engines
+  SPARK     = 3; // Spark app spec
+  SCRIPT    = 4; // Inline/packaged script (e.g., Python)
+}
+
+// ============================ Common messages ============================
+
+// Labels/annotations are small key-value maps for routing/ownership/metadata.
+message Labels {
+  map<string, string> items = 1;
+}
+
+message Annotations {
+  map<string, string> items = 1;
+}
+
+// Time window for slicing datasets or computing aggregates.
+message TimeWindow {
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end   = 2;
+}
+
+// Generic dataset descriptor (URIs support schemes: s3://, gs://, az://, file://, kafka://topic?partition=..&offset=.. etc.)
+message DatasetRef {
+  string uri                 = 1;  // e.g., "s3://bucket/prefix/2025/08/14/"
+  string format              = 2;  // json|parquet|avro|csv|raw|proto
+  string compression         = 3;  // none|gzip|zstd|snappy
+  string schema_ref          = 4;  // optional registry id or URL
+  TimeWindow window          = 5;  // optional for time-based slicing
+  map<string, string> props  = 10; // engine-specific hints (e.g., parquet.reader.batch=8192)
+  reserved 6, 7, 8, 9;
+}
+
+// Output artifact descriptor.
+message ArtifactRef {
+  string uri                 = 1;  // destination URI (prefix allowed)
+  string format              = 2;  // json|parquet|avro|csv|raw|proto
+  string compression         = 3;  // none|gzip|zstd|snappy
+  map<string, string> props  = 10; // e.g., "s3.storage_class"="STANDARD_IA"
+  reserved 4, 5, 6, 7, 8, 9;
+}
+
+// Resource requirements to guide scheduler.
+message ResourceSpec {
+  uint32 cpu_millis     = 1;  // e.g., 2000 = 2 vCPU
+  uint32 memory_mb      = 2;  // RAM
+  uint32 gpu_count      = 3;  // optional
+  uint32 disk_mb        = 4;  // persistent scratch
+  uint32 tmp_mb         = 5;  // ephemeral scratch
+  uint32 network_mbps   = 6;  // optional
+  string node_pool      = 7;  // affinity class
+  map<string, string> tolerations = 8;
+  reserved 9, 10;
+}
+
+// Retry/backoff policy for attempts.
+message RetryPolicy {
+  uint32 max_attempts                 = 1; // total attempts including the first
+  google.protobuf.Duration initial_backoff = 2;
+  google.protobuf.Duration max_backoff     = 3;
+  double backoff_multiplier           = 4; // e.g., 2.0
+  bool jitter                         = 5;
+  // Errors that should NOT be retried even if attempts remain.
+  repeated datafabric.v1.errors.ErrorCode non_retryable = 6;
+  reserved 7, 8, 9;
+}
+
+// ============================ Task Specification ============================
+
+message ContainerSpec {
+  string image             = 1;  // OCI image
+  repeated string command  = 2;  // overrides entrypoint if non-empty
+  repeated string args     = 3;
+  map<string, string> env  = 4;
+  repeated string volumes  = 5;  // logical volume mounts (platform-defined)
+  google.protobuf.Duration timeout = 6; // hard execution timeout
+}
+
+message SqlSpec {
+  string engine            = 1;  // postgres|clickhouse|spark-sql|...
+  string query             = 2;  // parameterized SQL (no secrets)
+  map<string, google.protobuf.Any> params = 3; // typed params
+  google.protobuf.Duration timeout = 4;
+}
+
+message SparkSpec {
+  string main_class        = 1;
+  string jar               = 2;
+  repeated string args     = 3;
+  map<string, string> conf = 4; // spark.* properties
+  google.protobuf.Duration timeout = 5;
+}
+
+message ScriptSpec {
+  string language          = 1;  // python|bash|r
+  string entry             = 2;  // module:function or path
+  repeated string args     = 3;
+  map<string, string> env  = 4;
+  google.protobuf.Duration timeout = 5;
+}
+
+// Canonical task specification (idempotent blueprint).
+message TaskSpec {
+  TaskKind kind            = 1;
+
+  repeated DatasetRef inputs   = 2;
+  repeated ArtifactRef outputs = 3;
+
+  ResourceSpec resources   = 4;
+  RetryPolicy retry        = 5;
+
+  oneof impl {
+    ContainerSpec container = 10;
+    SqlSpec       sql       = 11;
+    SparkSpec     spark     = 12;
+    ScriptSpec    script    = 13;
+  }
+
+  // Optional deduplication key supplied by client; tasks with same client_id + dedup_key are idempotent.
+  string dedup_key         = 20;
+
+  Labels labels            = 30;
+  Annotations annotations  = 31;
+
+  reserved 6, 7, 8, 9, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28, 29;
+}
+
+// ============================ Task Entity & Status ============================
+
+message AttemptTiming {
+  uint32 attempt                         = 1; // 1..N
+  google.protobuf.Timestamp queued_at    = 2;
+  google.protobuf.Timestamp leased_at    = 3;
+  google.protobuf.Timestamp started_at   = 4;
+  google.protobuf.Timestamp finished_at  = 5;
+  google.protobuf.Duration  runtime      = 6;
+  string worker_id                       = 7;
+}
+
+message TaskProgress {
+  uint32 attempt                         = 1;
+  float  percent                         = 2; // 0.0..100.0
+  map<string, double> metrics            = 3; // domain metrics, e.g., rows_read, bytes_written
+  google.protobuf.Timestamp updated_at   = 4;
+}
+
+message TaskResult {
+  repeated ArtifactRef produced          = 1;          // actual output locations (may differ via partitioning)
+  map<string, double> metrics            = 2;          // e.g., rows_out, errors, cpu_sec
+  map<string, string>  attributes        = 3;          // small string map, PII‑free
+  google.protobuf.Any   summary          = 10;         // optional domain summary
+  reserved 4, 5, 6, 7, 8, 9;
+}
+
+message LeaseInfo {
+  string lease_id                        = 1;
+  google.protobuf.Timestamp expires_at   = 2;          // server-driven lease expiry
+  google.protobuf.Timestamp heartbeat_deadline = 3;    // send heartbeat before this
+}
+
+message TaskStatus {
+  TaskState state                        = 1;
+  uint32 attempt                         = 2; // current attempt number
+  LeaseInfo lease                        = 3;
+
+  AttemptTiming last_timing              = 4;
+  repeated AttemptTiming attempts        = 5;
+
+  // Populated on terminal states FAILED/CANCELLED
+  datafabric.v1.errors.ErrorStatus error = 6;
+
+  // Populated on SUCCEEDED
+  TaskResult result                      = 7;
+
+  TaskProgress progress                  = 8;
+
+  reserved 9, 10, 11, 12;
+}
+
+message Task {
+  // Resource name: "tasks/{task_id}"
+  string name                            = 1;
+  string task_id                         = 2;
+  string tenant                          = 3; // optional multi-tenant routing
+  string client_id                       = 4; // caller identity (for quotas/audit)
+  TaskPriority priority                  = 5;
+
+  TaskSpec spec                          = 10;
+
+  google.protobuf.Timestamp create_time  = 20;
+  google.protobuf.Timestamp update_time  = 21;
+
+  TaskStatus status                      = 30;
+
+  reserved 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22, 23, 24, 25, 26, 27, 28, 29, 31, 32;
+}
+
+// ============================ Filters & Pagination ============================
+
+message TimeRange {
+  google.protobuf.Timestamp from = 1;
+  google.protobuf.Timestamp to   = 2;
+}
+
+message TaskFilter {
+  repeated TaskState states             = 1;
+  repeated TaskPriority priorities      = 2;
+  string tenant                         = 3;
+  string label_selector                 = 4; // "key=val,key2 in (a,b)"
+  TimeRange create_time                 = 5;
+  string kind                           = 6; // "CONTAINER", "SQL", etc.
+  string dedup_key                      = 7;
+  reserved 8, 9, 10;
+}
+
+message PageRequest {
+  uint32 page_size   = 1; // server may cap
+  string page_token  = 2; // opaque
+}
+
+message PageResponse {
+  string next_page_token = 1;
+  uint32 total_size      = 2; // optional, may be capped or omitted for performance
+}
+
+// ============================ Service API ============================
+
+service BatchTaskService {
+  // Create a new task; if dedup_key matches an existing active task for client_id, returns that task.
+  rpc CreateTask(CreateTaskRequest) returns (Task);
+
+  // Get task by name or task_id.
+  rpc GetTask(GetTaskRequest) returns (Task);
+
+  // List tasks with filters and pagination.
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+
+  // Lease tasks for execution by a worker (work stealing friendly).
+  rpc LeaseTasks(LeaseTasksRequest) returns (LeaseTasksResponse);
+
+  // Renew lease for a running task.
+  rpc RenewLease(RenewLeaseRequest) returns (Task);
+
+  // Report periodic heartbeat and optional progress metrics.
+  rpc ReportHeartbeat(ReportHeartbeatRequest) returns (Task);
+
+  // Acknowledge task completion (success or failure) and release lease.
+  rpc AckTask(AckTaskRequest) returns (Task);
+
+  // Cancel a task (best-effort). Running tasks should receive cancellation signal.
+  rpc CancelTask(CancelTaskRequest) returns (Task);
+}
+
+// ============================ Requests/Responses ============================
+
+message CreateTaskRequest {
+  Task task = 1; // Only spec, priority, labels/annotations, tenant/client_id are honored.
+}
+
+message GetTaskRequest {
+  // Accept either "tasks/{task_id}" in name or raw task_id.
+  string name    = 1;
+  string task_id = 2;
+}
+
+message ListTasksRequest {
+  TaskFilter filter     = 1;
+  PageRequest page      = 2;
+  // Optional sort: "create_time desc", "priority desc, create_time asc"
+  string order_by       = 3;
+}
+
+message ListTasksResponse {
+  repeated Task tasks   = 1;
+  PageResponse page     = 2;
+}
+
+message LeaseTasksRequest {
+  string worker_id                 = 1; // identity of worker/agent
+  uint32 max_tasks                 = 2; // capacity
+  google.protobuf.Duration lease_ttl = 3; // requested TTL (server may clamp)
+  TaskFilter filter                = 4; // e.g., tenant, priority classes
+  Labels worker_labels             = 5; // capabilities for matching (e.g., "gpu"="true")
+}
+
+message LeaseTasksResponse {
+  repeated Task tasks = 1; // tasks with populated status.lease
+}
+
+message RenewLeaseRequest {
+  string name                      = 1; // "tasks/{task_id}"
+  string lease_id                  = 2;
+  google.protobuf.Duration extend_by = 3; // server may cap by policy
+}
+
+message ReportHeartbeatRequest {
+  string name                      = 1;
+  string lease_id                  = 2;
+  TaskProgress progress            = 3;
+}
+
+message AckTaskRequest {
+  string name                      = 1;
+  string lease_id                  = 2;
+  // Terminal outcome
+  oneof outcome {
+    TaskResult success            = 10;
+    datafabric.v1.errors.ErrorStatus failure = 11;
+  }
+}
+
+message CancelTaskRequest {
+  string name                      = 1;
+  string reason                    = 2;  // human-friendly; avoid secrets/PII
+}
+
+// ============================ Notes & Evolution ============================
+//
+// - Only additive changes; never reuse removed field numbers.
+// - Use reserved tags to prevent accidental reuse.
+// - Avoid large payloads in ErrorStatus/Any; keep privacy in mind.
+// - URIs in DatasetRef/ArtifactRef must be normalized and PII-free.
+// - Server is authoritative for state transitions and lease validity.

@@ -1,0 +1,433 @@
+schema_version: "1.0"
+meta:
+  name: "cybersecurity-core-vuln-pipeline"
+  owner: "Security Engineering"
+  contact: "secops@example.com"
+  repo_url: "https://git.example.com/aethernova/cybersecurity-core"
+  created: "2025-09-02"
+  last_updated: "2025-09-02"
+
+anchors:
+  severity_policy: &severity_policy
+    min_report_severity: "MEDIUM"        # что попадет в отчет
+    block_on_severity: ["CRITICAL","HIGH"]
+    cvss:
+      version: "3.1"
+      min_base_score_block: 7.0
+      treat_unknown_as: "MEDIUM"
+    cwe_blocklist: [79, 89, 352, 434, 502]   # XSS, SQLi, CSRF, Unrestricted File Upload, Insecure Deserialization
+    allow_unfixed: false
+    temporal_exploitability:
+      use_epss: true
+      epss_threshold_block: 0.5             # блокировать если EPSS ≥ 0.5
+      use_kevc: true                        # CISA KEV всегда блокирует
+
+  outputs_sink: &outputs_sink
+    formats: ["sarif","json","cyclonedx","spdx"]
+    paths:
+      sarif: "./artifacts/security/vuln.sarif"
+      json: "./artifacts/security/vuln.json"
+      cyclonedx: "./artifacts/sbom/bom.cdx.json"
+      spdx: "./artifacts/sbom/bom.spdx.json"
+      logs: "./artifacts/security/logs/"
+    upload:
+      github_security: true                 # загрузка SARIF в GitHub Security
+      gitlab_vulnerabilities: false
+      s3:
+        enabled: false
+        bucket: "${SEC_CORE_S3_BUCKET}"
+        prefix: "cybersecurity-core/reports/"
+      splunk:
+        enabled: false
+        hec_url: "${SPLUNK_HEC_URL}"
+        hec_token: "${SPLUNK_HEC_TOKEN}"
+      opensearch:
+        enabled: false
+        endpoint: "${OPENSEARCH_ENDPOINT}"
+        index: "vuln-cybersecurity-core"
+      webhook:
+        enabled: false
+        url: "${SEC_CORE_WEBHOOK_URL}"
+        auth_header: "${SEC_CORE_WEBHOOK_AUTH}"
+    signing:
+      pgp:
+        enabled: true
+        key_ref: "${PGP_KEY_ID}"
+        passphrase_var: "PGP_PASSPHRASE"
+      sigstore:
+        enabled: true
+        oidc_provider: "https://accounts.google.com"
+        attestations: ["sbom","scan-report"]
+
+  registry_auth: &registry_auth
+    docker:
+      - registry: "ghcr.io"
+        username: "${REGISTRY_USER}"
+        password: "${REGISTRY_TOKEN}"
+      - registry: "registry-1.docker.io"
+        username: "${DOCKERHUB_USER}"
+        password: "${DOCKERHUB_TOKEN}"
+
+risk:
+  scoring:
+    weights:
+      cvss_base: 0.5
+      exploit_maturity: 0.2        # EPSS/KEVC
+      asset_criticality: 0.2       # из CMDB/labels
+      reachability: 0.1            # из SCA + Semgrep
+    normalize_to: 10
+  acceptance_policy:
+    require_ticket: true
+    require_owner: true
+    require_expiry: true
+    max_expiry_days: 30
+    evidence_required: true
+    evidence_types: ["poa-mitigation","compensating-control","vendor-advisory"]
+  exceptions:
+    - id: "CVE-2023-9999"
+      justification: "Вендорский патч недоступен, контроль через WAF."
+      owner: "seceng@example.com"
+      ticket: "SEC-1234"
+      expires: "2025-10-01"
+      scope:
+        components: ["api-gateway"]
+        images: ["ghcr.io/org/api:>=1.2.0,<1.2.5"]
+        paths: ["./services/api/**"]
+  sla:
+    CRITICAL: { fix_within: "24h", notify: ["pagerduty","slack"] }
+    HIGH:     { fix_within: "3d",  notify: ["slack"] }
+    MEDIUM:   { fix_within: "14d", notify: [] }
+    LOW:      { fix_within: "30d", notify: [] }
+  gating:
+    fail_pipeline_on:
+      any_new_vuln_ge_severity: "HIGH"     # фейлим на новых HIGH/CRITICAL
+      total_new_vulns_over: 0
+      kevc_present: true
+      epss_over_threshold: true
+    consider_only_changed_code: true       # дифф на PR
+    baseline:
+      enabled: true
+      file: "./artifacts/security/baseline.json"
+      update_on_branch: "main"
+    grace_period_days_for_new_services: 7
+
+data_sources:
+  nvd:
+    mirror_enabled: true
+    mirror_url: "${NVD_MIRROR_URL}"        # если пусто, используем публичный
+  ghsa:
+    token: "${GITHUB_TOKEN}"
+  osv:
+    enabled: true
+  kevc:
+    enabled: true
+    url: "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+  epss:
+    enabled: true
+    url: "https://api.first.org/data/v1/epss"
+  exploit_db:
+    enabled: true
+
+profiles:
+  default_profile: "ci"
+  dev:
+    parallel_scanners: 3
+    rate_limits:
+      http_rps: 10
+    active_scans_enabled: false
+  ci:
+    parallel_scanners: 6
+    rate_limits:
+      http_rps: 30
+    active_scans_enabled: true
+  prod:
+    parallel_scanners: 8
+    rate_limits:
+      http_rps: 50
+    active_scans_enabled: true
+    strict_mode: true
+
+inputs:
+  repository:
+    include:
+      - "./"
+    exclude:
+      - "**/node_modules/**"
+      - "**/vendor/**"
+      - "**/.git/**"
+      - "**/.venv/**"
+  images:
+    - name: "ghcr.io/org/cybersecurity-core-api:${IMAGE_TAG}"
+      registries: *registry_auth
+    - name: "ghcr.io/org/cybersecurity-core-worker:${IMAGE_TAG}"
+      registries: *registry_auth
+  iac:
+    terraform:
+      roots:
+        - "./ops/terraform/"
+    kubernetes:
+      manifests:
+        - "./ops/k8s/base/"
+      helm:
+        charts: []
+  dependency_manifests:
+    python: ["**/requirements.txt","**/poetry.lock"]
+    node: ["**/package-lock.json","**/yarn.lock","**/pnpm-lock.yaml"]
+    java: ["**/pom.xml","**/gradle.lockfile"]
+    go: ["**/go.mod","**/go.sum"]
+    rust: ["**/Cargo.lock"]
+    ruby: ["**/Gemfile.lock"]
+    php: ["**/composer.lock"]
+
+sbom:
+  enabled: true
+  tool: "syft"
+  formats: ["cyclonedx-json","spdx-json"]
+  include_sources: ["image","dir","lockfiles"]
+  attach_purls: true
+  output:
+    <<: *outputs_sink
+
+orchestrator:
+  concurrency: 6
+  timeout_minutes: 45
+  retry:
+    attempts: 2
+    backoff: "exponential"
+    max_delay_seconds: 60
+  notifications:
+    slack:
+      enabled: true
+      webhook: "${SLACK_WEBHOOK}"
+      channel: "#sec-alerts"
+      on_events: ["pipeline_failed","new_critical","new_high"]
+    email:
+      enabled: false
+      to: ["secops@example.com"]
+    telegram:
+      enabled: false
+      bot_token: "${TG_BOT_TOKEN}"
+      chat_id: "${TG_CHAT_ID}"
+
+scanners:
+  trivy:
+    enabled: true
+    version: "latest"
+    scan:
+      modes: ["image","fs","repo","config"]
+      severity_policy: *severity_policy
+      ignorefile: ".trivyignore"
+      misconfig:
+        policies:
+          - "CIS Kubernetes V1.24"
+          - "CIS Docker v1.2.0"
+          - "NSA-CISA Kubernetes Hardening"
+        include_non_server: false
+      vuln:
+        db:
+          skip_update: false
+          download_timeout: "5m"
+        scanners: ["vuln","secret","misconfig","license"]
+      license:
+        allow: ["MIT","Apache-2.0","BSD-2-Clause","BSD-3-Clause"]
+        deny: ["AGPL-3.0","GPL-3.0"]
+    performance:
+      cache_dir: ".cache/trivy"
+      timeout: "15m"
+      parallel: 4
+    output:
+      <<: *outputs_sink
+
+  grype:
+    enabled: true
+    version: "latest"
+    distro: "auto"
+    db:
+      auto_update: true
+    match:
+      stock: "all-layers"
+      scope: "squashed"
+    severity_policy: *severity_policy
+    performance:
+      concurrency: 4
+      timeout: "10m"
+    output:
+      formats: ["json"]
+      path: "./artifacts/security/grype.json"
+
+  osv_scanner:
+    enabled: true
+    version: "latest"
+    severity_policy: *severity_policy
+    output:
+      formats: ["json"]
+      path: "./artifacts/security/osv.json"
+
+  pip_audit:
+    enabled: true
+    ignore_vulns: []
+    index_url: "${PIP_INDEX_URL}"
+    extra_index_url: "${PIP_EXTRA_INDEX_URL}"
+    output:
+      formats: ["json"]
+      path: "./artifacts/security/pip-audit.json"
+
+  npm_audit:
+    enabled: true
+    production_only: true
+    audit_level: "low"
+    output:
+      formats: ["json"]
+      path: "./artifacts/security/npm-audit.json"
+
+  cargo_audit:
+    enabled: true
+    deny_warnings: true
+    output:
+      formats: ["json"]
+      path: "./artifacts/security/cargo-audit.json"
+
+  bandit:
+    enabled: true
+    severity_policy: *severity_policy
+    target_paths: ["./"]
+    exclude: ["**/tests/**","**/.venv/**"]
+    config_file: "./configs/bandit.yaml"
+    output:
+      formats: ["json","sarif"]
+      path_json: "./artifacts/security/bandit.json"
+      path_sarif: "./artifacts/security/bandit.sarif"
+
+  semgrep:
+    enabled: true
+    rulesets:
+      - "p/ci"
+      - "p/security-audit"
+      - "p/secrets"
+      - "p/owasp-top-ten"
+    autofix: false
+    timeout: "15m"
+    severity_policy: *severity_policy
+    output:
+      formats: ["sarif","json"]
+      path_sarif: "./artifacts/security/semgrep.sarif"
+      path_json: "./artifacts/security/semgrep.json"
+
+  gitleaks:
+    enabled: true
+    config: "./configs/gitleaks.toml"
+    redact: true
+    no_git: false
+    allowlist:
+      files: ["**/example/**"]
+      secrets: []
+    output:
+      formats: ["json","sarif"]
+      path_json: "./artifacts/security/gitleaks.json"
+      path_sarif: "./artifacts/security/gitleaks.sarif"
+
+  tfsec:
+    enabled: true
+    soft_fail: false
+    exclude_paths: []
+    additional_args: ["--minimum-severity", "MEDIUM"]
+    output:
+      formats: ["sarif","json"]
+      path_sarif: "./artifacts/security/tfsec.sarif"
+      path_json: "./artifacts/security/tfsec.json"
+
+  checkov:
+    enabled: true
+    framework: ["terraform","kubernetes","helm"]
+    skip_checks: []
+    hard_fail_on: ["HIGH","CRITICAL"]
+    output:
+      formats: ["sarif","json"]
+      path_sarif: "./artifacts/security/checkov.sarif"
+      path_json: "./artifacts/security/checkov.json"
+
+  kube_linter:
+    enabled: true
+    config: "./configs/kubelinter.yaml"
+    output:
+      formats: ["sarif","json"]
+      path_sarif: "./artifacts/security/kubelinter.sarif"
+      path_json: "./artifacts/security/kubelinter.json"
+
+  nuclei:
+    enabled: true
+    templates:
+      sources: ["cves","default-log4j","exposures"]
+      update: true
+    rate_limit:
+      rps: 20
+      max_hosts: 50
+    targets:
+      from_env: "${DAST_TARGETS}"      # список URL через запятую
+      allowlist_suffixes: [".example.com"]
+    safe_mode: true                    # в CI только пассивные/безопасные проверки
+    output:
+      formats: ["json"]
+      path: "./artifacts/security/nuclei.json"
+
+  zap:
+    enabled: true
+    mode: "passive"                    # в CI пассивно; актив — вручную
+    target: "${ZAP_TARGET}"
+    timeout: "20m"
+    output:
+      formats: ["json","sarif"]
+      path_json: "./artifacts/security/zap.json"
+      path_sarif: "./artifacts/security/zap.sarif"
+
+policy:
+  codeowners:
+    required_reviewers:
+      - "security-approvers"
+  pr_requirements:
+    require_clean_secrets_scan: true
+    require_no_new_high: true
+    require_sbom_attestation: true
+  license_policy:
+    allow: ["MIT","Apache-2.0","BSD-2-Clause","BSD-3-Clause"]
+    deny: ["AGPL-3.0","GPL-3.0","SSPL-1.0"]
+    on_violation: "fail"
+
+runtime_reachability:
+  enabled: true
+  sources:
+    - "semgrep-call-graph"
+    - "sca-transitive-depth"
+  treat_unreachable_as: "LOW"
+
+retention:
+  artifacts_days: 90
+  logs_days: 30
+  rotate_older_than_days: 180
+
+audit:
+  provenance:
+    slsa_provenance: true
+    include_builder_info: true
+  trail:
+    record_runner_identity: true
+    store_env_fingerprint: ["GIT_COMMIT","GIT_BRANCH","CI_PIPELINE_ID"]
+
+network_safety:
+  outbound_allowlist:
+    - "api.github.com:443"
+    - "ghcr.io:443"
+    - "registry-1.docker.io:443"
+    - "api.osv.dev:443"
+    - "api.first.org:443"
+  deny_active_scan_to_internal: true
+
+overrides:
+  # Пример точечных ослаблений для конкретного компонента
+  components:
+    - name: "telemetry-agent"
+      severity_policy:
+        <<: *severity_policy
+        block_on_severity: ["CRITICAL"]  # временно допускаем HIGH
+      expires: "2025-10-15"
+      ticket: "SEC-1456"

@@ -1,0 +1,150 @@
+# aethernova-chain-core/ops/terraform/modules/policies/gatekeeper/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ВНИМАНИЕ: CRD Gatekeeper и его контроллер предполагаются установленными отдельно (например, через helm gatekeeper).
+# Здесь — только политики/мутации (cluster-scoped).
+
+# Namespace контроллера (для совместимости с namespaced ресурсами вроде Service/Role, если появятся).
+# На cluster-scoped CRD (Assign/ConstraintTemplate/…) namespace не будет применён — это ожидаемо.
+namespace: gatekeeper-system
+
+# Агрегируемые каталоги. Создайте отсутствующие по мере роста набора политик.
+resources:
+  - templates/                 # ConstraintTemplate/*.yaml
+  - constraints/               # Constraint/*.yaml (K8sPSP*, K8sAllowedRepos*, K8sRequiredLabels*, …)
+  - mutations/assign/          # Assign/*.yaml
+  - mutations/assignmetadata/  # AssignMetadata/*.yaml
+  - mutations/modifyset/       # ModifySet/*.yaml
+  - mutations/assignimage/     # AssignImage/*.yaml
+  - sync/                      # (опционально) конфигурации Sync для external data, если используете
+
+# Единые производственные метки — для инвентаризации, трассировки и аналитики.
+commonLabels:
+  app.kubernetes.io/name: gatekeeper-policies
+  app.kubernetes.io/part-of: aethernova-chain-core
+  app.kubernetes.io/component: policies
+  app.kubernetes.io/managed-by: kustomize
+  policy.aethernova.io/bundle: gatekeeper
+  policy.aethernova.io/tier: baseline
+  policy.aethernova.io/env: prod
+
+# Единые аннотации — происхождение и управление изменениями.
+commonAnnotations:
+  policy.aethernova.io/source: "ops/terraform/modules/policies/gatekeeper"
+  policy.aethernova.io/change-control: "gitops"
+  policy.aethernova.io/reviewed-by: "platform-security-core"
+  policy.aethernova.io/docs: "internal://policies/gatekeeper"
+
+# Генераторы конфигов детерминированы (hash off) для стабильных ссылок в GitOps диффах.
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    policy.aethernova.io/generator: "true"
+  annotations:
+    policy.aethernova.io/generator-note: "nameSuffixHash disabled for deterministic refs"
+
+# Служебный ConfigMap с метаданными релиза policy-бандла.
+# Версии и ревизии поддерживайте в CI (замена через kustomize edit/set или kyaml).
+configMapGenerator:
+  - name: gatekeeper-policy-bundle-meta
+    literals:
+      - bundle=aethernova-gatekeeper
+      - version=1.0.0
+      - release-channel=stable
+      - owner=platform-security-core
+
+# Патчи для выравнивания меток/аннотаций на CRD Gatekeeper.
+# JSON6902 применяется к каждому типу отдельно (kustomize требует явного target).
+patches:
+  # Assign
+  - target:
+      group: mutations.gatekeeper.sh
+      version: v1alpha1
+      kind: Assign
+    patch: |-
+      - op: add
+        path: /metadata/labels/policy.aethernova.io~1sync
+        value: "true"
+      - op: add
+        path: /metadata/annotations/policy.aethernova.io~1last-reviewed
+        value: "2025-09-12"
+  # AssignMetadata
+  - target:
+      group: mutations.gatekeeper.sh
+      version: v1alpha1
+      kind: AssignMetadata
+    patch: |-
+      - op: add
+        path: /metadata/labels/policy.aethernova.io~1sync
+        value: "true"
+      - op: add
+        path: /metadata/annotations/policy.aethernova.io~1last-reviewed
+        value: "2025-09-12"
+  # ModifySet
+  - target:
+      group: mutations.gatekeeper.sh
+      version: v1alpha1
+      kind: ModifySet
+    patch: |-
+      - op: add
+        path: /metadata/labels/policy.aethernova.io~1sync
+        value: "true"
+      - op: add
+        path: /metadata/annotations/policy.aethernova.io~1last-reviewed
+        value: "2025-09-12"
+  # AssignImage
+  - target:
+      group: mutations.gatekeeper.sh
+      version: v1beta1
+      kind: AssignImage
+    patch: |-
+      - op: add
+        path: /metadata/labels/policy.aethernova.io~1sync
+        value: "true"
+      - op: add
+        path: /metadata/annotations/policy.aethernova.io~1last-reviewed
+        value: "2025-09-12"
+  # ConstraintTemplate
+  - target:
+      group: templates.gatekeeper.sh
+      version: v1
+      kind: ConstraintTemplate
+    patch: |-
+      - op: add
+        path: /metadata/labels/policy.aethernova.io~1sync
+        value: "true"
+      - op: add
+        path: /metadata/annotations/policy.aethernova.io~1last-reviewed
+        value: "2025-09-12"
+  # Constraints (Generic — подхватит K8sAllowedRepos, K8sRequiredLabels, K8sPSP*, и т.д.)
+  - target:
+      group: constraints.gatekeeper.sh
+      version: v1beta1
+      kind: "*"
+    patch: |-
+      - op: add
+        path: /metadata/labels/policy.aethernova.io~1sync
+        value: "true"
+      - op: add
+        path: /metadata/annotations/policy.aethernova.io~1last-reviewed
+        value: "2025-09-12"
+
+# Конфигурация substitutions (если в подкаталогах будут использоваться $(VAR)).
+# Здесь задаём подстановки в аннотации/параметры constraints.
+# substitutions:
+#   - src:
+#       kind: ConfigMap
+#       name: gatekeeper-policy-bundle-meta
+#       fieldPath: data.version
+#     targets:
+#       - select:
+#           group: constraints.gatekeeper.sh
+#           version: v1beta1
+#           kind: "*"
+#         fieldPaths:
+#           - metadata.annotations.policy.aethernova.io~1bundle-version
+
+# Примечания по ожиданиям применения:
+# - Cluster-scoped ресурсы не получат namespace (это корректно).
+# - Порядок применения: сначала templates/, затем constraints/, затем mutations/* — обеспечивается kustomize/ArgoCD по списку resources.

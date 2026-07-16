@@ -1,0 +1,315 @@
+# =============================================================================
+# omnimind-core — Tool Manifest (industrial template)
+# Назначение: декларативная установка CLI-инструментов через Ansible/CI.
+# Совместим с Jinja2: {{ var }}. Не хранит секретов. Все хэши/версии — плейсхолдеры.
+# =============================================================================
+apiVersion: omnimind.devtools/v1
+kind: ToolManifest
+
+metadata:
+  name: omnimind-core-tools
+  owner: platform-engineering
+  schemaVersion: "1.0.0"
+  environment: "{{ omnimind_core_env | default('production') }}"
+  timezone: "Europe/Stockholm"
+
+# ------------------------------- Anchors -------------------------------------
+x-anchors:
+  common_paths: &common_paths
+    installRoot: "{{ tool_install_root | default('/usr/local') }}"
+    binDir: "{{ tool_bin_dir | default('/usr/local/bin') }}"
+    stateDir: "{{ tool_state_dir | default('/var/lib/omnimind-tools') }}"
+    cacheDir: "{{ tool_cache_dir | default('/var/cache/omnimind-tools') }}"
+    tmpDir: "{{ tool_tmp_dir | default('/tmp/omnimind-tools') }}"
+
+  http_fetch: &http_fetch
+    retries: 5
+    retryBackoffSec: 2
+    connectTimeoutSec: 20
+    readTimeoutSec: 120
+    tlsVerify: true
+    proxy:
+      httpProxy: "{{ http_proxy | default('') }}"
+      httpsProxy: "{{ https_proxy | default('') }}"
+      noProxy: "{{ no_proxy | default('') }}"
+
+  gpg_policy: &gpg_policy
+    enabled: true
+    keyserver: "keys.openpgp.org"
+    keyringPath: "{{ tool_gpg_keyring | default('/etc/omnimind-tools/trusted.gpg') }}"
+    allowedKeyIDs: []        # пример: ["FINGERPRINT_HELM", "FINGERPRINT_COSIGN"]
+    requireSig: false        # включите true при наличии *.asc источников
+
+  cosign_policy: &cosign_policy
+    enabled: false           # включите для артефактов с sigstore подписями
+    keyless: false
+    keyPath: ""              # путь к PEM, если используется keyful режим
+    fulcioURL: ""            # опционально
+    rekorURL: ""             # опционально
+
+  sandbox_policy: &sandbox_policy
+    # Базовая политика запуска инструментов (для wrapper-а роли)
+    runAs:
+      user: "root"
+      group: "root"
+      umask: "022"
+      noNewPrivileges: true
+    seccompProfile: "default"   # или путь к профилю
+    capabilitiesDrop: ["ALL"]
+    readOnlyPaths:
+      - "/"
+    readWritePaths:
+      - "{{ *common_paths.cacheDir }}"
+      - "{{ *common_paths.stateDir }}"
+      - "{{ *common_paths.tmpDir }}"
+
+# ------------------------------- Defaults ------------------------------------
+defaults:
+  <<: *common_paths
+  http: *http_fetch
+  gpg: *gpg_policy
+  cosign: *cosign_policy
+  sandbox: *sandbox_policy
+  installMode: "atomic"            # atomic|inplace
+  ownership:
+    user: "root"
+    group: "root"
+    dirMode: "0755"
+    fileMode: "0755"
+  updatePolicy:
+    pin: "patch"                   # none|patch|minor|major
+    allowDowngrade: false
+    allowPrerelease: false
+  validation:
+    versionCheck: true
+    runSmokeTest: true
+  provenance:
+    sbomRequire: false
+    attestationsRequire: false
+
+# ------------------------------- Platforms -----------------------------------
+platforms:
+  # Нормализация архитектур Ansible -> артефактов
+  os: "{{ ansible_system | lower }}"   # linux, darwin (если используется локально)
+  archMap:
+    x86_64: amd64
+    aarch64: arm64
+    armv7l: armv7
+  arch: "{{ platforms.archMap[ansible_architecture] | default(ansible_architecture | lower) }}"
+
+# ------------------------------- Versions ------------------------------------
+versions:
+  kubectl: "1.30.0"      # обновляйте согласно политике
+  helm: "3.15.2"
+  cosign: "2.2.2"
+  yq: "4.44.3"
+  jq: "1.7.1"
+
+# ------------------------------- Tools ---------------------------------------
+tools:
+
+  - id: kubectl
+    name: "kubectl"
+    description: "Kubernetes CLI"
+    license: "Apache-2.0"
+    source:
+      type: "github_release"
+      repo: "kubernetes/kubernetes"
+      version: "{{ versions.kubectl }}"
+      asset:
+        # Пример шаблона имени артефакта
+        nameTemplate: "kubectl-{{ platforms.os }}-{{ platforms.arch }}"
+        # URL(ы) не зашиваются жестко; роль вычисляет по repo/version/asset
+      checksum:
+        algorithm: "sha256"
+        value: "<FILL_ME_SHA256>"   # для зафиксированного артефакта
+        file: ""                    # либо путь/URL на файл сумм
+      signature:
+        gpg:
+          enabled: false           # включите при наличии *.asc
+          keyID: ""                # добавьте в defaults.gpg.allowedKeyIDs
+        cosign:
+          enabled: false
+    install:
+      steps:
+        - ensureDirs: ["{{ defaults.binDir }}", "{{ defaults.cacheDir }}", "{{ defaults.stateDir }}"]
+        - fetch: { to: "{{ defaults.cacheDir }}/kubectl", mode: "0644" }     # скачивание бинаря
+        - move:  { src: "{{ defaults.cacheDir }}/kubectl", dest: "{{ defaults.binDir }}/kubectl", mode: "0755" }
+        - symlink:
+            src: "{{ defaults.binDir }}/kubectl"
+            dest: "/usr/bin/kubectl"
+            force: false
+    validate:
+      version:
+        command: "{{ defaults.binDir }}/kubectl version --client --output=yaml"
+        mustMatch: "gitVersion: v{{ versions.kubectl }}"
+        timeoutSec: 20
+      smoke:
+        command: "{{ defaults.binDir }}/kubectl version --client"
+        timeoutSec: 10
+    healthcheck:
+      command: "{{ defaults.binDir }}/kubectl version --client --short"
+      timeoutSec: 10
+    security:
+      sandbox: *sandbox_policy
+
+  - id: helm
+    name: "helm"
+    description: "Helm package manager for Kubernetes"
+    license: "Apache-2.0"
+    source:
+      type: "github_release"
+      repo: "helm/helm"
+      version: "{{ versions.helm }}"
+      asset:
+        nameTemplate: "helm-v{{ versions.helm }}-{{ platforms.os }}-{{ platforms.arch }}.tar.gz"
+      checksum:
+        algorithm: "sha256"
+        value: "<FILL_ME_SHA256>"
+        file: ""
+      signature:
+        gpg:
+          enabled: true
+          keyID: "<FILL_HELM_GPG_FPR>"
+    install:
+      steps:
+        - ensureDirs: ["{{ defaults.binDir }}", "{{ defaults.cacheDir }}"]
+        - fetch: { to: "{{ defaults.cacheDir }}/helm.tgz", mode: "0644" }
+        - extract:
+            src: "{{ defaults.cacheDir }}/helm.tgz"
+            dest: "{{ defaults.cacheDir }}/helm"
+            stripComponents: 1
+        - move:
+            src: "{{ defaults.cacheDir }}/helm/helm"
+            dest: "{{ defaults.binDir }}/helm"
+            mode: "0755"
+    validate:
+      version:
+        command: "{{ defaults.binDir }}/helm version --short"
+        mustMatch: "v{{ versions.helm }}"
+        timeoutSec: 15
+    healthcheck:
+      command: "{{ defaults.binDir }}/helm env"
+      timeoutSec: 10
+    security:
+      sandbox: *sandbox_policy
+    provenance:
+      sbom:
+        require: false
+        path: ""
+      attestations:
+        require: false
+
+  - id: cosign
+    name: "cosign"
+    description: "Sigstore signing and verification"
+    license: "Apache-2.0"
+    source:
+      type: "github_release"
+      repo: "sigstore/cosign"
+      version: "{{ versions.cosign }}"
+      asset:
+        nameTemplate: "cosign-{{ versions.cosign }}-{{ platforms.os }}-{{ platforms.arch }}"
+      checksum:
+        algorithm: "sha256"
+        value: "<FILL_ME_SHA256>"
+        file: ""
+      signature:
+        cosign:
+          enabled: true
+          keyless: true
+    install:
+      steps:
+        - ensureDirs: ["{{ defaults.binDir }}"]
+        - fetch: { to: "{{ defaults.binDir }}/cosign", mode: "0755" }
+    validate:
+      version:
+        command: "{{ defaults.binDir }}/cosign version"
+        mustMatch: "GitVersion:    {{ versions.cosign }}"
+        timeoutSec: 15
+    security:
+      sandbox: *sandbox_policy
+
+  - id: yq
+    name: "yq"
+    description: "YAML processor"
+    license: "MIT"
+    source:
+      type: "github_release"
+      repo: "mikefarah/yq"
+      version: "{{ versions.yq }}"
+      asset:
+        nameTemplate: "yq_{{ platforms.os }}_{{ platforms.arch }}"
+      checksum:
+        algorithm: "sha256"
+        value: "<FILL_ME_SHA256>"
+        file: ""
+    install:
+      steps:
+        - ensureDirs: ["{{ defaults.binDir }}"]
+        - fetch: { to: "{{ defaults.binDir }}/yq", mode: "0755" }
+    validate:
+      version:
+        command: "{{ defaults.binDir }}/yq --version"
+        mustMatch: "yq (version {{ versions.yq }})"
+        timeoutSec: 10
+    security:
+      sandbox: *sandbox_policy
+
+  - id: jq
+    name: "jq"
+    description: "JSON processor"
+    license: "MIT"
+    source:
+      type: "github_release"
+      repo: "jqlang/jq"
+      version: "{{ versions.jq }}"
+      asset:
+        nameTemplate: "jq-{{ platforms.os }}-{{ platforms.arch }}"
+      checksum:
+        algorithm: "sha256"
+        value: "<FILL_ME_SHA256>"
+        file: ""
+    install:
+      steps:
+        - ensureDirs: ["{{ defaults.binDir }}"]
+        - fetch: { to: "{{ defaults.binDir }}/jq", mode: "0755" }
+    validate:
+      version:
+        command: "{{ defaults.binDir }}/jq --version"
+        mustMatch: "jq-{{ versions.jq }}"
+        timeoutSec: 10
+    security:
+      sandbox: *sandbox_policy
+
+# ------------------------------ Compliance -----------------------------------
+compliance:
+  antivirus:
+    enabled: false
+    engine: "clamscan"
+    quarantineDir: "{{ defaults.stateDir }}/quarantine"
+  cveGate:
+    enabled: false
+    # Используйте внешний шаг CI для trivy/grype; роль читает итоговый verdict
+    maxSeverity: "high"
+  licenseAllowList:
+    - "Apache-2.0"
+    - "MIT"
+  licenseDenyList:
+    - "GPL-3.0-only"
+    - "AGPL-3.0-only"
+
+# ------------------------------- Policies ------------------------------------
+policies:
+  rollbackOnValidateFail: true
+  cleanupCacheOnSuccess: true
+  preserveCacheOnFail: true
+  restartServices:
+    enabled: false
+    systemdUnits: []   # пример: ["kubelet", "containerd"]
+
+# ------------------------------- Notes ---------------------------------------
+notes:
+  - "Все значения checksum/signature необходимо заполнить из доверенных источников. I cannot verify this."
+  - "Поле source.repo и asset.nameTemplate интерпретируются установочной ролью, ссылки не захардкожены."
+  - "Для darwin/windows укажите отдельные записи tools с иными шаблонами активов при необходимости."

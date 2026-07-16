@@ -1,0 +1,400 @@
+# OblivionVault Core — Legal Hold Configuration
+# Schema: semantic + JSON-Schema compatibility for CI validation
+apiVersion: legalhold.oblivionvault.io/v1
+kind: LegalHoldConfig
+metadata:
+  name: legal-hold-master
+  labels:
+    app.kubernetes.io/part-of: oblivionvault-core
+    governance/level: critical
+  annotations:
+    description: "Единый конфиг юридического удержания и eDiscovery."
+    managedBy: "gitops/argocd"
+    lastReviewedBy: "chief-compliance-officer@company.tld"
+    reviewSchedule: "P30D"
+
+spec:
+  tenant:
+    id: "ov-tenant-prod"
+    environment: "prod"             # dev|staging|prod
+    jurisdiction:
+      primary: "EU"
+      fallback: ["US", "UK"]
+    dataResidency:
+      requiredRegions: ["eu-central-1","eu-west-1"]
+      denyRegions: ["ap-east-1"]
+
+  schema:
+    version: "1.0.0"
+    $schema: "https://schemas.oblivionvault.io/legalhold/v1.json"
+    validation:
+      requiredKeys:
+        - matters
+        - custodians
+        - policies
+      forbidUnknownKeys: true
+      strictTypes: true
+
+  rbac:
+    roles:
+      - id: "LEGAL_ADMIN"
+        description: "Полные права управления Legal Hold"
+        subjects:
+          users: ["alice@company.tld","bob@company.tld"]
+          groups: ["grp-legal-admins"]
+      - id: "LEGAL_REVIEWER"
+        description: "Просмотр, запрос экспорта, комментарии"
+        groups: ["grp-legal-reviewers"]
+      - id: "SECURITY_OFFICER"
+        description: "Аварийные снятия блокировок по утверждению"
+        users: ["so@company.tld"]
+      - id: "SYSTEM"
+        description: "Сервисные аккаунты автоматизации"
+        serviceAccounts:
+          - "system:serviceaccount:observability:ov-legal-operator"
+    permissions:
+      - role: "LEGAL_ADMIN"
+        actions: ["create","update","delete","applyHold","releaseHold","export","override"]
+      - role: "LEGAL_REVIEWER"
+        actions: ["view","comment","requestExport"]
+      - role: "SECURITY_OFFICER"
+        actions: ["emergencyRelease"]
+      - role: "SYSTEM"
+        actions: ["sync","auditWrite","metricsWrite"]
+
+  kms:
+    default:
+      provider: "aws-kms"
+      keyArn: "arn:aws:kms:eu-central-1:123456789012:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+      rotationPeriod: "P180D"
+    signing:
+      provider: "aws-kms"
+      keyArn: "arn:aws:kms:eu-central-1:123456789012:key/ffffffff-1111-2222-3333-444444444444"
+      algorithm: "RSA_PSS_SHA_256"
+    envelope:
+      enabled: true
+      dataKeySpec: "AES_256"
+
+  object_store:
+    provider: "s3"
+    bucket: "ov-prod-legal-hold"
+    prefix: "holds/"
+    region: "eu-central-1"
+    endpoint: null
+    serverSideEncryption: "aws:kms"
+    sseKmsKeyId: "arn:aws:kms:eu-central-1:123456789012:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    retentionLock:
+      mode: "COMPLIANCE"    # GOVERNANCE|COMPLIANCE
+      minRetention: "P365D" # защитный минимум
+
+  audit:
+    sinks:
+      - type: "loki"
+        url: "http://loki-gateway.observability.svc:80"
+        labels:
+          stream: "legalhold"
+          severity: "audit"
+      - type: "kafka"
+        brokers: ["kafka-1:9092","kafka-2:9092"]
+        topic: "ov.legalhold.audit.v1"
+    fields:
+      includeRequestContext: true
+      includeCaller: true
+      includeDiff: true
+    integrity:
+      hashAlgorithm: "SHA3-512"
+      merkle:
+        enabled: true
+        cadence: "PT1H"
+
+  notifications:
+    channels:
+      - id: "slack-legal"
+        type: "slack"
+        webhookRef: "secret://notifications/slack-legal"
+      - id: "email-legal"
+        type: "email"
+        smtpProfile: "smtp-prod"
+    rules:
+      - onEvents: ["HOLD_APPLIED","HOLD_RELEASED","EXPORT_READY","POLICY_VIOLATION"]
+        to: ["slack-legal","email-legal"]
+        template: "default"
+
+  custodians:
+    defaults:
+      escalationAfter: "P3D"
+      acknowledgmentRequired: true
+    list:
+      - id: "cst-001"
+        principal: "john.doe@company.tld"
+        dept: "Finance"
+        manager: "mgr-finance@company.tld"
+      - id: "cst-002"
+        principal: "jane.smith@company.tld"
+        dept: "Engineering"
+        manager: "mgr-eng@company.tld"
+
+  sources:
+    # Каталогируем источники для точного таргетинга hold
+    k8s:
+      - id: "k8s-logs"
+        namespaces: ["prod-api","prod-ml","observability"]
+        kinds: ["Pod","ConfigMap","Secret"]
+    s3:
+      - id: "s3-archives"
+        buckets: ["prod-archives-1","prod-archives-2"]
+        prefixes: ["mail/","docs/"]
+    databases:
+      - id: "pg-main"
+        engine: "postgres"
+        dsnRef: "secret://db/pg-main-dsn"
+        schemas: ["public","audit"]
+    messaging:
+      - id: "mx-queue"
+        type: "kafka"
+        topics: ["prod.mail.ingest","prod.docs.ingest"]
+
+  piiCatalog:
+    classes:
+      - id: "PII_NAME"      # имена
+        detectors: ["regex://\\b[A-Z][a-z]+\\s[A-Z][a-z]+\\b"]
+        action: "mask"
+        mask: "NAME_REDACTED"
+      - id: "PII_EMAIL"
+        detectors: ["regex://[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"]
+        action: "hash"
+        hashAlgorithm: "SHA256"
+      - id: "PII_PHONE"
+        detectors: ["regex://\\+?[0-9][0-9\\- ]{7,}"]
+        action: "mask"
+        mask: "PHONE_REDACTED"
+
+  dlp:
+    rules:
+      - id: "dlp-secrets"
+        description: "Запрет ключей/секретов в экспорт"
+        detectors:
+          - "regex://(?i)(api|secret|token|key)[=:]\\s*[-_A-Za-z0-9]{16,}"
+        onMatch:
+          action: "quarantine"
+          quarantineLocation: "s3://ov-prod-legal-hold/quarantine/"
+          notify: ["LEGAL_ADMIN","SECURITY_OFFICER"]
+
+  chainOfCustody:
+    enabled: true
+    fields: ["timestamp","actor","action","object","hash","signature"]
+    signingKeyRef: "kms://signing"
+
+  policies:
+    defaults:
+      freezeDeletes: true        # запрет удаления затронутых объектов
+      readOnlySnapshots: true
+      snapshotSchedule: "0 2 * * *" # ежедневный снапшот
+      export:
+        format: "parquet"
+        compression: "zstd"
+        chunkSize: "1Gi"
+        destination: "s3://ov-prod-legal-hold/exports/"
+        redactPII: true
+        includeMetadata: true
+      approvals:
+        required: 2
+        matrix:
+          - anyOfRoles: ["LEGAL_ADMIN"]
+          - anyOfRoles: ["LEGAL_REVIEWER","SECURITY_OFFICER"]
+      breachOnViolation: true
+
+    list:
+      - id: "policy-fin-001"
+        title: "Расследование: финансовые документы и переписка"
+        retention:
+          min: "P730D"         # 2 года
+          max: "P3650D"        # 10 лет
+          legalHold: true
+        scopes:
+          - sourcesRef: ["s3-archives"]
+            include:
+              - "docs/finance/**"
+              - "mail/finance/**"
+            exclude:
+              - "**/*.tmp"
+              - "**/~$*"
+        exceptions:
+          custodians: ["cst-002"] # исключение конкретного сотрудника
+          patterns: ["**/personal/**"]
+        redaction:
+          enable: true
+          piiClasses: ["PII_EMAIL","PII_PHONE"]
+        exportOverrides:
+          destination: "s3://ov-prod-legal-hold/exports/fin/"
+          encryptTo:
+            kmsKeyArn: "arn:aws:kms:eu-central-1:123456789012:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+      - id: "policy-sec-logs-001"
+        title: "Инцидент‑респонс: системные журналы"
+        retention:
+          min: "P365D"
+          max: "P1825D"
+          legalHold: true
+        scopes:
+          - sourcesRef: ["k8s-logs"]
+            labelSelector: "app in (api,ml,ingester)"
+          - sourcesRef: ["mx-queue"]
+            topics: ["prod.mail.ingest"]
+        redaction:
+          enable: false
+        dlpenforce: ["dlp-secrets"]
+
+  matters:
+    # Матер — объект дела/разбирательства: связывает политику, хранителей и таймлайн
+    - id: "matter-2025-001"
+      title: "Дело №2025‑001: Финансовая проверка"
+      status: "OPEN"            # OPEN|SUSPENDED|CLOSED
+      jurisdiction: ["EU","US"]
+      owners: ["LEGAL_ADMIN"]
+      custodians: ["cst-001"]
+      policiesRef: ["policy-fin-001"]
+      timeline:
+        openedAt: "2025-08-24T12:00:00Z"
+        nextReviewAt: "2025-09-07T12:00:00Z"
+      sla:
+        applyHold: "PT2H"       # применить hold не позднее 2 часов
+        exportReady: "P2D"
+      evidence:
+        storage: "s3://ov-prod-legal-hold/evidence/matter-2025-001/"
+        hash: "SHA3-512"
+      approvals:
+        required: 2
+        approversRoles: ["LEGAL_ADMIN","LEGAL_REVIEWER"]
+
+    - id: "matter-2025-002"
+      title: "Дело №2025‑002: Инфобез инцидент"
+      status: "OPEN"
+      owners: ["SECURITY_OFFICER","LEGAL_ADMIN"]
+      custodians: ["cst-002"]
+      policiesRef: ["policy-sec-logs-001"]
+      timeline:
+        openedAt: "2025-08-25T08:30:00Z"
+        nextReviewAt: "2025-09-01T08:30:00Z"
+      sla:
+        applyHold: "PT1H"
+        exportReady: "P1D"
+
+  overrides:
+    # Ручные перекрытия по решению комитета
+    emergencyRelease:
+      enabled: false
+      quorum:
+        ofRoles: ["LEGAL_ADMIN","SECURITY_OFFICER"]
+        minApprovals: 3
+      logging: "strict"
+
+  compliance:
+    mappings:
+      - framework: "ISO/IEC 27001"
+        controls: ["A.8.12","A.12.4","A.18.1.3"]
+      - framework: "SOC 2"
+        controls: ["CC3.2","CC7.2","A1.2"]
+      - framework: "GDPR"
+        articles: ["5","6","17","30","32"]
+    checks:
+      - id: "chk-hold-immutability"
+        type: "assert"
+        query: "holds[*].freezeDeletes == true"
+      - id: "chk-export-redaction"
+        type: "assert"
+        query: "policies[*].export.redactPII == true"
+
+  observability:
+    metrics:
+      enabled: true
+      namespace: "observability"
+      slos:
+        - name: "hold-apply-latency"
+          objective: "99p<=5m"
+        - name: "export-ready-latency"
+          objective: "99p<=24h"
+    tracing:
+      enabled: true
+      otlpEndpoint: "http://otel-collector.observability.svc:4317"
+    logging:
+      level: "INFO"
+
+  reconciler:
+    interval: "PT10M"
+    backoff:
+      base: "PT10S"
+      max: "PT5M"
+      factor: 2.0
+    driftDetection:
+      enabled: true
+      mode: "report"
+
+  guardrails:
+    # Жёсткие предохранители: запреты на ошибочные изменения
+    deny:
+      - when: "policy.retention.max < policy.retention.min"
+        reason: "Max retention меньше Min retention"
+      - when: "object_store.retentionLock.mode == 'COMPLIANCE' and overrides.emergencyRelease.enabled == true"
+        reason: "В режиме COMPLIANCE экстренный релиз запрещён"
+    requireApprovals:
+      - paths:
+          - "policies.list[*]"
+          - "matters[*]"
+        minApprovals: 2
+
+  exports:
+    formats: ["parquet","jsonl"]
+    encryption:
+      mode: "envelope"
+      kmsKeyRef: "kms://default"
+    delivery:
+      destinations:
+        - id: "ext-legal-s3"
+          type: "s3"
+          uri: "s3://external-counsel/legal/"
+          kmsKeyArn: "arn:aws:kms:eu-west-1:210987654321:key/99999999-8888-7777-6666-555555555555"
+          allowlistPrincipals: ["arn:aws:iam::210987654321:role/ext-counsel-role"]
+      accessWindow:
+        ttl: "P14D"
+        signedUrls: true
+        ipAllowlist: ["203.0.113.0/24","198.51.100.0/24"]
+
+  retentionValidation:
+    dryRunOnApply: true
+    sampleSize: 1000
+    deleteSimulations: false
+
+  redaction:
+    default:
+      strategy: "contextual"
+      contextLines: 2
+    custom:
+      - pattern: "regex://\\b\\d{16}\\b"
+        replaceWith: "PAN_REDACTED"
+
+  quarantine:
+    bucket: "ov-prod-legal-hold"
+    prefix: "quarantine/"
+    access:
+      readRoles: ["LEGAL_ADMIN","SECURITY_OFFICER"]
+      writeRoles: ["SYSTEM"]
+
+  network:
+    egress:
+      allow:
+        - "s3.eu-central-1.amazonaws.com:443"
+        - "kafka-1:9092"
+        - "kafka-2:9092"
+        - "otel-collector.observability.svc:4317"
+
+  lifecycle:
+    reviewCadence: "P14D"
+    autoCloseAfter: "P365D"
+    archival:
+      moveTo: "s3://ov-prod-legal-hold/archive/"
+      after: "P1825D"
+
+  ####################################################################
+  # End of spec
+  ####################################################################

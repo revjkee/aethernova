@@ -1,0 +1,381 @@
+# datafabric-core / configs / security.yaml
+# Принципы:
+#  - Никаких секретов в файле. Только ссылки на env/Secret Manager/Vault.
+#  - Безопасные дефолты: deny-first, минимальные привилегии, явные allow-листы.
+#  - Все сроки/пороговые значения вынесены в переменные окружения с безопасными значениями по умолчанию.
+
+meta:
+  version: 1
+  environment: ${APP_ENV:-staging}
+  owner: platform-security
+  lastReviewedAt: "2025-08-01"
+
+crypto:
+  kms:
+    enabled: true
+    provider: aws-kms
+    keyArn: ${KMS_KEY_ARN:?KMS key required}
+  defaultAlgorithms:
+    jwtSigning: RS256           # допускаются: RS256/RS384/ES256/EdDSA
+    tlsMinVersion: TLS1.2
+    mTLS:
+      requireClientCert: ${MTLS_REQUIRE_CLIENT_CERT:false}
+      trustedCaBundlePath: ${MTLS_CA_BUNDLE_PATH:/etc/ssl/certs/ca-bundle.crt}
+    atRest:
+      data:
+        enabled: true
+        algorithm: AES-256-GCM
+      secrets:
+        enabled: true
+        algorithm: AES-256-GCM
+  keyRotation:
+    jwtDays: 30
+    dataKeyDays: 90
+    enforced: true
+  hashing:
+    password:
+      algorithm: argon2id
+      params:
+        memoryKiB: 65536
+        iterations: 3
+        parallelism: 1
+        saltBytes: 16
+        hashBytes: 32
+    piiFingerprint:
+      algorithm: sha256
+
+secrets:
+  provider: ${SECRETS_PROVIDER:vault}    # vault|aws-sm|gcp-sm|k8s
+  references:
+    jwtPrivateKey: ${JWT_SIGNING_KEY_REF:secret://jwt/private}         # ссылка на секрет
+    jwtPublicKey:  ${JWT_PUBLIC_KEY_REF:secret://jwt/public}
+    oauthClientSecret: ${OAUTH_CLIENT_SECRET_REF:secret://oauth/client}
+    webhookSigningKey: ${WEBHOOK_SIGNING_KEY_REF:secret://webhook}
+    dbPassword: ${DB_PASSWORD_REF:secret://postgres/password}
+    redisPassword: ${REDIS_PASSWORD_REF:secret://redis/password}
+    kafkaSaslPassword: ${KAFKA_SASL_PASSWORD_REF:secret://kafka/sasl}
+  cache:
+    enabled: true
+    ttlSeconds: 300
+    negativeTtlSeconds: 60
+
+auth:
+  modes:
+    - jwt
+    - oidc
+    - mtls
+    - serviceToken
+  jwt:
+    issuer: ${JWT_ISSUER:https://auth.example.org}
+    audience:
+      - ${JWT_AUDIENCE:datafabric-core}
+    jwksUrl: ${OIDC_JWKS_URL:https://auth.example.org/.well-known/jwks.json}
+    signingKeyRef: ${JWT_SIGNING_KEY_REF:secret://jwt/private}
+    verificationKeys:
+      - ${JWT_PUBLIC_KEY_REF:secret://jwt/public}
+    accessTokenTtlSeconds: 900
+    refreshTokenTtlSeconds: 1209600
+    clockSkewSeconds: 60
+    requireExp: true
+    requireIat: true
+    requireSub: true
+    claimsMapping:
+      subject: sub
+      roles: roles
+      org: org_id
+    constraints:
+      maxTokenSizeBytes: 8192
+      disallowNoneAlg: true
+  oidc:
+    provider: ${OIDC_ISSUER:https://auth.example.org}
+    clientId: ${OAUTH_CLIENT_ID:?}
+    clientSecretRef: ${OAUTH_CLIENT_SECRET_REF:secret://oauth/client}
+    scopes: ["openid","profile","email","offline_access"]
+    prompt: "login"
+    pkce: required
+    redirectUris:
+      - ${OIDC_REDIRECT_URI:https://app.example.org/callback}
+  mtls:
+    enabled: ${MTLS_ENABLED:false}
+    clientAuth: require     # require|verify_if_given|none
+    san:
+      required: true
+      allowedOrgUnits: ${MTLS_ALLOWED_OU:DataFabric,Platform}
+  serviceToken:
+    header: "X-Service-Token"
+    acceptedIssuers: ["datafabric-internal"]
+    keyRefs:
+      - ${SERVICE_TOKEN_KEY_REF:secret://service-token/key}
+
+accessControl:
+  model: rbac-abac
+  rbac:
+    roles:
+      - name: admin
+        inherits: ["editor","viewer"]
+        permissions: ["*"]
+      - name: editor
+        permissions:
+          - dataset:write
+          - pipeline:write
+          - secret:read
+      - name: viewer
+        permissions:
+          - dataset:read
+          - pipeline:read
+  abac:
+    attributes:
+      - key: org
+        rule: "resource.org == user.org"
+      - key: sensitivity
+        rule: "resource.sensitivity <= user.clearance"
+  defaultDeny: true
+
+sessions:
+  store: redis
+  redis:
+    host: ${REDIS_HOST:redis}
+    port: ${REDIS_PORT:6379}
+    passwordRef: ${REDIS_PASSWORD_REF:secret://redis/password}
+    tls: ${REDIS_TLS_ENABLED:false}
+    keyPrefix: "df:sess:"
+    ttlSeconds: 3600
+  csrf:
+    enabled: true
+    sameSite: Strict
+    headerName: "X-CSRF-Token"
+    cookieName: "__Host-csrf"
+    rotateOnAuth: true
+
+network:
+  cors:
+    enabled: true
+    allowedOrigins:
+      - ${CORS_ALLOWED_ORIGINS:https://app.example.org}
+    allowedMethods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+    allowedHeaders: ["Authorization","Content-Type","X-Request-Id","X-CSRF-Token"]
+    exposedHeaders: ["X-Request-Id"]
+    maxAgeSeconds: 600
+    allowCredentials: true
+  headers:
+    strictTransportSecurity: "max-age=63072000; includeSubDomains; preload"
+    contentSecurityPolicy: >
+      default-src 'none'; base-uri 'self'; form-action 'self';
+      frame-ancestors 'none';
+      img-src 'self' data:;
+      script-src 'self';
+      style-src 'self' 'unsafe-inline';
+      connect-src 'self' https:;
+    xContentTypeOptions: "nosniff"
+    referrerPolicy: "no-referrer"
+    permissionsPolicy: "geolocation=(), microphone=(), camera=()"
+    xFrameOptions: "DENY"
+  ipFilters:
+    allowCidrs: ${ALLOW_CIDRS:10.0.0.0/8,192.168.0.0/16}
+    denyCidrs: ${DENY_CIDRS:}
+  rateLimit:
+    enabled: true
+    strategies:
+      - name: burst-ip
+        key: "ip"
+        windowSeconds: 1
+        limit: 20
+      - name: sustained-ip
+        key: "ip"
+        windowSeconds: 60
+        limit: 600
+      - name: auth-actor
+        key: "user_or_client_id"
+        windowSeconds: 60
+        limit: 300
+    ban:
+      enabled: true
+      thresholdViolations: 5
+      ttlSeconds: 900
+  bruteForce:
+    login:
+      windowSeconds: 300
+      limit: 10
+
+audit:
+  enabled: true
+  redact:
+    fields:
+      - password
+      - access_token
+      - refresh_token
+      - secret
+      - authorization
+      - set-cookie
+  sinks:
+    - type: stdout
+      level: info
+    - type: opensearch
+      endpoint: ${AUDIT_OPENSEARCH_ENDPOINT:http://opensearch:9200}
+      index: "audit-datafabric-${APP_ENV:-staging}"
+      tls:
+        insecure: ${AUDIT_TLS_INSECURE:false}
+  retention:
+    days: 365
+  integrity:
+    signing:
+      enabled: true
+      keyRef: ${AUDIT_HMAC_KEY_REF:secret://audit/hmac}
+    sequence:
+      enabled: true
+
+privacy:
+  pii:
+    classification:
+      patterns:
+        email: "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b"
+        phone: "\\b\\+?[0-9\\- ]{7,15}\\b"
+        ssn: "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+    actions:
+      store: encrypt-at-rest
+      transport: tls-only
+      egress:
+        requireDpa: true
+        allowedDestinations: ${PII_EGRESS_ALLOW:analytics.example.org}
+  dataRetention:
+    defaultDays: 180
+    datasets:
+      logs: 30
+      metrics: 400
+      traces: 14
+  subjectAccessRequests:
+    enabled: true
+    slaDays: 30
+
+database:
+  postgres:
+    host: ${POSTGRES_HOST:postgres}
+    port: ${POSTGRES_PORT:5432}
+    db: ${POSTGRES_DB:datafabric}
+    user: ${POSTGRES_USER:datafabric}
+    passwordRef: ${DB_PASSWORD_REF:secret://postgres/password}
+    ssl:
+      mode: ${PG_SSLMODE:require}     # disable|require|verify-ca|verify-full
+      rootCertPath: ${PG_SSL_ROOT_CERT:/etc/ssl/certs/ca-bundle.crt}
+    pool:
+      min: 5
+      max: 50
+      connTimeoutSeconds: 5
+    migration:
+      allowDangerous: false
+
+broker:
+  kafka:
+    bootstrap: ${KAFKA_BROKER:kafka:9092}
+    security:
+      protocol: ${KAFKA_SECURITY_PROTOCOL:SASL_SSL}   # SASL_SSL|SSL|PLAINTEXT (не рекомендуется)
+      sasl:
+        mechanism: ${KAFKA_SASL_MECHANISM:OAUTHBEARER} # или SCRAM-SHA-512
+        username: ${KAFKA_SASL_USERNAME:}
+        passwordRef: ${KAFKA_SASL_PASSWORD_REF:secret://kafka/sasl}
+        oauthOidcIssuer: ${KAFKA_OIDC_ISSUER:https://auth.example.org}
+        oauthClientId: ${KAFKA_OIDC_CLIENT_ID:datafabric-core}
+        oauthClientSecretRef: ${KAFKA_OIDC_CLIENT_SECRET_REF:secret://kafka/oidc/client}
+      tls:
+        enabled: true
+        insecureSkipVerify: ${KAFKA_TLS_INSECURE:false}
+        caPath: ${KAFKA_CA_PATH:/etc/ssl/certs/ca-bundle.crt}
+    producer:
+      acks: all
+      enableIdempotence: true
+      maxInFlight: 5
+      retries: 10
+      compression: zstd
+    consumer:
+      isolationLevel: read_committed
+      autoOffsetReset: earliest
+      maxPollRecords: 500
+    topics:
+      enforceAcls: true
+      defaults:
+        replicationFactor: 3
+        partitions: 6
+        retentionHours: 168
+        minInsyncReplicas: 2
+
+objectStorage:
+  s3:
+    endpoint: ${S3_ENDPOINT:https://s3.amazonaws.com}
+    bucket: ${S3_BUCKET:datafabric}
+    region: ${AWS_REGION:us-east-1}
+    sse:
+      enabled: true
+      algorithm: aws:kms
+      keyArn: ${KMS_KEY_ARN:?KMS key required}
+    publicAccessBlock: true
+    signedUrls:
+      enabled: true
+      ttlSeconds: 600
+    pathStyle: ${S3_PATH_STYLE:false}
+
+webhooks:
+  inbound:
+    signature:
+      algorithm: HMAC-SHA256
+      keyRef: ${WEBHOOK_SIGNING_KEY_REF:secret://webhook}
+      toleranceSeconds: 300
+    ipAllowList: ${WEBHOOK_IP_ALLOW:}
+  outbound:
+    retryPolicy:
+      attempts: 6
+      baseDelayMs: 200
+      maxDelayMs: 10000
+    tls:
+      minVersion: TLS1.2
+
+observability:
+  logging:
+    level: ${LOG_LEVEL:info}
+    json: true
+    scrub:
+      keys: ["password","token","secret","authorization","cookie"]
+  tracing:
+    enabled: true
+    sampler: parentbased_traceidratio
+    ratio: 0.1
+    propagators: ["tracecontext","baggage","b3multi"]
+  metrics:
+    enabled: true
+    export: otlp
+    otlpEndpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://otel-collector:4318}
+    tlsInsecure: ${OTEL_EXPORTER_TLS_INSECURE:true}
+
+runtimeProtection:
+  http:
+    maxRequestBodyBytes: ${HTTP_MAX_BODY:10485760}
+    maxHeaderBytes: 16384
+    rejectOnUnknownContentType: false
+  uploads:
+    allowedContentTypes: ["text/csv","application/json","application/octet-stream"]
+    malwareScan:
+      enabled: ${MALWARE_SCAN_ENABLED:false}
+      provider: ${MALWARE_PROVIDER:clamav}
+      maxFileSizeBytes: 52428800
+  features:
+    dangerousOpsDisabled: true
+    sqlSafeMode: true
+
+dependencyPolicy:
+  vulnerabilityThreshold:
+    severity: high
+    action: block
+  allowListPackages: []
+  denyListPackages: []
+  sbom:
+    requiredAtStartup: ${SBOM_REQUIRED:false}
+    path: ${SBOM_PATH:/app/sbom/sbom-syft.spdx.json}
+
+startupChecks:
+  require:
+    - secrets.provider
+    - crypto.kms
+    - auth.jwt
+    - database.postgres
+    - broker.kafka
+  failFast: true
+  readinessTimeoutSeconds: 60

@@ -1,0 +1,3 @@
+# gateway-core
+
+Project Documentation

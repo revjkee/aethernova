@@ -1,0 +1,263 @@
+# core-systems/zero-trust-core/ops/k8s/base/prometheus-rules.yaml
+# Production-grade Prometheus rules for zero-trust-core
+# - Recording rules for common KPIs
+# - Alerting rules with sensible thresholds and 'for' durations
+# - Labels: severity, team, runbook
+#
+# NOTE: Metric names used here (example: zero_trust_auth_failed_total, zero_trust_queue_depth)
+# should be provided by your exporters / app instrumentation. I cannot verify this.
+
+groups:
+  - name: zero_trust_recording_rules
+    interval: 30s
+    rules:
+      # Request rate per instance
+      - record: zero_trust:requests:rate5m
+        expr: sum by(instance) (rate(http_requests_total{job="zero-trust-core"}[5m]))
+      - record: zero_trust:requests:rate1m
+        expr: sum by(instance) (rate(http_requests_total{job="zero-trust-core"}[1m]))
+
+      # Error rate (5xx)
+      - record: zero_trust:errors:rate5m
+        expr: sum by(instance) (rate(http_requests_total{job="zero-trust-core", code=~"5.."}[5m]))
+
+      # Fraction of 5xx
+      - record: zero_trust:error_ratio:5m
+        expr: (sum by(instance) (rate(http_requests_total{job="zero-trust-core", code=~"5.."}[5m]))
+               / clamp_min(sum by(instance) (rate(http_requests_total{job="zero-trust-core"}[5m])), 1e-9))
+
+      # Auth failures rate
+      - record: zero_trust:auth_failures:rate5m
+        expr: sum by(instance) (rate(zero_trust_auth_failed_total{job="zero-trust-core"}[5m]))
+
+      # Token misuse rate (per token subject)
+      - record: zero_trust:token_use_rate:5m
+        expr: sum by(subject) (rate(zero_trust_token_usage_total{job="zero-trust-core"}[5m]))
+
+      # Queue depth
+      - record: zero_trust:queue_depth
+        expr: max(zero_trust_queue_depth{job="zero-trust-core"}) or vector(0)
+
+      # Container resource usage (node-local metrics expected)
+      - record: zero_trust:cpu_usage:rate1m
+        expr: sum by(instance) (rate(container_cpu_usage_seconds_total{pod=~"zero-trust-core.*"}[1m]))
+      - record: zero_trust:memory_bytes
+        expr: sum by(instance) (container_memory_working_set_bytes{pod=~"zero-trust-core.*"})
+
+  - name: zero_trust_alerts_high
+    interval: 30s
+    rules:
+      # Service down
+      - alert: ZeroTrustServiceDown
+        expr: up{job="zero-trust-core"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: security
+          service: zero-trust-core
+        annotations:
+          summary: "zero-trust-core instance(s) down"
+          description: "No scrape target 'zero-trust-core' is up for >2m. Check pods, node and service discovery."
+          runbook: "https://runbooks.example.com/zero-trust/ServiceDown"
+
+      # High error ratio (5xx) across instances
+      - alert: ZeroTrustHighErrorRate
+        expr: avg_over_time(zero_trust:error_ratio:5m[10m]) > 0.05
+        for: 5m
+        labels:
+          severity: high
+          team: security
+          service: zero-trust-core
+        annotations:
+          summary: "High 5xx rate in zero-trust-core"
+          description: "Average 5xx fraction >5% during last 10m. Investigate recent deploys, upstream failures, exceptions."
+          runbook: "https://runbooks.example.com/zero-trust/HighErrorRate"
+
+      # Spike in auth failures (possible brute force or misconfiguration)
+      - alert: ZeroTrustAuthFailuresSpike
+        expr: increase(zero_trust_auth_failed_total{job="zero-trust-core"}[5m]) > 100
+        for: 2m
+        labels:
+          severity: critical
+          team: security
+          service: zero-trust-core
+        annotations:
+          summary: "Spike in authentication failures"
+          description: "More than 100 authentication failures in 5m. Could be brute-force or integration misconfiguration."
+          runbook: "https://runbooks.example.com/zero-trust/AuthFailuresSpike"
+
+      # Sustained suspicious JWT verification failures
+      - alert: ZeroTrustJWTVerificationFailures
+        expr: rate(zero_trust_jwt_verify_failures_total{job="zero-trust-core"}[5m]) > 10
+        for: 5m
+        labels:
+          severity: high
+          team: security
+        annotations:
+          summary: "JWT verification failures exceed threshold"
+          description: "JWT verification failures >10/s over 5m. Check identity provider and token signature keys."
+          runbook: "https://runbooks.example.com/zero-trust/JWTFailures"
+
+      # Excessive token reuse (possible token theft)
+      - alert: ZeroTrustTokenReuseHigh
+        expr: max by(subject) (increase(zero_trust_token_usage_total[10m])) > 100
+        for: 10m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "High token usage for a single subject"
+          description: "A single subject shows >100 token uses in 10m. Possible token compromise."
+          runbook: "https://runbooks.example.com/zero-trust/TokenReuse"
+
+      # Queue depth too high (backpressure / consumer lag)
+      - alert: ZeroTrustQueueDepthHigh
+        expr: zero_trust:queue_depth > 1000
+        for: 3m
+        labels:
+          severity: high
+          team: platform
+        annotations:
+          summary: "High internal queue depth in zero-trust-core"
+          description: "Queue depth exceeded 1000 for >3m. Investigate downstream consumers and DB latencies."
+          runbook: "https://runbooks.example.com/zero-trust/QueueDepth"
+
+      # Pod crashloop / container restart storm
+      - alert: ZeroTrustPodCrashLooping
+        expr: increase(kube_pod_container_status_restarts_total{namespace=~"^avm.*", pod=~"zero-trust-core.*"}[15m]) > 5
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "zero-trust-core pods restarting heavily"
+          description: "Container restarts >5 in 15m. Could be crashloop or OOM. Check logs and OOMKilled events."
+          runbook: "https://runbooks.example.com/zero-trust/PodCrashLoop"
+
+      # High CPU or memory pressure on zero-trust-core pods
+      - alert: ZeroTrustHighCPU
+        expr: zero_trust:cpu_usage:rate1m > 0.9
+        for: 5m
+        labels:
+          severity: high
+          team: platform
+        annotations:
+          summary: "High CPU usage by zero-trust-core"
+          description: "CPU usage >90% sustained for 5m. Investigate hot loops, GC, or misconfiguration."
+          runbook: "https://runbooks.example.com/zero-trust/HighCPU"
+
+      - alert: ZeroTrustHighMemoryUsage
+        expr: zero_trust:memory_bytes / 1024 / 1024 > (node_memory_MemTotal_bytes{job="node-exporter"} / (1024*1024) * 0.9)
+        for: 5m
+        labels:
+          severity: high
+          team: platform
+        annotations:
+          summary: "High memory usage by zero-trust-core"
+          description: "Memory usage nearing node capacity; consider OOM or memory leak."
+          runbook: "https://runbooks.example.com/zero-trust/HighMemory"
+
+  - name: zero_trust_alerts_security
+    interval: 30s
+    rules:
+      # Policy engine blocking spike (mass enforcement)
+      - alert: ZeroTrustPolicyBlockSpike
+        expr: increase(security_core_blocked_total{job="security-core"}[5m]) > 50
+        for: 3m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "Spike in policy engine blocks"
+          description: "security-core blocked >50 actions in 5m. Could indicate mis-deploy or attack."
+          runbook: "https://runbooks.example.com/zero-trust/PolicyBlockSpike"
+
+      # Secret exfiltration detection (application emits explicit metric)
+      - alert: ZeroTrustSecretLeakDetected
+        expr: increase(zero_trust_secret_leak_alerts_total{job="zero-trust-core"}[1m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "Potential secret leak detected by runtime"
+          description: "Runtime detected secret-like patterns in payloads/logs. Immediate investigation required."
+          runbook: "https://runbooks.example.com/zero-trust/SecretLeak"
+
+      # Egress to blocked domains / suspicious outbound connections
+      - alert: ZeroTrustEgressToBlockedDomains
+        expr: increase(egress_requests_total{job="zero-trust-core", blocked="true"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          team: network-security
+        annotations:
+          summary: "Egress to blocked domains detected"
+          description: "Outbound requests to denylisted domains detected. Could indicate data exfiltration."
+          runbook: "https://runbooks.example.com/zero-trust/EgressBlocked"
+
+      # Certificate expiry (cert_exporter or app provides cert_expiry_seconds)
+      - alert: ZeroTrustCertificateExpiringSoon
+        expr: cert_expiry_seconds{job=~"cert-exporter|zero-trust-core"} < 86400
+        for: 0m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "Certificate expiring within 24h"
+          description: "Certificate expiry is less than 24h. Renew immediately or rotate certs."
+          runbook: "https://runbooks.example.com/zero-trust/CertExpiry"
+
+      # Vulnerable image detected (image scanner provides metric)
+      - alert: ZeroTrustImageVulnerable
+        expr: container_image_vulnerabilities_critical{job="image-scanner", namespace=~"avm.*"} > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: platform-security
+        annotations:
+          summary: "Critical vulnerabilities in deployed image"
+          description: "Image scanner reported critical vulnerabilities in running image. Quarantine and remediate."
+          runbook: "https://runbooks.example.com/zero-trust/ImageVulnerable"
+
+  - name: zero_trust_alerts_operational
+    interval: 30s
+    rules:
+      # High deploy/rollout failure (k8s deployment unavailable)
+      - alert: ZeroTrustDeploymentUnavailable
+        expr: kube_deployment_status_replicas_unavailable{namespace=~"^avm.*", deployment=~"zero-trust-core.*"} > 0
+        for: 3m
+        labels:
+          severity: high
+          team: platform
+        annotations:
+          summary: "Deployment has unavailable replicas"
+          description: "One or more replicas of zero-trust-core deployment are unavailable."
+          runbook: "https://runbooks.example.com/zero-trust/DeploymentUnavailable"
+
+      # Prometheus target scrape errors (high scrape_failures)
+      - alert: ZeroTrustPrometheusScrapeFailures
+        expr: increase(prometheus_target_interval_length_seconds_count{job="prometheus", job=~"zero-trust-core"}[10m]) > 5
+        for: 10m
+        labels:
+          severity: warning
+          team: observability
+        annotations:
+          summary: "Prometheus scrape failures for zero-trust-core"
+          description: "Multiple scrape failures occurred for zero-trust-core metrics."
+          runbook: "https://runbooks.example.com/zero-trust/ScrapeFailures"
+
+      # High latency for critical API endpoints (example: /auth)
+      - alert: ZeroTrustHighLatencyAuthAPI
+        expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="zero-trust-core", handler=~"/auth.*"}[5m])) by (le,instance))
+               > 1.5
+        for: 5m
+        labels:
+          severity: high
+          team: platform
+        annotations:
+          summary: "Auth API latency high (p95 > 1.5s)"
+          description: "Authentication endpoint latency p95 above 1.5s for 5m."
+          runbook: "https://runbooks.example.com/zero-trust/HighLatencyAuth"
+
+# End of file

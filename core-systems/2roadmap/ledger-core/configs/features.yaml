@@ -1,0 +1,267 @@
+# ledger-core/ops/configs/features.yaml
+# Feature Flags Catalog for ledger-core
+# Schema supports server-side evaluation with context:
+#   env: dev|staging|prod
+#   component: api|worker|migration
+#   user / account / tenant: ID strings
+#   tags: arbitrary labels (e.g., beta_tester, canary)
+# All times are UTC ISO8601. Percentages are [0..100].
+
+schema:
+  version: 1
+  updatedAt: "2025-08-15T00:00:00Z"
+  owner: data-platform@company.example
+  defaults:
+    # Client-side caching hints
+    clientCacheTTLSeconds: 300
+    # What to do on evaluation error: return "off" for booleans, "control" for multivariants
+    failOpenStrategy: "safe_off"
+    # Telemetry routing keys (metrics labels)
+    telemetry:
+      app: ledger-core
+      domain: feature_flags
+  environments:
+    - dev
+    - staging
+    - prod
+  components:
+    - api
+    - worker
+    - migration
+
+policies:
+  evaluationOrder: [overrides, scheduled, dependencies, rules, default]
+  # If dependencies unmet: force off unless allowPartial=true in a flag
+  unmetDependency: "force_off"
+  # Global emergency kill-switch list (evaluated first)
+  globalKillSwitches: []
+
+flags:
+
+  # 1) Read-only mode for maintenance windows
+  readonly_mode:
+    type: boolean
+    description: Put API into read-only mode: disallow mutating endpoints
+    owner: sre@company.example
+    tags: [safety, maintenance]
+    default: false
+    dependencies: []  # none
+    allowPartial: false
+    schedules:
+      - id: maint-2025-08
+        active: true
+        window:
+          start: "2025-08-20T22:00:00Z"
+          end:   "2025-08-20T23:30:00Z"
+        rules:
+          - match:
+              env: ["prod"]
+              component: ["api"]
+            set: true
+    overrides:
+      - match:
+          env: ["staging"]
+        set: false
+    rules:
+      - match:
+          env: ["dev"]
+        set: false
+
+  # 2) Gradual rollout of a new rating engine
+  rating_engine_v2:
+    type: gradual
+    description: New pricing engine with vectorized rules
+    owner: core-team@company.example
+    tags: [canary, performance]
+    default: false
+    hashBy: tenant # hashing field used for % rollout determinism
+    dependencies:
+      - flag: feature_store_online
+        requiredState: true
+    rollout:
+      # Progressive per environment
+      dev:
+        - percent: 100
+          since: "2025-08-01T00:00:00Z"
+      staging:
+        - percent: 25
+          since: "2025-08-10T00:00:00Z"
+        - percent: 50
+          since: "2025-08-12T00:00:00Z"
+        - percent: 100
+          since: "2025-08-15T00:00:00Z"
+      prod:
+        - percent: 5
+          since: "2025-08-18T08:00:00Z"
+        - percent: 20
+          since: "2025-08-20T08:00:00Z"
+        - percent: 50
+          since: "2025-08-22T08:00:00Z"
+        - percent: 100
+          since: "2025-08-25T08:00:00Z"
+    rules:
+      - match:
+          env: ["prod", "staging"]
+          tags: ["beta_tester", "canary"]
+        set: true
+      - match:
+          env: ["prod"]
+          tenant: ["tenant-demo-001", "tenant-internal-ops"]
+        set: true
+    overrides: []
+    telemetry:
+      counters:
+        on: rating_engine_v2_enabled_total
+        off: rating_engine_v2_disabled_total
+
+  # 3) Multi-variant experiment on batching size
+  worker_batch_size:
+    type: multivariant
+    description: Tune worker batch size for throughput/latency trade-off
+    owner: platform@company.example
+    tags: [experiment, worker]
+    default: control
+    variants:
+      control: { value: 50,  weight: 40 }
+      b100:    { value: 100, weight: 30 }
+      b200:    { value: 200, weight: 20 }
+      b400:    { value: 400, weight: 10 }
+    hashBy: account
+    constraints:
+      component: ["worker"]
+    rules:
+      - match:
+          env: ["dev"]
+        set: b100
+      - match:
+          env: ["staging"]
+        trafficSplit:
+          control: 50
+          b100: 30
+          b200: 20
+    overrides:
+      - match:
+          env: ["prod"]
+          tags: ["hot_partition_incident"]
+        set: control
+    telemetry:
+      histogram: worker_batch_size_selected
+    notes: Adjust CPU/memory requests accordingly in HPA targets
+
+  # 4) Config flag – externalized endpoints and thresholds
+  external_io_config:
+    type: config
+    description: External endpoints and timeouts for integrations
+    owner: integrations@company.example
+    default:
+      http:
+        timeoutMs: 1500
+        retry:
+          attempts: 2
+          backoffMs: 200
+      partners:
+        kyc:
+          baseUrl: "https://kyc.svc.local"
+          timeoutMs: 2000
+        scoring:
+          baseUrl: "https://scoring.svc.local"
+          timeoutMs: 2500
+    rules:
+      - match:
+          env: ["prod"]
+        set:
+          http:
+            timeoutMs: 1200
+            retry: { attempts: 3, backoffMs: 150 }
+      - match:
+          env: ["staging"]
+        set:
+          partners:
+            kyc: { baseUrl: "https://kyc.stg.svc.local", timeoutMs: 1800 }
+            scoring: { baseUrl: "https://scoring.stg.svc.local", timeoutMs: 2000 }
+
+  # 5) Kill-switch for outbound writes
+  writes_kill_switch:
+    type: boolean
+    description: Global kill switch to block outbound writes in emergencies
+    owner: sre@company.example
+    default: false
+    overrides: []
+    rules:
+      - match:
+          env: ["prod"]
+          component: ["api", "worker"]
+          tags: ["incident_mode"]
+        set: true
+
+  # 6) Feature store online dependency
+  feature_store_online:
+    type: boolean
+    description: Gate for online feature store dependency
+    owner: ml-platform@company.example
+    default: false
+    rules:
+      - match:
+          env: ["dev", "staging"]
+        set: true
+      - match:
+          env: ["prod"]
+          tags: ["canary"]
+        set: true
+
+  # 7) GDPR export pipeline toggle
+  gdpr_export_v2:
+    type: boolean
+    description: New GDPR export with streaming s3 sink
+    owner: governance@company.example
+    default: false
+    constraints:
+      component: ["worker"]
+    dependencies:
+      - flag: writes_kill_switch
+        requiredState: false
+    rollout:
+      prod:
+        - percent: 10
+          since: "2025-08-21T09:00:00Z"
+        - percent: 100
+          since: "2025-08-28T09:00:00Z"
+    rules:
+      - match:
+          env: ["staging"]
+        set: true
+
+# Priority overrides by identities (evaluated first)
+identityOverrides:
+  users:
+    # Example: force-enable a flag for a specific user for debugging
+    - id: "user-000-admin"
+      set:
+        rating_engine_v2: true
+        worker_batch_size: b200
+  tenants:
+    - id: "tenant-a1b2c3"
+      set:
+        readonly_mode: false
+        external_io_config:
+          http:
+            timeoutMs: 900
+
+auditing:
+  changeLog:
+    enabled: true
+    destination: "otlp"  # or "stdout", "s3"
+  requiredReview:
+    prod: 2  # two reviewers for prod changes
+  signatures:
+    required: true
+
+validation:
+  # Built-in validators to run in CI
+  rules:
+    - kind: dependency
+      description: All dependencies must exist and avoid cycles
+    - kind: type_safety
+      description: Variant values must conform to declared type
+    - kind: schedule_bounds
+      description: All schedules must have start < end

@@ -1,0 +1,324 @@
+# datafabric-core/configs/policies/dlp.yaml
+version: 1
+policyId: "datafabric-core-dlp"
+metadata:
+  owner: "security@company.example"
+  env: "prod"
+  updatedAt: "2025-08-14"
+  description: "Политика DLP: PII/PCI/PHI/Secrets для всех каналов Datafabric Core"
+
+mode:
+  # Глобальный режим: monitor|enforce
+  default: "enforce"
+  perChannel:
+    http_api: "enforce"
+    kafka_ingest: "monitor"     # канареечный режим
+    file_import: "enforce"
+    audit_sink: "monitor"
+
+limits:
+  maxPayloadBytes: 10485760         # 10 MiB
+  maxFindingsPerItem: 100
+  sampling:
+    enabled: true
+    probability: 0.1                # для высоконагруженных топиков
+
+observability:
+  metrics:
+    enabled: true
+    namespace: "datafabric.dlp"
+  logging:
+    level: "INFO"
+    sampleRate: 0.2
+  redactInLogs: true
+
+# ---------- Детекторы ----------
+detectors:
+  regex:
+    # ИНН/паспорт/телефон и пр. — примеры, уточняйте под юрисдикции
+    PHONE_INTL:
+      pattern: "\\b\\+?[1-9]\\d{1,14}\\b"
+      flags: ["UNICODE"]
+    EMAIL:
+      pattern: "(?i)\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,63}\\b"
+      flags: ["UNICODE"]
+    CREDIT_CARD:
+      pattern: "\\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\\d{3})\\d{11})\\b"
+      postValidate: "luhn"
+    IBAN:
+      pattern: "\\b[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}\\b"
+    PASSPORT_RU:
+      pattern: "\\b\\d{2}\\s?\\d{2}\\s?\\d{6}\\b"
+    SNILS_RU:
+      pattern: "\\b\\d{3}-\\d{3}-\\d{3}\\s?\\d{2}\\b"
+      postValidate: "snilsChecksum"
+    JWT:
+      pattern: "\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9._-]+\\.[A-Za-z0-9_-]+\\b"
+    AWS_ACCESS_KEY_ID:
+      pattern: "\\bAKIA[0-9A-Z]{16}\\b"
+    AWS_SECRET_ACCESS_KEY:
+      pattern: "(?i)\\baws(.{0,10})?(secret|sk|secret_access_key)\\b[:=\\s]*[A-Za-z0-9/+=]{40}\\b"
+    PRIVATE_KEY_BLOCK:
+      pattern: "-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+    IPV4:
+      pattern: "\\b(?:(?:2(?:5[0-5]|[0-4]\\d))|(?:1?\\d?\\d))(?:\\.(?:(?:2(?:5[0-5]|[0-4]\\d))|(?:1?\\d?\\d))){3}\\b"
+    DATE_ISO:
+      pattern: "\\b\\d{4}-\\d{2}-\\d{2}\\b"
+  dictionary:
+    PII_NAMES_COMMON:
+      # Сокращённый пример; расширяйте из корпоративного словаря
+      entries: ["александр","мария","иван","екатерина","анна","сергей","john","maria","peter","anna"]
+      caseSensitive: false
+      wordBoundary: true
+  ml:
+    PERSON_NAME:
+      provider: "builtin"
+      locale: ["ru","en"]
+    ADDRESS:
+      provider: "builtin"
+      locale: ["ru","en"]
+
+# ---------- Классы данных ----------
+classes:
+  PII_BASIC:
+    severity: "medium"
+    detectors:
+      - { type: "regex", ref: "EMAIL", weight: 1 }
+      - { type: "regex", ref: "PHONE_INTL", weight: 1 }
+      - { type: "ml", ref: "PERSON_NAME", weight: 1, minConfidence: 0.7 }
+    minEvidence: 1
+    context:
+      windows: [40, 40]
+      anchors: ["name","email","phone","телефон","почта"]
+  PII_STRICT:
+    severity: "high"
+    detectors:
+      - { type: "regex", ref: "PASSPORT_RU", weight: 2 }
+      - { type: "regex", ref: "SNILS_RU", weight: 2 }
+      - { type: "regex", ref: "IBAN", weight: 2 }
+    minEvidence: 1
+  PCI_CARD:
+    severity: "critical"
+    detectors:
+      - { type: "regex", ref: "CREDIT_CARD", weight: 3, minConfidence: 0.9 }
+    minEvidence: 1
+    validators: ["luhn"]
+  CREDENTIALS:
+    severity: "critical"
+    detectors:
+      - { type: "regex", ref: "AWS_ACCESS_KEY_ID", weight: 2 }
+      - { type: "regex", ref: "AWS_SECRET_ACCESS_KEY", weight: 3 }
+      - { type: "regex", ref: "PRIVATE_KEY_BLOCK", weight: 3 }
+      - { type: "regex", ref: "JWT", weight: 2 }
+    minEvidence: 1
+  PHI_BASIC:
+    severity: "high"
+    detectors:
+      - { type: "dictionary", ref: "PII_NAMES_COMMON", weight: 1 }
+      - { type: "regex", ref: "DATE_ISO", weight: 1 }
+    minEvidence: 2
+    context:
+      anchors: ["diagnosis","диагноз","medical","медицин", "patient","пациент"]
+
+# ---------- Действия ----------
+actions:
+  mask:
+    strategy: "mask"
+    params:
+      visibleStart: 2
+      visibleEnd: 2
+      maskChar: "*"
+  hash:
+    strategy: "hash"
+    params:
+      algorithm: "sha256"
+      saltEnv: "DLP_SALT"     # берётся из окружения/секрета
+  redact:
+    strategy: "redact"
+    params:
+      replacement: "[REDACTED]"
+  deny:
+    strategy: "deny"
+  route_dlq:
+    strategy: "route"
+    params:
+      destination: "kafka:df.dlq"
+  annotate:
+    strategy: "annotate"
+    params:
+      field: "_dlpFindings"
+
+# ---------- Правила (приоритет сверху вниз) ----------
+rules:
+  - id: "R-001-secrets-block"
+    description: "Блокировать утечку секретов/ключей"
+    appliesTo: ["http_api","kafka_ingest","file_import"]
+    when:
+      anyClass: ["CREDENTIALS"]
+    then:
+      - action: "deny"
+      - action: "route_dlq"
+      - action: "annotate"
+    severityOverride: "critical"
+
+  - id: "R-002-pci-mask-enforce"
+    description: "PCI PAN — маскировать и запрещать хранение в payload"
+    appliesTo: ["http_api","kafka_ingest","file_import"]
+    when:
+      anyClass: ["PCI_CARD"]
+    then:
+      - action: "mask"
+      - action: "annotate"
+    storage:
+      allowPersist: false
+    severityOverride: "critical"
+
+  - id: "R-003-pii-strict-redact"
+    description: "Строгая PII — редактирование"
+    appliesTo: ["http_api","kafka_ingest","file_import"]
+    when:
+      anyClass: ["PII_STRICT"]
+    then:
+      - action: "redact"
+      - action: "annotate"
+
+  - id: "R-004-pii-basic-hash-in-logs"
+    description: "Базовая PII — хэшируем при логировании, оставляем в обработке"
+    appliesTo: ["http_api","kafka_ingest"]
+    when:
+      anyClass: ["PII_BASIC","PHI_BASIC"]
+    then:
+      - action: "hash"
+      - action: "annotate"
+
+  - id: "R-005-context-allow-billing"
+    description: "Разрешить IBAN в доверенном биллинговом сервисе"
+    appliesTo: ["http_api","kafka_ingest"]
+    when:
+      all:
+        - class: "PII_STRICT"
+        - context:
+            header:
+              X-Service-Name: ["billing-api"]
+            pathPrefix: ["/v1/payments","/v1/payouts"]
+    then:
+      - action: "annotate"
+    modeOverride: "monitor"
+
+  - id: "R-006-deid-analytics"
+    description: "Анонимизация PII для аналитики"
+    appliesTo: ["kafka_ingest","file_import"]
+    when:
+      anyClass: ["PII_BASIC","PII_STRICT","PHI_BASIC"]
+      context:
+        topic: ["df.events","df.analytics"]
+    then:
+      - action: "hash"
+      - action: "annotate"
+
+# ---------- Исключения и доверенные зоны ----------
+exemptions:
+  trustedServices:
+    - name: "ledger-api"
+      channels: ["http_api"]
+      methods: ["POST","PUT"]
+      paths: ["/v1/anchor/*"]
+      expiresAt: "2026-01-01"
+  fields:
+    # Разрешённые поля с PII‑семантикой, проходящие без модификации
+    - path: "$.user.consentGiven"   # булев флаг согласия
+    - path: "$.billing.ibanMasked"  # заранее маскировано
+  dataResidency:
+    euOnly: true
+
+# ---------- Каналы и источники ----------
+channels:
+  http_api:
+    bodyPaths:
+      json:
+        include: ["$"]
+        exclude: ["$.files[*].content"]   # бинарные вложения
+    headers:
+      inspect: ["authorization","x-request-id"]
+      redact:
+        - name: "authorization"
+          action: "redact"
+  kafka_ingest:
+    topics:
+      include: ["df.*"]
+      exclude: ["df.metrics"]
+    valueFormat: "json"
+  file_import:
+    filetypes:
+      include: ["application/json","text/csv","text/plain"]
+      maxFileBytes: 52428800
+      lineByLine: true
+
+# ---------- Пост‑обработка ----------
+postProcessing:
+  annotatePayload: true
+  annotationField: "_dlp"
+  includeFindingsSnapshot: true
+  keepOriginalOnDeny: false
+
+# ---------- Аудит и уведомления ----------
+audit:
+  enabled: true
+  sink:
+    type: "http"
+    endpoint: "${AUDIT_ENDPOINT:-https://audit.example.com/api/dlp}"
+    headers:
+      Authorization: "Bearer ${AUDIT_TOKEN:-}"
+  notify:
+    severity:
+      critical:
+        snsTopicArn: "${DLP_SNS_CRITICAL_ARN:-}"
+      high:
+        snsTopicArn: "${DLP_SNS_HIGH_ARN:-}"
+    throttle:
+      perMinute: 60
+
+# ---------- Версионирование/канареечность ----------
+release:
+  canary:
+    enabled: true
+    match:
+      headers:
+        X-DLP-Canary: ["1"]
+      percentage: 10
+  rollbackOn:
+    errorRatePct: 5
+    falsePositiveSpikePct: 20
+
+# ---------- Тестовые кейсы (self-test) ----------
+tests:
+  - name: "cc-mask"
+    input:
+      channel: "http_api"
+      payload: { "cc": "4111111111111111" }
+    expect:
+      actions: ["mask","annotate"]
+      denied: false
+  - name: "aws-secret-deny"
+    input:
+      channel: "kafka_ingest"
+      payload: { "secret": "aws_secret_access_key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    expect:
+      actions: ["deny","route"]
+      denied: true
+  - name: "iban-allowed-billing"
+    input:
+      channel: "http_api"
+      headers: { "X-Service-Name": "billing-api" }
+      path: "/v1/payments/create"
+      payload: { "iban": "DE44500105175407324931" }
+    expect:
+      mode: "monitor"
+
+# ---------- Валидация ----------
+validation:
+  require:
+    - detectors.regex.CREDIT_CARD
+    - classes.PII_BASIC
+    - rules
+  maxRuleEvalMs: 50

@@ -1,0 +1,171 @@
+---
+# Настройка systemd-journald для omnimind-core
+# Предполагает наличие handler'ов:
+# - name: restart journald
+#     systemd:
+#       name: systemd-journald
+#       state: restarted
+#       daemon_reload: true
+#   listen: "journald configuration changed"
+
+- name: "Set journald defaults (sane) if not provided"
+  vars:
+    _defaults:
+      omnimind_journald_persistent: true
+      omnimind_journald_compress: true
+      omnimind_journald_seal: true
+      omnimind_journald_forward_to_syslog: false
+      omnimind_journald_forward_to_console: false
+      omnimind_journald_rate_limit_interval_sec: 30s
+      omnimind_journald_rate_limit_burst: 2000
+      omnimind_journald_system_max_use: 2G
+      omnimind_journald_system_keep_free: 512M
+      omnimind_journald_system_max_file_size: 128M
+      omnimind_journald_runtime_max_use: 512M
+      omnimind_journald_runtime_keep_free: 256M
+      omnimind_journald_max_retention_sec: ""     # пример: 14day; пусто = не задаём
+      omnimind_journald_max_file_sec: 1day
+      omnimind_journald_vacuum_enable: true
+      omnimind_journald_vacuum_size: 1G          # будет применено при vacuum_enable: true
+      omnimind_journald_vacuum_time: 14d         # будет применено при vacuum_enable: true
+      omnimind_journald_runtime_directory: "/run/log/journal"
+      omnimind_journald_persistent_directory: "/var/log/journal"
+      omnimind_journald_owner: "root"
+      omnimind_journald_group: "systemd-journal"
+      omnimind_journald_dir_mode: "2755"
+  set_fact:
+    "{{ item.key }}": "{{ hostvars[inventory_hostname][item.key] | default(item.value) }}"
+  loop: "{{ _defaults|dict2items }}"
+  tags: [journald, config]
+
+- name: "Ensure persistent journal directory exists (if enabled)"
+  file:
+    path: "{{ omnimind_journald_persistent_directory }}"
+    state: "{{ 'directory' if omnimind_journald_persistent else 'absent' }}"
+    owner: "{{ omnimind_journald_owner }}"
+    group: "{{ omnimind_journald_group }}"
+    mode: "{{ omnimind_journald_dir_mode }}"
+  tags: [journald, filesystem, config]
+
+- name: "Ensure runtime journal directory exists (best practice)"
+  file:
+    path: "{{ omnimind_journald_runtime_directory }}"
+    state: directory
+    owner: "{{ omnimind_journald_owner }}"
+    group: "{{ omnimind_journald_group }}"
+    mode: "{{ omnimind_journald_dir_mode }}"
+  tags: [journald, filesystem, config]
+
+- name: "Add current user to systemd-journal group (optional, when become_user is used)"
+  user:
+    name: "{{ ansible_user | default(lookup('env','USER')) }}"
+    groups: "systemd-journal"
+    append: true
+  when: ansible_user is defined
+  tags: [journald, access]
+
+- name: "Create journald drop-in directory"
+  file:
+    path: "/etc/systemd/journald.conf.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags: [journald, config]
+
+- name: "Render journald drop-in configuration"
+  copy:
+    dest: "/etc/systemd/journald.conf.d/omnimind.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (omnimind-core)
+      [Journal]
+      Storage={{ 'persistent' if omnimind_journald_persistent else 'auto' }}
+      Compress={{ 'yes' if omnimind_journald_compress else 'no' }}
+      Seal={{ 'yes' if omnimind_journald_seal else 'no' }}
+      ForwardToSyslog={{ 'yes' if omnimind_journald_forward_to_syslog else 'no' }}
+      ForwardToConsole={{ 'yes' if omnimind_journald_forward_to_console else 'no' }}
+
+      # Rate limiting
+      RateLimitIntervalSec={{ omnimind_journald_rate_limit_interval_sec }}
+      RateLimitBurst={{ omnimind_journald_rate_limit_burst }}
+
+      # System (persistent) limits
+      SystemMaxUse={{ omnimind_journald_system_max_use }}
+      SystemKeepFree={{ omnimind_journald_system_keep_free }}
+      SystemMaxFileSize={{ omnimind_journald_system_max_file_size }}
+
+      # Runtime (volatile) limits
+      RuntimeMaxUse={{ omnimind_journald_runtime_max_use }}
+      RuntimeKeepFree={{ omnimind_journald_runtime_keep_free }}
+
+      # Retention & rotation
+      {% if omnimind_journald_max_retention_sec|length > 0 %}
+      MaxRetentionSec={{ omnimind_journald_max_retention_sec }}
+      {% endif %}
+      MaxFileSec={{ omnimind_journald_max_file_sec }}
+  notify: "journald configuration changed"
+  tags: [journald, config]
+
+- name: "systemd daemon-reload (only if files changed)"
+  systemd:
+    daemon_reload: true
+  when: false  # reload делаем в handler при рестарте journald
+  tags: [journald]
+
+- name: "Validate journald configuration (dry check)"
+  command: "systemd-analyze cat-config systemd/journald.conf"
+  register: _journald_validate
+  changed_when: false
+  failed_when: _journald_validate.rc != 0
+  tags: [journald, validate]
+
+- name: "Restart journald safely via handler"
+  meta: flush_handlers
+  tags: [journald, service]
+
+- name: "Wait for journald socket after restart"
+  wait_for:
+    path: "/run/systemd/journal/socket"
+    timeout: 15
+  tags: [journald, service]
+
+- name: "Verify journald is active"
+  systemd:
+    name: systemd-journald
+    state: started
+    enabled: true
+  tags: [journald, service]
+
+- name: "Vacuum old journals by size"
+  command: "journalctl --vacuum-size={{ omnimind_journald_vacuum_size }}"
+  when: omnimind_journald_vacuum_enable | bool
+  changed_when: "'Freed' in _vac_size.stdout"
+  register: _vac_size
+  tags: [journald, vacuum, maintenance]
+
+- name: "Vacuum old journals by time"
+  command: "journalctl --vacuum-time={{ omnimind_journald_vacuum_time }}"
+  when: omnimind_journald_vacuum_enable | bool
+  changed_when: "'Freed' in _vac_time.stdout"
+  register: _vac_time
+  tags: [journald, vacuum, maintenance]
+
+- name: "Verify journal integrity (non-fatal)"
+  command: "journalctl --verify"
+  register: _journal_verify
+  changed_when: false
+  failed_when: false
+  tags: [journald, validate]
+
+- name: "Debug verification summary (optional)"
+  debug:
+    msg:
+      - "journald config validated: rc={{ _journald_validate.rc }}"
+      - "journalctl --verify rc={{ _journal_verify.rc }}"
+      - "vacuum-size: {{ _vac_size.stdout | default('n/a') | regex_replace('\\n',' ') }}"
+      - "vacuum-time: {{ _vac_time.stdout | default('n/a') | regex_replace('\\n',' ') }}"
+  when: ansible_verbosity | int >= 1
+  tags: [journald, validate]

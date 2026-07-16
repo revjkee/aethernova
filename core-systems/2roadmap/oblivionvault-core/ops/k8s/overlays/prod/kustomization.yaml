@@ -1,0 +1,302 @@
+# oblivionvault-core/ops/k8s/overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Пространство имён продакшена и единый префикс ресурсов
+namespace: oblivionvault-prod
+namePrefix: ov-
+
+# Базовые манифесты сервиса
+resources:
+  - ../../base
+  # Дополнительные объекты, если не входят в base:
+  - pdb.yaml
+  - hpa.yaml
+  - networkpolicy.yaml
+  - ingress.yaml
+  - servicemonitor.yaml
+
+# Единые метки и аннотации
+commonLabels:
+  app.kubernetes.io/name: oblivionvault-core
+  app.kubernetes.io/instance: oblivionvault-core
+  app.kubernetes.io/part-of: oblivionvault
+  app.kubernetes.io/component: api
+  app.kubernetes.io/environment: prod
+  app.kubernetes.io/managed-by: kustomize
+
+commonAnnotations:
+  contact: sre@your-domain.example
+  repo: https://git.example.com/oblivionvault-core
+  owner: platform-team
+  maintenance: "24x7"
+
+# Генераторы конфигурации и секретов (хеш в имени гарантирует rollout)
+generatorOptions:
+  disableNameSuffixHash: false
+  annotations:
+    reloader.stakater.com/match: "true"
+
+configMapGenerator:
+  - name: core-config
+    behavior: replace
+    literals:
+      - LOG_LEVEL=warn
+      - METRICS_ENABLED=true
+      - OTLP_ENABLED=true
+      - OTLP_INSECURE=false
+      - HEALTHCHECK_PATH=/health
+    # при необходимости: files: [app.yaml]
+  - name: core-env
+    behavior: merge
+    envs:
+      - env/prod.env
+
+secretGenerator:
+  - name: core-secrets
+    behavior: replace
+    type: Opaque
+    envs:
+      - secrets/prod.env
+  # для облачных провайдеров можно добавить другие secretGenerator с внешними провайдерами
+
+# Фиксация образа по репозиторию, тэгу и digest (digest имеет приоритет над тэгом)
+images:
+  - name: oblivionvault-core
+    newName: registry.example.com/oblivionvault/oblivionvault-core
+    newTag: v1.2.3
+    digest: sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+
+# Базовое количество реплик поверх base (kustomize replicas transformer)
+replicas:
+  - name: oblivionvault-core
+    kind: Deployment
+    count: 6
+
+# Единые лейблы/аннотации к объектам (включая селекторы)
+labels:
+  - includeSelectors: true
+    pairs:
+      tier: backend
+annotations:
+  - pairs:
+      prometheus.io/scrape: "true"
+      prometheus.io/path: /metrics
+      prometheus.io/port: "9464"
+
+# Стратегические патчи для продакшена
+patches:
+  # Service: строгий ClusterIP и аннотации Prometheus (если не в base)
+  - target:
+      version: v1
+      kind: Service
+      name: oblivionvault-core
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: oblivionvault-core
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9464"
+      spec:
+        type: ClusterIP
+        ports:
+          - name: http
+            port: 8080
+            targetPort: http
+
+  # Deployment: стратегия, ресурсы, securityContext, probes, spread, envFrom
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: oblivionvault-core
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: oblivionvault-core
+      spec:
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxSurge: 25%
+            maxUnavailable: 0
+        template:
+          metadata:
+            annotations:
+              # триггерить перезапуск при изменениях конфигов/секретов
+              checksum/config: "use-configmap-hash"
+          spec:
+            serviceAccountName: oblivionvault
+            automountServiceAccountToken: false
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 10001
+              runAsGroup: 10001
+              fsGroup: 10001
+              seccompProfile:
+                type: RuntimeDefault
+            topologySpreadConstraints:
+              - maxSkew: 1
+                topologyKey: topology.kubernetes.io/zone
+                whenUnsatisfiable: ScheduleAnyway
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: oblivionvault-core
+            containers:
+              - name: app
+                imagePullPolicy: IfNotPresent
+                ports:
+                  - name: http
+                    containerPort: 8080
+                envFrom:
+                  - configMapRef:
+                      name: core-config
+                  - configMapRef:
+                      name: core-env
+                  - secretRef:
+                      name: core-secrets
+                resources:
+                  requests:
+                    cpu: "500m"
+                    memory: "512Mi"
+                  limits:
+                    cpu: "2"
+                    memory: "1Gi"
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: http
+                  initialDelaySeconds: 20
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /ready
+                    port: http
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                startupProbe:
+                  httpGet:
+                    path: /health
+                    port: http
+                  periodSeconds: 2
+                  failureThreshold: 30
+                volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+            volumes:
+              - name: tmp
+                emptyDir:
+                  sizeLimit: 256Mi
+
+  # PodDisruptionBudget: сохраняем доступность при эвакуациях
+  - target:
+      version: policy/v1
+      kind: PodDisruptionBudget
+      name: oblivionvault-core
+    patch: |-
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: oblivionvault-core
+      spec:
+        minAvailable: 2
+
+  # HPA: автоскейл на CPU/Memory с продакшен-политиками поведения
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: oblivionvault-core
+    patch: |-
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: oblivionvault-core
+      spec:
+        minReplicas: 6
+        maxReplicas: 24
+        metrics:
+          - type: Resource
+            resource:
+              name: cpu
+              target:
+                type: Utilization
+                averageUtilization: 60
+          - type: Resource
+            resource:
+              name: memory
+              target:
+                type: Utilization
+                averageUtilization: 70
+        behavior:
+          scaleUp:
+            stabilizationWindowSeconds: 0
+            policies:
+              - type: Percent
+                value: 100
+                periodSeconds: 60
+          scaleDown:
+            stabilizationWindowSeconds: 300
+            policies:
+              - type: Percent
+                value: 50
+                periodSeconds: 60
+
+  # ServiceAccount: аннотации для облачных IAM-ролей (если требуется)
+  - target:
+      version: v1
+      kind: ServiceAccount
+      name: oblivionvault
+    patch: |-
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: oblivionvault
+        annotations:
+          eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ov-core
+          iam.gke.io/gcp-service-account: ov-core@project.iam.gserviceaccount.com
+
+  # Ingress: TLS и аннотации контроллера
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: oblivionvault-core
+    patch: |-
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: oblivionvault-core
+        annotations:
+          kubernetes.io/ingress.class: nginx
+          nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+          nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+          nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          cert-manager.io/cluster-issuer: letsencrypt
+      spec:
+        tls:
+          - hosts: [api.oblivionvault.example]
+            secretName: ov-core-tls
+        rules:
+          - host: api.oblivionvault.example
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: ov-oblivionvault-core
+                      port:
+                        number: 8080

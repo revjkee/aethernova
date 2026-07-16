@@ -1,0 +1,583 @@
+# cyberscurity-core quickstart configuration
+# Schema references:
+# - NIST SP 800-207 Zero Trust (policy enforcement, continuous verification)
+# - NIST SP 800-53 Rev.5 (AC, AU, CM, CP, IA, IR, RA, SC, SI control families)
+# - OWASP ASVS 5.0 (verification requirements for web/services)
+# - MITRE ATT&CK (tactics/techniques mapping for detections)
+# - CycloneDX (SBOM), SLSA (provenance), Sigstore Cosign (signing)
+schema_version: "1.0.0"
+kind: cybersecurity-core-config
+metadata:
+  name: "aethernova-cybersecurity-core"
+  description: "Industrial security baseline for services and pipelines (secure-by-default)."
+  owner: "security@aethernova.local"
+  timezone: "UTC"
+  labels:
+    project: "Aethernova"
+    domain: "platform-security-core"
+    environment: "dev"   # Overridden per-profile
+  attestation:
+    slsa_level: 3  # Supply-chain provenance target (SLSA v1 ladder)
+    sbom_format: "cyclonedx-json@1.6"
+    signing_tool: "cosign"
+    verification_enforced: true
+
+# -------- Anchors: common reusable blocks --------
+anchors:
+  logging: &common_logging
+    enabled: true
+    format: "ecs"            # Elastic Common Schema-like fields
+    level: "info"            # dev: info, stage: info, prod: warn
+    redact:
+      pii:
+        enabled: true
+        strategies: ["mask", "hash"]
+        fields:
+          - "user.email"
+          - "user.phone"
+          - "auth.token"
+      secrets:
+        enabled: true
+        patterns:
+          - "(?i)api[_-]?key"
+          - "(?i)secret"
+          - "(?i)password"
+    sinks:
+      stdout:
+        enabled: true
+      otlp:
+        enabled: true
+        endpoint: "http://otel-collector:4317"
+        timeout_s: 5
+      file:
+        enabled: false
+        path: "/var/log/app/app.log"
+    retention:
+      days: 14
+
+  tracing: &common_tracing
+    enabled: true
+    otlp:
+      endpoint: "http://otel-collector:4317"
+      protocol: "grpc"
+      timeout_s: 5
+    sampling:
+      # Lower in prod to reduce cost; head-based sampling
+      ratio: 0.2
+
+  metrics: &common_metrics
+    enabled: true
+    exporters:
+      otlp:
+        enabled: true
+        endpoint: "http://otel-collector:4317"
+      prometheus:
+        enabled: true
+        endpoint: ":9464"
+    runtime:
+      go_gc: true
+      process: true
+      system: true
+
+  alerting: &common_alerting
+    enabled: true
+    routes:
+      - name: "critical-p1"
+        matchers: { severity: "critical" }
+        targets:
+          slack:
+            enabled: true
+            webhook_url: "${SLACK_P1_WEBHOOK:?set-in-env}"
+          email:
+            enabled: true
+            to: ["soc@aethernova.local"]
+      - name: "high-p2"
+        matchers: { severity: "high" }
+        targets:
+          slack:
+            enabled: true
+            webhook_url: "${SLACK_P2_WEBHOOK:?set-in-env}"
+      - name: "default"
+        matchers: {}
+        targets:
+          webhook:
+            enabled: true
+            url: "https://alert-gateway.internal/v1/ingest"
+
+  siem: &common_siem
+    enabled: true
+    vendor: "generic"     # e.g., "splunk" | "elastic" | "chronicle" | "sentinel"
+    sinks:
+      http:
+        enabled: true
+        endpoint: "https://siem-ingest.internal/v1/events"
+        auth_header_env: "SIEM_TOKEN"
+        timeout_s: 5
+      syslog:
+        enabled: false
+        endpoint: "siem-syslog.internal:514"
+
+  policies: &common_policies
+    # Policy-as-code: OPA/Rego bundles and admission controls
+    opa:
+      enabled: true
+      bundles:
+        - name: "service-authz"
+          url: "https://policies.internal/bundles/service-authz.tar.gz"
+          polling_seconds: 300
+        - name: "k8s-admission"
+          url: "https://policies.internal/bundles/k8s-admission.tar.gz"
+          polling_seconds: 300
+    gatekeeper:
+      enabled: true
+      constraint_templates:
+        - "k8srequiredlabels"
+        - "k8suniqueingresshost"
+
+  authz: &common_authz
+    # Zero Trust policy: continuous verification per request
+    mode: "deny-by-default"
+    rbac:
+      enabled: true
+      roles:
+        - name: "service-reader"
+          permissions: ["GET:/v1/*", "GET:/healthz"]
+        - name: "service-writer"
+          permissions: ["POST:/v1/*", "PUT:/v1/*", "DELETE:/v1/*"]
+    abac:
+      enabled: true
+      attributes:
+        - key: "tenant"
+          strategy: "exact"
+        - key: "risk_score"
+          strategy: "gte"
+    pep:
+      # Policy Enforcement Point
+      type: "sidecar" # sidecar | library | gateway
+      fail_closed: true
+
+  authn: &common_authn
+    oidc:
+      enabled: true
+      issuer: "https://idp.internal/realms/aethernova"
+      audience: ["aethernova-api"]
+      jwks_uri: "https://idp.internal/realms/aethernova/protocol/openid-connect/certs"
+      clock_skew_s: 60
+    mtls:
+      enabled: true
+      ca_bundle: "/etc/ssl/certs/ca-bundle.crt"
+      require_san: true
+    session:
+      max_age_minutes: 30
+      idle_timeout_minutes: 10
+    passwordless:
+      webauthn:
+        enabled: false
+
+  crypto: &common_crypto
+    tls:
+      min_version: "1.2"
+      prefer_server_ciphers: true
+      ciphers:
+        - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+        - "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+        - "TLS_AES_256_GCM_SHA384"      # TLS 1.3
+        - "TLS_CHACHA20_POLY1305_SHA256" # TLS 1.3
+      hsts:
+        enabled: true
+        max_age_seconds: 31536000
+        include_subdomains: true
+        preload: false
+    jwt:
+      alg_allowlist: ["RS256", "ES256"]
+      reject_none_alg: true
+
+  network: &common_network
+    waf:
+      enabled: true
+      ruleset: "owasp-modsecurity-crs@4"
+      anomaly_threshold: 5
+    rate_limit:
+      enabled: true
+      default_rps: 50
+      burst: 100
+      per_route:
+        - route: "POST:/v1/login"
+          rps: 5
+          burst: 10
+    ddos:
+      enabled: true
+      provider: "edge"
+      modes: ["challenge", "rate-limit"]
+
+  secrets: &common_secrets
+    provider_order: ["vault", "aws-kms", "gcp-kms", "env"]
+    vault:
+      enabled: true
+      address: "https://vault.internal:8200"
+      auth_method: "kubernetes"
+      mount: "kv"
+      path_prefix: "aethernova/"
+      rotation_days: 30
+    aws_kms:
+      enabled: false
+      key_arn: ""
+    gcp_kms:
+      enabled: false
+      key_resource: ""
+    env:
+      enabled: true
+    seal_wrapping:
+      enabled: true
+
+  supply_chain: &common_supply_chain
+    sbom:
+      enabled: true
+      format: "cyclonedx-json"
+      include_licenses: true
+      include_hashes: true
+      output_path: "artifacts/sbom.cdx.json"
+    signing:
+      enabled: true
+      tool: "cosign"
+      identity: "https://fulcio.sigstore.dev"
+      rekor_url: "https://rekor.sigstore.dev"
+      verify_on_startup: true
+    provenance:
+      enabled: true
+      slsa:
+        level: 3
+        predicate: "slsa-provenance-v1"
+      attest_on:
+        - "build"
+        - "release"
+        - "deploy"
+
+  scanners: &common_scanners
+    sast:
+      enabled: true
+      tools: ["semgrep"]
+      severity_threshold: "high"
+      fail_on_threshold: true
+    sca:
+      enabled: true
+      tools: ["syft", "grype"]
+      allow_vuln_licenses: []
+      severity_threshold: "high"
+      fail_on_threshold: true
+    dast:
+      enabled: true
+      tools: ["zap"]
+      auth_context: "oidc"
+      fail_on_threshold: false
+    container:
+      enabled: true
+      tools: ["trivy"]
+      severity_threshold: "high"
+      fail_on_threshold: true
+      reject_latest_tag: true
+    iac:
+      enabled: true
+      tools: ["checkov"]
+      fail_on_threshold: true
+
+  runtime_security: &common_runtime_security
+    falco:
+      enabled: true
+      rules:
+        - "https://rules.internal/falco/ruleset.yaml"
+      notify:
+        via_alerting: true
+    ebpf:
+      enabled: true
+      syscall_capture: ["execve", "open", "connect"]
+      network_capture: true
+    k8s_audit:
+      enabled: true
+      sink: "otlp"
+    file_integrity:
+      enabled: true
+      paths:
+        - "/etc"
+        - "/usr/local/bin"
+      hash: "sha256"
+
+  discovery_response: &common_discovery_response
+    # For well-known discovery endpoints (e.g., /.well-known/security.txt)
+    security_txt:
+      enabled: true
+      contact: "mailto:security@aethernova.local"
+      policy: "https://aethernova.local/security/policy"
+      preferred_languages: ["en", "ru"]
+      acknowledgments: "https://aethernova.local/security/hall-of-fame"
+
+  compliance: &common_compliance
+    frameworks:
+      nist_800_53_rev5:
+        enabled: true
+        controls:
+          - "AC-2"
+          - "AC-3"
+          - "AC-6"
+          - "AU-2"
+          - "AU-6"
+          - "IA-2"
+          - "IR-4"
+          - "RA-5"
+          - "SC-7"
+          - "SI-4"
+      owasp_asvs_5:
+        enabled: true
+        levels: [1, 2]   # target levels
+      soc2:
+        enabled: false
+      iso_27001:
+        enabled: false
+
+  detections: &common_detections
+    # Rule metadata aligned to MITRE ATT&CK (enterprise)
+    rules:
+      - id: "AUTH-FAILED-BRUTE"
+        name: "Auth brute-force suspected"
+        match:
+          event_type: "auth"
+          where:
+            - "failed_attempts >= 5 in 1m by ip"
+        severity: "high"
+        mitre:
+          tactic: "Credential Access"
+          technique: "Brute Force"
+          ids: ["T1110"]
+      - id: "PRIV-ESC-EXECVE"
+        name: "Potential privilege escalation via exec"
+        match:
+          event_type: "process"
+          where:
+            - "execve parent=/usr/bin/sudo child=/bin/sh"
+        severity: "critical"
+        mitre:
+          tactic: "Privilege Escalation"
+          technique: "Abuse Elevation Control Mechanism"
+          ids: ["T1548"]
+      - id: "DATA-EXFIL-NET"
+        name: "Large outbound data transfer anomaly"
+        match:
+          event_type: "network"
+          where:
+            - "egress_bytes > 500MB in 5m by service"
+        severity: "high"
+        mitre:
+          tactic: "Exfiltration"
+          technique: "Exfiltration Over Unencrypted/Obfuscated Non-C2"
+          ids: ["T1048"]
+
+  data_protection: &common_data_protection
+    pii_redaction:
+      enabled: true
+    encryption_at_rest:
+      enabled: true
+      provider: "aes-256-gcm"
+    key_rotation_days: 90
+    backups:
+      enabled: true
+      schedule_cron: "0 2 * * *"
+      retention_days: 30
+      immutable_storage: true
+
+  storage: &common_storage
+    audit_log_store:
+      type: "s3"
+      bucket: "audit-logs"
+      endpoint: "https://minio.internal"
+      region: "us-east-1"
+      sse: "AES256"
+      versioning: true
+      retention_days: 365
+    detections_store:
+      type: "postgres"
+      dsn: "${DETECTIONS_DB_DSN:?set-in-env}"
+
+# -------- Service defaults (inherited by profiles) --------
+defaults: &service_defaults
+  logging: *common_logging
+  tracing: *common_tracing
+  metrics: *common_metrics
+  alerting: *common_alerting
+  siem: *common_siem
+  policies: *common_policies
+  authn: *common_authn
+  authz: *common_authz
+  crypto: *common_crypto
+  network: *common_network
+  secrets: *common_secrets
+  supply_chain: *common_supply_chain
+  scanners: *common_scanners
+  runtime_security: *common_runtime_security
+  discovery_response: *common_discovery_response
+  compliance: *common_compliance
+  detections: *common_detections
+  data_protection: *common_data_protection
+  storage: *common_storage
+
+# -------- Profiles --------
+profiles:
+  dev:
+    <<: *service_defaults
+    metadata:
+      environment: "dev"
+    logging:
+      <<: *common_logging
+      level: "info"
+    tracing:
+      <<: *common_tracing
+      sampling:
+        ratio: 1.0           # full traces in dev
+    scanners:
+      <<: *common_scanners
+      dast:
+        <<: *common_scanners.dast
+        fail_on_threshold: false
+    network:
+      <<: *common_network
+      waf:
+        enabled: false       # disable WAF locally
+    compliance:
+      <<: *common_compliance
+      frameworks:
+        nist_800_53_rev5:
+          enabled: false
+        owasp_asvs_5:
+          enabled: true
+          levels: [1]
+
+  stage:
+    <<: *service_defaults
+    metadata:
+      environment: "stage"
+    logging:
+      <<: *common_logging
+      level: "info"
+    tracing:
+      <<: *common_tracing
+      sampling:
+        ratio: 0.3
+    scanners:
+      <<: *common_scanners
+      dast:
+        <<: *common_scanners.dast
+        fail_on_threshold: true
+    network:
+      <<: *common_network
+      waf:
+        enabled: true
+    compliance:
+      <<: *common_compliance
+      frameworks:
+        nist_800_53_rev5:
+          enabled: true
+        owasp_asvs_5:
+          enabled: true
+          levels: [1, 2]
+
+  prod:
+    <<: *service_defaults
+    metadata:
+      environment: "prod"
+    logging:
+      <<: *common_logging
+      level: "warn"
+      retention:
+        days: 90
+    tracing:
+      <<: *common_tracing
+      sampling:
+        ratio: 0.1
+    alerting:
+      <<: *common_alerting
+    siem:
+      <<: *common_siem
+      vendor: "elastic"
+    network:
+      <<: *common_network
+      rate_limit:
+        enabled: true
+        default_rps: 20
+        burst: 40
+    scanners:
+      <<: *common_scanners
+      sast:
+        <<: *common_scanners.sast
+        fail_on_threshold: true
+      sca:
+        <<: *common_scanners.sca
+        fail_on_threshold: true
+      container:
+        <<: *common_scanners.container
+        fail_on_threshold: true
+      iac:
+        <<: *common_scanners.iac
+        fail_on_threshold: true
+    supply_chain:
+      <<: *common_supply_chain
+      provenance:
+        enabled: true
+        slsa:
+          level: 3
+        attest_on: ["build", "release", "deploy"]
+      signing:
+        enabled: true
+        verify_on_startup: true
+    compliance:
+      <<: *common_compliance
+      frameworks:
+        nist_800_53_rev5:
+          enabled: true
+        owasp_asvs_5:
+          enabled: true
+          levels: [2]
+        soc2:
+          enabled: true
+        iso_27001:
+          enabled: true
+
+# -------- Service registry (example) --------
+services:
+  - name: "gateway"
+    profile: "${PROFILE:dev}"
+    endpoints:
+      healthz: "/healthz"
+      readyz: "/readyz"
+    authz_overrides:
+      roles:
+        - name: "gateway-frontend"
+          permissions: ["GET:/", "GET:/assets/*"]
+  - name: "api"
+    profile: "${PROFILE:dev}"
+    endpoints:
+      base: "/v1"
+    sensitive_routes:
+      - "POST:/v1/payments"
+      - "POST:/v1/users"
+    rate_limit_overrides:
+      - route: "POST:/v1/payments"
+        rps: 10
+        burst: 20
+
+# -------- Runbook hints (non-functional, for operators) --------
+runbook:
+  severity_mapping:
+    critical: ["PRIV-ESC-EXECVE"]
+    high: ["AUTH-FAILED-BRUTE", "DATA-EXFIL-NET"]
+  response_playbooks:
+    - id: "PB-IR-001"
+      name: "Account Takeover Suspected"
+      steps:
+        - "Block source IP in edge WAF"
+        - "Force logout sessions of affected account"
+        - "Require password reset + WebAuthn re-enroll"
+    - id: "PB-IR-002"
+      name: "PrivEsc via sudo"
+      steps:
+        - "Quarantine pod/node"
+        - "Collect eBPF/Falco traces"
+        - "Rotate credentials & validate integrity"

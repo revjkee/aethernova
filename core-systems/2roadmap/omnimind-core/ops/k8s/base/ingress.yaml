@@ -1,0 +1,143 @@
+# path: omnimind-core/ops/k8s/base/ingress.yaml
+# NGINX Ingress Controller required. Designed for k8s >=1.22 (networking.k8s.io/v1).
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: omnimind-core
+  labels:
+    app.kubernetes.io/name: omnimind-core
+    app.kubernetes.io/part-of: omnimind
+    app.kubernetes.io/component: api
+    app.kubernetes.io/tier: backend
+  annotations:
+    # Use NGINX controller and enforce HTTPS
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+    # HSTS (enable after TLS verified in staging)
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "63072000"   # 2 years
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    nginx.ingress.kubernetes.io/hsts-preload: "true"
+
+    # Timeouts and buffers
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/client-body-timeout: "60"
+    nginx.ingress.kubernetes.io/client-header-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "8"
+    nginx.ingress.kubernetes.io/client-body-buffer-size: "16k"
+    nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+
+    # Rate limiting (per client IP)
+    nginx.ingress.kubernetes.io/limit-rps: "25"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+
+    # CORS (подстройте домены; при необходимости отключите)
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.com"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET,PUT,POST,PATCH,DELETE,OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Accept,Authorization,Content-Type,Origin,User-Agent"
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+    nginx.ingress.kubernetes.io/cors-max-age: "86400"
+
+    # Security headers (requires allow-snippet-annotations=true in NGINX config)
+    nginx.ingress.kubernetes.io/server-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "Referrer-Policy: no-referrer";
+      more_set_headers "Permissions-Policy: accelerometer=(), camera=(), geolocation=(), microphone=()";
+      # CSP может сломать фронт, включайте осознанно:
+      # more_set_headers "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'";
+
+    # Optional: ModSecurity + OWASP CRS (включайте в проде после обкатки)
+    # nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    # nginx.ingress.kubernetes.io/enable-owasp-modsecurity-crs: "true"
+    # nginx.ingress.kubernetes.io/modsecurity-snippet: |
+    #   SecRuleEngine On
+    #   SecRequestBodyAccess On
+
+    # Optional: mTLS for client auth (requires a secret with CA)
+    # nginx.ingress.kubernetes.io/auth-tls-secret: "omnimind-core/ingress-clientca"  # <namespace>/<secret>
+    # nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    # nginx.ingress.kubernetes.io/auth-tls-verify-depth: "2"
+    # nginx.ingress.kubernetes.io/auth-tls-error-page: "https://api.example.com/403-mtls"
+    # nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream: "true"
+
+    # Canary (enable in canary overlay)
+    # nginx.ingress.kubernetes.io/canary: "true"
+    # nginx.ingress.kubernetes.io/canary-weight: "10"
+
+    # Cert-manager (если используется ACME)
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.example.com        # Замените в overlay (kustomize)
+      secretName: omnimind-core-tls  # Должен существовать (или будет создан cert-manager)
+  rules:
+    - host: api.example.com       # Замените в overlay
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: omnimind-core
+                port:
+                  number: 8080
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: omnimind-core
+                port:
+                  number: 8080
+
+---
+# Separate, hardened Ingress for /metrics with IP allowlist.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: omnimind-core-metrics
+  labels:
+    app.kubernetes.io/name: omnimind-core
+    app.kubernetes.io/part-of: omnimind
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/tier: operations
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Restrict metrics to trusted networks only:
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16,172.16.0.0/12"
+    # Tight timeouts; metrics should be fast:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # Optional basic auth (requires secret 'metrics-basic-auth' with auth file)
+    # nginx.ingress.kubernetes.io/auth-type: "basic"
+    # nginx.ingress.kubernetes.io/auth-secret: "metrics-basic-auth"
+    # nginx.ingress.kubernetes.io/auth-realm: 'Authentication Required - Metrics'
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - metrics.api.example.com
+      secretName: omnimind-core-tls  # Можно использовать тот же сертификат (SAN)
+  rules:
+    - host: metrics.api.example.com
+      http:
+        paths:
+          - path: /metrics
+            pathType: Exact
+            backend:
+              service:
+                name: omnimind-core-metrics
+                port:
+                  number: 9090

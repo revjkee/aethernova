@@ -1,0 +1,264 @@
+# policy-core/ops/k8s/base/networkpolicy.yaml
+# Zero-Trust baseline for policy-core workloads
+# Подразумевается, что ваши Pod'ы помечены:
+#   app.kubernetes.io/part-of: policy-core
+# (при необходимости скорректируйте селекторы ниже)
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: policy-core-default-deny
+  labels:
+    app.kubernetes.io/part-of: policy-core
+    app.kubernetes.io/component: network
+    app.kubernetes.io/name: policy-core-netpol
+    policy.aethernova.io/profile: strict
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: policy-core
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []   # deny all
+  egress:  []   # deny all
+
+---
+# Разрешаем egress только на DNS (TCP/UDP 53) к CoreDNS в kube-system.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: policy-core-allow-dns-egress
+  labels:
+    app.kubernetes.io/part-of: policy-core
+    app.kubernetes.io/component: network
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: policy-core
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: coredns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# Разрешаем вход из ingress-контроллеров (HTTP/HTTPS) к policy-core.
+# При необходимости оставьте только используемый вами контроллер.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: policy-core-allow-from-ingress-controllers
+  labels:
+    app.kubernetes.io/part-of: policy-core
+    app.kubernetes.io/component: network
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: policy-core
+  policyTypes: [Ingress]
+  ingress:
+    # ingress-nginx
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+    # Istio ingressgateway
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              istio: ingressgateway
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+    # Gateway API / gateway-system (если используется)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gateway-system
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+
+---
+# Разрешаем межсервисный трафик внутри namespace между компонентами policy-core.
+# Уточните список портов под ваш сервис.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: policy-core-allow-intra-namespace
+  labels:
+    app.kubernetes.io/part-of: policy-core
+    app.kubernetes.io/component: network
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: policy-core
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: policy-core
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+        - port: 9090
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+
+---
+# Разрешаем scrape метрик из namespace "monitoring" (Prometheus/Agent).
+# Порты типично: 8080/metrics или 9464 (OpenMetrics/OTel exporter).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: policy-core-allow-prometheus
+  labels:
+    app.kubernetes.io/part-of: policy-core
+    app.kubernetes.io/component: observability
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: policy-core
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 9464
+          protocol: TCP
+
+---
+# Контролируемый egress ТОЛЬКО на публичный HTTPS (443) с блоком внутренних диапазонов (anti-SSRF).
+# IPv4 + IPv6. При необходимости добавьте 80/TCP отдельно.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: policy-core-allow-public-https-egress
+  labels:
+    app.kubernetes.io/part-of: policy-core
+    app.kubernetes.io/component: network
+    policy.aethernova.io/egress-profile: public-https
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: policy-core
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            # Блокируем RFC1918, loopback, link-local, CGNAT, localhost и метаданные.
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 198.18.0.0/15
+              - 192.0.0.0/24
+              - 192.0.2.0/24
+              - 198.51.100.0/24
+              - 203.0.113.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - ::1/128
+              - fc00::/7       # Unique-Local
+              - fe80::/10      # Link-Local
+              - fec0::/10      # Site-Local (deprecated)
+      ports:
+        - protocol: TCP
+          port: 443
+
+---
+# (Опционально, раскомментируйте при необходимости)
+# Разрешаем egress NTP к публичным пулам (UDP/123) с блокировкой внутренних диапазонов.
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: policy-core-allow-ntp-egress
+#   labels:
+#     app.kubernetes.io/part-of: policy-core
+#     app.kubernetes.io/component: network
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/part-of: policy-core
+#   policyTypes: [Egress]
+#   egress:
+#     - to:
+#         - ipBlock:
+#             cidr: 0.0.0.0/0
+#             except:
+#               - 10.0.0.0/8
+#               - 172.16.0.0/12
+#               - 192.168.0.0/16
+#               - 100.64.0.0/10
+#               - 127.0.0.0/8
+#               - 169.254.0.0/16
+#       ports:
+#         - protocol: UDP
+#           port: 123

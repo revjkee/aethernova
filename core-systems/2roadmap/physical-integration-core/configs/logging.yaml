@@ -1,0 +1,274 @@
+# OpenTelemetry Collector (contrib) — универсальная конфигурация логирования
+# Профилируется для Kubernetes кластера physical-integration-core.
+# Требуются бинарники otelcol-contrib с включенными компонентами:
+# receivers: filelog, otlp, fluentforward (опц.)
+# processors: k8sattributes, attributes, redaction, transform, filter, memory_limiter, batch, resource, resourceattributetransposer (опц.)
+# exporters: loki, elasticsearch, otlphttp (для форварда), debug
+# extensions: health_check, pprof, zpages, basicauth (для Loki/ES при необходимости)
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:${HEALTH_PORT:13133}
+  pprof:
+    endpoint: 0.0.0.0:${PPROF_PORT:1777}
+  zpages:
+    endpoint: 0.0.0.0:${ZPAGES_PORT:55679}
+  basicauth/loki:
+    client_auth:
+      username: ${LOKI_USERNAME:}
+      password: ${LOKI_PASSWORD:}
+  basicauth/es:
+    client_auth:
+      username: ${ES_USERNAME:}
+      password: ${ES_PASSWORD:}
+
+receivers:
+  # Читает контейнерные логи kubelet (CRI). Настройте путь под ваш дистрибутив.
+  filelog/containers:
+    include:
+      - ${CONTAINER_LOG_GLOB:/var/log/containers/*.log}
+    start_at: beginning
+    include_file_path: true
+    resource:
+      service.name: physical-integration-core
+    operators:
+      # Парсинг стандартного формата контейнерных логов (CRI + JSON строки приложения)
+      - type: json_parser
+        id: parse_json
+        parse_from: body
+        # Не падать, если строка не JSON — оставляем как text
+        if: 'body matches "^\\s*\\{" == true'
+      - type: move
+        from: attributes.log
+        to: body
+        if: 'is_string(attributes.log)'
+      # Проставление уровня, если отсутствует
+      - type: add
+        field: attributes.level
+        value: info
+        if: 'attributes.level == nil'
+      # Нормализация timestamp, если приложение не ставит
+      - type: time_parser
+        parse_from: attributes.timestamp
+        layout: '%Y-%m-%dT%H:%M:%S.%f%z'
+        if: 'attributes.timestamp != nil'
+
+  # Прямой приём логов по OTLP из сервисов (рекомендуется для sidecar-паттерна).
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:${OTLP_HTTP_PORT:4318}
+      grpc:
+        endpoint: 0.0.0.0:${OTLP_GRPC_PORT:4317}
+
+  # Необязательный приемник для совместимости с Fluent Bit/Forward
+  fluentforward:
+    endpoint: 0.0.0.0:${FLUENT_FORWARD_PORT:24224}
+
+processors:
+  # Жесткие лимиты по памяти коллектора (защита от OOM).
+  memory_limiter:
+    check_interval: 5s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Обогащение k8s‑метаданными.
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.container.name
+        - k8s.node.name
+        - k8s.pod.start_time
+      labels:
+        - tag_name: app.kubernetes.io/name
+        - tag_name: app.kubernetes.io/part-of
+        - tag_name: workload
+    pod_association:
+      - from: resource_attribute
+        name: k8s.pod.uid
+      - from: connection
+
+  # Общие атрибуты ресурса.
+  resource/common:
+    attributes:
+      - key: deployment.environment
+        value: ${ENV:staging}
+        action: upsert
+      - key: service.name
+        value: physical-integration-core
+        action: upsert
+      - key: service.namespace
+        value: physical-integration-core
+        action: upsert
+      - key: service.version
+        value: ${SERVICE_VERSION:unknown}
+        action: upsert
+      - key: cloud.region
+        value: ${CLOUD_REGION:eu-north-1}
+        action: upsert
+
+  # Редакция (маскирование) чувствительных данных.
+  # Требует redaction processor (otelcol-contrib).
+  redaction/pii:
+    allow_all_keys: true
+    blocked_values:
+      # Маскируем секреты и токены по шаблонам
+      - pattern: '(?i)(api[-_]?key|secret|password|token|authorization)\\s*[:=]\\s*[^\\s"]+'
+        group: 0
+    blocked_keys:
+      - (?i)password
+      - (?i)passwd
+      - (?i)secret
+      - (?i)authorization
+      - (?i)cookie
+    summary:
+      # Добавляет счетчики замен (полезно для аудита)
+      enabled: true
+
+  # Трансформация: выравнивание полей, переименование, корреляция trace_id/span_id.
+  attributes/normalize:
+    actions:
+      - key: severity
+        from_attribute: attributes.level
+        action: upsert
+      - key: log.severity
+        from_attribute: severity
+        action: upsert
+      - key: trace_id
+        from_attribute: attributes.trace_id
+        action: upsert
+      - key: span_id
+        from_attribute: attributes.span_id
+        action: upsert
+      # Удаляем шумовые внутренние поля, если они есть
+      - key: k8s.container.hash
+        action: delete
+
+  # Фильтрация шумов: отбрасываем очень частые health‑чекап‑строки и DEBUG в проде
+  filter/log-noise:
+    logs:
+      exclude:
+        match_type: regexp
+        record_attributes:
+          - key: body
+            value: '^(GET|HEAD) /healthz.* 200'
+          - key: log.severity
+            value: '^debug$'
+        # В staging можно ослабить через ENV
+
+  # Семплирование "неважных" логов (уровни ниже warning)
+  # Используйте processor tail_sampling для трасс, а для логов — probabilistic_sampler (через transform).
+  transform/sampling:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes.sampled) = true where attributes["log.severity"] in ["info","debug","trace"] and rand() > ${LOG_SAMPLE_KEEP:0.10}
+
+  # Батчирование для повышения пропускной способности.
+  batch:
+    timeout: 2s
+    send_batch_size: 2048
+    send_batch_max_size: 8192
+
+exporters:
+  # Loki: используйте базовую авторизацию или bearer (если включено).
+  loki:
+    endpoint: ${LOKI_ENDPOINT:http://loki.observability:3100/loki/api/v1/push}
+    labels:
+      attributes:
+        k8s.namespace.name: "namespace"
+        k8s.pod.name: "pod"
+        k8s.container.name: "container"
+        app.kubernetes.io/part-of: "partof"
+        deployment.environment: "env"
+        service.name: "service"
+    default_labels_enabled:
+      exporter: false
+      job: true
+    tls:
+      insecure: ${LOKI_INSECURE:false}
+      ca_file: ${LOKI_CA_FILE:}
+    sending_queue:
+      queue_size: 20480
+    retry_on_failure:
+      enabled: true
+      initial_interval: 500ms
+      max_interval: 10s
+      max_elapsed_time: 0
+    auth:
+      authenticator: basicauth/loki
+
+  # Elasticsearch OpenSearch совместимый экспортер
+  elasticsearch:
+    endpoints: [ ${ES_ENDPOINT:https://elasticsearch.observability:9200} ]
+    logs_index: ${ES_LOG_INDEX:pic-logs-%{+yyyy.MM.dd}}
+    flush:
+      bytes: 10485760
+      interval: 5s
+    tls:
+      insecure: ${ES_INSECURE:false}
+      ca_file: ${ES_CA_FILE:}
+    retry:
+      enabled: true
+      max_requests: 0
+      initial_interval: 1s
+      max_interval: 10s
+    auth:
+      authenticator: basicauth/es
+    mapping:
+      mode: ecs # По возможности придерживаться ECS для SIEM
+
+  # Для отладки: печать в STDOUT
+  debug:
+    verbosity: basic
+
+  # Опционально — форвард в централизованный OTLP‑хаб
+  otlphttp/forward:
+    endpoint: ${FORWARD_OTLP_ENDPOINT:}
+    compression: gzip
+    tls:
+      insecure: ${FORWARD_OTLP_INSECURE:false}
+    headers:
+      Authorization: ${FORWARD_OTLP_AUTH:}
+
+service:
+  telemetry:
+    logs:
+      level: ${OTEL_LOG_LEVEL:info}
+
+  extensions: [health_check, pprof, zpages, basicauth/loki, basicauth/es]
+
+  pipelines:
+    logs/containers:
+      receivers:  [filelog/containers]
+      processors: [memory_limiter, k8sattributes, resource/common, redaction/pii, attributes/normalize, filter/log-noise, transform/sampling, batch]
+      exporters:  [loki, elasticsearch, debug]
+
+    logs/otlp:
+      receivers:  [otlp]
+      processors: [memory_limiter, k8sattributes, resource/common, redaction/pii, attributes/normalize, filter/log-noise, transform/sampling, batch]
+      exporters:  [loki, elasticsearch]
+
+    logs/fluent:
+      receivers:  [fluentforward]
+      processors: [memory_limiter, k8sattributes, resource/common, redaction/pii, attributes/normalize, filter/log-noise, transform/sampling, batch]
+      exporters:  [loki]
+
+# =========================
+# Профиль‑переключатели ENV
+# =========================
+# ENV=production:
+#   - LOG_SAMPLE_KEEP=0.05 (меньше информационных логов)
+#   - OTEL_LOG_LEVEL=warn
+# ENV=staging:
+#   - LOG_SAMPLE_KEEP=0.25
+#   - OTEL_LOG_LEVEL=info
+#
+# Для выключения конкретного экспорта оставьте endpoint пустым или используйте
+# альтернативный values‑overlay/ConfigMap‑patch в Kustomize/Helm.

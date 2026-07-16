@@ -1,0 +1,365 @@
+# mythos-core/configs/templates/timeline_rules.example.yaml
+# Шаблон декларативных правил ленты (timeline).
+# Назначение: ранжирование и отбор карточек в ленту.
+# Формат: YAML, комментарии — часть документации. Секреты не хранить здесь.
+
+version: 1
+meta:
+  ruleset_name: "default-timeline"
+  owner: "growth-platform"
+  description: "Базовые правила подбора и ранжирования контента для основной ленты"
+  created_at: "2025-01-01T00:00:00Z"
+  updated_at: "2025-01-01T00:00:00Z"
+  dry_run: false          # если true — только логировать решения без применения
+  disabled: false         # если true — весь набор правил отключён
+
+validation:
+  schema_version: 1
+  strict: true            # при неизвестных ключах — ошибка
+  lint:
+    enabled: true
+    severity: warn        # warn|error
+    rules:
+      - no_empty_slot_budgets
+      - non_overlapping_time_windows
+      - valid_rate_limits
+
+globals:
+  locale_defaults: ["en", "ru"]
+  timezone: "UTC"
+  max_feed_size: 50
+  # Слоты ленты (визуальные зоны) и ёмкости
+  slots:
+    - id: "top"
+      capacity: 3
+      refill_policy: "per_request"   # per_request|per_minute
+    - id: "main"
+      capacity: 30
+      refill_policy: "per_request"
+    - id: "bottom"
+      capacity: 17
+      refill_policy: "per_request"
+  # Полосы приоритета с бюджетами (anti-starvation)
+  priority_bands:
+    - id: "urgent"
+      weight: 1.0
+      min_quota: 0.05      # минимум 5% выдачи
+      max_quota: 0.50
+    - id: "high"
+      weight: 0.7
+      min_quota: 0.20
+      max_quota: 0.70
+    - id: "normal"
+      weight: 0.4
+      min_quota: 0.20
+      max_quota: 0.80
+    - id: "low"
+      weight: 0.2
+      min_quota: 0.00
+      max_quota: 0.30
+  # Дефолтные веса и функции распада для скоринга
+  scoring:
+    weights:
+      recency: 0.40
+      engagement: 0.25
+      affinity: 0.20
+      editorial_boost: 0.10
+      diversity_penalty: -0.05
+    decay:
+      kind: "exp"          # exp|linear
+      half_life_s: 14400   # 4 часа
+  # Общие политики
+  deduplication:
+    group_by: ["content_id"]     # поля события для группировки
+    window_s: 7200               # 2 часа
+  cooldowns:
+    per_publisher_s: 60          # интервал между карточками одного publisher
+  rate_limits:
+    per_user_per_minute: 60
+    per_user_per_hour: 600
+    per_content_per_day: 3
+  # Функции/макросы, доступные в формулах (должны поддерживаться движком)
+  functions:
+    - name: now_s
+    - name: hours_since
+    - name: sigmoid
+    - name: exp_decay
+  # Канальная политика (веб/мобайл)
+  channels:
+    - id: "web"
+      enabled: true
+    - id: "mobile"
+      enabled: true
+
+experiments:
+  enabled: true
+  buckets:
+    - id: "exp-new-scorer"
+      traffic: 0.1
+      seed: 42
+      overrides:
+        globals:
+          scoring:
+            weights:
+              engagement: 0.35
+              affinity: 0.15
+        rules:
+          include: ["hot-trending"]    # форсируем правило в эксперименте
+    - id: "control"
+      traffic: 0.9
+
+audience_segments:
+  # Предопределённые сегменты для match-гейтов
+  - id: "all"
+    filter: "true"
+  - id: "new_users"
+    filter: "user.account_age_days < 7"
+  - id: "power_users"
+    filter: "user.d30_sessions > 20"
+  - id: "ru_locale"
+    filter: "user.locale == 'ru'"
+
+safety_and_compliance:
+  content_safety:
+    toxicity_threshold: 0.85
+    block_if:
+      - "content.safety.toxicity >= 0.98"
+      - "content.safety.self_harm == true"
+  compliance:
+    blocked_countries: ["CN", "IR"]
+    min_user_age: 13
+  moderation:
+    require_editorial_review_for_tags: ["medical", "finance"]
+
+defaults:
+  placement:
+    slot: "main"
+    ttl_s: 86400
+    sticky: false
+  tie_breaker:
+    order: ["score_desc", "recency_desc", "random"]
+  gates:
+    locales: ["*"]         # "*" — все
+    channels: ["web", "mobile"]
+    time_windows: []       # формат: "HH:MM-HH:MM", в timezone из globals
+  limits:
+    per_user_per_day: 30
+    per_session: 10
+
+rules:
+  # 1) Срочные новости — максимально высокий приоритет
+  - id: "breaking-news"
+    description: "Срочные публикации с тегом breaking"
+    disabled: false
+    priority_band: "urgent"
+    match:
+      any:
+        - "event.type == 'content_published' and 'breaking' in content.tags"
+        - "event.type == 'alert' and content.category == 'breaking'"
+    gates:
+      locales: ["*", "!ar"]          # все, кроме ar
+      channels: ["web", "mobile"]
+      time_windows: []               # без ограничения времени
+      audience: ["all"]
+      compliance:
+        min_user_age: 13
+      safety:
+        max_toxicity: 0.95
+    score:
+      formula: >
+        1.0
+        * weight('recency')   * exp_decay(hours_since(content.published_at), half_life_hours=4)
+        + weight('engagement')* sigmoid(content.metrics.d30_ctr, k=12, x0=0.08)
+        + weight('affinity')  * user.affinity[content.publisher_id]
+        + weight('editorial_boost') * content.editorial.boost
+        + weight('diversity_penalty') * penalty.same_publisher_in_last_n(10)
+      min_score: 0.10
+      cap: 10.0
+    placement:
+      slot: "top"
+      ttl_s: 3600
+      sticky: true
+    limits:
+      per_user_per_day: 10
+      per_session: 5
+    rate_limit:
+      per_content_per_hour: 2
+    deduplication:
+      group_by: ["content_id", "edition_id"]
+      window_s: 7200
+    actions:
+      - publish
+      - notify:
+          channel: "push"
+          template_id: "breaking_01"
+          if: "user.permissions.push_enabled == true"
+
+  # 2) Популярное и трендовое
+  - id: "hot-trending"
+    description: "Контент с ускоренным набором вовлечённости"
+    priority_band: "high"
+    match:
+      all:
+        - "event.type == 'content_published'"
+        - "content.metrics.d1_views > 100"
+        - "content.metrics.trend_zscore >= 1.5"
+    gates:
+      locales: ["*"]
+      channels: ["web", "mobile"]
+      audience: ["all", "power_users"]
+      time_windows:
+        - "06:00-23:59"
+    score:
+      formula: >
+        weight('engagement') * sigmoid(content.metrics.d1_ctr, k=10, x0=0.06)
+        + weight('recency')  * exp_decay(hours_since(content.published_at), half_life_hours=8)
+        + 0.05 * content.metrics.reshares_d1
+      min_score: 0.05
+    placement:
+      slot: "main"
+      ttl_s: 21600
+      sticky: false
+    limits:
+      per_user_per_day: 20
+    rate_limit:
+      per_user_per_minute: 5
+    actions:
+      - publish
+
+  # 3) Диверсификация по интересам пользователя (fallback)
+  - id: "personalized-fallback"
+    description: "Персональное заполнение ленты интересами"
+    priority_band: "normal"
+    match:
+      all:
+        - "event.type == 'candidate_pool'"
+        - "user.affinity.exists == true"
+    gates:
+      locales: ["*"]
+      channels: ["web", "mobile"]
+      audience: ["all", "new_users"]
+      time_windows: []
+    score:
+      formula: >
+        0.6 * user.affinity_topic[content.topic] +
+        0.2 * exp_decay(hours_since(content.published_at), half_life_hours=12) +
+        0.2 * sigmoid(content.metrics.d7_ctr, k=8, x0=0.05)
+      min_score: 0.01
+    placement:
+      slot: "main"
+      ttl_s: 43200
+    limits:
+      per_user_per_day: 40
+    deduplication:
+      group_by: ["content_id"]
+      window_s: 10800
+    actions: [publish]
+
+  # 4) Локальные события — для ru сегмента в вечернее время
+  - id: "local-events-ru-evening"
+    description: "Локальные события для RU, вечерние окна"
+    priority_band: "normal"
+    match:
+      all:
+        - "event.type == 'content_published'"
+        - "'events' in content.tags"
+        - "content.locale == 'ru'"
+    gates:
+      locales: ["ru"]
+      channels: ["web", "mobile"]
+      audience: ["ru_locale"]
+      time_windows:
+        - "17:00-23:00"
+    score:
+      formula: >
+        0.5 * exp_decay(hours_since(content.published_at), half_life_hours=6) +
+        0.3 * sigmoid(content.metrics.intent_clicks_d1, k=10, x0=50) +
+        0.2 * user.affinity_city[content.location.city]
+      min_score: 0.02
+    placement:
+      slot: "main"
+      ttl_s: 14400
+    limits:
+      per_user_per_day: 15
+    actions: [publish]
+
+  # 5) Низкий приоритет — длинный хвост для разнообразия
+  - id: "long-tail-diversity"
+    description: "Заполнение хвоста ленты контентом низкой популярности для диверсификации"
+    priority_band: "low"
+    match:
+      all:
+        - "event.type == 'candidate_pool'"
+        - "content.metrics.d30_views < 100"
+    gates:
+      locales: ["*"]
+      channels: ["web", "mobile"]
+      audience: ["all"]
+    score:
+      formula: >
+        0.3 * exp_decay(hours_since(content.published_at), half_life_hours=24) +
+        0.7 * random()   # допускаем небольшой стохастический шум
+      min_score: 0.0
+      cap: 0.5
+    placement:
+      slot: "bottom"
+      ttl_s: 86400
+    limits:
+      per_user_per_day: 10
+    rate_limit:
+      per_user_per_minute: 2
+    actions: [publish]
+
+suppression:
+  # Условия для мягкого/жёсткого скрытия независимо от правил
+  soft_block:
+    - "publisher.score < 0.2"
+    - "content.flags.contains('spam_suspected')"
+  hard_block:
+    - "content.safety.illegal == true"
+    - "user.age < compliance.min_user_age"
+
+tiebreakers:
+  # Общая политика на случай равных скоринговых баллов
+  order: ["priority_band", "slot_capacity", "score_desc", "recency_desc", "random"]
+
+observability:
+  logging:
+    decision_log_enabled: true
+    log_top_k: 20
+    redact_pii: true
+  metrics:
+    export_scores_histogram: true
+    export_rule_hit_counters: true
+  tracing:
+    enabled: true
+    sample_ratio: 0.05
+
+testing:
+  # Бумажные правила для локальной проверки
+  fixtures:
+    users:
+      - id: "u_dev_1"
+        locale: "ru"
+        account_age_days: 2
+        d30_sessions: 5
+      - id: "u_power_1"
+        locale: "en"
+        account_age_days: 200
+        d30_sessions: 60
+    contents:
+      - content_id: "c_breaking_1"
+        tags: ["breaking"]
+        published_at: "2025-01-01T10:00:00Z"
+        metrics: { d1_views: 10000, d1_ctr: 0.12, d30_ctr: 0.08, reshares_d1: 120 }
+        editorial: { boost: 0.5 }
+        safety: { toxicity: 0.1, self_harm: false, illegal: false }
+      - content_id: "c_tail_1"
+        tags: ["misc"]
+        published_at: "2024-12-01T00:00:00Z"
+        metrics: { d30_views: 50, d7_ctr: 0.02 }
+        safety: { toxicity: 0.05, self_harm: false, illegal: false }
+
+notes:
+  - "Формулы и предикаты зависят от возможностей движка (CEL/DSL)."
+  - "Для продакшна рекомендуются unit/e2e тесты правил и защита от регрессий через CI."

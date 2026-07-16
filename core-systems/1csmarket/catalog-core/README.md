@@ -1,0 +1,3 @@
+# catalog-core
+
+Project Documentation

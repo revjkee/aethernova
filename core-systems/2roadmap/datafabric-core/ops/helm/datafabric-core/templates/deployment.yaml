@@ -1,0 +1,260 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "datafabric-core.fullname" . }}
+  labels:
+    {{- include "datafabric-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  annotations:
+    # Обновление подов при изменении конфигов/секретов (checksum-паттерн)
+    {{- if .Values.config }}
+    checksum/config: {{ toYaml .Values.config | sha256sum }}
+    {{- end }}
+    {{- if .Values.extraConfig }}
+    checksum/extra-config: {{ toYaml .Values.extraConfig | sha256sum }}
+    {{- end }}
+    {{- if .Values.secrets }}
+    checksum/secrets: {{ toYaml .Values.secrets | sha256sum }}
+    {{- end }}
+    {{- with .Values.deployment.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount | default 2 }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.deployment.revisionHistoryLimit | default 10 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.deployment.strategy.maxUnavailable | default "25%" }}
+      maxSurge: {{ .Values.deployment.strategy.maxSurge | default "25%" }}
+  selector:
+    matchLabels:
+      {{- include "datafabric-core.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "datafabric-core.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+        app.kubernetes.io/version: {{ .Chart.AppVersion | default .Chart.Version | quote }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Prometheus scrape (можете переопределить в values)
+        prometheus.io/scrape: {{ (.Values.metrics.scrape | default true) | quote }}
+        prometheus.io/path: {{ (.Values.metrics.path | default "/metrics") | quote }}
+        prometheus.io/port: {{ (.Values.metrics.port | default 8080) | quote }}
+        # Опциональные аннотации пода
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range .Values.imagePullSecrets }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      serviceAccountName: {{ include "datafabric-core.serviceAccountName" . }}
+      priorityClassName: {{ .Values.priorityClassName | default "" | quote }}
+      {{- with .Values.security.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      # По-умолчанию равномерное распределение по нодам/зонам
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "datafabric-core.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: api
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "datafabric-core.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: api
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.initContainers }}
+      initContainers:
+        {{- tpl (toYaml .Values.initContainers) . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (include "datafabric-core.imageTag" .) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          {{- with .Values.security.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop: ["ALL"]
+          {{- end }}
+          {{- if .Values.command }}
+          command: {{- toYaml .Values.command | nindent 12 }}
+          {{- end }}
+          {{- if .Values.args }}
+          args: {{- toYaml .Values.args | nindent 12 }}
+          {{- end }}
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: APP_ENV
+              value: {{ .Values.env.APP_ENV | default "production" | quote }}
+            - name: APP_NAME
+              value: {{ include "datafabric-core.fullname" . | quote }}
+            {{- range $k, $v := .Values.env.extra }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- range . }}
+            - {{- toYaml . | nindent 14 }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.container.port | default 8080 }}
+              protocol: TCP
+          {{- if .Values.metrics.separatePort }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port | default 9090 }}
+              protocol: TCP
+          {{- end }}
+
+          {{- with .Values.probes.startup }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.container.health.startupPath | default "/startup" | quote }}
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          {{- end }}
+
+          {{- with .Values.probes.liveness }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.container.health.livenessPath | default "/health" | quote }}
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          {{- end }}
+
+          {{- with .Values.probes.readiness }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.container.health.readinessPath | default "/ready" | quote }}
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          {{- end }}
+
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          {{- end }}
+
+          lifecycle:
+            {{- if .Values.lifecycle }}
+            {{- toYaml .Values.lifecycle | nindent 12 }}
+            {{- else }}
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >
+                    echo "preStop: draining..." &&
+                    sleep {{ .Values.deployment.preStopSleepSeconds | default 5 }}
+            {{- end }}
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        {{- if .Values.sidecars }}
+        {{- tpl (toYaml .Values.sidecars) . | nindent 8 }}
+        {{- end }}
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+
+      {{- if .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml .Values.hostAliases | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml .Values.dnsConfig | nindent 8 }}
+      {{- end }}
+      dnsPolicy: {{ .Values.dnsPolicy | default "ClusterFirst" }}

@@ -1,0 +1,557 @@
+# human-sovereignty-core/config/escalation_policy.yaml
+apiVersion: human-sovereignty-core/v1
+kind: EscalationPolicy
+metadata:
+  name: default-escalation-policy
+  owner: human-sovereignty-core
+  managedBy: policy-core
+  createdAt: "2026-01-27T00:00:00Z"
+  schemaVersion: "1.0.0"
+
+spec:
+  principles:
+    - human_in_control
+    - least_privilege
+    - explicit_ack_required
+    - progressive_escalation
+    - auditability
+    - minimization_of_noise
+
+  glossary:
+    severity:
+      SEV0: existential_or_safety_critical
+      SEV1: critical_outage_or_data_integrity
+      SEV2: major_degradation_or_security_risk
+      SEV3: minor_degradation_or_single_component
+      SEV4: informational_or_noise
+    ack:
+      definition: "Explicit confirmation that a responsible actor accepted ownership of incident handling."
+      allowedStates: [acknowledged, rejected, reassigned]
+    sla:
+      mttr: mean_time_to_recovery
+      mtta: mean_time_to_acknowledge
+
+  defaults:
+    timezone: "Europe/Stockholm"
+    language: "ru"
+    requireAck: true
+    ackTimeoutSeconds: 600
+    closeTimeoutSeconds: 14400
+    reNotifyEverySeconds: 600
+    maxEscalationDepth: 6
+    stopEscalationOn:
+      - status: resolved
+      - status: closed
+      - status: false_positive
+    escalationOn:
+      - condition: "ack_timeout"
+      - condition: "no_owner"
+      - condition: "severity_upgrade"
+      - condition: "breach_mtta"
+      - condition: "breach_mttr"
+    incidentIdStrategy:
+      type: deterministic
+      fields:
+        - source
+        - fingerprint
+        - service
+        - environment
+        - normalizedSummary
+    correlation:
+      enabled: true
+      windowSeconds: 900
+      keys:
+        - service
+        - environment
+        - component
+        - tenantId
+
+  guardrails:
+    rateLimiting:
+      enabled: true
+      perServicePerMinute: 60
+      perEnvironmentPerMinute: 120
+      globalPerMinute: 300
+      onLimitAction: "aggregate_and_suppress"
+    deduplication:
+      enabled: true
+      windowSeconds: 1800
+      fingerprintFields:
+        - source
+        - service
+        - environment
+        - component
+        - ruleId
+        - normalizedSummary
+      treatAsSameIf:
+        - "same_fingerprint"
+        - "same_correlation_group"
+    noiseControl:
+      minSeverityToPage: "SEV2"
+      allowPagingFor:
+        - ruleTag: "security"
+        - ruleTag: "safety"
+        - ruleTag: "integrity"
+      suppressIf:
+        - condition: "maintenance_window_active"
+        - condition: "service_muted"
+        - condition: "tenant_muted"
+    quietHours:
+      enabled: true
+      windows:
+        - name: "night"
+          days: [mon, tue, wed, thu, fri]
+          start: "22:00"
+          end: "07:00"
+          behavior:
+            pageMinSeverity: "SEV1"
+            preferChannels: ["push", "sms"]
+        - name: "weekend"
+          days: [sat, sun]
+          start: "00:00"
+          end: "24:00"
+          behavior:
+            pageMinSeverity: "SEV1"
+            preferChannels: ["push", "sms"]
+
+  sources:
+    - name: prometheus_alertmanager
+      type: alerting
+      trust: internal
+      normalize:
+        severityFrom:
+          field: labels.severity
+          mapping:
+            critical: SEV1
+            high: SEV2
+            warning: SEV3
+            info: SEV4
+        serviceFrom:
+          field: labels.service
+        environmentFrom:
+          field: labels.env
+        componentFrom:
+          field: labels.component
+        tenantFrom:
+          field: labels.tenant_id
+        ruleIdFrom:
+          field: labels.alertname
+        summaryFrom:
+          field: annotations.summary
+        descriptionFrom:
+          field: annotations.description
+      requiredFields:
+        - labels.service
+        - labels.env
+        - labels.alertname
+
+    - name: security_siem
+      type: security
+      trust: internal
+      normalize:
+        severityFrom:
+          field: event.risk
+          mapping:
+            100: SEV0
+            90: SEV1
+            70: SEV2
+            40: SEV3
+            10: SEV4
+        serviceFrom:
+          field: event.service
+        environmentFrom:
+          field: event.environment
+        componentFrom:
+          field: event.asset
+        tenantFrom:
+          field: event.tenantId
+        ruleIdFrom:
+          field: event.ruleId
+        summaryFrom:
+          field: event.title
+        descriptionFrom:
+          field: event.details
+      requiredFields:
+        - event.ruleId
+        - event.title
+
+    - name: manual_report
+      type: human
+      trust: internal
+      normalize:
+        severityFrom:
+          field: form.severity
+          mapping:
+            SEV0: SEV0
+            SEV1: SEV1
+            SEV2: SEV2
+            SEV3: SEV3
+            SEV4: SEV4
+        serviceFrom:
+          field: form.service
+        environmentFrom:
+          field: form.environment
+        componentFrom:
+          field: form.component
+        tenantFrom:
+          field: form.tenantId
+        summaryFrom:
+          field: form.summary
+        descriptionFrom:
+          field: form.description
+      requiredFields:
+        - form.service
+        - form.environment
+        - form.summary
+
+  channels:
+    email:
+      enabled: true
+      from: "no-reply@aethernova.local"
+      templates:
+        subject: "[{severity}] {service} {environment} {summary}"
+        body: "incident_id={incidentId}\nstatus={status}\nowner={owner}\nsummary={summary}\ndescription={description}\nlink={link}\n"
+    sms:
+      enabled: true
+      provider: "generic"
+      templates:
+        body: "[{severity}] {service}/{environment}: {summary} id={incidentId}"
+    push:
+      enabled: true
+      provider: "generic"
+      templates:
+        title: "[{severity}] {service}/{environment}"
+        body: "{summary}"
+    voice:
+      enabled: false
+      provider: "generic"
+    chat:
+      enabled: true
+      providers:
+        telegram:
+          enabled: true
+          routeTag: "telegram"
+        slack:
+          enabled: false
+      templates:
+        message: |
+          [{severity}] {service}/{environment}
+          incident_id={incidentId}
+          status={status}
+          summary={summary}
+          owner={owner}
+          link={link}
+
+  roles:
+    - name: incident_commander
+      description: "Responsible for overall coordination and decisions."
+    - name: oncall_primary
+      description: "First responder, must acknowledge and start mitigation."
+    - name: oncall_secondary
+      description: "Backup responder, assists or takes over if needed."
+    - name: security_officer
+      description: "Security escalation owner for security-tagged incidents."
+    - name: platform_owner
+      description: "Service/platform owner for business-critical services."
+    - name: human_governor
+      description: "Human sovereignty gatekeeper for high-impact decisions."
+
+  routing:
+    rules:
+      - name: security_override
+        match:
+          any:
+            - field: tags
+              contains: "security"
+            - field: source
+              equals: "security_siem"
+        set:
+          ladder: "ladder_security"
+          minSeverity: "SEV2"
+          requireAck: true
+          channelsPreferred: ["push", "sms", "chat"]
+
+      - name: sev0_global
+        match:
+          all:
+            - field: severity
+              equals: "SEV0"
+        set:
+          ladder: "ladder_sev0"
+          requireAck: true
+          channelsPreferred: ["push", "sms", "chat"]
+
+      - name: sev1_default
+        match:
+          all:
+            - field: severity
+              equals: "SEV1"
+        set:
+          ladder: "ladder_sev1"
+          requireAck: true
+          channelsPreferred: ["push", "sms", "chat"]
+
+      - name: sev2_default
+        match:
+          all:
+            - field: severity
+              equals: "SEV2"
+        set:
+          ladder: "ladder_sev2"
+          requireAck: true
+          channelsPreferred: ["push", "chat", "email"]
+
+      - name: sev3_default
+        match:
+          all:
+            - field: severity
+              equals: "SEV3"
+        set:
+          ladder: "ladder_sev3"
+          requireAck: false
+          channelsPreferred: ["chat", "email"]
+
+      - name: sev4_default
+        match:
+          all:
+            - field: severity
+              equals: "SEV4"
+        set:
+          ladder: "ladder_sev4"
+          requireAck: false
+          channelsPreferred: ["email"]
+
+  ladders:
+    ladder_sev0:
+      description: "Existential or safety critical. Immediate human control."
+      mttaSeconds: 300
+      mttrSeconds: 1800
+      steps:
+        - step: 1
+          notify:
+            roles: ["incident_commander", "oncall_primary"]
+            channels: ["push", "sms", "chat"]
+          ackRequired: true
+          ackTimeoutSeconds: 180
+          onTimeout:
+            escalateToStep: 2
+        - step: 2
+          notify:
+            roles: ["oncall_secondary", "platform_owner"]
+            channels: ["push", "sms", "chat"]
+          ackRequired: true
+          ackTimeoutSeconds: 180
+          onTimeout:
+            escalateToStep: 3
+        - step: 3
+          notify:
+            roles: ["human_governor"]
+            channels: ["push", "sms", "chat"]
+          ackRequired: true
+          ackTimeoutSeconds: 240
+          controls:
+            freeze_autonomy: true
+            require_human_approval_for_actions: true
+          onTimeout:
+            escalateToStep: 4
+        - step: 4
+          notify:
+            roles: ["incident_commander", "platform_owner", "human_governor"]
+            channels: ["push", "sms", "chat"]
+          ackRequired: true
+          ackTimeoutSeconds: 240
+          controls:
+            freeze_autonomy: true
+            emergency_mode: true
+
+    ladder_sev1:
+      description: "Critical outage or integrity risk."
+      mttaSeconds: 600
+      mttrSeconds: 3600
+      steps:
+        - step: 1
+          notify:
+            roles: ["oncall_primary"]
+            channels: ["push", "sms", "chat"]
+          ackRequired: true
+          ackTimeoutSeconds: 300
+          onTimeout:
+            escalateToStep: 2
+        - step: 2
+          notify:
+            roles: ["incident_commander", "oncall_secondary"]
+            channels: ["push", "sms", "chat"]
+          ackRequired: true
+          ackTimeoutSeconds: 300
+          onTimeout:
+            escalateToStep: 3
+        - step: 3
+          notify:
+            roles: ["platform_owner"]
+            channels: ["push", "chat", "email"]
+          ackRequired: true
+          ackTimeoutSeconds: 600
+
+    ladder_sev2:
+      description: "Major degradation or elevated risk. Paging allowed."
+      mttaSeconds: 900
+      mttrSeconds: 14400
+      steps:
+        - step: 1
+          notify:
+            roles: ["oncall_primary"]
+            channels: ["push", "chat"]
+          ackRequired: true
+          ackTimeoutSeconds: 600
+          onTimeout:
+            escalateToStep: 2
+        - step: 2
+          notify:
+            roles: ["oncall_secondary"]
+            channels: ["push", "chat", "email"]
+          ackRequired: true
+          ackTimeoutSeconds: 900
+          onTimeout:
+            escalateToStep: 3
+        - step: 3
+          notify:
+            roles: ["platform_owner"]
+            channels: ["chat", "email"]
+          ackRequired: false
+
+    ladder_sev3:
+      description: "Minor degradation. No paging by default."
+      mttaSeconds: 3600
+      mttrSeconds: 86400
+      steps:
+        - step: 1
+          notify:
+            roles: ["platform_owner"]
+            channels: ["chat", "email"]
+          ackRequired: false
+        - step: 2
+          notify:
+            roles: ["oncall_primary"]
+            channels: ["chat"]
+          ackRequired: false
+          conditions:
+            any:
+              - "breach_mtta"
+              - "severity_upgrade"
+
+    ladder_sev4:
+      description: "Informational. Logged and emailed only."
+      steps:
+        - step: 1
+          notify:
+            roles: ["platform_owner"]
+            channels: ["email"]
+          ackRequired: false
+
+    ladder_security:
+      description: "Security incidents. Always includes security officer."
+      mttaSeconds: 600
+      mttrSeconds: 7200
+      steps:
+        - step: 1
+          notify:
+            roles: ["security_officer", "oncall_primary"]
+            channels: ["push", "sms", "chat"]
+          ackRequired: true
+          ackTimeoutSeconds: 300
+          onTimeout:
+            escalateToStep: 2
+        - step: 2
+          notify:
+            roles: ["incident_commander", "platform_owner", "security_officer"]
+            channels: ["push", "sms", "chat", "email"]
+          ackRequired: true
+          ackTimeoutSeconds: 600
+        - step: 3
+          notify:
+            roles: ["human_governor"]
+            channels: ["push", "sms", "chat"]
+          ackRequired: true
+          ackTimeoutSeconds: 600
+          controls:
+            freeze_autonomy: true
+            require_human_approval_for_actions: true
+
+  lifecycle:
+    stateMachine:
+      allowedTransitions:
+        - from: "draft"
+          to: ["proposed", "rejected"]
+        - from: "proposed"
+          to: ["approved", "rejected"]
+        - from: "approved"
+          to: ["executed", "failed", "resolved"]
+        - from: "executed"
+          to: ["resolved", "closed"]
+        - from: "failed"
+          to: ["proposed", "closed"]
+        - from: "resolved"
+          to: ["closed"]
+      autoTransitions:
+        - condition: "is_expired"
+          to: "expired"
+
+  audit:
+    enabled: true
+    capture:
+      - incident_created
+      - notification_sent
+      - ack_received
+      - escalation_triggered
+      - owner_assigned
+      - severity_changed
+      - status_changed
+      - suppression_applied
+    redactFields:
+      - inputs.secret
+      - inputs.password
+      - inputs.token
+      - context.pii
+    retentionDays: 365
+    integrity:
+      enabled: true
+      hashAlgorithm: "sha256"
+      chainMode: "append_only"
+
+  ownership:
+    assignment:
+      required: true
+      strategy:
+        - "ack_owner_is_responder"
+        - "fallback_to_oncall_primary"
+        - "fallback_to_incident_commander"
+    overrideRules:
+      - when:
+          field: tags
+          contains: "human-sovereignty"
+        setOwnerRole: "human_governor"
+
+  compliance:
+    constraints:
+      - name: "human_approval_for_high_impact"
+        when:
+          any:
+            - field: severity
+              equals: "SEV0"
+            - field: tags
+              contains: "safety"
+            - field: tags
+              contains: "integrity"
+        require:
+          humanApproval: true
+          approverRole: "human_governor"
+      - name: "security_dual_control"
+        when:
+          any:
+            - field: source
+              equals: "security_siem"
+            - field: tags
+              contains: "security"
+        require:
+          dualApproval: true
+          approverRoles: ["security_officer", "human_governor"]

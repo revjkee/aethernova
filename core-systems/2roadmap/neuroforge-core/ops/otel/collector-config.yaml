@@ -1,0 +1,259 @@
+# OpenTelemetry Collector (contrib) — production-grade config
+# Signals: traces, metrics, logs
+# NOTE: требует образ opentelemetry-collector-contrib
+
+receivers:
+  # Универсальный приёмник из приложений/SDK
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # Доп. ограничения/keepalive по необходимости:
+        # max_recv_msg_size_mib: 64
+      http:
+        endpoint: 0.0.0.0:4318
+        # CORS по мере необходимости:
+        # cors:
+        #   allowed_origins: ["*"]
+        include_metadata: true
+
+  # Сбор метрик по конфигу Prometheus (скрейп внутренних /metrics и пр.)
+  prometheus:
+    config: |
+      global:
+        scrape_interval: 30s
+        scrape_timeout: 10s
+      scrape_configs:
+        - job_name: 'otel-collector'
+          static_configs:
+            - targets: ['0.0.0.0:8888']
+        # Пример приложения (замените target на сервис/ингресс своего приложения)
+        - job_name: 'neuroforge-core'
+          static_configs:
+            - targets: ['neuroforge-core:8080']
+
+  # Метрики кластера (K8s) — cluster-level
+  k8s_cluster:
+    auth_type: serviceAccount
+    collection_interval: 60s
+
+  # Метрики ноды/pod/контейнеров от kubelet (DaemonSet-сценарий)
+  kubeletstats:
+    auth_type: serviceAccount
+    collection_interval: 60s
+    # Укажите через env переменную корректную точку kubelet (см. манифест DaemonSet):
+    endpoint: ${KUBELET_ENDPOINT}
+    insecure_skip_verify: true
+    metric_groups: [container, pod, node, volume]
+
+  # Метрики хоста (CPU/RAM/FS/NET/LOAD/PROCESS)
+  hostmetrics:
+    collection_interval: 60s
+    scrapers:
+      cpu: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      load: {}
+      network: {}
+      process: {}
+
+  # Логи контейнеров (DaemonSet на каждой ноде; требует доступ к /var/log/containers)
+  filelog:
+    include:
+      - /var/log/containers/*.log
+    start_at: end
+    include_file_path: true
+    include_file_name: false
+    # Нормализация мультилайн и JSON, сохранение исходного при ошибке
+    operators:
+      - type: recombine
+        combine_field: body
+        is_first_entry: body matches '^\S'
+        source_identifier: attributes["log.file.path"]
+      - type: json_parser
+        parse_from: body
+        on_error: send
+      - type: move
+        from: attributes.stream
+        to: attributes["log.iostream"]
+
+processors:
+  # Ограничение памяти коллектора (чтобы не OOM-kill)
+  memory_limiter:
+    check_interval: 2s
+    limit_mib: ${OTEL_MEMORY_LIMIT_MIB:512}
+    spike_limit_mib: ${OTEL_MEMORY_SPIKE_MIB:128}
+
+  # Обогащение объектами Kubernetes (namespace/pod/labels/annotations)
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    filter:
+      # Для DaemonSet пробрасывайте env K8S_NODE_NAME из status.hostIP/fieldRef
+      node_from_env_var: K8S_NODE_NAME
+    extract:
+      metadata:
+        - k8s.cluster.name
+        - k8s.namespace.name
+        - k8s.node.name
+        - k8s.pod.uid
+        - k8s.pod.name
+        - k8s.container.name
+      labels:
+        - key: app.kubernetes.io/name
+          tag_name: app.kubernetes.io/name
+        - key: app.kubernetes.io/instance
+          tag_name: app.kubernetes.io/instance
+      annotations:
+        - key: prometheus.io/scrape
+          tag_name: k8s.annotations.prometheus.io/scrape
+
+  # Ресурсные атрибуты для унификации
+  resource:
+    attributes:
+      - action: insert
+        key: service.namespace
+        value: neuroforge
+      - action: upsert
+        key: deployment.environment
+        value: ${ENVIRONMENT:dev}
+      - action: insert
+        key: telemetry.distro.name
+        value: otelcol-contrib
+
+  # Удаление чувствительных полей
+  attributes/sanitize:
+    actions:
+      - action: delete
+        key: http.request.header.authorization
+      - action: delete
+        key: db.password
+      - action: delete
+        key: aws.secret_key
+      - action: delete
+        key: gcp.credentials_json
+
+  # Семплирование на хвосте (сохраняем ошибки/медленные, отбрасываем шум)
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 500
+    policies:
+      - name: keep_errors
+        type: status_code
+        status_code: ERROR
+      - name: keep_slow
+        type: latency
+        threshold_ms: 500
+      - name: drop_healthz
+        type: string_attribute
+        key: http.target
+        values: ["/healthz", "/readyz", "/metrics"]
+        invert_match: true
+      - name: rate_limit_rest
+        type: rate_limiting
+        spans_per_second: 1000
+
+  # Батчирование на выход (снижает накладные расходы)
+  batch:
+    send_batch_size: 8192
+    timeout: 5s
+    send_batch_max_size: 0
+
+connectors:
+  # Генерация RED-метрик из трасс
+  spanmetrics:
+    dimensions:
+      - http.method
+      - http.route
+      - http.status_code
+      - rpc.system
+    histogram:
+      explicit:
+        buckets: [1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s]
+    metrics_flush_interval: 15s
+
+exporters:
+  # Универсальный OTLP (глубокая телеметрия в бэкенд трасс/метрик/логов)
+  otlp:
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+    # true для небезопасных/внутренних эндпоинтов, иначе настройте tls.ca_file
+    tls:
+      insecure: ${OTEL_EXPORTER_OTLP_INSECURE:false}
+    headers:
+      # Пример: "Bearer <token>"; значение берётся из env
+      authorization: ${OTEL_EXPORTER_OTLP_HEADERS_AUTH}
+
+  # Альтернатива через OTLP/HTTP (если требуется)
+  otlphttp:
+    endpoint: ${OTEL_EXPORTER_OTLP_HTTP_ENDPOINT}
+    headers:
+      Authorization: "Bearer ${OTEL_EXPORTER_OTLP_TOKEN}"
+
+  # Прямая отдача метрик в Prometheus Remote Write
+  prometheusremotewrite:
+    endpoint: ${PROM_REMOTEWRITE_ENDPOINT}
+    tls:
+      insecure: ${PROM_REMOTEWRITE_INSECURE:true}
+    external_labels:
+      cluster: ${CLUSTER_NAME:dev-cluster}
+      namespace: ${NAMESPACE:default}
+
+  # Экспозиция pull-метрик (для Prometheus-сервера)
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: otel-collector
+    const_labels:
+      app: neuroforge-core
+
+  # Диагностический лог-экспортёр (оставить включенным на уровне info)
+  logging:
+    loglevel: info
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+  # Опциональный экспорт логов в Loki (если установлен соответствующий экспортер)
+  loki:
+    endpoint: ${LOKI_ENDPOINT}
+    tls:
+      insecure: ${LOKI_INSECURE:true}
+    labels:
+      attributes:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.container.name
+        - severity
+    tenant_id: ${LOKI_TENANT_ID:}
+
+extensions:
+  health_check: {}
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888
+
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resource, attributes/sanitize, tail_sampling, batch]
+      exporters: [otlp, spanmetrics, logging]
+
+    metrics:
+      receivers: [otlp, k8s_cluster, kubeletstats, hostmetrics, prometheus, spanmetrics]
+      processors: [memory_limiter, k8sattributes, resource, batch]
+      exporters: [prometheusremotewrite, prometheus, otlp]
+
+    logs:
+      receivers: [otlp, filelog]
+      processors: [memory_limiter, k8sattributes, resource, attributes/sanitize, batch]
+      exporters: [otlp, logging, loki]

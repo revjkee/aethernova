@@ -1,0 +1,283 @@
+---
+# Role: omnimind-core
+# File: tasks/users.yml
+# Purpose: Industrial-grade user & access management
+
+# =========================
+# Expected variables (examples in role defaults/vars):
+# -------------------------
+# omnimind_groups:
+#   - { name: "omni", gid: 6000, system: true, state: "present" }
+# omnimind_users:
+#   - name: "deploy"
+#     uid: 6001
+#     comment: "Omnimind deploy user"
+#     group: "omni"
+#     groups: ["omni", "adm"]
+#     append: true
+#     shell: "/bin/bash"
+#     home: "/home/deploy"
+#     create_home: true
+#     state: "present"
+#     system: false
+#     password_hash: "$6$rounds=65536$..."  # pre-hashed, never plain
+#     lock: false
+#     expire: "2026-12-31"                  # or null
+#     umask: "0027"                         # applied via profile.d
+#     ssh_keys:
+#       - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@host"
+#     ssh_key_options: 'no-agent-forwarding,no-port-forwarding'
+#     sudo:
+#       nopasswd: true
+#       commands:
+#         - "/bin/systemctl restart omnimind-core*"
+#         - "/usr/bin/journalctl -u omnimind-core*"
+# omnimind_sudo_defaults:
+#   - "env_reset"
+#   - "secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# omnimind_sudoers:
+#   - name: "omnimind-maintainers"
+#     users: ["deploy"]
+#     hosts: ["ALL"]
+#     as_users: ["root"]
+#     as_groups: []
+#     nopasswd: true
+#     commands: ["ALL"]
+# omnimind_login_defs:
+#   UMASK: "027"
+#   PASS_MAX_DAYS: "365"
+#   PASS_MIN_DAYS: "1"
+#   PASS_WARN_AGE: "14"
+# omnimind_limits:
+#   - { domain: "@omni", type: "soft", item: "nofile", value: "65536" }
+#   - { domain: "@omni", type: "hard", item: "nofile", value: "65536" }
+# =========================
+
+- name: "Preflight | Ensure sudo & shadow packages are present"
+  ansible.builtin.package:
+    name:
+      - sudo
+      - shadow
+    state: present
+  tags: [users, packages, hardening]
+
+# ---------- Groups ----------
+
+- name: "Groups | Manage omnimind groups"
+  ansible.builtin.group:
+    name: "{{ item.name }}"
+    gid: "{{ item.gid | default(omit) }}"
+    system: "{{ item.system | default(false) }}"
+    state: "{{ item.state | default('present') }}"
+  loop: "{{ omnimind_groups | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [users, groups]
+
+# ---------- Users basic ----------
+
+- name: "Users | Manage omnimind users"
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    uid: "{{ item.uid | default(omit) }}"
+    comment: "{{ item.comment | default('') }}"
+    group: "{{ item.group | default(omit) }}"
+    groups: "{{ (item.groups | default([])) | join(',') if (item.groups is defined) else omit }}"
+    append: "{{ item.append | default(true) }}"
+    shell: "{{ item.shell | default('/bin/bash') }}"
+    home: "{{ item.home | default(omit) }}"
+    create_home: "{{ item.create_home | default(true) }}"
+    state: "{{ item.state | default('present') }}"
+    password: "{{ item.password_hash | default(omit) }}"
+    system: "{{ item.system | default(false) }}"
+    expires: "{{ (item.expire | default(omit)) | default(omit) }}"
+    remove: "{{ item.remove | default(false) }}"
+  loop: "{{ omnimind_users | default([]) }}"
+  when: item.state | default('present') in ['present', 'absent']
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [users, accounts]
+
+- name: "Users | Lock or unlock accounts"
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    password_lock: "{{ item.lock | default(false) }}"
+  loop: "{{ omnimind_users | default([]) }}"
+  when: item.state | default('present') == 'present'
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [users, accounts, security]
+
+# ---------- SSH hardening (per user) ----------
+
+- name: "SSH | Ensure ~/.ssh directory exists with secure perms"
+  ansible.builtin.file:
+    path: "{{ (item.home | default('/home/' + item.name)) ~ '/.ssh' }}"
+    state: directory
+    owner: "{{ item.name }}"
+    group: "{{ item.group | default(item.name) }}"
+    mode: "0700"
+  loop: "{{ omnimind_users | default([]) }}"
+  when:
+    - item.state | default('present') == 'present'
+    - (item.create_home | default(true)) | bool
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [users, ssh, hardening]
+
+- name: "SSH | Install authorized_keys (idempotent)"
+  ansible.builtin.copy:
+    dest: "{{ (item.home | default('/home/' + item.name)) ~ '/.ssh/authorized_keys' }}"
+    owner: "{{ item.name }}"
+    group: "{{ item.group | default(item.name) }}"
+    mode: "0600"
+    content: |
+      {% for k in (item.ssh_keys | default([])) %}
+      {% if item.ssh_key_options is defined and item.ssh_key_options %}
+      {{ item.ssh_key_options }} {{ k }}
+      {% else %}
+      {{ k }}
+      {% endif %}
+      {% endfor %}
+  loop: "{{ omnimind_users | default([]) }}"
+  when:
+    - item.state | default('present') == 'present'
+    - item.ssh_keys is defined
+    - (item.ssh_keys | length) > 0
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [users, ssh]
+
+# ---------- Per-user umask via profile.d ----------
+
+- name: "ENV | Configure per-user umask via /etc/profile.d/omnimind-<user>.sh"
+  ansible.builtin.copy:
+    dest: "/etc/profile.d/omnimind-{{ item.name }}.sh"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (omnimind-core)
+      # Apply user-specific umask on login shells
+      if [ "$LOGNAME" = "{{ item.name }}" ]; then
+        umask {{ item.umask | default('0027') }}
+      fi
+  loop: "{{ omnimind_users | default([]) }}"
+  when: item.state | default('present') == 'present'
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [users, env, hardening]
+
+# ---------- Sudoers defaults (global) ----------
+
+- name: "Sudo | Global defaults drop-in"
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/00-omnimind-defaults"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "/usr/sbin/visudo -cf %s"
+    content: |
+      # Managed by Ansible (omnimind-core)
+      Defaults !lecture,tty_tickets,timestamp_timeout=15
+      {% for d in (omnimind_sudo_defaults | default([])) %}
+      Defaults {{ d }}
+      {% endfor %}
+  tags: [users, sudo, hardening]
+
+# ---------- Per-user/group sudoers ----------
+
+- name: "Sudo | Access policies"
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/10-{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "/usr/sbin/visudo -cf %s"
+    content: |
+      # Managed by Ansible (omnimind-core)
+      {% set users = (item.users | default([])) | join(',') %}
+      {% set hosts = (item.hosts | default(['ALL'])) | join(',') %}
+      {% set asu   = (item.as_users | default(['ALL'])) | join(',') %}
+      {% set asg   = (item.as_groups | default([])) | join(',') %}
+      {% set nopw  = 'NOPASSWD:' if (item.nopasswd | default(false)) else '' %}
+      {% set cmds  = (item.commands | default(['ALL'])) | join(', ') %}
+      {{ users }} {{ hosts }} = ({{ asu }}{% if asg %}:{{ asg }}{% endif %}) {{ nopw }} {{ cmds }}
+  loop: "{{ omnimind_sudoers | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [users, sudo]
+
+# ---------- Inline sudo grants from omnimind_users[].sudo ----------
+
+- name: "Sudo | Per-user inline policy from omnimind_users"
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/20-{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: "/usr/sbin/visudo -cf %s"
+    content: |
+      # Managed by Ansible (omnimind-core)
+      {% set nopw = 'NOPASSWD:' if (item.sudo.nopasswd | default(false)) else '' %}
+      {% set cmds = (item.sudo.commands | default(['ALL'])) | join(', ') %}
+      {{ item.name }} ALL=(ALL) {{ nopw }} {{ cmds }}
+  loop: "{{ omnimind_users | default([]) }}"
+  when:
+    - item.state | default('present') == 'present'
+    - item.sudo is defined
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [users, sudo]
+
+# ---------- login.defs hardening ----------
+
+- name: "Auth | Harden /etc/login.defs (UMASK & password aging)"
+  ansible.builtin.lineinfile:
+    path: "/etc/login.defs"
+    regexp: "^(#\\s*)?{{ item.key }}\\s+.*$"
+    line: "{{ item.key }}\t{{ item.val }}"
+    state: present
+    backrefs: false
+  loop: "{{ (omnimind_login_defs | default({})) | dict2items(key_name='key', value_name='val') }}"
+  loop_control:
+    label: "{{ item.key }}"
+  notify: [ "nss-pam-reload" ]
+  tags: [users, auth, hardening]
+
+# ---------- PAM & security limits ----------
+
+- name: "Limits | Ensure /etc/security/limits.d/99-omnimind.conf"
+  ansible.builtin.copy:
+    dest: "/etc/security/limits.d/99-omnimind.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (omnimind-core)
+      {% for l in (omnimind_limits | default([])) %}
+      {{ l.domain }} {{ l.type }} {{ l.item }} {{ l.value }}
+      {% endfor %}
+  notify: [ "nss-pam-reload" ]
+  tags: [users, limits, hardening]
+
+# ---------- Clean up sudoers for absent users (safety) ----------
+
+- name: "Cleanup | Remove sudoers files for absent users"
+  ansible.builtin.file:
+    path: "/etc/sudoers.d/20-{{ item.name }}"
+    state: absent
+  loop: "{{ omnimind_users | default([]) }}"
+  when: item.state | default('present') == 'absent'
+  loop_control:
+    label: "{{ item.name }}"
+  tags: [users, sudo, cleanup]
+
+# ---------- Handlers (declared locally for role if not already) ----------
+# Note: Handlers can also live in handlers/main.yml;
+# kept inline-safe — if duplicated, Ansible will merge by name.
+
+- name: "Flush handlers early"
+  ansible.builtin.meta: flush_handlers
+
+# End of tasks/users.yml

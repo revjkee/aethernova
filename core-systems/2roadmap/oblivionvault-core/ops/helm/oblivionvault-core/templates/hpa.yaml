@@ -1,0 +1,95 @@
+{{- /*
+  File: ops/helm/oblivionvault-core/templates/hpa.yaml
+  Purpose: Industrial-grade HPA template for oblivionvault-core
+*/ -}}
+{{- if and .Values.autoscaling .Values.autoscaling.enabled }}
+
+{{- $hpaApiVersion := default "autoscaling/v2" .Values.autoscaling.apiVersion -}}
+{{- $name := include "oblivionvault-core.fullname" . -}}
+{{- $labels := include "oblivionvault-core.labels" . -}}
+
+apiVersion: {{ $hpaApiVersion }}
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+{{- $labels | nindent 4 }}
+{{- with .Values.autoscaling.labels }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+  annotations:
+{{- with .Values.autoscaling.annotations }}
+{{- /* Allow templated annotations via tpl */}}
+{{ tpl (toYaml .) $ | nindent 4 }}
+{{- else }}
+    {}
+{{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: {{ default "apps/v1" (dig "scaleTargetRef" "apiVersion" "apps/v1" .Values.autoscaling) }}
+    kind: {{ default "Deployment" (dig "scaleTargetRef" "kind" "Deployment" .Values.autoscaling) }}
+    name: {{ default $name (dig "scaleTargetRef" "name" $name .Values.autoscaling) }}
+
+  minReplicas: {{ default 2 .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ default 10 .Values.autoscaling.maxReplicas }}
+
+  {{- /*
+      Metrics rendering:
+      - If .Values.autoscaling.metrics provided, render as-is (supports Resource/Pods/Object/External)
+      - Else, provide safe defaults for CPU & Memory utilization
+  */ -}}
+  {{- if .Values.autoscaling.metrics }}
+  metrics:
+{{ tpl (toYaml .Values.autoscaling.metrics) . | nindent 4 }}
+  {{- else }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ default 70 .Values.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ default 80 .Values.autoscaling.targetMemoryUtilizationPercentage }}
+  {{- end }}
+
+  {{- /*
+      Behavior rendering:
+      - Use provided behavior if present
+      - Else, apply production-safe defaults:
+        ScaleUp: fast but controlled (Max of 100% or 4 pods per 60s), no stabilization
+        ScaleDown: conservative (Min of 50% or 1 pod per 60s), 300s stabilization
+  */ -}}
+  {{- if .Values.autoscaling.behavior }}
+  behavior:
+{{ toYaml .Values.autoscaling.behavior | nindent 4 }}
+  {{- else }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+  {{- end }}
+
+{{- end }}

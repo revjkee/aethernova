@@ -1,0 +1,184 @@
+# -----------------------------------------------------------------------------
+# 1) DEFAULT DENY: Полный запрет входящего и исходящего трафика для всех Pod
+#    Базовый нулевой доступ — фундамент Zero Trust. Далее добавляются точечные allow.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-default-deny-all
+  labels:
+    app.kubernetes.io/part-of: veilmind-core
+    netpolicy.veilmind.io/profile: base
+spec:
+  podSelector: {}                # все Pod в текущем namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []                    # запретить всё
+  egress: []                     # запретить всё
+---
+# -----------------------------------------------------------------------------
+# 2) EGRESS DNS: Разрешить DNS (TCP/UDP 53) к CoreDNS в kube-system.
+#    Поддерживает типичные метки CoreDNS (k8s-app=coredns|kube-dns).
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-dns-egress
+  labels:
+    app.kubernetes.io/part-of: veilmind-core
+    netpolicy.veilmind.io/profile: base
+spec:
+  podSelector: {}                # всем Pod нужна резолюция имён
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: coredns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# -----------------------------------------------------------------------------
+# 3) OPTIONAL INTRA-NS: Разрешить обмен внутри namespace (east-west) — ВЫКЛ по умолчанию.
+#    Включение — меткой pod: netpolicy.veilmind.io/intra-allow=true
+#    Без этой метки Pod остаются изолированы даже внутри namespace.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-intra-namespace-optin
+  labels:
+    app.kubernetes.io/part-of: veilmind-core
+    netpolicy.veilmind.io/profile: base
+spec:
+  podSelector:
+    matchLabels:
+      netpolicy.veilmind.io/intra-allow: "true"
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}        # только Pod этого же namespace
+---
+# -----------------------------------------------------------------------------
+# 4) PROMETHEUS SCRAPE: Разрешить ingress для метрик ТОЛЬКО для Pod с меткой
+#    metrics.veilmind.io/allow-scrape=true. Доступ только из namespace "monitoring"
+#    и от Pod с меткой app.kubernetes.io/name=prometheus на именованный порт "metrics".
+#    Требование: контейнер должен объявлять namedPort "metrics".
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-metrics-scrape
+  labels:
+    app.kubernetes.io/part-of: veilmind-core
+    netpolicy.veilmind.io/profile: observability
+spec:
+  podSelector:
+    matchLabels:
+      metrics.veilmind.io/allow-scrape: "true"
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: metrics          # namedPort в Pod spec (containerPort name: "metrics")
+          protocol: TCP
+---
+# -----------------------------------------------------------------------------
+# 5) ISTIO INGRESSGATEWAY: Разрешить вход только приложений, которые должны быть
+#    опубликованы извне. ВКЛЮЧАЕТСЯ меткой exposed.veilmind.io/ingress=true.
+#    Допускаем трафик от istio-ingressgateway на 80/443 (L7 управляет Istio).
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-from-istio-ingressgateway
+  labels:
+    app.kubernetes.io/part-of: veilmind-core
+    netpolicy.veilmind.io/profile: ingress
+spec:
+  podSelector:
+    matchLabels:
+      exposed.veilmind.io/ingress: "true"
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: istio-system
+          podSelector:
+            matchLabels:
+              istio: ingressgateway
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+---
+# -----------------------------------------------------------------------------
+# 6) EGRESS HTTPS (OPT-IN): Разрешить исходящий HTTPS ТОЛЬКО Pod с меткой
+#    egress.veilmind.io/allow-external-https=true. Разрешение по 443/TCP ко всем
+#    адресам (0.0.0.0/0). Рекомендуется ограничивать через egress‑proxy/NAT.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-external-https-optin
+  labels:
+    app.kubernetes.io/part-of: veilmind-core
+    netpolicy.veilmind.io/profile: egress
+spec:
+  podSelector:
+    matchLabels:
+      egress.veilmind.io/allow-external-https: "true"
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 443
+          protocol: TCP
+---
+# -----------------------------------------------------------------------------
+# 7) EGRESS NTP (OPT-IN): Разрешить синхронизацию времени для Pod с меткой
+#    egress.veilmind.io/allow-ntp=true по UDP/123 ко всем адресам.
+#    В проде желательно указать ipBlock конкретных NTP‑серверов.
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: np-allow-ntp-optin
+  labels:
+    app.kubernetes.io/part-of: veilmind-core
+    netpolicy.veilmind.io/profile: egress
+spec:
+  podSelector:
+    matchLabels:
+      egress.veilmind.io/allow-ntp: "true"
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 123
+          protocol: UDP

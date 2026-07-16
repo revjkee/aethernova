@@ -1,0 +1,3 @@
+# analytics-core
+
+Project Documentation

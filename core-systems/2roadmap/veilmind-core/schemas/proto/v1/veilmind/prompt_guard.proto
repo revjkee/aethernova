@@ -1,0 +1,194 @@
+// path: veilmind-core/schemas/proto/v1/veilmind/prompt_guard.proto
+syntax = "proto3";
+
+package veilmind.v1;
+
+option go_package = "github.com/veilmind/veilmind-core/schemas/proto/v1;veilmindv1";
+option java_multiple_files = true;
+option java_package = "io.veilmind.core.v1";
+option csharp_namespace = "Veilmind.Core.V1";
+option ruby_package = "Veilmind::Core::V1";
+option objc_class_prefix = "VM";
+
+import "google/protobuf/timestamp.proto";
+import "google/rpc/status.proto";
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+// Уровень серьёзности итоговой оценки.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_LOW         = 1;
+  SEVERITY_MEDIUM      = 2;
+  SEVERITY_HIGH        = 3;
+  SEVERITY_CRITICAL    = 4;
+}
+
+// Категории, выявляемые на этапе анализа промпта.
+enum Category {
+  CATEGORY_UNSPECIFIED     = 0;
+  INJECTION_ATTEMPT        = 1;  // jailbreaking / игнорирование инструкций
+  DATA_EXFILTRATION        = 2;  // попытки утечки системного промпта/секретов
+  PII_PRESENT              = 3;  // обнаружение персональных данных
+  SEXUAL_MINORS            = 4;  // блок
+  EXPLICIT_SEXUAL          = 5;  // ограничение
+  SELF_HARM                = 6;  // блок
+  HATE_VIOLENCE            = 7;  // блок
+  ILLEGAL_ACTIVITY         = 8;  // блок
+  MALWARE_CYBERCRIME       = 9;  // блок
+  MEDICAL_ADVICE           = 10; // ограничение
+  LEGAL_ADVICE             = 11; // ограничение
+  FINANCIAL_ADVICE         = 12; // ограничение
+  CODE_EXECUTION           = 13; // ограничение
+  COPYRIGHT_RISKY          = 14; // ограничение
+  ADULT_NSFW               = 15; // ограничение
+}
+
+// Типы редактируемых PII, пригодны для отчётности/аудита.
+enum PIIType {
+  PII_TYPE_UNSPECIFIED = 0;
+  PII_EMAIL            = 1;
+  PII_PHONE            = 2;
+  PII_CARD             = 3;
+  PII_IBAN             = 4;
+  PII_OTHER            = 99;
+}
+
+// Запрошенные клиентом инструменты (мета‑информация).
+enum ToolType {
+  TOOL_TYPE_UNSPECIFIED = 0;
+  TOOL_WEB_BROWSE       = 1;
+  TOOL_CODE_EXEC        = 2;
+  TOOL_SHELL            = 3;
+  TOOL_IMAGE_EDIT       = 4;
+  TOOL_DATA_READ        = 5;
+  TOOL_DATA_WRITE       = 6;
+}
+
+// Ограничения инструментов, налагаемые политикой.
+enum ToolRestriction {
+  TOOL_RESTRICTION_UNSPECIFIED = 0;
+  NO_WEB_BROWSE                = 1;
+  NO_CODE_EXEC                 = 2;
+  NO_SHELL                     = 3;
+  NO_IMAGE_EDIT_FACES          = 4;
+  NO_SYSTEM_PROMPT_ECHO        = 5;
+  NO_FILE_SYSTEM_READ          = 6;
+  NO_ENV_LEAK                  = 7;
+  SANDBOX_ONLY                 = 8;
+  NO_NETWORK                   = 9;
+}
+
+// Гайдлайны для безопасного ответа модели.
+enum AnswerGuideline {
+  ANSWER_GUIDELINE_UNSPECIFIED            = 0;
+  REFUSE_AND_REDIRECT                     = 1; // вежливый отказ и безопасная альтернатива
+  IGNORE_INJECTIONS_AND_STAY_INSTRUCTIONS = 2; // игнорировать попытки injection
+  PROVIDE_GENERAL_INFO_NOT_ADVICE         = 3; // только общая инфо (медицина и т.д.)
+  NOT_A_LAWYER_NO_PERSONAL_ADVICE         = 4; // юридическое
+  EDUCATIONAL_ONLY_NO_FINANCIAL_ADVICE    = 5; // финансы
+  SUMMARIZE_NO_LONG_VERBATIM              = 6; // ограничение цитирования
+  AVOID_EXPLICIT_DESCRIPTIONS             = 7; // NSFW сдержанность
+}
+
+// -----------------------------------------------------------------------------
+// MESSAGES
+// -----------------------------------------------------------------------------
+
+// Метаданные запроса: кто/где/как инициировал вызов.
+message Meta {
+  string tenant_id         = 1;
+  string user_id           = 2;
+  string lang              = 3;  // ISO‑язык, напр. "ru"|"en"
+  string channel           = 4;  // "web"|"api"|"cli"|...
+  repeated ToolType tools_requested = 5;
+  repeated string prior_flags       = 6; // исторические флаги риска
+  map<string, string> labels        = 7; // произвольные метки/атрибуты
+}
+
+// Единичный запрос на оценку промпта.
+message PromptGuardRequest {
+  string prompt                       = 1;  // сырой промпт пользователя
+  Meta meta                           = 2;  // метаданные инициатора
+  string correlation_id               = 3;  // для сквозной трассировки
+  google.protobuf.Timestamp ts        = 4;  // момент формирования запроса
+  // зарезервировано под будущие поля
+  reserved 5, 6;
+  reserved "session_id", "trace_id";
+}
+
+// Обязательства, которые движок обязан выполнить при allow=true
+// или для безопасного ответа при условных категориях.
+message Obligations {
+  repeated string disclaimers             = 1; // локализованные дисклеймеры
+  repeated PIIType redactions             = 2; // типы отредактированных PII
+  repeated ToolRestriction tool_restrictions = 3;
+  repeated AnswerGuideline answer_guidelines = 4;
+  double rate_limit_multiplier            = 5; // множитель RL (<=1 => ужесточение)
+}
+
+// Успешный результат оценки.
+message PromptGuardSuccess {
+  bool allow                       = 1;
+  repeated Category categories     = 2;
+  double risk_score                = 3; // 0..1
+  Severity severity                = 4;
+  Obligations obligations          = 5;
+  string sanitized_prompt          = 6;
+  string version                   = 7; // версия политики/движка
+  repeated string reasons          = 8; // человекочитаемые причины
+}
+
+// Единичный ответ на оценку.
+message PromptGuardResponse {
+  string request_id                = 1;  // сгенерированный ID ответа
+  string correlation_id            = 2;
+  google.protobuf.Timestamp ts     = 3;  // время обработки на сервере
+
+  // Итог. При наличии error поля результата могут быть не заполнены.
+  PromptGuardSuccess result        = 10;
+  google.rpc.Status error          = 90;
+
+  // зарезервировано под будущее расширение
+  reserved 4 to 9;
+  reserved 11 to 19;
+}
+
+// Пакетные запрос/ответ.
+message BatchEvaluateRequest {
+  repeated PromptGuardRequest items = 1;
+}
+
+message BatchEvaluateResponse {
+  repeated PromptGuardResponse results = 1;
+}
+
+// Health‑проверка/сводка версии.
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string status                    = 1; // "ok"|"degraded"|"error"
+  string version                   = 2; // версия сервиса
+  map<string, string> info         = 3; // произвольные метрики/параметры
+  google.protobuf.Timestamp ts     = 4;
+}
+
+// -----------------------------------------------------------------------------
+// SERVICE
+// -----------------------------------------------------------------------------
+
+service PromptGuard {
+  // Синхронная оценка одного промпта.
+  rpc Evaluate (PromptGuardRequest) returns (PromptGuardResponse);
+
+  // Пакетная оценка нескольких промптов.
+  rpc BatchEvaluate (BatchEvaluateRequest) returns (BatchEvaluateResponse);
+
+  // Двунаправленный стрим для низкой задержки (чат/реал‑тайм).
+  rpc EvaluateStream (stream PromptGuardRequest) returns (stream PromptGuardResponse);
+
+  // Health‑проверка для probing/observability.
+  rpc Health (HealthCheckRequest) returns (HealthCheckResponse);
+}

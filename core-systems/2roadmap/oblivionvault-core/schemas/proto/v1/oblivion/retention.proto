@@ -1,0 +1,393 @@
+// oblivionvault-core/schemas/proto/v1/oblivion/retention.proto
+syntax = "proto3";
+
+package oblivion.v1;
+
+option go_package = "github.com/oblivionvault/oblivionvault-core/schemas/proto/v1/oblivion;oblivionv1";
+option java_multiple_files = true;
+option java_package = "com.oblivionvault.oblivion.v1";
+option java_outer_classname = "RetentionProto";
+option csharp_namespace = "OblivionVault.Oblivion.V1";
+option ruby_package = "Oblivion::V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// ============================================================
+// Доменные перечисления
+// ============================================================
+
+// Класс данных для политики хранения.
+enum DataClass {
+  DATA_CLASS_UNSPECIFIED = 0;
+  DATA_CLASS_PUBLIC = 1;
+  DATA_CLASS_INTERNAL = 2;
+  DATA_CLASS_CONFIDENTIAL = 3;
+  DATA_CLASS_RESTRICTED = 4;
+}
+
+// Юрисдикции/режимы комплаенса (для матчинга правил).
+enum Jurisdiction {
+  JURISDICTION_UNSPECIFIED = 0;
+  JURISDICTION_EU_GDPR = 1;          // ЕС/GDPR
+  JURISDICTION_US_CA_CCPA = 2;       // Калифорния/CCPA
+  JURISDICTION_US_HIPAA = 3;         // HIPAA (пример)
+  JURISDICTION_BR_LGPD = 4;          // Бразилия/LGPD
+  JURISDICTION_RU_FZ152 = 5;         // РФ/152-ФЗ (пример)
+}
+
+// Итоговое действие ретеншна.
+enum RetentionAction {
+  RETENTION_ACTION_UNSPECIFIED = 0;
+  RETENTION_ACTION_DELETE = 1;           // Удалить (см. DeleteMethod)
+  RETENTION_ACTION_ANONYMIZE = 2;        // Анонимизировать
+  RETENTION_ACTION_QUARANTINE = 3;       // В карантин (форензика)
+  RETENTION_ACTION_ARCHIVE = 4;          // Переместить в холодное хранилище
+  RETENTION_ACTION_RETAIN = 5;           // Сохранить (могут быть переходы lifecycle)
+}
+
+// Метод удаления (для DELETE).
+enum DeleteMethod {
+  DELETE_METHOD_UNSPECIFIED = 0;
+  DELETE_METHOD_SOFT = 1; // Логическая пометка с дальнейшей очисткой
+  DELETE_METHOD_HARD = 2; // Необратимое физическое удаление
+}
+
+// Storage класс при lifecycle-переходе.
+enum StorageClass {
+  STORAGE_CLASS_UNSPECIFIED = 0;
+  STORAGE_CLASS_STANDARD = 1;
+  STORAGE_CLASS_INFREQUENT_ACCESS = 2;
+  STORAGE_CLASS_GLACIER = 3;
+  STORAGE_CLASS_DEEP_ARCHIVE = 4;
+}
+
+// Статус результата принудительного применения.
+enum EnforcementStatus {
+  ENFORCEMENT_STATUS_UNSPECIFIED = 0;
+  ENFORCEMENT_STATUS_APPLIED = 1;
+  ENFORCEMENT_STATUS_SKIPPED = 2;
+  ENFORCEMENT_STATUS_FAILED = 3;
+}
+
+// Причина Legal Hold (не исчерпывающий список).
+enum HoldReason {
+  HOLD_REASON_UNSPECIFIED = 0;
+  HOLD_REASON_LITIGATION = 1;
+  HOLD_REASON_INVESTIGATION = 2;
+  HOLD_REASON_REGULATORY = 3;
+  HOLD_REASON_INCIDENT = 4;
+}
+
+// ============================================================
+// Модели домена
+// ============================================================
+
+// Переход жизненного цикла хранения (tiering) по возрасту.
+message LifecycleTransition {
+  // После какого возраста данных применять переход (с даты создания).
+  google.protobuf.Duration after_age = 1;
+
+  // Целевой класс хранения.
+  StorageClass target_class = 2;
+
+  // Необязательный целевой bucket/архив / tier-идентификатор.
+  string target_location = 3;
+
+  // Человеко-читаемое описание.
+  string description = 4;
+}
+
+// Legal Hold: блокирует удаление/анонимизацию/переезды.
+message LegalHold {
+  string id = 1;
+  HoldReason reason = 2;
+  string note = 3;
+  string created_by = 4;
+  google.protobuf.Timestamp create_time = 5;
+  // Опциональный срок действия hold (null = до ручного снятия).
+  google.protobuf.Timestamp expires_at = 6;
+  bool active = 7;
+}
+
+// Матчинг контекста для правил.
+message RuleMatcher {
+  // Логические ключи для матчинга.
+  repeated string resource_types = 1;          // напр. "user.profile", "invoice", "log.entry"
+  map<string, string> labels = 2;              // точное совпадение ключ/значение
+  repeated DataClass data_classes = 3;         // разрешённые классы данных
+  repeated string pii_types = 4;               // перечень PII (напр. "email", "phone", "ssn")
+  repeated Jurisdiction jurisdiction_allow = 5;// юрисдикции, для которых правило действует
+  repeated Jurisdiction jurisdiction_deny = 6; // исключения юрисдикций
+  repeated string env_allow = 7;               // окружения: "prod","stage","dev"
+  repeated string env_deny = 8;                // исключения окружений
+}
+
+// Условия срабатывания.
+message RuleConditions {
+  // Минимальный возраст данных от create_time.
+  google.protobuf.Duration min_age = 1;
+
+  // Максимальный возраст данных (жёсткий дедлайн).
+  google.protobuf.Duration max_age = 2;
+
+  // Период неактивности от last_accessed_at.
+  google.protobuf.Duration inactivity = 3;
+
+  // Жёсткие границы дат (если заданы).
+  google.protobuf.Timestamp created_before = 4;
+  google.protobuf.Timestamp last_modified_before = 5;
+  google.protobuf.Timestamp last_accessed_before = 6;
+
+  // Требовать отсутствие активного Legal Hold.
+  bool require_no_legal_hold = 7;
+}
+
+// Конфигурация действия.
+message RuleAction {
+  RetentionAction action = 1;
+
+  // Для DELETE.
+  DeleteMethod delete_method = 2;
+
+  // Для ANONYMIZE: ссылка на профиль анонимизации.
+  string anonymization_profile = 3;
+
+  // Для QUARANTINE: место карантина (bucket/prefix/queue).
+  string quarantine_location = 4;
+
+  // Для ARCHIVE: явная локация, если не через LifecycleTransition.
+  string archive_location = 5;
+
+  // Грейс-период перед финальным действием.
+  google.protobuf.Duration grace_period = 6;
+
+  // Нотификации (каналы/темы).
+  repeated string notify_channels = 7; // напр. "slack:#sec-incidents", "sns:arn:..."
+}
+
+// Отдельное правило политики ретеншна.
+message RetentionRule {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  int32 priority = 4;                 // Меньше значение — выше приоритет
+  bool enabled = 5;
+
+  RuleMatcher matcher = 6;
+  RuleConditions conditions = 7;
+  RuleAction action = 8;
+
+  // Дополнительные lifecycle-переходы (помимо action).
+  repeated LifecycleTransition lifecycle = 9;
+
+  // Метки и владельцы.
+  string owner = 10;
+  map<string, string> annotations = 11;
+}
+
+// Политика хранения — набор упорядоченных правил и настроек.
+message RetentionPolicy {
+  string id = 1;                      // policies/{policy_id}
+  string name = 2;
+  string description = 3;
+  string version = 4;                 // семантическая версия политики
+  bool enabled = 5;
+  int32 priority = 6;                 // для коллизий между политиками
+  string owner = 7;
+
+  google.protobuf.Timestamp create_time = 8;
+  google.protobuf.Timestamp update_time = 9;
+  string etag = 10;
+
+  repeated RetentionRule rules = 11;
+
+  // Глобальные lifecycle-переходы (для RETAIN/ARCHIVE сценариев).
+  repeated LifecycleTransition lifecycle = 12;
+
+  // Исключения на уровне политики.
+  repeated string resource_type_exemptions = 13;
+
+  // Юрисдикционные исключения на уровне политики.
+  repeated Jurisdiction jurisdiction_exemptions = 14;
+}
+
+// Контекст записи для оценки.
+message RecordContext {
+  string record_id = 1;
+  string resource_type = 2;
+  DataClass data_class = 3;
+  map<string, string> labels = 4;
+  repeated string pii_types = 5;
+  repeated Jurisdiction jurisdictions = 6;
+  string environment = 7; // "prod","stage","dev"
+
+  // Таймштампы.
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp last_modified_at = 9;
+  google.protobuf.Timestamp last_accessed_at = 10;
+
+  // Прочее.
+  uint64 size_bytes = 11;
+
+  // Флаг активного Legal Hold из внешней системы.
+  bool legal_hold_active = 12;
+}
+
+// Результат оценки.
+message EvaluationDecision {
+  string decision_id = 1;
+  bool applicable = 2;                        // Есть ли применимое правило/политика
+  RetentionAction final_action = 3;           // Итоговое действие
+  DeleteMethod delete_method = 4;             // Если DELETE
+  string anonymization_profile = 5;           // Если ANONYMIZE
+  StorageClass target_storage_class = 6;      // Если ARCHIVE/Lifecycle
+  string target_location = 7;                 // Явная локация (архив/карантин)
+
+  // Дедлайны/переходы.
+  google.protobuf.Timestamp due_time = 8;     // Время, когда действие допустимо/обязательно
+  google.protobuf.Duration grace_period = 9;  // Грейс перед применением
+
+  // Обоснование.
+  repeated string matched_rule_ids = 10;
+  string matched_policy_id = 11;
+  string rationale = 12;
+
+  // Доп. lifecycle-шаги для плана.
+  repeated LifecycleTransition planned_lifecycle = 13;
+}
+
+// ============================================================
+// Сервис: управление и исполнение ретеншна
+// ============================================================
+
+service RetentionService {
+  // CRUD политики
+  rpc CreatePolicy(CreatePolicyRequest) returns (RetentionPolicy);
+  rpc GetPolicy(GetPolicyRequest) returns (RetentionPolicy);
+  rpc UpdatePolicy(UpdatePolicyRequest) returns (RetentionPolicy);
+  rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse);
+  rpc ListPolicies(ListPoliciesRequest) returns (ListPoliciesResponse);
+
+  // Оценка и принудительное применение.
+  rpc Evaluate(EvaluationRequest) returns (EvaluationDecision);
+  rpc Enforce(EnforcementRequest) returns (EnforcementResult);
+
+  // Поток обновлений политик (для кэшей агентов/воркеров).
+  rpc StreamPolicyUpdates(StreamPoliciesRequest) returns (stream PolicyUpdate);
+}
+
+// ============================================================
+// Запросы/ответы сервиса
+// ============================================================
+
+message CreatePolicyRequest {
+  RetentionPolicy policy = 1;
+}
+
+message GetPolicyRequest {
+  // Может быть либо абсолютный ID (policies/xxx), либо короткий policy_id.
+  string id = 1;
+}
+
+message UpdatePolicyRequest {
+  RetentionPolicy policy = 1;
+  // Опциональная проверка на гонки.
+  string if_match_etag = 2;
+}
+
+message DeletePolicyRequest {
+  string id = 1;
+  bool allow_missing = 2; // не считать ошибкой отсутствие
+}
+
+message DeletePolicyResponse {
+  string id = 1;
+  bool deleted = 2;
+}
+
+message ListPoliciesRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  // Фильтры
+  bool only_enabled = 3;
+  string owner = 4;
+}
+
+message ListPoliciesResponse {
+  repeated RetentionPolicy policies = 1;
+  string next_page_token = 2;
+}
+
+// Оценка.
+message EvaluationRequest {
+  RecordContext record = 1;
+
+  // Явный перечень политик/правил для быстрой выборки (опционально).
+  repeated string candidate_policy_ids = 2;
+}
+
+// Принудительное применение решения.
+message EnforcementRequest {
+  string decision_id = 1;                   // из Evaluate
+  string record_id = 2;                     // fallback, если применяем без decision_id
+  RetentionAction override_action = 3;      // принудительный override (аудит обязателен)
+  string actor = 4;                         // кто инициировал
+  google.protobuf.Timestamp request_time = 5;
+}
+
+message EnforcementResult {
+  EnforcementStatus status = 1;
+  RetentionAction applied_action = 2;
+  DeleteMethod delete_method = 3;
+  string location = 4; // архив/карантин/итд
+  google.protobuf.Timestamp action_time = 5;
+  string error_message = 6;
+}
+
+// События обновления политик для стрима/кэша.
+message PolicyUpdate {
+  string policy_id = 1;
+  google.protobuf.Timestamp update_time = 2;
+  string etag = 3;
+  UpdateKind kind = 4;
+
+  enum UpdateKind {
+    UPDATE_KIND_UNSPECIFIED = 0;
+    UPDATE_KIND_CREATED = 1;
+    UPDATE_KIND_MODIFIED = 2;
+    UPDATE_KIND_DELETED = 3;
+  }
+}
+
+message StreamPoliciesRequest {
+  // С какой метки времени получать обновления (для ре-подключений).
+  google.protobuf.Timestamp since = 1;
+  // Фильтр владельца/пространства.
+  string owner = 2;
+}
+
+// ============================================================
+// Дополнительно: аудит и статус ретеншна
+// ============================================================
+
+message RetentionAuditEvent {
+  string event_id = 1;
+  string record_id = 2;
+  string policy_id = 3;
+  string rule_id = 4;
+  string actor = 5; // "system", "admin:<id>", "svc:<id>"
+  RetentionAction action = 6;
+  EnforcementStatus status = 7;
+  string message = 8;
+  google.protobuf.Timestamp event_time = 9;
+}
+
+message RetentionStatus {
+  string record_id = 1;
+  bool legal_hold_active = 2;
+  google.protobuf.Timestamp next_due_time = 3;
+  RetentionAction next_action = 4;
+  repeated string matched_policy_ids = 5;
+  repeated string matched_rule_ids = 6;
+}

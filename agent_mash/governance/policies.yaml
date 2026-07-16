@@ -1,0 +1,375 @@
+# agent_mash/governance/policies.yaml
+#
+# Industrial policy pack for agent_mash governance.
+# This file is intended to be machine-validated by your governance loader.
+#
+# NOTE: Replace placeholders under "trust_anchors" and "integrity" with real values
+# once your signing pipeline is in place.
+
+schema_version: "1.0.0"
+policy_pack_id: "agent_mash.governance.default"
+policy_pack_name: "agent_mash Governance Policy Pack"
+environment: "prod"
+created_utc: "1970-01-01T00:00:00Z"   # to be injected by CI
+updated_utc: "1970-01-01T00:00:00Z"   # to be injected by CI
+
+metadata:
+  owner: "governance"
+  contact: "security@invalid.local"   # replace in deployment
+  description: "Default industrial governance policies for agent_mash."
+  tags:
+    - "policy-as-code"
+    - "governance"
+    - "security"
+    - "safety"
+  compatibility:
+    min_runtime: "0.1.0"
+    max_runtime: "999.999.999"
+
+integrity:
+  mode: "unsigned"                    # unsigned|signed
+  signing:
+    required: false
+    key_id: null                      # e.g. "gpg:ABCD1234..." or "cosign:..."
+    algorithm: null                   # e.g. "ed25519" / "rsa-pss" / "ecdsa-p256"
+  checksums:
+    sha256: null                      # CI can inject checksum of this file
+
+trust_anchors:
+  maintainers:
+    - id: "maintainer-1"
+      name: "TBD"
+      keys: []
+  break_glass:
+    enabled: true
+    require_mfa: true
+    require_ticket: true
+    max_duration_seconds: 3600
+    reason_required: true
+
+defaults:
+  fail_closed: true
+  deny_by_default: true
+  timezone: "UTC"
+  decision_clock_skew_seconds: 15
+  max_decision_depth: 12
+  max_parallel_agents: 16
+  max_parallel_tool_calls: 8
+  allowlist_mode: "strict"            # strict|hybrid
+  logging:
+    redaction:
+      enabled: true
+      redact_secrets: true
+      redact_pii: true
+      redact_tokens: true
+      patterns:
+        - "(?i)api[_-]?key\\s*[:=]\\s*[^\\s]+"
+        - "(?i)bearer\\s+[a-z0-9\\-\\._~\\+\\/]+=*"
+        - "(?i)secret\\s*[:=]\\s*[^\\s]+"
+        - "(?i)password\\s*[:=]\\s*[^\\s]+"
+        - "(?i)private[_-]?key\\s*[:=]"
+  data_handling:
+    allow_external_network: false
+    allow_file_write: false
+    allow_subprocess: false
+    allow_shell: false
+    allow_unsafe_deserialization: false
+    allow_dynamic_code_exec: false
+    allowed_content_types:
+      - "application/json"
+      - "text/plain"
+      - "text/markdown"
+
+runtime_gate:
+  # Hard global switches. Keep these minimal and high-signal.
+  enabled: true
+  deny_if:
+    - id: "deny.dynamic_code_exec"
+      description: "Deny any request to execute dynamic code."
+      condition:
+        any:
+          - field: "request.capabilities.dynamic_code_exec"
+            op: "eq"
+            value: true
+      action: "deny"
+    - id: "deny.shell_access"
+      description: "Deny direct shell access unless explicitly allowed by policy."
+      condition:
+        any:
+          - field: "request.capabilities.shell"
+            op: "eq"
+            value: true
+      action: "deny"
+    - id: "deny.external_network"
+      description: "Deny external network access by default."
+      condition:
+        any:
+          - field: "request.capabilities.external_network"
+            op: "eq"
+            value: true
+      action: "deny"
+  allow_if:
+    - id: "allow.internal_only"
+      description: "Allow internal-only operations (no network, no shell, no file writes)."
+      condition:
+        all:
+          - field: "request.capabilities.external_network"
+            op: "eq"
+            value: false
+          - field: "request.capabilities.shell"
+            op: "eq"
+            value: false
+          - field: "request.capabilities.file_write"
+            op: "eq"
+            value: false
+      action: "allow"
+
+approvals:
+  # Approval rules define when human approval is required before execution.
+  enabled: true
+  default_policy: "require_approval_on_risky"
+  policies:
+    require_approval_on_risky:
+      description: "Require approval when risk score exceeds threshold or sensitive domains touched."
+      require_approval: true
+      thresholds:
+        risk_score_min: 60
+      sensitive_domains:
+        - "payments"
+        - "identity"
+        - "keys"
+        - "crypto"
+        - "governance"
+        - "security"
+      triggers:
+        - id: "approval.high_risk"
+          when:
+            all:
+              - field: "risk.score"
+                op: "gte"
+                value: 60
+          reason: "Risk score >= 60"
+        - id: "approval.sensitive_domain"
+          when:
+            any:
+              - field: "request.domain"
+                op: "in"
+                value:
+                  - "payments"
+                  - "identity"
+                  - "keys"
+                  - "crypto"
+                  - "governance"
+                  - "security"
+          reason: "Sensitive domain"
+
+veto:
+  # Veto rules are absolute denies regardless of approvals.
+  enabled: true
+  rules:
+    - id: "veto.exfiltration"
+      description: "Veto data exfiltration attempts."
+      when:
+        any:
+          - field: "intent"
+            op: "in"
+            value:
+              - "exfiltrate_data"
+              - "steal_secrets"
+              - "bypass_auth"
+      action: "deny"
+    - id: "veto.malware"
+      description: "Veto malware or destructive instructions."
+      when:
+        any:
+          - field: "intent"
+            op: "in"
+            value:
+              - "malware_development"
+              - "ransomware"
+              - "destructive_actions"
+      action: "deny"
+    - id: "veto.unsafe_code_exec"
+      description: "Veto dynamic execution primitives."
+      when:
+        any:
+          - field: "request.contains"
+            op: "regex"
+            value: "(?i)\\b(eval|exec|pickle\\.loads|marshal\\.loads|os\\.system|subprocess\\.)\\b"
+      action: "deny"
+
+escalation:
+  # Escalation determines who/what to notify or route to when approvals/denies happen.
+  enabled: true
+  routes:
+    - id: "route.security_on_veto"
+      when:
+        all:
+          - field: "decision.status"
+            op: "eq"
+            value: "denied"
+          - field: "decision.reason_category"
+            op: "eq"
+            value: "veto"
+      notify:
+        channels:
+          - type: "log"
+            level: "error"
+          - type: "webhook"
+            url: "https://invalid.local/webhook"   # replace in deployment
+      severity: "high"
+    - id: "route.ops_on_degraded"
+      when:
+        all:
+          - field: "system.health"
+            op: "eq"
+            value: "degraded"
+      notify:
+        channels:
+          - type: "log"
+            level: "warning"
+      severity: "medium"
+
+ttl:
+  # Time-to-live policies for requests/packets/decisions.
+  enabled: true
+  defaults:
+    request_ttl_seconds: 120
+    decision_ttl_seconds: 300
+    approval_ttl_seconds: 900
+  overrides:
+    - id: "ttl.short_for_sensitive"
+      when:
+        any:
+          - field: "request.domain"
+            op: "in"
+            value:
+              - "keys"
+              - "payments"
+              - "identity"
+      set:
+        request_ttl_seconds: 60
+        decision_ttl_seconds: 180
+        approval_ttl_seconds: 600
+    - id: "ttl.long_for_batch"
+      when:
+        all:
+          - field: "request.mode"
+            op: "eq"
+            value: "batch"
+      set:
+        request_ttl_seconds: 600
+        decision_ttl_seconds: 1200
+        approval_ttl_seconds: 1800
+
+limits:
+  # Hard limits to prevent runaway behavior.
+  enabled: true
+  budgets:
+    max_prompt_chars: 200000
+    max_response_chars: 200000
+    max_tool_calls: 20
+    max_external_requests: 0
+    max_file_bytes_total: 0
+    max_runtime_seconds: 60
+  per_domain:
+    payments:
+      max_tool_calls: 8
+      max_runtime_seconds: 30
+    governance:
+      max_tool_calls: 10
+      max_runtime_seconds: 45
+    security:
+      max_tool_calls: 10
+      max_runtime_seconds: 45
+
+risk_scoring:
+  # Deterministic scoring. No ML required.
+  enabled: true
+  score_range:
+    min: 0
+    max: 100
+  thresholds:
+    low: 0
+    medium: 35
+    high: 60
+    critical: 85
+  factors:
+    - id: "factor.sensitive_domain"
+      weight: 25
+      when:
+        any:
+          - field: "request.domain"
+            op: "in"
+            value:
+              - "payments"
+              - "keys"
+              - "identity"
+              - "crypto"
+              - "security"
+    - id: "factor.external_network"
+      weight: 30
+      when:
+        any:
+          - field: "request.capabilities.external_network"
+            op: "eq"
+            value: true
+    - id: "factor_shell"
+      weight: 30
+      when:
+        any:
+          - field: "request.capabilities.shell"
+            op: "eq"
+            value: true
+    - id: "factor_pii"
+      weight: 20
+      when:
+        any:
+          - field: "request.contains"
+            op: "regex"
+            value: "(?i)\\b(passport|ssn|social security|card number|cvv|iban|swift)\\b"
+    - id: "factor_dynamic_exec"
+      weight: 40
+      when:
+        any:
+          - field: "request.contains"
+            op: "regex"
+            value: "(?i)\\b(eval|exec|pickle\\.loads|os\\.system|subprocess\\.)\\b"
+  clamp:
+    min: 0
+    max: 100
+
+audit:
+  enabled: true
+  mode: "append_only"
+  record:
+    include_request_hash: true
+    include_policy_pack_id: true
+    include_version: true
+    include_risk_score: true
+    include_decision_trace: true
+  retention:
+    days: 365
+  pii:
+    store_pii: false
+    store_raw_prompts: false
+    store_redacted_prompts: true
+
+change_control:
+  # Control who can change policies and how.
+  enabled: true
+  workflow:
+    require_code_review: true
+    min_approvers: 2
+    require_signed_commits: true
+    require_ci_pass: true
+    require_checksum_update: true
+  emergency_patch:
+    enabled: true
+    require_break_glass: true
+    max_duration_seconds: 3600
+
+extensions:
+  # Safe area for downstream overrides without breaking schema.
+  enabled: true
+  items: {}

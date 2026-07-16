@@ -1,0 +1,423 @@
+# human-sovereignty-core/config/approval_rules.yaml
+# Purpose: Policy-as-code for human approval of high-impact actions and decision packets.
+# Model: Deny-first, least-privilege, multi-approval, audit-by-default.
+# All durations are seconds unless explicitly stated.
+
+version: "1.0.0"
+kind: "approval_rules"
+name: "human_sovereignty_approval_rules"
+updated_at_utc: "2026-01-27T00:00:00Z"
+owner: "human-sovereignty-core"
+
+global:
+  enabled: true
+
+  evaluation:
+    # Deterministic behavior.
+    deny_by_default: true
+    # If multiple rules match, apply the strictest effective requirement.
+    conflict_resolution: "most_restrictive"
+    # Order of evaluation: explicit priority desc, then specificity desc, then rule id asc.
+    ordering:
+      primary: "priority_desc"
+      secondary: "specificity_desc"
+      tertiary: "id_asc"
+
+  identity:
+    # Approver identities must be verified by IAM and bound to roles/scopes.
+    require_strong_auth: true
+    # Allowed strong auth methods identifiers.
+    allowed_mfa_methods:
+      - "webauthn"
+      - "totp"
+    # Session freshness requirement for approvals.
+    max_auth_age_seconds: 900
+
+  integrity:
+    # Every approval must reference a signed decision packet / action request.
+    require_signed_request: true
+    # For request signatures.
+    allowed_signature_algorithms:
+      - "ed25519"
+      - "rsa-pss-sha256"
+      - "ecdsa-p256-sha256"
+    # Prevent replay by requiring nonce and enforcing dedup in window.
+    require_nonce: true
+    nonce_dedup_window_seconds: 900
+
+  timeouts:
+    # If approvals are not collected in time, request expires and must be re-created.
+    approval_window_seconds: 1800
+    # After this, escalation may be triggered if enabled for the rule.
+    escalation_after_seconds: 600
+
+  audit:
+    enabled: true
+    # Minimum audit fields required in events emitted by the enforcement layer.
+    required_fields:
+      - "request_id"
+      - "packet_id"
+      - "action"
+      - "domain"
+      - "environment"
+      - "risk_level"
+      - "rule_id"
+      - "decision"
+      - "approvers"
+      - "created_at"
+      - "finalized_at"
+      - "reason"
+    # Policy for redaction of sensitive payload parts.
+    redact:
+      enabled: true
+      fields:
+        - "secrets"
+        - "private_keys"
+        - "raw_tokens"
+        - "credentials"
+        - "pii"
+
+risk_model:
+  # Risk score can be computed by upstream and passed as risk_score, then mapped to risk_level.
+  # If not present, level may be inferred from action category using defaults below.
+  enabled: true
+
+  levels:
+    - id: "LOW"
+      min_score: 0
+      max_score: 24
+      default_approvals_required: 0
+    - id: "MEDIUM"
+      min_score: 25
+      max_score: 49
+      default_approvals_required: 1
+    - id: "HIGH"
+      min_score: 50
+      max_score: 79
+      default_approvals_required: 2
+    - id: "CRITICAL"
+      min_score: 80
+      max_score: 100
+      default_approvals_required: 3
+
+  action_defaults:
+    # Fallback risk levels by action category if risk_score not provided.
+    # These are intentionally conservative.
+    "read_only": "LOW"
+    "write_config": "MEDIUM"
+    "deploy_change": "HIGH"
+    "security_sensitive": "CRITICAL"
+    "irreversible": "CRITICAL"
+
+approver_constraints:
+  # Independence rules ensure approvals are not self-approved or from same control boundary.
+  independence:
+    require_distinct_approvers: true
+    # Disallow same principal approving multiple slots.
+    disallow_duplicate_principal: true
+    # Disallow requester approving their own request.
+    disallow_requester_as_approver: true
+    # Enforce separation of duties where configured by rule.
+    enforce_sod: true
+
+  # Minimum roles that can approve per risk level (baseline).
+  # Rules may override with stricter requirements.
+  baseline_roles_by_risk_level:
+    LOW: []
+    MEDIUM:
+      - "approver"
+    HIGH:
+      - "senior_approver"
+    CRITICAL:
+      - "security_officer"
+
+  # Optional additional constraints that enforcement can use if present in IAM.
+  attributes:
+    require_active_employment: true
+    require_not_suspended: true
+
+policies:
+  # Named policies can be referenced by rules to avoid duplication.
+  templates:
+    - id: "no_approval"
+      approvals_required: 0
+      roles_any_of: []
+      scopes_all_of: []
+      escalation:
+        enabled: false
+
+    - id: "single_approver"
+      approvals_required: 1
+      roles_any_of:
+        - "approver"
+        - "senior_approver"
+        - "security_officer"
+      scopes_all_of:
+        - "approval:write"
+      escalation:
+        enabled: true
+        to_roles_any_of:
+          - "senior_approver"
+        after_seconds: 600
+
+    - id: "two_person_rule"
+      approvals_required: 2
+      roles_any_of:
+        - "senior_approver"
+        - "security_officer"
+      scopes_all_of:
+        - "approval:write"
+      separation_of_duties:
+        enabled: true
+        disallow_same_team: true
+      escalation:
+        enabled: true
+        to_roles_any_of:
+          - "security_officer"
+        after_seconds: 600
+
+    - id: "critical_tri_approval"
+      approvals_required: 3
+      roles_any_of:
+        - "security_officer"
+      scopes_all_of:
+        - "approval:write"
+      separation_of_duties:
+        enabled: true
+        disallow_same_team: true
+        require_at_least_one_role:
+          - "security_officer"
+      escalation:
+        enabled: true
+        to_roles_any_of:
+          - "security_officer"
+        after_seconds: 300
+
+break_glass:
+  # Emergency bypass is controlled, audited, time-bounded, and requires explicit justification.
+  enabled: true
+  # Break-glass never removes audit and never allows irreversible actions unless explicitly allowed by rule.
+  audit_required: true
+  require_reason: true
+  require_ticket_reference: true
+  # Additional approvals required for break-glass usage itself.
+  break_glass_approvals_required: 1
+  break_glass_roles_any_of:
+    - "security_officer"
+  # How long the break-glass session is valid after being granted.
+  session_ttl_seconds: 600
+
+rules:
+  # Each rule yields an "effective policy" that defines approval requirements.
+  # Match fields are ANDed. Omitted match means "any".
+
+  - id: "deny_unsafe_by_default"
+    enabled: true
+    priority: 1000
+    description: "Deny any request lacking mandatory fields or failing integrity checks."
+    match:
+      always: true
+    effect:
+      decision: "deny_if_invalid"
+      policy_template: "no_approval"
+
+  - id: "allow_read_only_low_risk"
+    enabled: true
+    priority: 900
+    description: "Allow low risk read-only operations without human approval."
+    match:
+      action_categories:
+        - "read_only"
+      risk_levels:
+        - "LOW"
+      environments:
+        - "dev"
+        - "staging"
+        - "prod"
+    effect:
+      decision: "allow"
+      policy_template: "no_approval"
+
+  - id: "config_changes_require_single_approval"
+    enabled: true
+    priority: 800
+    description: "Configuration writes require at least one approval."
+    match:
+      action_categories:
+        - "write_config"
+      environments:
+        - "staging"
+        - "prod"
+      domains:
+        - "platform_ops"
+        - "observability"
+        - "gateway"
+        - "collaboration"
+    effect:
+      decision: "require_approval"
+      policy_template: "single_approver"
+
+  - id: "deployments_require_two_person_rule"
+    enabled: true
+    priority: 750
+    description: "Deploy, rollback and runtime policy changes require two-person approval."
+    match:
+      action_categories:
+        - "deploy_change"
+      environments:
+        - "staging"
+        - "prod"
+      actions:
+        - "deploy"
+        - "rollback"
+        - "apply_policy"
+        - "update_runtime_rules"
+    effect:
+      decision: "require_approval"
+      policy_template: "two_person_rule"
+
+  - id: "security_sensitive_always_critical"
+    enabled: true
+    priority: 700
+    description: "Security sensitive actions always require critical multi-approval."
+    match:
+      action_categories:
+        - "security_sensitive"
+      environments:
+        - "prod"
+      domains:
+        - "identity"
+        - "platform_security"
+        - "keyvault"
+        - "zero_trust"
+    effect:
+      decision: "require_approval"
+      policy_template: "critical_tri_approval"
+      constraints:
+        # Break-glass is allowed only for explicitly reversible operations.
+        break_glass_allowed: true
+        break_glass_disallow_if_action_categories:
+          - "irreversible"
+
+  - id: "irreversible_actions_strict"
+    enabled: true
+    priority: 650
+    description: "Irreversible actions require critical approvals and no break-glass."
+    match:
+      action_categories:
+        - "irreversible"
+      environments:
+        - "staging"
+        - "prod"
+    effect:
+      decision: "require_approval"
+      policy_template: "critical_tri_approval"
+      constraints:
+        break_glass_allowed: false
+
+  - id: "dev_relaxed_for_non_sensitive"
+    enabled: true
+    priority: 600
+    description: "Dev environment can be relaxed except security-sensitive and irreversible actions."
+    match:
+      environments:
+        - "dev"
+    effect:
+      decision: "require_approval_by_risk"
+      risk_overrides:
+        LOW:
+          policy_template: "no_approval"
+        MEDIUM:
+          policy_template: "single_approver"
+        HIGH:
+          policy_template: "two_person_rule"
+        CRITICAL:
+          policy_template: "critical_tri_approval"
+      constraints:
+        break_glass_allowed: true
+
+  - id: "fallback_require_approval_medium_plus"
+    enabled: true
+    priority: 10
+    description: "Fallback: require approval based on risk, deny unknown if risk missing."
+    match: {}
+    effect:
+      decision: "require_approval_by_risk"
+      on_missing_risk:
+        decision: "deny"
+        reason: "risk_level_or_score_missing"
+      risk_overrides:
+        LOW:
+          policy_template: "no_approval"
+        MEDIUM:
+          policy_template: "single_approver"
+        HIGH:
+          policy_template: "two_person_rule"
+        CRITICAL:
+          policy_template: "critical_tri_approval"
+
+enforcement:
+  # How enforcement should behave when collecting approvals.
+  collection:
+    quorum_mode: "exact" # "exact" means approvals_required must be met exactly or above, but unique principals enforced.
+    max_parallel_requests_per_principal: 20
+    idempotency_required: true
+
+  decision_packet_binding:
+    # Approval must bind to immutable digest of the request payload.
+    require_payload_digest: true
+    digest_algorithms_allowlist:
+      - "sha256"
+      - "sha512"
+
+  outputs:
+    # Standard decision outputs produced by the approval engine.
+    statuses:
+      - "approved"
+      - "rejected"
+      - "expired"
+      - "cancelled"
+
+  failure_modes:
+    # If storage or IAM is unavailable, fail closed in prod/staging.
+    fail_closed_environments:
+      - "staging"
+      - "prod"
+    # In dev, allow fail-open only for LOW risk read-only actions.
+    dev_fail_open:
+      enabled: true
+      allowed_only_if:
+        environments:
+          - "dev"
+        action_categories:
+          - "read_only"
+        risk_levels:
+          - "LOW"
+
+observability:
+  metrics:
+    enabled: true
+    namespace: "aethernova.approval"
+    counters:
+      - "approval_requests_total"
+      - "approval_approved_total"
+      - "approval_rejected_total"
+      - "approval_expired_total"
+      - "approval_break_glass_total"
+    histograms:
+      - "approval_time_to_decision_seconds"
+      - "approval_required_count"
+  logging:
+    enabled: true
+    level: "info"
+    log_fields:
+      - "request_id"
+      - "packet_id"
+      - "rule_id"
+      - "policy_template"
+      - "approvals_required"
+      - "approvals_collected"
+      - "environment"
+      - "risk_level"
+      - "decision"
+      - "final_reason"

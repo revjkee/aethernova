@@ -1,0 +1,478 @@
+apiVersion: veilmind.io/v1
+kind: RiskPolicy
+metadata:
+  name: default-risk-policy
+  owner: platform-security
+  environment: prod
+  version: "2025.08.21"
+  annotations:
+    description: >
+      Политика оценки и управления рисками для Zero Trust PEP/PDP.
+      Включает модели скоринга, бэнды риска, действия, исключения и телеметрию.
+spec:
+  schema:
+    checksum: "sha256:CHANGEME"   # заполняется CI при проверке целостности
+    minEngineVersion: "1.2.0"
+
+  defaults:
+    ttlSeconds: 300                # время жизни вычисленного риска для одного субъекта/контекста
+    timeDecay:
+      halfLifeSeconds: 1800        # полураспад влияния сырых событий
+      minWeight: 0.25              # нижняя граница веса сигнала после распада
+    normalization:
+      method: "winsorize"          # winsorize|zscore|minmax
+      winsorizeQuantiles: [0.02, 0.98]
+    missingSignalPolicy: "neutral" # neutral|pessimistic|optimistic
+    unknownValueScore: 0.0
+
+  # Таксономия уровней риска (0..100 после нормализации)
+  bands:
+    - name: low
+      range: [0, 29.99]
+      color: "#2E7D32"
+      action: allow
+    - name: medium
+      range: [30, 59.99]
+      color: "#F9A825"
+      action: step_up
+    - name: high
+      range: [60, 79.99]
+      color: "#EF6C00"
+      action: quarantine
+    - name: critical
+      range: [80, 100]
+      color: "#C62828"
+      action: deny
+
+  # Карта действий по умолчанию
+  actions:
+    allow:
+      description: "Доступ разрешен"
+      session:
+        maxDurationSeconds: 3600
+        sliding: true
+      logging: info
+    step_up:
+      description: "Требуется усиленная аутентификация"
+      mfa:
+        methods: ["webauthn", "totp", "push"]
+        timeoutSeconds: 120
+        retries: 2
+      session:
+        maxDurationSeconds: 1800
+        sliding: true
+      logging: warn
+    quarantine:
+      description: "Ограниченный режим: только безопасные маршруты"
+      controls:
+        restrictResourcesToLabels:
+          sensitivity: ["low"]
+        network:
+          outboundCIDRs: ["0.0.0.0/0"]
+          blockedDestinations: ["admin.veilmind.local"]
+      requireTicket: true
+      logging: warn
+    deny:
+      description: "Блокировка доступа"
+      errorCode: "RISK_DENY"
+      logging: error
+      notify:
+        channels: ["siem", "secops"]
+
+  # Источники сигналов и их доверенность
+  sources:
+    - id: posture
+      description: "Результаты posture-агента"
+      trust: high
+      freshnessSeconds: 300
+      required: true
+    - id: idp
+      description: "События IdP (аутентификация, риск входа)"
+      trust: high
+      freshnessSeconds: 600
+      required: true
+    - id: threat_intel
+      description: "IOC/репутация IP/ASN/гео"
+      trust: medium
+      freshnessSeconds: 3600
+      required: false
+    - id: anomaly
+      description: "UEBA/поведенческий анализ"
+      trust: medium
+      freshnessSeconds: 900
+      required: false
+    - id: app_audit
+      description: "Журналы приложений/PEP"
+      trust: medium
+      freshnessSeconds: 900
+      required: true
+
+  # Модель скоринга: взвешенные сигналы по контекстам
+  scoring:
+    totalScale: [0, 100]           # итоговая шкала риска
+    combine: weighted_sum_clip     # метод агрегации: weighted_sum_clip|max|logistic
+    signals:
+
+      # -------- Контекст: пользователь --------
+      - key: user.risk.idp_last_login
+        description: "Оценка риска последнего входа по данным IdP (0..1)"
+        source: idp
+        path: "risk_score"         # путь в payload источника
+        transform:
+          scale: [0, 1]            # входной диапазон
+          mapTo: [0, 25]           # вклад в итоговую шкалу
+        weight: 1.0
+        timeDecay: inherit
+
+      - key: user.mfa_strength
+        description: "Сила последней аутентификации (webauthn>totp>sms)"
+        source: idp
+        derive:
+          mapping:
+            webauthn: 0
+            totp: 5
+            push: 8
+            sms: 12
+            password_only: 18
+            unknown: 10
+        transform:
+          mapTo: [0, 18]           # чем больше — тем рискованнее
+        weight: 0.8
+
+      - key: user.privilege_level
+        description: "Уровень привилегий (admin/ops/user)"
+        source: idp
+        derive:
+          mapping:
+            admin: 15
+            ops: 8
+            user: 0
+        transform:
+          clamp: [0, 15]
+        weight: 0.7
+
+      # -------- Контекст: устройство --------
+      - key: device.posture_score
+        description: "Композитный posture‑балл 0..100 (ниже лучше)"
+        source: posture
+        path: "score"
+        transform:
+          mapTo: [0, 30]
+        weight: 1.2
+        quality:
+          requiredFields: ["disk_encryption","secure_boot","firewall","time_sync"]
+          onMissing: penalize   # penalize|neutral
+          penalty: 8
+
+      - key: device.tamper_events
+        description: "Попытки вмешательства/руткит‑индикаторы за 24h"
+        source: posture
+        path: "tamper_count_24h"
+        transform:
+          bucket:
+            - when: "value == 0"   # CEL‑подобное выражение
+              score: 0
+            - when: "value <= 2"
+              score: 6
+            - when: "value > 2"
+              score: 14
+        weight: 0.9
+        timeDecay:
+          halfLifeSeconds: 7200
+          minWeight: 0.3
+
+      # -------- Контекст: сеть --------
+      - key: network.geo_anomaly
+        description: "Отклонение географии (новая страна/невозможное перемещение)"
+        source: anomaly
+        path: "geo_anomaly"
+        transform:
+          mapping:
+            none: 0
+            mild: 6
+            severe: 14
+        weight: 0.9
+
+      - key: network.ip_reputation
+        description: "Репутация исходного IP/ASN по TI"
+        source: threat_intel
+        path: "score"              # 0 (хорошо) .. 1 (плохо)
+        transform:
+          mapTo: [0, 18]
+        weight: 0.8
+        freshnessGraceSeconds: 600 # допускаем устаревание с штрафом
+        stalenessPenalty: 4
+
+      # -------- Контекст: приложение/операция --------
+      - key: app.resource_sensitivity
+        description: "Чувствительность ресурса (low/medium/high/secret)"
+        source: app_audit
+        path: "resource_label.sensitivity"
+        transform:
+          mapping:
+            low: 0
+            medium: 6
+            high: 12
+            secret: 20
+        weight: 1.1
+
+      - key: app.action_risk
+        description: "Риск действия (read<write<delete<admin)"
+        source: app_audit
+        path: "action"
+        transform:
+          mapping:
+            read: 0
+            list: 2
+            write: 10
+            delete: 16
+            admin: 22
+        weight: 1.0
+
+  # Правила принятия решений (Policy) поверх бэндов
+  policy:
+    evaluationOrder: ["hardDeny", "guardrails", "bandActions", "overrides"]
+
+    hardDeny:
+      - when: "device.posture_score >= 90"       # критически плохое устройство
+        action: deny
+        reason: "DEVICE_POSTURE_CRITICAL"
+      - when: "network.ip_reputation > 16 && app.resource_sensitivity in ['high','secret']"
+        action: deny
+        reason: "BAD_REP_SENSITIVE_RESOURCE"
+
+    guardrails:
+      - when: "user.privilege_level >= 12 && app.action_risk >= 16" # admin + delete/admin
+        action: step_up
+        mfa:
+          methods: ["webauthn"]
+          timeoutSeconds: 120
+        reason: "PRIV_ACTION_STEPUP"
+
+    bandActions:
+      apply: true   # применять действия, определенные в bands.action
+
+    overrides:
+      # Повышаем действие для определенных приложений
+      - when: "band == 'medium' && app.resource_sensitivity in ['high','secret']"
+        action: quarantine
+        reason: "SENSITIVE_BUMP"
+      # Если step-up успешно пройден, можно снизить бэнд на один уровень
+      - when: "ctx.mfaSatisfied == true && band in ['medium','high']"
+        adjustBand: "-1"
+        reason: "STEPUP_RELIEF"
+
+  # Исключения (временные, аттестованные, с аудитом)
+  exceptions:
+    requireTicket: true
+    items:
+      - id: "EX-1234"
+        subject:
+          users: ["alice@corp.local"]
+          groups: ["engineers"]
+        scope:
+          resources:
+            labels:
+              project: ["veilmind"]
+              sensitivity: ["high"]
+          actions: ["read","list"]
+        bandCap: "medium"          # не выше medium
+        expiresAt: "2025-09-30T23:59:59Z"
+        justification: "Incident investigation access"
+      - id: "EX-5678"
+        subject:
+          devices: ["ULID-DEVICE-123"]
+        scope:
+          allResources: true
+        bandCap: "low"
+        expiresAt: "2025-08-31T23:59:59Z"
+        justification: "Loaner device with partial posture"
+
+  # Согласование требований аутентификации с риском
+  authRequirements:
+    byBand:
+      low:
+        mfaRequired: false
+        sessionMaxSeconds: 3600
+      medium:
+        mfaRequired: true
+        allowedMethods: ["webauthn","totp"]
+        sessionMaxSeconds: 1800
+      high:
+        mfaRequired: true
+        allowedMethods: ["webauthn"]
+        sessionMaxSeconds: 900
+      critical:
+        mfaRequired: true
+        allowedMethods: ["webauthn"]
+        sessionMaxSeconds: 0         # не создавать сессию
+    stepUpWindowSeconds: 600
+
+  # Контроль качества сигналов и отказоустойчивость
+  signalQuality:
+    dropIfStale:
+      - keyPrefix: "threat_intel"
+        olderThanSeconds: 7200
+    weightAdjustments:
+      - key: "anomaly"              # общий префикс
+        factor: 0.8                 # уменьшаем вес, если высокий процент ложных
+        when: "ctx.providerFalsePositiveRate > 0.1"
+    fallback:
+      postureUnavailable:
+        when: "source('posture').available == false"
+        action: quarantine
+        reason: "NO_POSTURE_DATA"
+
+  # Телеметрия и аудит
+  telemetry:
+    emit:
+      destination: "siem"
+      format: "json"
+      fields:
+        - "subject.user"
+        - "subject.device"
+        - "ctx.ip"
+        - "score.total"
+        - "score.band"
+        - "decision.action"
+        - "explanations"            # список вкладов сигналов
+        - "policy.ruleMatched"
+    piiRedaction:
+      mode: "hash"
+      saltRef: "KMS:projects/CHANGEME/locations/global/keyRings/risk/cryptoKeys/redact"
+    sampling:
+      defaultRate: 1.0
+      highVolumeBands:
+        band: "low"
+        rate: 0.2
+
+  # Определение контекста (входные атрибуты для движка)
+  contextSchema:
+    subject:
+      user:
+        id: "string"
+        groups: ["string"]
+        privilege: "enum[admin,ops,user]"
+      device:
+        id: "string"
+        posture_id: "string"
+      session:
+        id: "string"
+        mfaSatisfied: "bool"
+    request:
+      action: "enum[read,list,write,delete,admin]"
+      resource:
+        id: "string"
+        labels:
+          project: "string"
+          sensitivity: "enum[low,medium,high,secret]"
+    environment:
+      ip: "ip"
+      geo: "country"
+      asn: "int"
+      timestamp: "rfc3339"
+
+  # Валидация и тестовые векторы для CI
+  validation:
+    strict: true
+    tests:
+      - name: "low-risk read"
+        ctx:
+          subject:
+            user: { id: "bob@corp.local", groups: ["dev"], privilege: "user" }
+            device: { id: "D1" }
+            session: { id: "S1", mfaSatisfied: false }
+          request:
+            action: "read"
+            resource:
+              id: "doc-1"
+              labels: { project: "veilmind", sensitivity: "low" }
+          environment:
+            ip: "198.51.100.10"
+            geo: "SE"
+            asn: 12345
+            timestamp: "2025-08-21T10:00:00Z"
+        signals:
+          idp: { risk_score: 0.05 }
+          posture: { score: 10, disk_encryption: true, secure_boot: true, firewall: true, time_sync: true, tamper_count_24h: 0 }
+          threat_intel: { score: 0.0 }
+          anomaly: { geo_anomaly: "none" }
+          app_audit: { action: "read", resource_label: { sensitivity: "low" } }
+        expect:
+          band: "low"
+          action: "allow"
+
+      - name: "admin delete on secret from bad IP"
+        ctx:
+          subject:
+            user: { id: "alice@corp.local", groups: ["admins"], privilege: "admin" }
+            device: { id: "D2" }
+            session: { id: "S2", mfaSatisfied: false }
+          request:
+            action: "delete"
+            resource:
+              id: "vault-1"
+              labels: { project: "veilmind", sensitivity: "secret" }
+          environment:
+            ip: "203.0.113.13"
+            geo: "DE"
+            asn: 64512
+            timestamp: "2025-08-21T12:00:00Z"
+        signals:
+          idp: { risk_score: 0.2 }
+          posture: { score: 35, disk_encryption: true, secure_boot: true, firewall: true, time_sync: true, tamper_count_24h: 0 }
+          threat_intel: { score: 0.9 }
+          anomaly: { geo_anomaly: "mild" }
+          app_audit: { action: "delete", resource_label: { sensitivity: "secret" } }
+        expect:
+          band: "critical"
+          action: "deny"
+
+      - name: "step-up relief after MFA on high"
+        ctx:
+          subject:
+            user: { id: "carol@corp.local", groups: ["ops"], privilege: "ops" }
+            device: { id: "D3" }
+            session: { id: "S3", mfaSatisfied: true }
+          request:
+            action: "write"
+            resource:
+              id: "cfg-1"
+              labels: { project: "veilmind", sensitivity: "high" }
+          environment:
+            ip: "192.0.2.15"
+            geo: "SE"
+            asn: 11111
+            timestamp: "2025-08-21T09:30:00Z"
+        signals:
+          idp: { risk_score: 0.4 }
+          posture: { score: 55, disk_encryption: true, secure_boot: true, firewall: true, time_sync: true, tamper_count_24h: 1 }
+          threat_intel: { score: 0.1 }
+          anomaly: { geo_anomaly: "none" }
+          app_audit: { action: "write", resource_label: { sensitivity: "high" } }
+        expect:
+          band: "high"          # базовый
+          effectiveBand: "medium" # после override с учетом MFA
+          action: "step_up"
+
+  # Управление изменениями
+  changeControl:
+    approval:
+      required: true
+      roles: ["secops", "risk-owners"]
+    rollout:
+      mode: "staged"
+      stages:
+        - name: "shadow"
+          trafficPercent: 0
+          durationMinutes: 30
+        - name: "canary"
+          trafficPercent: 10
+          durationMinutes: 60
+        - name: "full"
+          trafficPercent: 100
+    rollback:
+      on:
+        - "spike_in_denies>30%"
+        - "mfa_prompts>+50%"
+        - "latency_p99>250ms"

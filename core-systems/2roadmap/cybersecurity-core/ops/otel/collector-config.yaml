@@ -1,0 +1,254 @@
+# =====================================================================
+# cybersecurity-core / ops / otel / collector-config.yaml
+# Требуется: otelcol-contrib (OpenTelemetry Collector Contrib)
+# Версия синтаксиса: совместимо с 0.9x+
+# =====================================================================
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:${HEALTH_CHECK_PORT:-13133}
+  pprof:
+    endpoint: 0.0.0.0:${PPROF_PORT:-1777}
+  zpages:
+    endpoint: 0.0.0.0:${ZPAGES_PORT:-55679}
+
+receivers:
+  # Универсальный приемник телеметрии
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:${OTLP_GRPC_PORT:-4317}
+        max_recv_msg_size_mib: ${OTLP_MAX_RECV_MIB:-128}
+      http:
+        endpoint: 0.0.0.0:${OTLP_HTTP_PORT:-4318}
+        include_metadata: true
+        max_request_body_size: ${OTLP_MAX_BODY:-20971520} # 20 MiB
+        cors:
+          allowed_origins: [${OTLP_CORS_ORIGINS:-"*"}]
+          allowed_headers: [Content-Type, Authorization]
+
+  # Прием системных логов по RFC5424/3164
+  syslog:
+    tcp:
+      endpoint: 0.0.0.0:${SYSLOG_TCP_PORT:-6514}
+    udp:
+      endpoint: 0.0.0.0:${SYSLOG_UDP_PORT:-6514}
+    protocol: rfc5424
+    location: UTC
+
+  # Чтение файлов логов (Docker json, приложения и т.п.)
+  filelog/app:
+    include: [${FILELOG_PATHS:-/var/log/*.log}]
+    start_at: beginning
+    include_file_name: false
+    include_file_path: true
+    polling_interval: 5s
+    retry_on_failure:
+      enabled: true
+    operators:
+      # Если строка похожа на JSON — распарсить
+      - type: json_parser
+        id: parse_json_if_any
+        if: 'body matches "^\\s*\\{"'
+        timestamp:
+          parse_from: body.time
+          layout: '%Y-%m-%dT%H:%M:%S.%fZ'
+        severity:
+          parse_from: body.level
+      # Пример выделения уровня из произвольной строки
+      - type: regex_parser
+        id: level_from_text
+        regex: '(?i)level[=: ](?P<level>\w+)'
+        parse_from: body
+        severity:
+          parse_from: attributes.level
+      - type: move
+        from: attributes.level
+        to: attributes.log.level
+      - type: add
+        field: attributes.log.source
+        value: filelog
+
+  # Журналы systemd (при наличии смонтированного /run/log/journal)
+  # Включайте только если директория доступна контейнеру.
+  # journald:
+  #   directory: /run/log/journal
+  #   units: [${JOURNALD_UNITS:-}]
+
+  # Метрики хоста (CPU, память, диск, сеть, процессы)
+  hostmetrics:
+    collection_interval: 60s
+    scrapers:
+      cpu: {}
+      load: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      network: {}
+      paging: {}
+      processes: {}
+      process: {}
+
+  # Само-скрейп метрик коллектора через Prometheus receiver
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector
+          scrape_interval: 15s
+          static_configs:
+            - targets: ['0.0.0.0:${TELEMETRY_METRICS_PORT:-8888}']
+
+processors:
+  # Защита от OOM
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: ${MEM_LIMIT_PERCENT:-85}
+    spike_limit_percentage: ${MEM_SPIKE_PERCENT:-25}
+
+  # Обогащение ресурсных меток
+  resourcedetection:
+    detectors: [env, host, os, container]
+    timeout: 5s
+    override: false
+
+  # Единые атрибуты окружения
+  attributes/global:
+    actions:
+      - key: service.namespace
+        value: ${SERVICE_NAMESPACE:-cybersecurity-core}
+        action: upsert
+      - key: deployment.environment
+        value: ${ENVIRONMENT:-dev}
+        action: upsert
+      - key: cloud.region
+        value: ${CLOUD_REGION:-local}
+        action: upsert
+
+  # Маскировка чувствительных данных (OTTL)
+  transform/redact:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["http.request.header.authorization"], "<redacted>") where attributes["http.request.header.authorization"] != nil
+          - set(attributes["authorization"], "<redacted>") where attributes["authorization"] != nil
+          - set(attributes["password"], "<redacted>") where attributes["password"] != nil
+          - set(attributes["token"], "<redacted>") where attributes["token"] != nil
+          - set(attributes["secret"], "<redacted>") where attributes["secret"] != nil
+          - set(body, replace_all_patterns(body, "(?i)(password|secret|token)[^\\S\\r\\n]*[:=][^\\r\\n\\s]+", "${1}:<redacted>")) where IsString(body)
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["db.statement"], "<redacted>") where attributes["db.statement"] != nil
+          - set(attributes["http.request.header.authorization"], "<redacted>") where attributes["http.request.header.authorization"] != nil
+
+  # Отсев шума (пример: healthchecks)
+  filter/drop-noisy:
+    logs:
+      exclude:
+        match_type: regexp
+        resource_attributes:
+          - key: service.name
+            value: "healthcheck|blackbox|prometheus"
+    metrics:
+      exclude:
+        match_type: strict
+        metric_names:
+          - go_gc_duration_seconds
+          - otelcol_process_uptime
+
+  # Батчирование для стабильной доставки
+  batch:
+    send_batch_max_size: 8192
+    send_batch_size: 2048
+    timeout: 1s
+
+  # Хвостовая выборка трейсов
+  tailsampling:
+    decision_wait: 10s
+    num_traces: 100000
+    expected_new_traces_per_sec: 1000
+    policies:
+      - name: errors
+        type: status_code
+        status_code: ERROR
+      - name: latency_gt_1s
+        type: latency
+        threshold_ms: 1000
+      - name: critical_services
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values: [${CRITICAL_SERVICES:-payment-gw,auth,edge}]
+      - name: probabilistic_10pct
+        type: probabilistic
+        hash_seed: 22
+        sampling_percentage: ${TRACE_SAMPLING_PERCENT:-10}
+
+exporters:
+  # Универсальный OTLP экспортер (в APM/аналитику/шину)
+  otlp/primary:
+    endpoint: ${OTLP_EXPORTER_ENDPOINT:-tempo:4317}
+    tls:
+      insecure: ${OTLP_INSECURE:-true}
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  # Экспортер метрик для Prometheus (pull модель)
+  prometheus:
+    endpoint: 0.0.0.0:${PROMETHEUS_EXPORTER_PORT:-8889}
+    namespace: otelcol
+    const_labels:
+      service: otel-collector
+
+  # Экспортер логов в Loki (push модель)
+  loki:
+    endpoint: ${LOKI_ENDPOINT:-http://loki:3100/loki/api/v1/push}
+    tls:
+      insecure: ${LOKI_INSECURE:-true}
+    # Дополнительная очередь и ретраи унаследованы от общего механизма экспортеров
+
+  # Для диагностики: пишет в stdout (отключите в проде)
+  debug:
+    verbosity: normal
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:${TELEMETRY_METRICS_PORT:-8888}
+
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, attributes/global, tailsampling, batch]
+      exporters: [otlp/primary, debug]
+
+    metrics:
+      receivers: [otlp, hostmetrics, prometheus/self]
+      processors: [memory_limiter, resourcedetection, attributes/global, filter/drop-noisy, batch]
+      exporters: [prometheus, otlp/primary, debug]
+
+    logs/security:
+      receivers: [syslog]
+      processors: [memory_limiter, resourcedetection, attributes/global, transform/redact, filter/drop-noisy, batch]
+      exporters: [loki, otlp/primary, debug]
+
+    logs/app:
+      receivers: [filelog/app, otlp]
+      processors: [memory_limiter, resourcedetection, attributes/global, transform/redact, filter/drop-noisy, batch]
+      exporters: [loki, otlp/primary, debug]
+
+    # logs/journald:
+    #   receivers: [journald]
+    #   processors: [memory_limiter, resourcedetection, attributes/global, transform/redact, filter/drop-noisy, batch]
+    #   exporters: [loki, otlp/primary]

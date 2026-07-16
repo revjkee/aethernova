@@ -1,0 +1,93 @@
+{{- /*
+PodDisruptionBudget (PDB) — промышленный шаблон.
+Особенности:
+- Автоподбор apiVersion по доступности API в кластере.
+- Защита от одновременной установки minAvailable и maxUnavailable (fail).
+- Безопасные, стандартизованные метки и аннотации.
+- Настраиваемые matchLabels/matchExpressions.
+- Поддержка unhealthyPodEvictionPolicy при K8s >= 1.26.
+- Адекватные дефолты: prod -> minAvailable "60%", иначе 1.
+*/ -}}
+
+{{- $enabled := default true .Values.pdb.enabled -}}
+{{- if $enabled }}
+
+{{- $hasV1 := has "policy/v1/PodDisruptionBudget" .Capabilities.APIVersions -}}
+{{- $hasV1beta1 := has "policy/v1beta1/PodDisruptionBudget" .Capabilities.APIVersions -}}
+{{- if not (or $hasV1 $hasV1beta1) -}}
+{{- fail "PDB API not available: neither policy/v1 nor policy/v1beta1 is supported by this cluster." -}}
+{{- end -}}
+
+{{- /* Имена без зависимостей от _helpers.tpl */ -}}
+{{- $chartName := .Chart.Name -}}
+{{- $name := default $chartName .Values.nameOverride -}}
+{{- $fullname := default (printf "%s-%s" .Release.Name $name) .Values.fullnameOverride -}}
+
+{{- /* Валидация min/max */ -}}
+{{- $min := .Values.pdb.minAvailable -}}
+{{- $max := .Values.pdb.maxUnavailable -}}
+{{- if and (not (empty $min)) (not (empty $max)) -}}
+{{- fail "Both pdb.minAvailable and pdb.maxUnavailable are set; choose only one." -}}
+{{- end -}}
+
+apiVersion: {{- if $hasV1 }} policy/v1 {{- else }} policy/v1beta1 {{- end }}
+kind: PodDisruptionBudget
+metadata:
+  name: {{ printf "%s-pdb" $fullname | trunc 63 | trimSuffix "-" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: {{ default "backend" .Values.component | quote }}
+    app.kubernetes.io/part-of: {{ default "neurocity" .Values.partOf | quote }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    helm.sh/chart: "{{ .Chart.Name }}-{{ .Chart.Version }}"
+    app.kubernetes.io/managed-by: "Helm"
+    {{- with .Values.pdb.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.pdb.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+spec:
+  {{- /* Выбор стратегии доступности */ -}}
+  {{- if not (empty $min) }}
+  {{- if kindIs "string" $min }}
+  minAvailable: "{{ $min }}"
+  {{- else }}
+  minAvailable: {{ $min }}
+  {{- end }}
+  {{- else if not (empty $max) }}
+  {{- if kindIs "string" $max }}
+  maxUnavailable: "{{ $max }}"
+  {{- else }}
+  maxUnavailable: {{ $max }}
+  {{- end }}
+  {{- else }}
+  {{- if eq (default "production" .Values.environment) "production" }}
+  minAvailable: "60%"
+  {{- else }}
+  minAvailable: 1
+  {{- end }}
+  {{- end }}
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name | quote }}
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      {{- with .Values.pdb.matchLabels }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+    {{- with .Values.pdb.matchExpressions }}
+    matchExpressions:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+
+  {{- /* Доступно в policy/v1 при Kubernetes >= 1.26 */ -}}
+  {{- if and (semverCompare ">=1.26-0" .Capabilities.KubeVersion.Version) (.Values.pdb.unhealthyPodEvictionPolicy) }}
+  unhealthyPodEvictionPolicy: {{ .Values.pdb.unhealthyPodEvictionPolicy | quote }} # IfHealthyBudget|AlwaysAllow
+  {{- end }}
+
+{{- end }}

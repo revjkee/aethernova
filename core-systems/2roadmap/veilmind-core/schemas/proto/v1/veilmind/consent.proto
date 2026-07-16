@@ -1,0 +1,270 @@
+syntax = "proto3";
+
+package veilmind.v1;
+
+option csharp_namespace = "VeilMind.V1";
+option go_package       = "github.com/veilmind/veilmind-core/gen/go/veilmind/v1;veilmindv1";
+option java_multiple_files = true;
+option java_package        = "com.veilmind.v1";
+option optimize_for        = SPEED;
+
+// Внешние типы
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/field_mask.proto";
+
+// Правила стабильности
+// 1. Не удалять и не переиспользовать существующие поля, использовать reserved.
+// 2. Новые поля добавлять с новыми номерами, делая их опциональными для бэккомпат.
+// 3. В запросах на обновление использовать FieldMask.
+// 4. Любые PII значения хранить и передавать только в безопасной среде; в событиях не передавать значения чувствительных полей.
+
+// Каноническое имя ресурса согласия:
+// name = "tenants/{tenant_id}/consents/{consent_id}"
+
+// Доменные перечисления
+
+// Цель обработки данных
+enum Purpose {
+  PURPOSE_UNSPECIFIED = 0;
+  PURPOSE_ANALYTICS = 1;
+  PURPOSE_PERSONALIZATION = 2;
+  PURPOSE_MARKETING = 3;
+  PURPOSE_SECURITY = 4;
+  PURPOSE_FRAUD_PREVENTION = 5;
+  PURPOSE_BILLING = 6;
+  PURPOSE_RESEARCH = 7;
+  PURPOSE_SUPPORT = 8;
+  PURPOSE_OTHER = 9;
+}
+
+// Категория данных
+enum DataCategory {
+  DATA_CATEGORY_UNSPECIFIED = 0;
+  DATA_CATEGORY_PII = 1;        // персональные данные
+  DATA_CATEGORY_SPI = 2;        // специальные категории
+  DATA_CATEGORY_HEALTH = 3;
+  DATA_CATEGORY_CONTACT = 4;
+  DATA_CATEGORY_LOCATION = 5;
+  DATA_CATEGORY_TELEMETRY = 6;
+  DATA_CATEGORY_PAYMENT = 7;
+}
+
+// Правовое основание
+enum LegalBasis {
+  LEGAL_BASIS_UNSPECIFIED = 0;
+  LEGAL_BASIS_CONSENT = 1;
+  LEGAL_BASIS_CONTRACT = 2;
+  LEGAL_BASIS_LEGAL_OBLIGATION = 3;
+  LEGAL_BASIS_VITAL_INTERESTS = 4;
+  LEGAL_BASIS_PUBLIC_TASK = 5;
+  LEGAL_BASIS_LEGITIMATE_INTERESTS = 6;
+}
+
+// Статус согласия
+enum ConsentStatus {
+  CONSENT_STATUS_UNSPECIFIED = 0;
+  CONSENT_STATUS_ACTIVE = 1;
+  CONSENT_STATUS_REVOKED = 2;
+  CONSENT_STATUS_EXPIRED = 3;
+}
+
+// Тип события
+enum ConsentEventType {
+  CONSENT_EVENT_TYPE_UNSPECIFIED = 0;
+  CONSENT_EVENT_CREATED = 1;
+  CONSENT_EVENT_UPDATED = 2;
+  CONSENT_EVENT_REVOKED = 3;
+  CONSENT_EVENT_EXPIRED = 4;
+}
+
+// Область данных, на которую распространяется согласие
+message Scope {
+  // Логическое имя типа ресурса, например profile, session, telemetry.
+  string resource_type = 1;
+
+  // Конкретные поля, на которые распространяется согласие.
+  // Не передавать значения самих полей в событиях.
+  repeated string fields = 2;
+
+  // Категории данных.
+  repeated DataCategory categories = 3;
+}
+
+// Идентификатор субъекта. Ровно один вариант.
+message Subject {
+  oneof id {
+    string user_id = 1;
+    string device_id = 2;
+    string service_account_id = 3;
+  }
+}
+
+// Модель согласия
+message Consent {
+  // Ресурсное имя: tenants/{tenant_id}/consents/{consent_id}
+  string name = 1;
+
+  // Для удобства фильтрации
+  string tenant_id = 2;
+
+  Subject subject = 3;
+
+  // Цели обработки
+  repeated Purpose purposes = 4;
+
+  // Правовое основание
+  LegalBasis legal_basis = 5;
+
+  // Области действия согласия
+  repeated Scope scopes = 6;
+
+  // Сроки действия
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  google.protobuf.Timestamp expires_at = 9;
+
+  // Отзыв
+  google.protobuf.Timestamp revoked_at = 10;
+  string revoked_reason = 11;
+
+  // Версия для оптимистичной блокировки
+  int64 version = 12;
+
+  // ETag для If-Match в мутирующих запросах
+  string etag = 13;
+
+  // Доказательство согласия: подпись, хэш документа или ссылка
+  bytes proof_signature = 14;
+  string proof_reference = 15;
+
+  // Атрибуты для расширения схемы
+  map<string, string> attributes = 16;
+
+  // Отражение рассчитанного статуса
+  ConsentStatus status = 17;
+
+  reserved 100 to 199; // зарезервировано для вендорских расширений
+}
+
+// Событие по согласию (для CDC и аудита)
+message ConsentEvent {
+  ConsentEventType type = 1;
+  Consent snapshot = 2; // снимок после применения операции
+  // Инициатор
+  string actor = 3;
+  map<string, string> actor_meta = 4;
+  google.protobuf.Timestamp occurred_at = 5;
+}
+
+// Запросы и ответы
+
+message CreateConsentRequest {
+  string tenant_id = 1;         // требуемый арендатор
+  Consent consent = 2;          // без name, version, etag (сервер заполнит)
+  string idempotency_key = 3;   // идемпотентность на стороне сервера
+  bool validate_only = 4;       // если true, провести валидацию без сохранения
+}
+
+message CreateConsentResponse {
+  Consent consent = 1;
+}
+
+message GetConsentRequest {
+  string name = 1;              // tenants/{tenant_id}/consents/{consent_id}
+  // Видимость уровня деталей
+  enum View {
+    VIEW_UNSPECIFIED = 0;
+    VIEW_BASIC = 1;   // без чувствительных полей proof_signature
+    VIEW_FULL = 2;    // все поля
+  }
+  View view = 2;
+}
+
+message ListConsentsRequest {
+  string parent = 1;            // tenants/{tenant_id}
+  int32 page_size = 2;
+  string page_token = 3;
+
+  // Фильтры
+  string subject_id = 4;        // любой из user_id/device_id/service_account_id
+  Purpose purpose = 5;
+  bool active_only = 6;
+  ConsentStatus status = 7;
+}
+
+message ListConsentsResponse {
+  repeated Consent consents = 1;
+  string next_page_token = 2;
+}
+
+message UpdateConsentRequest {
+  Consent consent = 1;                 // должен включать name и актуальный etag
+  google.protobuf.FieldMask update_mask = 2; // допустимые пути: purposes, scopes, expires_at, attributes
+  bool validate_only = 3;
+}
+
+message UpdateConsentResponse {
+  Consent consent = 1;
+}
+
+message RevokeConsentRequest {
+  string name = 1;
+  string reason = 2;
+  // Для защиты от гонок передавайте If-Match через etag
+  string etag = 3;
+  bool hard_delete = 4; // по умолчанию мягкий отзыв
+}
+
+message RevokeConsentResponse {
+  Consent consent = 1;
+}
+
+// Оценка применимости согласия к запросу обработки
+message EvaluateConsentRequest {
+  string tenant_id = 1;
+  Subject subject = 2;
+  Purpose purpose = 3;
+  repeated Scope scopes = 4;                // предполагаемые области обработки
+  string jurisdiction = 5;                  // ISO страна или область
+  google.protobuf.Timestamp at = 6;         // момент времени, по умолчанию now
+  map<string, string> attributes = 7;       // дополнительные атрибуты контекста
+}
+
+message EvaluateConsentResponse {
+  bool allow = 1;
+  repeated string reasons = 2;              // причины отказа или примечания
+  string consent_name = 3;                  // совпавшее активное согласие
+  // Обязательства для потребителя решения
+  message Obligations {
+    bool audit_required = 1;
+    int32 retention_days = 2;
+    LegalBasis legal_basis = 3;
+  }
+  Obligations obligations = 4;
+}
+
+// Потоковое получение событий
+message StreamConsentEventsRequest {
+  string parent = 1;             // tenants/{tenant_id}
+  string filter = 2;             // например: "type=UPDATED,status=ACTIVE,subject_id=123"
+}
+
+message StreamConsentEventsResponse {
+  ConsentEvent event = 1;
+}
+
+// gRPC сервис
+
+service ConsentService {
+  rpc CreateConsent(CreateConsentRequest) returns (CreateConsentResponse);
+  rpc GetConsent(GetConsentRequest) returns (Consent);
+  rpc ListConsents(ListConsentsRequest) returns (ListConsentsResponse);
+  rpc UpdateConsent(UpdateConsentRequest) returns (UpdateConsentResponse);
+  rpc RevokeConsent(RevokeConsentRequest) returns (RevokeConsentResponse);
+
+  // Решение о допустимости обработки по текущим активным согласиям
+  rpc EvaluateConsent(EvaluateConsentRequest) returns (EvaluateConsentResponse);
+
+  // Серверный стрим событий
+  rpc StreamConsentEvents(StreamConsentEventsRequest) returns (stream StreamConsentEventsResponse);
+}

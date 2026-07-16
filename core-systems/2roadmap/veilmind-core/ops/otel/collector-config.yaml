@@ -1,0 +1,297 @@
+# OpenTelemetry Collector (contrib) industrial config for VeilMind
+# Parametrized via env to run on dev/stage/prod without edits.
+
+receivers:
+  # Primary ingress for services
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:${OTEL_OTLP_GRPC_PORT:4317}
+        max_recv_msg_size_mib: ${OTEL_MAX_RECV_MIB:64}
+        compression: ${OTEL_OTLP_GRPC_COMPRESSION:gzip}
+      http:
+        endpoint: 0.0.0.0:${OTEL_OTLP_HTTP_PORT:4318}
+        compression: ${OTEL_OTLP_HTTP_COMPRESSION:gzip}
+        max_request_body_size: ${OTEL_HTTP_MAX_BODY:10485760}  # 10 MiB
+
+  # Prometheus metrics scraping (services + self)
+  prometheus:
+    config:
+      global:
+        scrape_interval: ${PROM_SCRAPE_INTERVAL:15s}
+        scrape_timeout: ${PROM_SCRAPE_TIMEOUT:10s}
+      scrape_configs:
+        - job_name: 'otel-collector'
+          static_configs:
+            - targets: ['${OTEL_SELF_PROM_TARGET:0.0.0.0:8888}']
+        - job_name: 'veilmind-services'
+          honor_labels: true
+          static_configs:
+            - targets: ${PROM_STATIC_TARGETS:["app1:9100","app2:9090"]}
+
+  # Host/system metrics (if running as DaemonSet/agent)
+  hostmetrics:
+    collection_interval: ${HOSTMETRICS_INTERVAL:10s}
+    scrapers:
+      cpu: {}
+      load: {}
+      memory: {}
+      filesystem:
+        exclude_fs_types: [autofs, proc, sysfs, cgroup, devtmpfs, devfs, overlay, tmpfs, nsfs]
+      disk: {}
+      network: {}
+      paging: {}
+      processes: {}
+
+  # File log tailing with multiline support (Java/.NET/Go stacktraces)
+  filelog:
+    include: ${FILELOG_PATHS:["/var/log/containers/*.log","/var/log/app/*.log"]}
+    exclude: ${FILELOG_EXCLUDE:["/var/log/containers/*istio*.log"]}
+    start_at: ${FILELOG_START:beginning}
+    include_file_path: true
+    include_file_name: true
+    fingerprint_size: 1kb
+    max_log_size: 256kb
+    operators:
+      - type: regex_parser
+        regex: '^(?P<timestamp>\\d{4}-\\d{2}-\\d{2}[^ ]+) (?P<severity>[A-Z]+) (?P<message>.*)$'
+        timestamp:
+          parse_from: attributes.timestamp
+          layout: '%Y-%m-%dT%H:%M:%S.%f%z'
+      - type: multiline
+        output: detect_exceptions
+        rules:
+          - '^\\s+at\\s+'
+          - '^(Caused by|During handling of the above exception)'
+          - '^\\s*\\.{3}.*\\d+\\smore$'
+      - type: move
+        from: attributes.severity
+        to: body.severity
+
+processors:
+  # Memory safety
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: ${OTEL_MEMORY_LIMIT_PERCENT:80}
+    spike_limit_percentage: ${OTEL_MEMORY_SPIKE_PERCENT:25}
+
+  # Batch for better throughput
+  batch:
+    timeout: ${OTEL_BATCH_TIMEOUT:5s}
+    send_batch_size: ${OTEL_BATCH_SIZE:8192}
+    send_batch_max_size: ${OTEL_BATCH_MAX:16384}
+
+  # Enrich resources with service/env/deployment
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: ${DEPLOY_ENV:dev}
+        action: upsert
+      - key: service.namespace
+        value: ${SERVICE_NAMESPACE:veilmind}
+        action: upsert
+      - key: telemetry.distro
+        value: veilmind-otel
+        action: upsert
+
+  # Redaction / hashing of sensitive attributes
+  attributes/sanitize:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: db.statement
+        action: delete
+      - key: user.password
+        action: delete
+      - key: token
+        action: hash
+      - key: api.key
+        action: hash
+      - key: email
+        action: hash
+
+  # Noise filtering (drop low-value health checks)
+  filter/noise:
+    spans:
+      span:
+        - 'attributes["http.target"] == "/healthz"'
+        - 'attributes["http.target"] == "/readyz"'
+        - 'attributes["rpc.system"] == "grpc" and attributes["rpc.service"] == "grpc.health.v1.Health"'
+
+  # Tail-based sampling for accurate SLO/SLA and cost control
+  tailsampling:
+    decision_wait: ${TAIL_DECISION_WAIT:10s}
+    num_traces: ${TAIL_NUM_TRACES:50000}
+    expected_new_traces_per_sec: ${TAIL_EXPECTED_TPS:2000}
+    policies:
+      - name: errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: high_latency
+        type: latency
+        latency: { threshold_ms: ${TAIL_LATENCY_MS:500} }
+      - name: key_services
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values: ${TAIL_KEY_SERVICES:["api-gateway","payments","auth"]}
+          enabled_regex_matching: false
+      - name: rate_limit_default
+        type: rate_limiting
+        rate_limiting: { spans_per_second: ${TAIL_RATE_LIMIT_SPS:2000} }
+
+  # Transform example: normalize HTTP url/path to reduce cardinality
+  transform/http_normalize:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - replace_pattern(attributes["http.target"], "/v[0-9]+", "/vX")
+          - replace_match(attributes["url.path"], "[0-9a-fA-F]{8,}", ":id")
+
+  # Optional: k8s attribution (enable when running in Kubernetes by adding to pipelines)
+  # k8sattributes:
+  #   auth_type: serviceAccount
+  #   filter:
+  #     node_from_env_var: KUBE_NODE_NAME
+  #   extract:
+  #     metadata:
+  #       - k8s.namespace.name
+  #       - k8s.pod.name
+  #       - k8s.pod.uid
+  #       - k8s.container.name
+  #       - k8s.node.name
+  #       - k8s.deployment.name
+
+connectors:
+  # Derive RED/SLA metrics from traces
+  spanmetrics:
+    metrics_flush_interval: ${SPANMETRICS_FLUSH:15s}
+    dimensions_cache_size: 10000
+    dimensions:
+      - name: http.method
+      - name: http.route
+      - name: service.name
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+
+exporters:
+  # Generic OTLP exporter (Tempo/Jaeger/OTel backends)
+  otlp:
+    endpoint: ${OTLP_EXPORTER_ENDPOINT:otel-collector:4317}
+    tls:
+      insecure: ${OTLP_EXPORTER_INSECURE:false}
+      ca_file: ${OTLP_EXPORTER_CA_FILE:}
+      cert_file: ${OTLP_EXPORTER_CERT_FILE:}
+      key_file: ${OTLP_EXPORTER_KEY_FILE:}
+    headers: ${OTLP_EXPORTER_HEADERS:{}}
+    compression: ${OTLP_EXPORTER_COMPRESSION:gzip}
+    timeout: ${OTLP_EXPORTER_TIMEOUT:10s}
+    sending_queue:
+      enabled: true
+      num_consumers: ${OTLP_QUEUE_CONSUMERS:8}
+      queue_size: ${OTLP_QUEUE_SIZE:20480}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 120s
+
+  # Prometheus Remote Write (Thanos/Mimir/VictoriaMetrics)
+  prometheusremotewrite:
+    endpoint: ${PRW_ENDPOINT:https://prom-remote-write.example/api/v1/write}
+    tls:
+      insecure_skip_verify: ${PRW_INSECURE:false}
+      ca_file: ${PRW_CA_FILE:}
+      cert_file: ${PRW_CERT_FILE:}
+      key_file: ${PRW_KEY_FILE:}
+    headers:
+      Authorization: ${PRW_AUTH_HEADER:}
+    external_labels:
+      cluster: ${CLUSTER_NAME:dev-cluster}
+      env: ${DEPLOY_ENV:dev}
+    remote_write_queue:
+      enabled: true
+      queue_size: ${PRW_QUEUE_SIZE:20000}
+      num_consumers: ${PRW_CONSUMERS:8}
+    timeout: ${PRW_TIMEOUT:10s}
+    compression: ${PRW_COMPRESSION:gzip}
+
+  # Loki logs exporter (requires otel-contrib build)
+  loki:
+    endpoint: ${LOKI_ENDPOINT:https://loki.example/loki/api/v1/push}
+    tls:
+      insecure_skip_verify: ${LOKI_INSECURE:false}
+      ca_file: ${LOKI_CA_FILE:}
+      cert_file: ${LOKI_CERT_FILE:}
+      key_file: ${LOKI_KEY_FILE:}
+    headers:
+      X-Scope-OrgID: ${LOKI_TENANT:veilmind}
+      Authorization: ${LOKI_AUTH_HEADER:}
+    default_labels_enabled:
+      exporter: true
+      job: true
+    format: json
+    timeout: ${LOKI_TIMEOUT:10s}
+    sending_queue:
+      enabled: true
+      num_consumers: ${LOKI_QUEUE_CONSUMERS:6}
+      queue_size: ${LOKI_QUEUE_SIZE:15000}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 120s
+
+  # Debug exporter (keep disabled in prod)
+  logging:
+    verbosity: normal
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:${OTEL_HEALTH_PORT:13133}
+  pprof:
+    endpoint: 0.0.0.0:${OTEL_PPROF_PORT:1777}
+  zpages:
+    endpoint: 0.0.0.0:${OTEL_ZPAGES_PORT:55679}
+  # Optional auth extensions (wire as needed)
+  # basicauth/client:
+  #   client_auth:
+  #     username: ${BASIC_AUTH_USER:}
+  #     password: ${BASIC_AUTH_PASS:}
+  # oidc:
+  #   issuer_url: ${OIDC_ISSUER:}
+  #   audience: ${OIDC_AUDIENCE:}
+
+service:
+  telemetry:
+    logs:
+      level: ${OTEL_LOG_LEVEL:info}
+    metrics:
+      address: 0.0.0.0:${OTEL_INTERNAL_METRICS_PORT:8888}
+
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/sanitize, filter/noise, transform/http_normalize, batch, tailsampling]
+      exporters: [otlp]  # add "logging" for debugging
+
+    traces/spanmetrics:
+      receivers: [spanmetrics]
+      processors: [batch]
+      exporters: [prometheusremotewrite]
+
+    metrics:
+      receivers: [prometheus, hostmetrics, spanmetrics]
+      processors: [memory_limiter, batch, resource]
+      exporters: [prometheusremotewrite, otlp]
+
+    logs:
+      receivers: [filelog, otlp]
+      processors: [memory_limiter, attributes/sanitize, batch, resource]
+      exporters: [loki, otlp]

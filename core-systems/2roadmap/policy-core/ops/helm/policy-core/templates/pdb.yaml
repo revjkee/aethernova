@@ -1,0 +1,70 @@
+{{- /*
+PodDisruptionBudget для policy-core.
+Особенности:
+- Совместимость с policy/v1 и (при необходимости) со старыми API-версиями.
+- Включение/выключение через .Values.pdb.enabled.
+- Безопасное поведение: PDB не создаётся, если реплик < 2 (нет смысла).
+- Взаимоисключающие параметры minAvailable / maxUnavailable (приоритет у minAvailable).
+- Гибкие селекторы: базовые метки + дополнительные matchLabels/matchExpressions.
+*/ -}}
+{{- $enabled := and (dig "pdb" "enabled" true .Values) (gt (int (dig "replicaCount" nil .Values 1)) 1) -}}
+{{- if $enabled }}
+
+{{- /* Определяем apiVersion для PDB */ -}}
+{{- $usePolicyV1 := or (.Capabilities.APIVersions.Has "policy/v1/PodDisruptionBudget") (semverCompare ">=1.21-0" .Capabilities.KubeVersion.Version) -}}
+apiVersion: {{- if $usePolicyV1 }} policy/v1 {{- else }} policy/v1beta1 {{- end }}
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "policy-core.fullname" . }}-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "policy-core.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/part-of: policy-core
+    app.kubernetes.io/component: pdp
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ include "policy-core.chart" . }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.pdb.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.commonAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.pdb.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- /* minAvailable имеет приоритет, если задан */ -}}
+  {{- if hasKey .Values.pdb "minAvailable" }}
+  minAvailable: {{ .Values.pdb.minAvailable | quote }}
+  {{- else if hasKey .Values.pdb "maxUnavailable" }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable | quote }}
+  {{- else }}
+  # Значение по умолчанию: минимум 1 Pod должен быть доступен
+  minAvailable: "1"
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "policy-core.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: pdp
+      {{- with .Values.pdb.additionalMatchLabels }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+    {{- with .Values.pdb.matchExpressions }}
+    matchExpressions:
+      {{- /*
+        Ожидаемый формат:
+        - key: "app.kubernetes.io/version"
+          operator: In|NotIn|Exists|DoesNotExist|Gt|Lt
+          values: ["1.0.0"]
+      */ -}}
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+{{- else }}
+{{- /* PDB отключён или реплик недостаточно — ресурс не создаём */ -}}
+{{- end }}

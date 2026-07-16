@@ -1,0 +1,273 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# База, содержащая манифесты Deployment, Service и др.
+resources:
+  - ../../base
+
+# Прод-namespace и единые атрибуты
+namespace: chronowatch-prod
+
+nameSuffix: -prod
+
+commonLabels:
+  app.kubernetes.io/name: chronowatch-core
+  app.kubernetes.io/instance: chronowatch-core-prod
+  app.kubernetes.io/part-of: chronowatch
+  app.kubernetes.io/component: api
+  app.kubernetes.io/version: "0.1.0"
+  env: prod
+  tier: backend
+
+commonAnnotations:
+  maintainer: "platform-team@aethernova.local"
+  owner: "NeuroCity | Chronowatch"
+  runbook: "https://runbook.example.internal/chronowatch" # заменить при необходимости
+  backup.policy: "stateless"
+  security.policy: "restricted-v2"
+
+# Генераторы: фиксируем имена без хешей, чтобы ссылки envFrom были стабильны
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: chronowatch-config
+    behavior: replace
+    literals:
+      - LOG_LEVEL=INFO
+      - SCHED_TICK_MS=500
+      - LEADER_TTL_SEC=10
+
+# Секреты из env-файлов (не попадают в Git). Если .env.prod отсутствует — будет использован только .env
+secretGenerator:
+  - name: chronowatch-env
+    behavior: replace
+    envs:
+      - ../../../.env
+      - ../../../.env.prod
+    type: Opaque
+
+# Образы и тег прод-окружения
+images:
+  - name: chronowatch-core
+    newName: ghcr.io/aethernova/chronowatch-core
+    newTag: "0.1.0"
+
+# Минимум 3 реплики в проде
+replicas:
+  - name: chronowatch-core
+    count: 3
+
+# Патчи безопасности, отказоустойчивости и наблюдаемости
+patches:
+  # 1) Усиление Deployment: probes, ресурсы, security, anti-affinity, spread, envFrom и т.д.
+  - target:
+      kind: Deployment
+      name: chronowatch-core
+    patch: |
+      - op: add
+        path: /spec/strategy
+        value:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 1
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          # Аннотации для сборки метрик через аннотационные скрейперы (если нет ServiceMonitor)
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "8080"
+          prometheus.io/path: "/metrics"
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          fsGroup: 10001
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/volumes
+        value:
+          - name: tmp
+            emptyDir: {}
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: chronowatch-core
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: chronowatch-core
+                  topologyKey: kubernetes.io/hostname
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts
+        value:
+          - name: tmp
+            mountPath: /tmp
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: add
+        path: /spec/template/spec/terminationGracePeriodSeconds
+        value: 30
+      - op: add
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - secretRef:
+              name: chronowatch-env
+          - configMapRef:
+              name: chronowatch-config
+      - op: add
+        path: /spec/template/spec/containers/0/ports
+        value:
+          - name: http
+            containerPort: 8080
+            protocol: TCP
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "512Mi"
+
+  # 2) Сервис: именованный порт http и единый selector
+  - target:
+      kind: Service
+      name: chronowatch-core
+    patch: |
+      - op: add
+        path: /spec/ports/0/name
+        value: http
+      - op: add
+        path: /spec/selector
+        value:
+          app.kubernetes.io/name: chronowatch-core
+          app.kubernetes.io/instance: chronowatch-core-prod
+          app.kubernetes.io/component: api
+
+  # 3) PodDisruptionBudget (если уже есть в базе — усилим; если нет — патч будет проигнорирован без ошибки)
+  - target:
+      kind: PodDisruptionBudget
+      name: chronowatch-core
+    patch: |
+      - op: add
+        path: /spec/maxUnavailable
+        value: 1
+      - op: add
+        path: /spec/selector
+        value:
+          matchLabels:
+            app.kubernetes.io/name: chronowatch-core
+            app.kubernetes.io/instance: chronowatch-core-prod
+
+  # 4) HPA (если присутствует как ресурс базы — выставим прод-настройки)
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: chronowatch-core
+    patch: |
+      - op: add
+        path: /spec/minReplicas
+        value: 3
+      - op: add
+        path: /spec/maxReplicas
+        value: 10
+      - op: add
+        path: /spec/metrics
+        value:
+          - type: Resource
+            resource:
+              name: cpu
+              target:
+                type: Utilization
+                averageUtilization: 70
+          - type: Resource
+            resource:
+              name: memory
+              target:
+                type: Utilization
+                averageUtilization: 75
+
+  # 5) NetworkPolicy (при наличии — ограничим трафик; при отсутствии — пропуск)
+  - target:
+      kind: NetworkPolicy
+      name: chronowatch-core
+    patch: |
+      - op: add
+        path: /spec/podSelector
+        value:
+          matchLabels:
+            app.kubernetes.io/name: chronowatch-core
+      - op: add
+        path: /spec/policyTypes
+        value: ["Ingress","Egress"]
+      - op: add
+        path: /spec/ingress
+        value:
+          - from:
+              - namespaceSelector:
+                  matchLabels:
+                    name: ingress-nginx
+              - namespaceSelector:
+                  matchLabels:
+                    name: monitoring
+            ports:
+              - protocol: TCP
+                port: 8080
+      - op: add
+        path: /spec/egress
+        value:
+          - to:
+              - namespaceSelector: {}   # внутри кластера
+            ports:
+              - protocol: TCP
+                port: 5432              # PostgreSQL
+              - protocol: TCP
+                port: 6379              # Redis
+              - protocol: UDP
+                port: 53                # DNS
+              - protocol: TCP
+                port: 53

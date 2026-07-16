@@ -1,0 +1,274 @@
+name: identity-access-core-ci
+
+on:
+  pull_request:
+    paths:
+      - "core-systems/identity-access-core/**"
+      - ".github/workflows/ci.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "core-systems/identity-access-core/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: identity-access-core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+  pull-requests: write
+  security-events: write
+
+env:
+  CORE_DIR: core-systems/identity-access-core
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  FORCE_COLOR: "1"
+
+jobs:
+  quality:
+    name: Quality (lint/format/types)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CORE_DIR }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            ${{ env.CORE_DIR }}/requirements.txt
+            ${{ env.CORE_DIR }}/requirements-dev.txt
+            ${{ env.CORE_DIR }}/pyproject.toml
+
+      - name: Upgrade pip tooling
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+
+      - name: Install dev dependencies
+        run: |
+          if [[ -f "requirements-dev.txt" ]]; then
+            python -m pip install -r requirements-dev.txt
+          fi
+          if [[ -f "requirements.txt" ]]; then
+            python -m pip install -r requirements.txt
+          fi
+          # Fallback tools if not pinned in requirements-dev.txt
+          python -m pip install ruff mypy
+
+      - name: Ruff (lint)
+        run: |
+          ruff check .
+
+      - name: Ruff (format check)
+        run: |
+          ruff format --check .
+
+      - name: Mypy (types)
+        run: |
+          if [[ -f "mypy.ini" ]] || grep -q "\[tool.mypy\]" pyproject.toml 2>/dev/null; then
+            mypy .
+          else
+            echo "No mypy configuration found; skipping."
+          fi
+
+  tests:
+    name: Tests (pytest + coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [quality]
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CORE_DIR }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: identity_access_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U test -d identity_access_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=30
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/identity_access_test
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      APP_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            ${{ env.CORE_DIR }}/requirements.txt
+            ${{ env.CORE_DIR }}/requirements-dev.txt
+            ${{ env.CORE_DIR }}/pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          if [[ -f "requirements-dev.txt" ]]; then
+            python -m pip install -r requirements-dev.txt
+          fi
+          if [[ -f "requirements.txt" ]]; then
+            python -m pip install -r requirements.txt
+          fi
+          # Fallback if pytest/coverage not pinned
+          python -m pip install pytest pytest-cov
+
+      - name: Run tests
+        run: |
+          pytest -q --disable-warnings --maxfail=1 \
+            --cov=. --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml-py${{ matrix.python-version }}
+          path: ${{ env.CORE_DIR }}/coverage.xml
+          if-no-files-found: error
+          retention-days: 14
+
+  security:
+    name: Security (dependency + secrets + code scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [tests]
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CORE_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            ${{ env.CORE_DIR }}/requirements.txt
+            ${{ env.CORE_DIR }}/requirements-dev.txt
+            ${{ env.CORE_DIR }}/pyproject.toml
+
+      - name: Install deps for audits
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          if [[ -f "requirements.txt" ]]; then
+            python -m pip install -r requirements.txt
+          fi
+          python -m pip install pip-audit bandit
+
+      - name: Dependency audit (pip-audit)
+        run: |
+          # If a lockfile exists, prefer it; otherwise audit installed deps.
+          if [[ -f "requirements.txt" ]]; then
+            pip-audit -r requirements.txt
+          else
+            pip-audit
+          fi
+
+      - name: Static security scan (bandit)
+        run: |
+          bandit -q -r . -x "tests,./.venv,./venv" || (echo "Bandit findings detected." && exit 1)
+
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: >
+            detect
+            --source=${{ github.workspace }}
+            --no-git
+            --redact
+
+      - name: CodeQL init
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-and-quality
+
+      - name: CodeQL analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  docker:
+    name: Docker build (main only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [security]
+    if: github.event_name != 'pull_request'
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CORE_DIR }}
+          file: ${{ env.CORE_DIR }}/Dockerfile
+          push: false
+          tags: identity-access-core:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false

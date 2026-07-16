@@ -1,0 +1,3 @@
+# notification-core
+
+Project Documentation

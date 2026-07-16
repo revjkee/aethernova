@@ -1,0 +1,279 @@
+name: reva-studio-prod
+
+x-app-env: &app-env
+  APP_ENV: production
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  TZ: ${TZ:-Europe/Riga}
+
+  API_HOST: 0.0.0.0
+  API_PORT: 8000
+
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB}
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+  CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+
+x-app-base: &app-base
+  image: ${APP_IMAGE:?APP_IMAGE is required}
+  env_file:
+    - .env
+  environment:
+    <<: *app-env
+  restart: unless-stopped
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - backend
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+x-health-defaults: &health-defaults
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 20s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: reva-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: ${TZ:-Europe/Riga}
+      PGTZ: ${TZ:-Europe/Riga}
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} || exit 1"
+        ]
+      <<: *health-defaults
+    networks:
+      - backend
+    expose:
+      - "5432"
+    shm_size: "256mb"
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  redis:
+    image: redis:7-alpine
+    container_name: reva-redis
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--appendonly", "yes",
+        "--requirepass", "${REDIS_PASSWORD}",
+        "--maxmemory", "256mb",
+        "--maxmemory-policy", "allkeys-lru"
+      ]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -a ${REDIS_PASSWORD} ping | grep PONG || exit 1"
+        ]
+      <<: *health-defaults
+    networks:
+      - backend
+    expose:
+      - "6379"
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  migrate:
+    <<: *app-base
+    container_name: reva-migrate
+    restart: "no"
+    command: >
+      sh -c "alembic upgrade head"
+    profiles:
+      - ops
+
+  api:
+    <<: *app-base
+    container_name: reva-api
+    command: >
+      sh -c "uvicorn src.main:app
+      --host 0.0.0.0
+      --port 8000
+      --proxy-headers
+      --forwarded-allow-ips='*'"
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://127.0.0.1:8000/health || exit 1"
+        ]
+      <<: *health-defaults
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+
+  bot:
+    <<: *app-base
+    container_name: reva-bot
+    command: >
+      sh -c "python -m src.entrypoints.run_bot"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import os; print('bot ok')\" || exit 1"
+        ]
+      <<: *health-defaults
+    tmpfs:
+      - /tmp
+      - /var/tmp
+
+  worker:
+    <<: *app-base
+    container_name: reva-worker
+    command: >
+      sh -c "celery -A src.celery_app worker
+      --loglevel=INFO
+      --concurrency=${CELERY_WORKER_CONCURRENCY:-4}
+      --max-tasks-per-child=1000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "celery -A src.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    tmpfs:
+      - /tmp
+      - /var/tmp
+
+  beat:
+    <<: *app-base
+    container_name: reva-beat
+    command: >
+      sh -c "celery -A src.celery_app beat
+      --loglevel=INFO"
+    tmpfs:
+      - /tmp
+      - /var/tmp
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: reva-nginx
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
+      - nginx_cache:/var/cache/nginx
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://127.0.0.1/ || exit 1"
+        ]
+      <<: *health-defaults
+    read_only: true
+    tmpfs:
+      - /var/run
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - public
+      - backend
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  public:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+    name: reva_postgres_data
+  redis_data:
+    name: reva_redis_data
+  nginx_cache:
+    name: reva_nginx_cache

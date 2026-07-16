@@ -1,0 +1,166 @@
+# ledger-core/ops/helm/ledger-core/servicemonitor.yaml
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "ledger-core.fullname" . }}
+  namespace: {{ default .Release.Namespace .Values.serviceMonitor.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "ledger-core.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/version: {{ include "ledger-core.version" . }}
+    app.kubernetes.io/part-of: ledger-core
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.serviceMonitor.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  jobLabel: {{ default "app.kubernetes.io/name" .Values.serviceMonitor.jobLabel }}
+  selector:
+    matchLabels:
+      {{- /* Сервисы, предоставляющие /metrics */ -}}
+      app.kubernetes.io/name: {{ include "ledger-core.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- with .Values.serviceMonitor.matchLabels }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+  namespaceSelector:
+    {{- if .Values.serviceMonitor.namespaceSelector.any }}
+    any: true
+    {{- else }}
+    matchNames:
+      - {{ default .Release.Namespace .Values.serviceMonitor.namespace }}
+      {{- range .Values.serviceMonitor.namespaceSelector.matchNames }}
+      - {{ . }}
+      {{- end }}
+    {{- end }}
+  targetLabels:
+    {{- with .Values.serviceMonitor.targetLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  podTargetLabels:
+    {{- with .Values.serviceMonitor.podTargetLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  endpoints:
+    {{- $globalScrapeInterval := default "30s" .Values.serviceMonitor.interval }}
+    {{- $globalScrapeTimeout  := default "10s" .Values.serviceMonitor.scrapeTimeout }}
+    {{- range $i, $ep := (default (list (dict "port" "http" "path" "/metrics")) .Values.serviceMonitor.endpoints) }}
+    - port: {{ $ep.port | quote }}
+      {{- with $ep.targetPort }}  # альтернатива через номер
+      targetPort: {{ . }}
+      {{- end }}
+      scheme: {{ default "http" $ep.scheme | quote }}
+      path: {{ default "/metrics" $ep.path | quote }}
+      honorLabels: {{ default true $ep.honorLabels }}
+      scrapeInterval: {{ default $globalScrapeInterval $ep.interval | quote }}
+      scrapeTimeout: {{ default $globalScrapeTimeout  $ep.scrapeTimeout | quote }}
+      relabelings:
+        {{- /* Пример: нормализация имён и демпфер кардинальности */ -}}
+        {{- if not (hasKey $ep "relabelings") }}
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - action: labeldrop
+          regex: "controller_revision_hash|pod_template_hash"
+        {{- else }}
+        {{- toYaml $ep.relabelings | nindent 8 }}
+        {{- end }}
+      metricRelabelings:
+        {{- if not (hasKey $ep "metricRelabelings") }}
+        - action: drop
+          regex: "go_memstats_heap_.*_bytes"
+          sourceLabels: [__name__]
+        - action: drop
+          regex: "process_open_fds|process_max_fds"
+          sourceLabels: [__name__]
+        {{- else }}
+        {{- toYaml $ep.metricRelabelings | nindent 8 }}
+        {{- end }}
+      {{- with $ep.params }}
+      params:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $ep.proxyUrl }}
+      proxyUrl: {{ . | quote }}
+      {{- end }}
+      {{- with $ep.headers }}
+      authorization:
+        {{- if .type }}
+        type: {{ .type | quote }}
+        {{- end }}
+        {{- if .credentials }}
+        credentials: {{ .credentials | quote }}
+        {{- end }}
+      {{- end }}
+      {{- if or $ep.tlsConfig $.Values.serviceMonitor.tlsConfig }}
+      tlsConfig:
+        {{- $tls := (default $.Values.serviceMonitor.tlsConfig $ep.tlsConfig) }}
+        {{- with $tls.serverName }}
+        serverName: {{ . | quote }}
+        {{- end }}
+        {{- with $tls.ca }}
+        ca:
+          secret:
+            name: {{ .secretName | quote }}
+            key:  {{ default "ca.crt" .key | quote }}
+        {{- end }}
+        {{- with $tls.cert }}
+        cert:
+          secret:
+            name: {{ .secretName | quote }}
+            key:  {{ default "tls.crt" .key | quote }}
+        {{- end }}
+        {{- with $tls.key }}
+        keySecret:
+          name: {{ .secretName | quote }}
+          key:  {{ default "tls.key" .key | quote }}
+        {{- end }}
+        {{- with $tls.insecureSkipVerify }}
+        insecureSkipVerify: {{ . }}
+        {{- end }}
+        {{- with $tls.minVersion }}
+        minVersion: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with $ep.bearerTokenSecret }}
+      bearerTokenSecret:
+        name: {{ .name | quote }}
+        key:  {{ default "token" .key | quote }}
+      {{- end }}
+      {{- with $ep.oauth2 }}
+      oauth2:
+        tokenUrl: {{ .tokenUrl | quote }}
+        endpointParams:
+          {{- toYaml (default dict .endpointParams) | nindent 10 }}
+        clientId:
+          {{- if .clientId.value }}
+          value: {{ .clientId.value | quote }}
+          {{- else }}
+          secret:
+            name: {{ .clientId.secretName | quote }}
+            key:  {{ default "client_id" .clientId.key | quote }}
+          {{- end }}
+        clientSecret:
+          name: {{ .clientSecret.secretName | quote }}
+          key:  {{ default "client_secret" .clientSecret.key | quote }}
+        {{- with .scopes }}
+        scopes:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- end }}
+      {{- with $ep.sampleLimit }}
+      sampleLimit: {{ . }}
+      {{- end }}
+      {{- with $ep.enableHttp2 }}
+      enableHttp2: {{ . }}
+      {{- end }}
+      {{- with $ep.followRedirects }}
+      followRedirects: {{ . }}
+      {{- end }}
+    {{- end }}
+{{- end }}

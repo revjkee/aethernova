@@ -1,0 +1,163 @@
+{{- /*
+NetworkPolicy (industrial)
+- Default deny (Ingress/Egress)
+- Explicit allows for:
+  * Ingress from ingress controller namespace and monitoring namespace
+  * Metrics scrape from monitoring namespace
+  * Egress to kube-dns (UDP/TCP 53) in kube-system
+  * Egress to Postgres/Redis (values-driven)
+Docs:
+- Kubernetes Concepts / Network Policies: https://kubernetes.io/docs/concepts/services-networking/network-policies/
+- Task / Declare Network Policy: https://kubernetes.io/docs/tasks/administer-cluster/declare-network-policy/
+- Calico / Allow DNS egress: https://docs.tigera.io/calico/latest/network-policy/get-started/kubernetes-policy/kubernetes-policy-advanced
+- Minikube handbook: https://minikube.sigs.k8s.io/docs/handbook/network_policy/
+*/ -}}
+{{- if .Values.networkPolicy.enabled }}
+
+{{- $appLabels := dict
+      "app.kubernetes.io/name" (include "aethernova-chain-core.name" .)
+      "app.kubernetes.io/instance" .Release.Name
+      "app.kubernetes.io/component" "backend"
+      "app.kubernetes.io/part-of" "aethernova"
+-}}
+
+{{- $podSelector := (default (dict "matchLabels" $appLabels) .Values.networkPolicy.podSelector) -}}
+{{- $dnsNamespace := (default "kube-system" .Values.networkPolicy.kubeDNS.namespace) -}}
+{{- $dnsSelector := (default (dict "matchLabels" (dict "k8s-app" "kube-dns")) .Values.networkPolicy.kubeDNS.podSelector) -}}
+
+{{- $db := .Values.networkPolicy.egress.db -}}
+{{- $redis := .Values.networkPolicy.egress.redis -}}
+{{- $ingressCtl := .Values.networkPolicy.ingress.ingressController -}}
+{{- $monitoring := .Values.networkPolicy.ingress.monitoring -}}
+{{- $metrics := .Values.networkPolicy.metrics -}}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aethernova-chain-core.fullname" . }}-default-deny
+  labels: {{- include "aethernova-chain-core.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    {{- toYaml $podSelector | nindent 4 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []   # deny all ingress by default
+  egress:  []   # deny all egress by default
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aethernova-chain-core.fullname" . }}-allow-rules
+  labels: {{- include "aethernova-chain-core.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    {{- toYaml $podSelector | nindent 4 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- /* 1) Allow from Ingress Controller namespace (HTTP/HTTPS) */ -}}
+    {{- if $ingressCtl.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $ingressCtl.namespaceSelector.matchLabels | nindent 14 }}
+          {{- if $ingressCtl.podSelector }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $ingressCtl.namespaceSelector.matchLabels | nindent 14 }}
+          podSelector:
+            {{- toYaml $ingressCtl.podSelector | nindent 12 }}
+          {{- end }}
+      ports:
+        {{- range $p := $ingressCtl.ports }}
+        - protocol: TCP
+          port: {{ $p }}
+        {{- end }}
+    {{- end }}
+
+    {{- /* 2) Allow scrape from monitoring namespace (Prometheus) */ -}}
+    {{- if $monitoring.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $monitoring.namespaceSelector.matchLabels | nindent 14 }}
+          {{- if $monitoring.podSelector }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $monitoring.namespaceSelector.matchLabels | nindent 14 }}
+          podSelector:
+            {{- toYaml $monitoring.podSelector | nindent 12 }}
+          {{- end }}
+      ports:
+        {{- range $mp := $metrics.ports }}
+        - protocol: TCP
+          port: {{ $mp }}
+        {{- end }}
+    {{- end }}
+
+  egress:
+    {{- /* 3) Allow DNS egress to kube-dns (UDP/TCP 53) */ -}}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- /* kube-system does not always carry labels; allow override via values */ -}}
+              name: {{ $dnsNamespace }}
+          podSelector:
+            {{- toYaml $dnsSelector | nindent 12 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    {{- /* 4) Allow egress to Postgres */ -}}
+    {{- if $db.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $db.namespaceSelector.matchLabels | nindent 14 }}
+          {{- if $db.podSelector }}
+          podSelector:
+            {{- toYaml $db.podSelector | nindent 12 }}
+          {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $db.port }}
+    {{- end }}
+
+    {{- /* 5) Allow egress to Redis */ -}}
+    {{- if $redis.enabled }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $redis.namespaceSelector.matchLabels | nindent 14 }}
+          {{- if $redis.podSelector }}
+          podSelector:
+            {{- toYaml $redis.podSelector | nindent 12 }}
+          {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $redis.port }}
+    {{- end }}
+
+    {{- /* 6) Optional egress CIDR allow-list */ -}}
+    {{- range $item := .Values.networkPolicy.egress.cidrAllowList }}
+    - to:
+        - ipBlock:
+            cidr: {{ $item.cidr }}
+            {{- if $item.except }}
+            except:
+              {{- toYaml $item.except | nindent 14 }}
+            {{- end }}
+      ports:
+        {{- range $ep := $item.ports }}
+        - protocol: {{ $ep.protocol | default "TCP" }}
+          port: {{ $ep.port }}
+        {{- end }}
+    {{- end }}
+
+{{- end }}

@@ -1,0 +1,122 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: zero-trust-core-staging
+namePrefix: stg-
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/name: zero-trust-core
+  app.kubernetes.io/instance: zero-trust-core
+  app.kubernetes.io/part-of: zero-trust-core
+  app.kubernetes.io/component: service
+  app.kubernetes.io/environment: staging
+  environment: staging
+
+commonAnnotations:
+  security.aethernova/hardening: "true"
+  observability.aethernova/scope: "staging"
+
+images:
+  - name: ghcr.io/your-org/zero-trust-core
+    newName: ghcr.io/your-org/zero-trust-core
+    newTag: staging
+
+replicas:
+  - name: zero-trust-core
+    count: 3
+
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/environment: staging
+  annotations:
+    config.kubernetes.io/behavior: merge
+
+configMapGenerator:
+  - name: zero-trust-core
+    behavior: merge
+    literals:
+      - APP_ENV=staging
+      - LOG_LEVEL=INFO
+      - HTTP_PORT=8080
+      - GRPC_PORT=9090
+      - METRICS_PORT=9100
+    # При необходимости подключите файловый конфиг среды:
+    # files:
+    #   - config.yaml=../../../../configs/env/staging.yaml
+
+secretGenerator:
+  - name: zero-trust-core
+    behavior: merge
+    type: Opaque
+    # В реальном кластере секреты приходят из внешней системы (Vault/ESO/SealedSecrets).
+    # Эти значения — безопасные заглушки для локального staging.
+    literals:
+      - APP_SECRET=staging-change-me
+      - API_TOKEN=staging-placeholder
+
+patches:
+  # Жестко запрещаем автоподстановку SA-токена, если в чарте/базе есть ServiceAccount
+  - target:
+      version: v1
+      kind: ServiceAccount
+      name: zero-trust-core
+    patch: |-
+      - op: replace
+        path: /automountServiceAccountToken
+        value: false
+
+  # Основные патчи к Deployment
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: zero-trust-core
+    patch: |-
+      # Всегда подтягиваем свежий staging-образ
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: "Always"
+
+      # Явная установка переменных окружения для staging
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: APP_ENV
+          value: "staging"
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: LOG_LEVEL
+          value: "INFO"
+
+      # Толю под staging node-pool
+      - op: add
+        path: /spec/template/spec/tolerations
+        value:
+          - key: "env"
+            operator: "Equal"
+            value: "staging"
+            effect: "NoSchedule"
+
+      # Узлы staging-пула (добавляем к уже заданным выражениям)
+      - op: add
+        path: /spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/-
+        value:
+          key: "node-pool"
+          operator: "In"
+          values: ["staging"]
+
+      # Удаляем placeholder-аннотации checksum/* из base:
+      - op: remove
+        path: /spec/template/metadata/annotations/checksum~1config
+      - op: remove
+        path: /spec/template/metadata/annotations/checksum~1secret
+      - op: remove
+        path: /metadata/annotations/checksum~1config
+      - op: remove
+        path: /metadata/annotations/checksum~1secret

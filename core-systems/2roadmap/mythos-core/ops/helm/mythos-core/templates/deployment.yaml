@@ -1,0 +1,262 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mythos-core.fullname" . }}
+  labels:
+    {{- include "mythos-core.labels" . | nindent 4 }}
+    app.kubernetes.io/component: core
+  annotations:
+    {{- with .Values.deployment.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.checksums.configmap }}
+    checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    {{- end }}
+    {{- if .Values.checksums.secret }}
+    checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount | default 2 }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.deployment.revisionHistoryLimit | default 10 }}
+  minReadySeconds: {{ .Values.deployment.minReadySeconds | default 5 }}
+  progressDeadlineSeconds: {{ .Values.deployment.progressDeadlineSeconds | default 600 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.deployment.maxUnavailable | default "25%" | quote }}
+      maxSurge: {{ .Values.deployment.maxSurge | default "25%" | quote }}
+  selector:
+    matchLabels:
+      {{- include "mythos-core.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mythos-core.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/part-of: mythos-core
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        # Поддержка сервис-меша/проксей (опционально)
+        {{- if .Values.mesh.enabled }}
+        traffic.sidecar.istio.io/includeInboundPorts: "{{ .Values.mesh.includeInboundPorts | default "80,8080,9090,50051" }}"
+        sidecar.istio.io/inject: "{{ ternary "true" "false" .Values.mesh.inject }}"
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      serviceAccountName: {{ include "mythos-core.serviceAccountName" . }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+        fsGroup: {{ .Values.podSecurityContext.fsGroup | default 2000 }}
+        fsGroupChangePolicy: {{ .Values.podSecurityContext.fsGroupChangePolicy | default "OnRootMismatch" | quote }}
+        runAsNonRoot: true
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      # По умолчанию распределяем Pod'ы по зонам/нодам
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "mythos-core.selectorLabels" . | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "mythos-core.selectorLabels" . | nindent 14 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "mythos-core.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      ########################################################################
+      # Init-контейнеры (опционально)
+      ########################################################################
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- tpl (toYaml .) $ | nindent 8 }}
+      {{- end }}
+
+      ########################################################################
+      # Основной контейнер
+      ########################################################################
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "%s" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          {{- with .Values.command }}
+          command: {{- tpl (toYaml .) $ | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args: {{- tpl (toYaml .) $ | nindent 12 }}
+          {{- end }}
+
+          ports:
+            {{- if .Values.ports.http.enabled | default true }}
+            - name: {{ .Values.ports.http.name | default "http" }}
+              containerPort: {{ .Values.ports.http.number | default 8080 }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.ports.grpc.enabled }}
+            - name: {{ .Values.ports.grpc.name | default "grpc" }}
+              containerPort: {{ .Values.ports.grpc.number | default 50051 }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.ports.metrics.enabled | default true }}
+            - name: {{ .Values.ports.metrics.name | default "metrics" }}
+              containerPort: {{ .Values.ports.metrics.number | default 9090 }}
+              protocol: TCP
+            {{- end }}
+
+          env:
+            - name: TZ
+              value: {{ .Values.timezone | default "UTC" | quote }}
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- range . }}
+            - {{- toYaml . | nindent 14 }}
+            {{- end }}
+          {{- end }}
+
+          {{- if .Values.probes.startup.enabled | default true }}
+          startupProbe:
+            {{- if .Values.probes.startup.custom }}
+            {{- toYaml .Values.probes.startup.custom | nindent 12 }}
+            {{- else }}
+            httpGet:
+              path: {{ .Values.probes.startup.path | default "/healthz" | quote }}
+              port: {{ .Values.ports.http.name | default "http" }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold | default 30 }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds | default 2 }}
+            {{- end }}
+          {{- end }}
+
+          {{- if .Values.probes.liveness.enabled | default true }}
+          livenessProbe:
+            {{- if .Values.probes.liveness.custom }}
+            {{- toYaml .Values.probes.liveness.custom | nindent 12 }}
+            {{- else }}
+            httpGet:
+              path: {{ .Values.probes.liveness.path | default "/health" | quote }}
+              port: {{ .Values.ports.http.name | default "http" }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 10 }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 2 }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
+            {{- end }}
+          {{- end }}
+
+          {{- if .Values.probes.readiness.enabled | default true }}
+          readinessProbe:
+            {{- if .Values.probes.readiness.custom }}
+            {{- toYaml .Values.probes.readiness.custom | nindent 12 }}
+            {{- else }}
+            httpGet:
+              path: {{ .Values.probes.readiness.path | default "/ready" | quote }}
+              port: {{ .Values.ports.http.name | default "http" }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 5 }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 2 }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
+            {{- end }}
+          {{- end }}
+
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    # даём серверу корректно завершить соединения
+                    sleep {{ .Values.lifecycle.preStopSleepSeconds | default 5 }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: {{ .Values.containerSecurity.readOnlyRootFilesystem | default true }}
+            runAsUser: {{ .Values.containerSecurity.runAsUser | default 10001 }}
+            runAsGroup: {{ .Values.containerSecurity.runAsGroup | default 10001 }}
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        ######################################################################
+        # Sidecars (опционально)
+        ######################################################################
+        {{- with .Values.sidecars }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
+
+      ########################################################################
+      # Volumes
+      ########################################################################
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

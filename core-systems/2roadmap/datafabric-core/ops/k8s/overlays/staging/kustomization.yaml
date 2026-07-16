@@ -1,0 +1,239 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: datafabric-staging
+namePrefix: stg-
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/environment: staging
+  env: staging
+
+commonAnnotations:
+  maintainer: platform-team
+  rollout.strategy: progressive
+  backup.policy: daily
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: app-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=info
+      - FEATURE_FLAGS=beta=false,fast-path=true
+  - name: runtime-config
+    behavior: merge
+    envs:
+      - env.staging
+
+secretGenerator:
+  - name: app-secret
+    behavior: replace
+    envs:
+      - secrets.staging.env
+  - name: postgres-secret
+    behavior: replace
+    envs:
+      - secrets.pg.staging.env
+  - name: redis-secret
+    behavior: replace
+    envs:
+      - secrets.redis.staging.env
+  - name: minio-secret
+    behavior: replace
+    envs:
+      - secrets.minio.staging.env
+  - name: kafka-secret
+    behavior: replace
+    envs:
+      - secrets.kafka.staging.env
+
+images:
+  - name: ghcr.io/your-org/datafabric-core
+    newName: ghcr.io/your-org/datafabric-core
+    newTag: v1.2.0
+  - name: docker.io/bitnami/kafka
+    newTag: "3.7"
+  - name: docker.io/redis
+    newTag: "7-alpine"
+  - name: docker.io/postgres
+    newTag: "16-alpine"
+  - name: docker.io/minio/minio
+    newTag: "RELEASE.2025-02-18T10-30-00Z"
+
+replicas:
+  - name: app
+    count: 3
+
+patches:
+  # Deployment:app — ресурсы, переменные окружения, topologySpreadConstraints
+  - target:
+      kind: Deployment
+      name: app
+    patch: |-
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: api
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: APP_ENV
+          value: "staging"
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/component: api
+      - op: add
+        path: /spec/strategy
+        value:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 25%
+            maxSurge: 25%
+
+  # StatefulSet:postgres — ресурсы и аннотация о бэкапах
+  - target:
+      kind: StatefulSet
+      name: postgres
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          backup.velero.io/backup-volumes: pg-data
+
+  # Deployment:redis — ресурсы и anti-affinity
+  - target:
+      kind: Deployment
+      name: redis
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 50
+                podAffinityTerm:
+                  topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/component: cache
+
+  # StatefulSet:kafka — ресурсы и anti-affinity между брокерами
+  - target:
+      kind: StatefulSet
+      name: kafka
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "3Gi"
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                podAffinityTerm:
+                  topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/component: broker
+
+  # Deployment:minio — ресурсы
+  - target:
+      kind: Deployment
+      name: minio
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+
+  # Ingress:app — аннотации для staging и TLS-issuer
+  - target:
+      kind: Ingress
+      name: app
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          kubernetes.io/ingress.class: "nginx"
+          cert-manager.io/cluster-issuer: "letsencrypt-staging"
+          nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+          nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+  # PDB приложения — ужесточение доли доступности на стейджинге
+  - target:
+      kind: PodDisruptionBudget
+      name: app-pdb
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: "75%"
+
+  # Service:app — internal-only в стейджинге (если используется тип LoadBalancer в базе)
+  - target:
+      kind: Service
+      name: app
+    patch: |-
+      - op: add
+        path: /metadata/annotations
+        value:
+          service.kubernetes.io/annotations: internal
+      - op: replace
+        path: /spec/type
+        value: ClusterIP

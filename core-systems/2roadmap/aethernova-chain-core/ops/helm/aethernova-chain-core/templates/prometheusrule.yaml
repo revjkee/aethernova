@@ -1,0 +1,175 @@
+{{- /*
+PrometheusRule для Aethernova Chain Core.
+Включается флагом .Values.monitoring.prometheusRule.enabled
+Пороговые значения управляются через .Values.monitoring.prometheusRule.thresholds.*
+*/ -}}
+{{- if and .Values.monitoring .Values.monitoring.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ printf "%s-prometheusrule" .Release.Name | trunc 63 | trimSuffix "-" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ default "aethernova-chain-core" .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: "node"
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: aethernova.liveness
+      rules:
+        # Узел не производит блоки
+        - alert: AethernovaBlockProductionStalled
+          expr: |
+            sum(increase(aethernova_consensus_blocks_produced_total[{{ .Values.monitoring.prometheusRule.windows.blockProduction | default "10m" }}])) == 0
+          for: {{ .Values.monitoring.prometheusRule.for.blockProduction | default "10m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.blockProduction | default "critical" | quote }}
+          annotations:
+            summary: "Блокпроизводство остановлено"
+            description: "Не произведено ни одного блока за {{ .Values.monitoring.prometheusRule.windows.blockProduction | default "10m" }}."
+
+        # Пиры P2P ниже минимума
+        - alert: AethernovaP2PPeersLow
+          expr: |
+            avg(aethernova_p2p_peers) < {{ .Values.monitoring.prometheusRule.thresholds.minPeers | default 20 }}
+          for: {{ .Values.monitoring.prometheusRule.for.peers | default "5m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.peers | default "warning" | quote }}
+          annotations:
+            summary: "Низкое число P2P-пиров"
+            description: "Среднее число пиров < {{ .Values.monitoring.prometheusRule.thresholds.minPeers | default 20 }}."
+
+    - name: aethernova.finality
+      rules:
+        # Лаг финальности по высоте
+        - alert: AethernovaFinalityLagHigh
+          expr: |
+            (max(aethernova_chain_height) - max(aethernova_finality_checkpoint_height)) > {{ .Values.monitoring.prometheusRule.thresholds.finalityLagBlocks | default 1500 }}
+          for: {{ .Values.monitoring.prometheusRule.for.finalityLag | default "15m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.finalityLag | default "critical" | quote }}
+          annotations:
+            summary: "Высокий лаг финальности"
+            description: "Разница chain_height - checkpoint_height > {{ .Values.monitoring.prometheusRule.thresholds.finalityLagBlocks | default 1500 }} блоков."
+
+        # Нет новых чекпойнтов
+        - alert: AethernovaFinalityCheckpointStalled
+          expr: |
+            increase(aethernova_finality_checkpoints_total[{{ .Values.monitoring.prometheusRule.windows.checkpoint | default "30m" }}]) == 0
+          for: {{ .Values.monitoring.prometheusRule.for.checkpoint | default "30m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.checkpoint | default "warning" | quote }}
+          annotations:
+            summary: "Публикация чекпойнтов не наблюдается"
+            description: "За {{ .Values.monitoring.prometheusRule.windows.checkpoint | default "30m" }} не зафиксировано новых финальных чекпойнтов."
+
+    - name: aethernova.txpool
+      rules:
+        # Переполнение mempool
+        - alert: AethernovaMempoolSaturation
+          expr: |
+            (avg(aethernova_mempool_size) / {{ .Values.monitoring.prometheusRule.thresholds.mempoolMax | default 500000 }}) > {{ .Values.monitoring.prometheusRule.thresholds.mempoolSaturationRatio | default 0.85 }}
+          for: {{ .Values.monitoring.prometheusRule.for.mempool | default "10m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.mempool | default "warning" | quote }}
+          annotations:
+            summary: "Высокая загрузка mempool"
+            description: "Соотношение mempool_size к max > {{ .Values.monitoring.prometheusRule.thresholds.mempoolSaturationRatio | default 0.85 }}."
+
+        # Очередь неподтвержденных транзакций
+        - alert: AethernovaTxpoolCongestion
+          expr: |
+            avg(aethernova_txpool_pending_total) > {{ .Values.monitoring.prometheusRule.thresholds.txpoolPending | default 200000 }}
+          for: {{ .Values.monitoring.prometheusRule.for.txpool | default "10m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.txpool | default "warning" | quote }}
+          annotations:
+            summary: "Рост очереди транзакций"
+            description: "Неподтвержденных транзакций > {{ .Values.monitoring.prometheusRule.thresholds.txpoolPending | default 200000 }}."
+
+    - name: aethernova.rpc
+      rules:
+        # Ошибки HTTP JSON-RPC 5xx
+        - alert: AethernovaRpc5xxErrorRateHigh
+          expr: |
+            (
+              sum(rate(aethernova_rpc_http_requests_total{code=~"5.."}[{{ .Values.monitoring.prometheusRule.windows.rpc | default "5m" }}])) 
+              /
+              sum(rate(aethernova_rpc_http_requests_total[{{ .Values.monitoring.prometheusRule.windows.rpc | default "5m" }}]))
+            ) > {{ .Values.monitoring.prometheusRule.thresholds.rpc5xxErrorRatio | default 0.05 }}
+          for: {{ .Values.monitoring.prometheusRule.for.rpc | default "10m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.rpc | default "critical" | quote }}
+          annotations:
+            summary: "Высокая доля 5xx ответов RPC"
+            description: "Доля 5xx > {{ .Values.monitoring.prometheusRule.thresholds.rpc5xxErrorRatio | default 0.05 }} за {{ .Values.monitoring.prometheusRule.windows.rpc | default "5m" }}."
+
+        # Длительные RPC
+        - alert: AethernovaRpcLatencyP95High
+          expr: |
+            histogram_quantile(0.95, sum by (le) (rate(aethernova_rpc_http_request_duration_seconds_bucket[{{ .Values.monitoring.prometheusRule.windows.rpc | default "5m" }}])))
+              > {{ .Values.monitoring.prometheusRule.thresholds.rpcP95Seconds | default 0.8 }}
+          for: {{ .Values.monitoring.prometheusRule.for.rpcLatency | default "10m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.rpcLatency | default "warning" | quote }}
+          annotations:
+            summary: "Высокая задержка RPC (P95)"
+            description: "P95 длительности > {{ .Values.monitoring.prometheusRule.thresholds.rpcP95Seconds | default 0.8 }}s."
+
+    - name: aethernova.resources
+      rules:
+        # Память процесса
+        - alert: AethernovaProcessMemoryHigh
+          expr: |
+            avg(process_resident_memory_bytes{job=~".*aethernova.*"}) 
+              > {{ mul (default 8 .Values.monitoring.prometheusRule.thresholds.processMemoryGiB) 1073741824 | default 8589934592 }}
+          for: {{ .Values.monitoring.prometheusRule.for.processMemory | default "15m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.processMemory | default "warning" | quote }}
+          annotations:
+            summary: "Высокое потребление памяти процессом"
+            description: "RSS превышает {{ .Values.monitoring.prometheusRule.thresholds.processMemoryGiB | default 8 }} GiB."
+
+        # Перезапуски контейнера
+        - alert: AethernovaContainerRestarts
+          expr: |
+            increase(kube_pod_container_status_restarts_total{container=~".*aethernova.*"}[{{ .Values.monitoring.prometheusRule.windows.restarts | default "10m" }}]) 
+              > {{ .Values.monitoring.prometheusRule.thresholds.restarts | default 2 }}
+          for: {{ .Values.monitoring.prometheusRule.for.restarts | default "0m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.restarts | default "critical" | quote }}
+          annotations:
+            summary: "Перезапуски контейнера"
+            description: "Количество перезапусков за интервал превышает порог."
+
+        # Мало свободного места на диске (node-exporter)
+        - alert: NodeFilesystemSpaceLow
+          expr: |
+            (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})
+              < {{ .Values.monitoring.prometheusRule.thresholds.diskFreeRatio | default 0.10 }}
+          for: {{ .Values.monitoring.prometheusRule.for.disk | default "10m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.disk | default "warning" | quote }}
+          annotations:
+            summary: "Низкий запас свободного места на /"
+            description: "Свободное место на корневом разделе ниже {{ mul (default 0.10 .Values.monitoring.prometheusRule.thresholds.diskFreeRatio) 100 }}%."
+
+    - name: aethernova.storage
+      rules:
+        # Длительные compaction в RocksDB
+        - alert: AethernovaStorageCompactionSlow
+          expr: |
+            histogram_quantile(0.95, sum by (le) (rate(aethernova_storage_compaction_duration_seconds_bucket[{{ .Values.monitoring.prometheusRule.windows.storage | default "15m" }}])))
+              > {{ .Values.monitoring.prometheusRule.thresholds.compactionP95Seconds | default 2.5 }}
+          for: {{ .Values.monitoring.prometheusRule.for.storage | default "20m" }}
+          labels:
+            severity: {{ .Values.monitoring.prometheusRule.severity.storage | default "warning" | quote }}
+          annotations:
+            summary: "Медленные compaction в хранилище"
+            description: "P95 длительности compaction > {{ .Values.monitoring.prometheusRule.thresholds.compactionP95Seconds | default 2.5 }}s."
+{{- end }}

@@ -1,0 +1,124 @@
+# omnimind-core/ops/ansible/roles/omnimind-core/molecule/default/converge.yml
+---
+- name: Converge omnimind-core role
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    # Базовые параметры роли (минимально необходимые для конвергенции в CI)
+    omnimind_group: "omnimind"
+    omnimind_user: "omni"
+    omnimind_uid: 11001
+    omnimind_gid: 11001
+
+    # Отключаем то, что обычно недоступно в Molecule контейнерах
+    omnimind_docker_enable: false
+    omnimind_firewall_enable: false
+    omnimind_check_postgres: false
+    omnimind_check_redis: false
+    omnimind_check_docker: false
+
+    # Порты/эндпойнты приложения (если в сценарии есть тестовый сервис)
+    omnimind_http_host: "127.0.0.1"
+    omnimind_http_port: 8000
+    omnimind_health_path: "/healthz"
+    omnimind_ready_path: "/ready"
+    omnimind_version_path: "/version"
+    omnimind_expected_version_regex: '^[0-9]+\.[0-9]+\.[0-9]+'
+    omnimind_tls_enabled: false
+
+    # Лимиты/ресурсы — облегчаем под контейнеры CI
+    omnimind_check_ulimit: true
+    omnimind_min_nofile: 8192
+    omnimind_min_mem_free_mb: 128
+    omnimind_max_load1: 8.0
+    omnimind_monitored_mounts: ['/', '/var', '/opt']
+    omnimind_min_disk_free_bytes: 2684354560  # 2.5 GiB
+
+    # Путь отчета из healthcheck.yml роли
+    omnimind_health_report_path: "/var/log/omnimind/health_report.json"
+
+  pre_tasks:
+    - name: Prepare apt cache on Debian/Ubuntu
+      ansible.builtin.apt:
+        update_cache: true
+      when: ansible_facts.os_family == 'Debian'
+      changed_when: false
+      tags: [pre, pkg]
+
+    - name: Ensure dnf/yum metadata present on RedHat family
+      ansible.builtin.yum:
+        name: ca-certificates
+        state: present
+      when: ansible_facts.os_family == 'RedHat'
+      tags: [pre, pkg]
+
+    - name: Ensure python3 and basic tools present (generic)
+      vars:
+        _pkgs_debian: ['python3', 'python3-venv', 'python3-pip']
+        _pkgs_redhat: ['python3', 'python3-pip']
+      block:
+        - name: Install Python packages (Debian)
+          ansible.builtin.apt:
+            name: "{{ _pkgs_debian }}"
+            state: present
+          when: ansible_facts.os_family == 'Debian'
+        - name: Install Python packages (RedHat)
+          ansible.builtin.yum:
+            name: "{{ _pkgs_redhat }}"
+            state: present
+          when: ansible_facts.os_family == 'RedHat'
+      tags: [pre, python]
+
+  roles:
+    - role: omnimind-core
+      tags: [role]
+
+  # Верифицируем минимальные инварианты сразу после применения роли.
+  post_tasks:
+    - name: Assert app group exists
+      ansible.builtin.getent:
+        database: group
+        key: "{{ omnimind_group }}"
+      tags: [post, verify]
+
+    - name: Assert app user exists
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ omnimind_user }}"
+      tags: [post, verify]
+
+    - name: Stat health report if produced by role
+      ansible.builtin.stat:
+        path: "{{ omnimind_health_report_path }}"
+      register: _health_stat
+      tags: [post, health]
+
+    - name: Read health report content
+      ansible.builtin.slurp:
+        src: "{{ omnimind_health_report_path }}"
+      register: _health_raw
+      when: _health_stat.stat.exists | bool
+      tags: [post, health]
+
+    - name: Parse health report JSON
+      ansible.builtin.set_fact:
+        _health_report: "{{ (_health_raw.content | b64decode) | from_json }}"
+      when: _health_stat.stat.exists | bool
+      tags: [post, health]
+
+    - name: Show health report (for CI logs)
+      ansible.builtin.debug:
+        var: _health_report
+      when: _health_report is defined
+      tags: [post, health]
+
+    - name: Fail if health report contains failures
+      ansible.builtin.assert:
+        that:
+          - (_health_report.failures | length | default(0)) == 0
+        fail_msg: "Healthcheck failures: {{ _health_report.failures | default([]) | to_nice_json }}"
+        success_msg: "Healthcheck passed (no failures in report)"
+      when: _health_report is defined
+      tags: [post, health, verify]

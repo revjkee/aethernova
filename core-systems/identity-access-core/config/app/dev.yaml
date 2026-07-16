@@ -1,0 +1,325 @@
+# core-systems\identity-access-core\config\app\dev.yaml
+# STATUS: TEMPLATE. Не могу подтвердить это.
+
+app:
+  name: "identity-access-core"
+  env: "dev"
+  region: "${APP_REGION:-eu-central-1}"
+  instance_id: "${APP_INSTANCE_ID:-local}"
+  timezone: "Europe/Berlin"
+
+  # Включает строгие проверки конфигурации и блокирует запуск при ошибках.
+  fail_fast_config: true
+
+  # Единый корреляционный идентификатор для логов/трейсов/аудита.
+  correlation:
+    header_name: "X-Request-Id"
+    generate_if_missing: true
+
+server:
+  host: "${SERVER_HOST:-0.0.0.0}"
+  port: "${SERVER_PORT:-8080}"
+  public_base_url: "${PUBLIC_BASE_URL:-http://localhost:8080}"
+  admin_base_url: "${ADMIN_BASE_URL:-http://localhost:8081}"
+
+  # Gunicorn/Uvicorn параметры (даже в dev полезно держать близко к prod).
+  workers: "${SERVER_WORKERS:-1}"
+  graceful_timeout_seconds: 30
+  keepalive_seconds: 5
+  request_max_size_mb: 10
+
+  # HTTP безопасность
+  security_headers:
+    enabled: true
+    hsts:
+      enabled: false
+      max_age_seconds: 31536000
+      include_subdomains: true
+      preload: false
+    x_content_type_options: "nosniff"
+    x_frame_options: "DENY"
+    referrer_policy: "no-referrer"
+    content_security_policy: "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+    permissions_policy: "geolocation=(), microphone=(), camera=()"
+
+api:
+  version: "v1"
+  docs:
+    enabled: true
+    openapi_url: "/openapi.json"
+    docs_url: "/docs"
+    redoc_url: "/redoc"
+
+logging:
+  level: "${LOG_LEVEL:-DEBUG}"
+  format: "json"              # json | text
+  include_source: true
+  include_process: true
+  include_thread: true
+
+  # PII редактирование на уровне логгера (минимальная защита даже в dev).
+  pii_redaction:
+    enabled: true
+    rules:
+      - name: "email"
+        pattern: "(?i)([a-z0-9._%+-]+)@([a-z0-9.-]+\\.[a-z]{2,})"
+        replacement: "***@***"
+      - name: "bearer"
+        pattern: "(?i)bearer\\s+[a-z0-9._-]+"
+        replacement: "bearer ***"
+      - name: "api_key"
+        pattern: "(?i)(api[-_ ]?key\\s*[:=]\\s*)([^\\s,;]+)"
+        replacement: "\\1***"
+
+database:
+  dialect: "postgresql"
+  url: "${DATABASE_URL:-postgresql+asyncpg://identity:identity@localhost:5432/identity_access_dev}"
+  pool:
+    min_size: 1
+    max_size: 10
+    max_overflow: 10
+    pool_timeout_seconds: 30
+    pool_recycle_seconds: 1800
+    pool_pre_ping: true
+  statement_timeout_ms: 30000
+  connect_timeout_seconds: 10
+  echo_sql: "${DB_ECHO_SQL:-false}"
+
+migrations:
+  enabled: true
+  alembic:
+    config_path: "core-systems/identity-access-core/alembic.ini"
+    auto_upgrade_on_boot: "${DB_MIGRATE_ON_BOOT:-true}"
+
+redis:
+  enabled: true
+  url: "${REDIS_URL:-redis://localhost:6379/5}"
+  socket_timeout_seconds: 2
+  connect_timeout_seconds: 2
+  retry:
+    max_attempts: 5
+    backoff_ms: 200
+
+cache:
+  enabled: true
+  default_ttl_seconds: 300
+  namespaces:
+    jwks: 300
+    oidc_discovery: 300
+    sessions: 900
+    rate_limits: 60
+
+security:
+  # Секреты только через ENV. Значения по умолчанию намеренно отсутствуют.
+  secrets:
+    master_key: "${MASTER_KEY:?MASTER_KEY is required}"
+    pepper: "${SECURITY_PEPPER:?SECURITY_PEPPER is required}"
+
+  password_hashing:
+    algorithm: "argon2id"
+    # dev: снижено, но не до нуля; держать близко к адекватным значениям.
+    argon2id:
+      time_cost: 2
+      memory_cost_kib: 65536
+      parallelism: 2
+      hash_len: 32
+      salt_len: 16
+
+  csrf:
+    enabled: true
+    header_name: "X-CSRF-Token"
+    cookie_name: "__Host-csrf"
+    cookie_secure: false
+    cookie_samesite: "Lax"
+    cookie_http_only: true
+
+  cors:
+    enabled: true
+    allow_credentials: true
+    allow_origins:
+      - "http://localhost:3000"
+      - "http://127.0.0.1:3000"
+      - "http://localhost:5173"
+      - "http://127.0.0.1:5173"
+    allow_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    allow_headers:
+      - "Authorization"
+      - "Content-Type"
+      - "X-Request-Id"
+      - "X-CSRF-Token"
+      - "X-Client-Version"
+    expose_headers:
+      - "X-Request-Id"
+      - "X-RateLimit-Limit"
+      - "X-RateLimit-Remaining"
+      - "X-RateLimit-Reset"
+
+  sessions:
+    enabled: true
+    cookie_name: "__Host-ia_session"
+    cookie_secure: false
+    cookie_samesite: "Lax"
+    cookie_http_only: true
+    idle_timeout_seconds: 1800
+    absolute_timeout_seconds: 28800
+    storage: "redis"          # redis | database
+    rotation:
+      enabled: true
+      rotate_every_seconds: 900
+
+  rate_limiting:
+    enabled: true
+    strategy: "redis"
+    default:
+      limit: 300
+      window_seconds: 60
+    endpoints:
+      login:
+        limit: 20
+        window_seconds: 60
+      token:
+        limit: 60
+        window_seconds: 60
+      register:
+        limit: 10
+        window_seconds: 3600
+
+  brute_force_protection:
+    enabled: true
+    max_attempts: 8
+    window_seconds: 900
+    lockout_seconds: 900
+
+auth:
+  # Основные режимы ядра IAM: локальная аутентификация и интеграции OIDC/OAuth2.
+  local_auth_enabled: true
+  registration_enabled: "${REGISTRATION_ENABLED:-true}"
+  email_verification_required: "${EMAIL_VERIFY_REQUIRED:-false}"
+
+  jwt:
+    issuer: "${JWT_ISSUER:-identity-access-core}"
+    audience: "${JWT_AUDIENCE:-aethernova}"
+    access_token_ttl_seconds: 900
+    refresh_token_ttl_seconds: 2592000
+    clock_skew_seconds: 30
+
+    signing:
+      algorithm: "RS256"  # RS256 | ES256
+      private_key_pem: "${JWT_PRIVATE_KEY_PEM:?JWT_PRIVATE_KEY_PEM is required}"
+      public_key_pem: "${JWT_PUBLIC_KEY_PEM:?JWT_PUBLIC_KEY_PEM is required}"
+      kid: "${JWT_KID:-dev-kid-1}"
+      rotate:
+        enabled: "${JWT_ROTATION_ENABLED:-false}"
+        rotation_period_hours: 24
+        overlap_hours: 12
+
+    claims:
+      subject_field: "sub"
+      roles_field: "roles"
+      permissions_field: "perms"
+      tenant_field: "tenant"
+      device_field: "device_id"
+
+  oidc:
+    enabled: "${OIDC_ENABLED:-true}"
+    # Discovery cache через cache.namespaces.oidc_discovery
+    providers:
+      - name: "dev-keycloak"
+        enabled: "${OIDC_KEYCLOAK_ENABLED:-false}"
+        discovery_url: "${OIDC_KEYCLOAK_DISCOVERY_URL:-http://localhost:8080/realms/dev/.well-known/openid-configuration}"
+        client_id: "${OIDC_KEYCLOAK_CLIENT_ID:-identity-access-core}"
+        client_secret: "${OIDC_KEYCLOAK_CLIENT_SECRET:-}"
+        scopes: ["openid", "profile", "email"]
+        pkce: true
+        prompt: "login"
+        user_mapping:
+          id: "sub"
+          email: "email"
+          name: "name"
+
+rbac:
+  enabled: true
+  model: "rbac+abac"  # rbac | rbac+abac
+  default_role: "user"
+  admin_role: "admin"
+  role_hierarchy:
+    admin: ["moderator", "support", "user"]
+    moderator: ["support", "user"]
+    support: ["user"]
+
+  policy_engine:
+    type: "local" # local | opa
+    opa:
+      enabled: "${OPA_ENABLED:-false}"
+      url: "${OPA_URL:-http://localhost:8181}"
+      query_timeout_seconds: 2
+      default_package: "aethernova.identity"
+
+audit:
+  enabled: true
+  sink: "db+log"  # db | log | db+log
+  redact_fields: ["password", "token", "refresh_token", "authorization", "secret"]
+  include_request_body: false
+  include_response_body: false
+  retention_days: 7
+
+observability:
+  metrics:
+    enabled: true
+    path: "/metrics"
+  tracing:
+    enabled: true
+    service_name: "identity-access-core"
+    sampler:
+      type: "parentbased_traceidratio"
+      ratio: 1.0
+  otel:
+    enabled: true
+    exporter: "otlp"
+    otlp:
+      endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
+      protocol: "grpc" # grpc | http/protobuf
+      timeout_seconds: 5
+      headers:
+        # Пример: "Authorization=Bearer xxx"
+        value: "${OTEL_EXPORTER_OTLP_HEADERS:-}"
+  health:
+    liveness_path: "/health/live"
+    readiness_path: "/health/ready"
+
+features:
+  # Фичефлаги для безопасного включения функционала.
+  strict_mode: true
+  token_introspection: true
+  jwks_endpoint: true
+  device_fingerprint: "${DEVICE_FINGERPRINT_ENABLED:-false}"
+  mfa:
+    enabled: "${MFA_ENABLED:-false}"
+    totp:
+      issuer: "Aethernova"
+      window: 1
+    recovery_codes:
+      enabled: true
+      count: 10
+      length: 12
+
+mail:
+  enabled: "${MAIL_ENABLED:-false}"
+  provider: "smtp"
+  smtp:
+    host: "${SMTP_HOST:-localhost}"
+    port: "${SMTP_PORT:-1025}"
+    username: "${SMTP_USERNAME:-}"
+    password: "${SMTP_PASSWORD:-}"
+    use_tls: "${SMTP_USE_TLS:-false}"
+  from_email: "${MAIL_FROM_EMAIL:-noreply@localhost}"
+
+dev:
+  # ТОЛЬКО DEV: ослабления, которые недопустимы в prod.
+  insecure_allow_http: true
+  show_error_details: true
+  seed:
+    enabled: "${DEV_SEED_ENABLED:-true}"
+    admin_email: "${DEV_ADMIN_EMAIL:-admin@localhost}"
+    admin_password: "${DEV_ADMIN_PASSWORD:-ChangeMeNow!}"
+    tenant: "${DEV_TENANT:-dev}"

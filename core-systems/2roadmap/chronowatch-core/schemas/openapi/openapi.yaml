@@ -1,0 +1,758 @@
+openapi: 3.1.0
+info:
+  title: Chronowatch Core - SQL Migrations API
+  version: 1.0.0
+  description: >
+    Промышленный API управления миграциями БД: регистрация, планирование, dry-run,
+    применение, откат, батчи, логи и аудит. Контракт совместим с OpenAPI 3.1 и JSON Schema 2020-12.
+  contact:
+    name: NeuroCity Platform Team
+    email: platform@neurocity.example
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://api.neurocity.example/chronowatch
+    description: Production
+  - url: https://staging.api.neurocity.example/chronowatch
+    description: Staging
+  - url: http://localhost:8080
+    description: Local
+
+tags:
+  - name: migrations
+    description: Управление миграциями
+  - name: batches
+    description: Батч-операции над миграциями
+  - name: plans
+    description: Планирование и dry-run
+  - name: logs
+    description: Логи и аудит
+
+security:
+  - bearerAuth: []
+  - oauth2:
+      - migrations:read
+      - migrations:write
+
+x-rateLimit:
+  headers: ["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"]
+
+paths:
+  /v1/migrations:
+    get:
+      tags: [migrations]
+      summary: Список миграций
+      operationId: listMigrations
+      parameters:
+        - $ref: '#/components/parameters/pageSize'
+        - $ref: '#/components/parameters/pageToken'
+        - $ref: '#/components/parameters/orderBy'
+        - $ref: '#/components/parameters/tenant'
+        - $ref: '#/components/parameters/status'
+        - $ref: '#/components/parameters/version'
+        - $ref: '#/components/parameters/tag'
+        - $ref: '#/components/parameters/createdFrom'
+        - $ref: '#/components/parameters/createdTo'
+      responses:
+        '200':
+          description: OK
+          headers: &rate_headers
+            X-Request-Id:
+              description: Идентификатор запроса
+              schema: { type: string }
+            X-RateLimit-Limit:
+              description: Лимит запросов за окно
+              schema: { type: integer }
+            X-RateLimit-Remaining:
+              description: Остаток лимита
+              schema: { type: integer }
+            X-RateLimit-Reset:
+              description: Время сброса лимита (epoch seconds)
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationList'
+    post:
+      tags: [migrations]
+      summary: Создать/зарегистрировать миграцию
+      operationId: createMigration
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MigrationCreate' }
+      responses:
+        '201':
+          description: Created
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Migration' }
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/migrations/{migrationId}:
+    parameters:
+      - $ref: '#/components/parameters/migrationId'
+    get:
+      tags: [migrations]
+      summary: Получить миграцию
+      operationId: getMigration
+      responses:
+        '200':
+          description: OK
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Migration' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [migrations]
+      summary: Обновить метаданные/метки миграции
+      operationId: updateMigration
+      parameters:
+        - $ref: '#/components/parameters/ifMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MigrationUpdate' }
+      responses:
+        '200':
+          description: Updated
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Migration' }
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [migrations]
+      summary: Удалить миграцию (если не применена)
+      operationId: deleteMigration
+      parameters:
+        - $ref: '#/components/parameters/ifMatch'
+      responses:
+        '204':
+          description: No Content
+          headers: *rate_headers
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/migrations/{migrationId}:plan:
+    post:
+      tags: [plans]
+      summary: Сформировать план применения/отката миграции
+      operationId: planMigration
+      parameters:
+        - $ref: '#/components/parameters/migrationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlanRequest' }
+      responses:
+        '200':
+          description: OK
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Plan' }
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/migrations/{migrationId}:dry-run:
+    post:
+      tags: [plans]
+      summary: Dry-run миграции (эмуляция без изменений)
+      operationId: dryRunMigration
+      parameters:
+        - $ref: '#/components/parameters/migrationId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DryRunOptions' }
+      responses:
+        '200':
+          description: Симуляция завершена
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DryRunResult' }
+
+  /v1/migrations/{migrationId}:apply:
+    post:
+      tags: [migrations]
+      summary: Применить миграцию
+      operationId: applyMigration
+      parameters:
+        - $ref: '#/components/parameters/migrationId'
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplyOptions' }
+      responses:
+        '202':
+          description: Принято к выполнению
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+
+  /v1/migrations/{migrationId}:rollback:
+    post:
+      tags: [migrations]
+      summary: Откатить миграцию
+      operationId: rollbackMigration
+      parameters:
+        - $ref: '#/components/parameters/migrationId'
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RollbackOptions' }
+      responses:
+        '202':
+          description: Принято к выполнению
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '423':
+          $ref: '#/components/responses/Locked'
+
+  /v1/migrations/{migrationId}/logs:
+    get:
+      tags: [logs]
+      summary: Получить логи выполнения миграции
+      operationId: getMigrationLogs
+      parameters:
+        - $ref: '#/components/parameters/migrationId'
+        - $ref: '#/components/parameters/logLevel'
+        - $ref: '#/components/parameters/createdFrom'
+        - $ref: '#/components/parameters/createdTo'
+        - $ref: '#/components/parameters/pageSize'
+        - $ref: '#/components/parameters/pageToken'
+      responses:
+        '200':
+          description: OK
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LogList' }
+
+  /v1/batches:
+    post:
+      tags: [batches]
+      summary: Создать батч миграций
+      operationId: createBatch
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BatchCreate' }
+      responses:
+        '201':
+          description: Created
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+
+  /v1/batches/{batchId}:
+    parameters:
+      - $ref: '#/components/parameters/batchId'
+    get:
+      tags: [batches]
+      summary: Получить батч
+      operationId: getBatch
+      responses:
+        '200':
+          description: OK
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [batches]
+      summary: Запустить батч (apply/rollback в указанном порядке)
+      operationId: runBatch
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BatchRunOptions' }
+      responses:
+        '202':
+          description: Принято к выполнению
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+
+  /v1/operations/{operationId}:
+    parameters:
+      - $ref: '#/components/parameters/operationId'
+    get:
+      tags: [migrations, batches]
+      summary: Статус долгой операции
+      operationId: getOperation
+      responses:
+        '200':
+          description: OK
+          headers: *rate_headers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Operation' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+webhooks:
+  migrationEvent:
+    post:
+      summary: Вебхук событий миграций
+      description: Отправляется при изменении статуса миграции или шагов плана
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MigrationEvent' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    oauth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.neurocity.example/oauth2/token
+          scopes:
+            migrations:read: Чтение миграций
+            migrations:write: Управление миграциями
+
+  parameters:
+    migrationId:
+      name: migrationId
+      in: path
+      required: true
+      description: Идентификатор миграции
+      schema: { type: string, pattern: '^[a-zA-Z0-9._:-]{3,128}$' }
+    batchId:
+      name: batchId
+      in: path
+      required: true
+      description: Идентификатор батча
+      schema: { type: string }
+    operationId:
+      name: operationId
+      in: path
+      required: true
+      description: Идентификатор операции
+      schema: { type: string }
+    pageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 1000, default: 50 }
+    pageToken:
+      name: page_token
+      in: query
+      schema: { type: string }
+    orderBy:
+      name: order_by
+      in: query
+      schema:
+        type: string
+        description: Поля сортировки, например "created_at desc, version asc"
+    tenant:
+      name: tenant
+      in: query
+      schema: { type: string }
+    status:
+      name: status
+      in: query
+      schema:
+        $ref: '#/components/schemas/MigrationStatus'
+    version:
+      name: version
+      in: query
+      schema: { type: string }
+    tag:
+      name: tag
+      in: query
+      schema: { type: string }
+    createdFrom:
+      name: created_from
+      in: query
+      schema: { type: string, format: date-time }
+    createdTo:
+      name: created_to
+      in: query
+      schema: { type: string, format: date-time }
+    ifMatch:
+      name: If-Match
+      in: header
+      description: ETag для оптимистичной блокировки
+      schema: { type: string }
+    idempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Ключ идемпотентности для небезопасных операций
+      schema: { type: string, maxLength: 128 }
+    logLevel:
+      name: level
+      in: query
+      schema:
+        type: string
+        enum: [trace, debug, info, warn, error]
+
+  responses:
+    NotFound:
+      description: Resource not found
+      headers: *rate_headers
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Conflict
+      headers: *rate_headers
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Locked:
+      description: Resource is locked
+      headers: *rate_headers
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    PreconditionFailed:
+      description: Precondition failed (ETag mismatch)
+      headers: *rate_headers
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UnprocessableEntity:
+      description: Validation error
+      headers: *rate_headers
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 problem details
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              code: { type: string }
+              message: { type: string }
+      required: [title, status]
+
+    MigrationStatus:
+      type: string
+      enum: [draft, planned, applying, applied, rolling_back, rolled_back, failed, canceled]
+
+    Migration:
+      type: object
+      properties:
+        id: { type: string }
+        tenant: { type: string, nullable: true }
+        version: { type: string, description: Семантическая версия или монотонный номер }
+        checksum: { type: string, description: Хэш содержимого миграции }
+        title: { type: string }
+        description: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/MigrationStatus' }
+        direction:
+          type: string
+          enum: [up, down, both]
+          default: up
+        engine:
+          type: string
+          enum: [postgres, mysql, mariadb, sqlite, mssql, clickhouse]
+        script_up: { type: string, description: SQL (Base64), format: byte }
+        script_down: { type: string, nullable: true, description: SQL (Base64), format: byte }
+        transactional: { type: boolean, default: true }
+        etag: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+        updated_at: { type: string, format: date-time }
+        updated_by: { type: string }
+        last_applied_at: { type: string, format: date-time, nullable: true }
+        metadata:
+          type: object
+          additionalProperties: true
+      required: [id, version, status, engine, script_up, checksum, created_at, created_by, etag]
+
+    MigrationCreate:
+      type: object
+      properties:
+        tenant: { type: string, nullable: true }
+        version: { type: string }
+        title: { type: string }
+        description: { type: string, nullable: true }
+        direction:
+          type: string
+          enum: [up, down, both]
+          default: up
+        engine:
+          type: string
+          enum: [postgres, mysql, mariadb, sqlite, mssql, clickhouse]
+        script_up: { type: string, description: SQL (Base64), format: byte }
+        script_down: { type: string, nullable: true, description: SQL (Base64), format: byte }
+        transactional: { type: boolean, default: true }
+        tags:
+          type: array
+          items: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+      required: [version, engine, script_up, title]
+
+    MigrationUpdate:
+      type: object
+      properties:
+        title: { type: string }
+        description: { type: string, nullable: true }
+        tags:
+          type: array
+          items: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+
+    MigrationList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Migration' }
+        next_page_token: { type: string, nullable: true }
+        total_size: { type: integer }
+      required: [items]
+
+    PlanRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum: [apply, rollback]
+        target_version:
+          type: string
+          description: >
+            Версия до которой применять (для apply — верхняя граница включительно),
+            для rollback — версия к которой откатываемся.
+        include_tags:
+          type: array
+          items: { type: string }
+        exclude_tags:
+          type: array
+          items: { type: string }
+        stop_on_error: { type: boolean, default: true }
+      required: [action]
+
+    Plan:
+      type: object
+      properties:
+        id: { type: string }
+        action: { type: string, enum: [apply, rollback] }
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              migration_id: { type: string }
+              version: { type: string }
+              engine: { type: string }
+              direction: { type: string, enum: [up, down] }
+              transactional: { type: boolean }
+            required: [migration_id, version, direction]
+        estimated_time_seconds: { type: integer }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+      required: [id, action, steps, created_at]
+
+    DryRunOptions:
+      type: object
+      properties:
+        max_rows_inspect: { type: integer, minimum: 0, default: 1000 }
+        analyze_plan: { type: boolean, default: true }
+        check_lock_timeout_seconds: { type: integer, minimum: 1, default: 10 }
+
+    DryRunResult:
+      type: object
+      properties:
+        plan: { $ref: '#/components/schemas/Plan' }
+        warnings:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              message: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              message: { type: string }
+              location: { type: string }
+
+    ApplyOptions:
+      type: object
+      properties:
+        timeout_seconds: { type: integer, minimum: 1, default: 300 }
+        stop_on_error: { type: boolean, default: true }
+        lock_wait_seconds: { type: integer, minimum: 0, default: 10 }
+
+    RollbackOptions:
+      type: object
+      properties:
+        timeout_seconds: { type: integer, minimum: 1, default: 300 }
+        stop_on_error: { type: boolean, default: true }
+
+    BatchCreate:
+      type: object
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            properties:
+              migration_id: { type: string }
+              action: { type: string, enum: [apply, rollback] }
+            required: [migration_id, action]
+        stop_on_error: { type: boolean, default: true }
+        concurrency: { type: integer, minimum: 1, maximum: 16, default: 2 }
+      required: [items]
+
+    BatchRunOptions:
+      type: object
+      properties:
+        concurrency: { type: integer, minimum: 1, maximum: 16, default: 2 }
+        stop_on_error: { type: boolean, default: true }
+
+    BatchStatus:
+      type: string
+      enum: [queued, running, completed, failed, canceled, partial_success]
+
+    Batch:
+      type: object
+      properties:
+        id: { type: string }
+        status: { $ref: '#/components/schemas/BatchStatus' }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              migration_id: { type: string }
+              action: { type: string, enum: [apply, rollback] }
+              status: { $ref: '#/components/schemas/MigrationStatus' }
+              started_at: { type: string, format: date-time, nullable: true }
+              finished_at: { type: string, format: date-time, nullable: true }
+              error: { $ref: '#/components/schemas/Problem' }
+        created_at: { type: string, format: date-time }
+        created_by: { type: string }
+        updated_at: { type: string, format: date-time }
+      required: [id, status, items, created_at]
+
+    OperationStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, canceled]
+
+    Operation:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [apply, rollback, batch] }
+        status: { $ref: '#/components/schemas/OperationStatus' }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        result:
+          oneOf:
+            - $ref: '#/components/schemas/Migration'
+            - $ref: '#/components/schemas/Batch'
+        error: { $ref: '#/components/schemas/Problem' }
+      required: [id, kind, status]
+
+    LogRecord:
+      type: object
+      properties:
+        id: { type: string }
+        migration_id: { type: string }
+        level: { type: string, enum: [trace, debug, info, warn, error] }
+        message: { type: string }
+        time: { type: string, format: date-time }
+        attributes:
+          type: object
+          additionalProperties: true
+      required: [id, migration_id, level, message, time]
+
+    LogList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/LogRecord' }
+        next_page_token: { type: string, nullable: true }
+        total_size: { type: integer }
+      required: [items]
+
+    MigrationEvent:
+      type: object
+      properties:
+        id: { type: string }
+        migration_id: { type: string }
+        type:
+          type: string
+          enum: [status_changed, step_started, step_finished, failed]
+        old_status: { $ref: '#/components/schemas/MigrationStatus' }
+        new_status: { $ref: '#/components/schemas/MigrationStatus' }
+        occurred_at: { type: string, format: date-time }
+        metadata:
+          type: object
+          additionalProperties: true
+      required: [id, migration_id, type, occurred_at]

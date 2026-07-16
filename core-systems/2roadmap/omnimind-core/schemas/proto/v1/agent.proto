@@ -1,0 +1,406 @@
+syntax = "proto3";
+
+package omnimind.v1;
+
+// ----------------------------------------------------------------------------
+// Language options (без предположений о пути импорта в конкретном репозитории)
+option java_multiple_files = true;
+option java_package = "omnimind.v1";
+option csharp_namespace = "OmniMind.V1";
+option optimize_for = SPEED;
+// Примечание: go_package укажите в вашем репозитории, пример:
+// option go_package = "github.com/your-org/omnimind-core/gen/omnimind/v1;omnimindv1";
+
+// ----------------------------------------------------------------------------
+// Стандартные типы
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// ----------------------------------------------------------------------------
+// Инварианты эволюции:
+// - Никогда не переиспользуйте удалённые номера полей (используйте reserved).
+// - Только добавляйте новые поля с уникальными номерами.
+// - Изменение типа/смысла существующего поля запрещено.
+// - Не делайте обязательных полей (proto3), валидируйте на уровне сервиса.
+// ----------------------------------------------------------------------------
+
+// -----------------------------------
+// Общие типы и вспомогательные сущности
+// -----------------------------------
+
+message ResourceRef {
+  // Строковый идентификатор ресурса (например, UUID v4).
+  string id = 1;
+  // Полное имя ресурса (например, "agents/{agent_id}").
+  string name = 2;
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+message Labels {
+  // Свободные метки (ограничивайте состав ключ/значение на уровне сервиса).
+  map<string, string> entries = 1;
+}
+
+message PageInfo {
+  // Размер страницы, до 1000 (валидируйте в сервисе).
+  int32 page_size = 1;
+  // Токен продолжения.
+  string page_token = 2;
+}
+
+message RateLimitInfo {
+  // Для отладки ответов и клиентского backoff.
+  string limit = 1;
+  string remaining = 2;
+  // Unix seconds до сброса окна.
+  int64 reset_seconds = 3;
+}
+
+// Унифицированные детали ошибок для диагностики.
+message ErrorDetails {
+  string code = 1;              // машинно-читаемый код (например, "invalid_argument")
+  string message = 2;           // человеко-читаемое описание
+  map<string, string> meta = 3; // дополнительные атрибуты
+}
+
+// -----------------------------------
+// Доменные перечисления
+// -----------------------------------
+
+enum AgentStatus {
+  AGENT_STATUS_UNSPECIFIED = 0;
+  AGENT_STATUS_INACTIVE = 1;
+  AGENT_STATUS_ACTIVE = 2;
+  AGENT_STATUS_ERROR = 3;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING = 1;
+  TASK_STATUS_RUNNING = 2;
+  TASK_STATUS_COMPLETED = 3;
+  TASK_STATUS_FAILED = 4;
+  TASK_STATUS_CANCELED = 5;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_TASK_CREATED = 1;
+  EVENT_TYPE_TASK_UPDATED = 2;
+  EVENT_TYPE_TASK_COMPLETED = 3;
+  EVENT_TYPE_TASK_FAILED = 4;
+  EVENT_TYPE_PLAN_CREATED = 5;
+  EVENT_TYPE_PLAN_UPDATED = 6;
+  EVENT_TYPE_MEMORY_APPENDED = 7;
+  EVENT_TYPE_CUSTOM = 100; // для расширений
+}
+
+enum MemoryType {
+  MEMORY_TYPE_UNSPECIFIED = 0;
+  MEMORY_TYPE_EPISODIC = 1;
+  MEMORY_TYPE_SEMANTIC = 2;
+  MEMORY_TYPE_LONG_TERM = 3;
+  MEMORY_TYPE_VECTOR = 4;
+}
+
+enum PolicyEffect {
+  POLICY_EFFECT_UNSPECIFIED = 0;
+  POLICY_EFFECT_ALLOW = 1;
+  POLICY_EFFECT_DENY = 2;
+  POLICY_EFFECT_REVIEW = 3;
+}
+
+// -----------------------------------
+// Модель домена
+// -----------------------------------
+
+message Capability {
+  string name = 1;                 // человеко-читаемое имя/код
+  string version = 2;              // semver
+  repeated string actions = 3;     // допустимые действия
+  map<string, string> meta = 4;    // произвольные метаданные
+}
+
+message Skill {
+  string name = 1;
+  // Конфигурация навыка (структурированные настройки).
+  google.protobuf.Struct config = 2;
+}
+
+message Agent {
+  // RESERVED для будущей эволюции
+  reserved 9, 12;
+  reserved "deprecated_field", "legacy_mode";
+
+  string id = 1;                                 // стабильный идентификатор
+  string name = 2;                               // короткое имя/алиас
+  string display_name = 3;                       // отображаемое имя
+  string description = 4;                        // описание назначения
+  AgentStatus status = 5;                        // текущий статус
+  bool enabled = 6;                              // включен ли агент
+  Labels labels = 7;                             // произвольные метки
+  repeated Capability capabilities = 8;          // возможности
+  repeated Skill skills = 10;                    // подключенные навыки
+  string etag = 11;                              // для оптимистической блокировки
+  google.protobuf.Timestamp create_time = 13;    // когда создан
+  google.protobuf.Timestamp update_time = 14;    // когда изменён
+}
+
+message Task {
+  reserved 13;
+  string id = 1;
+  string parent_task_id = 2;
+  string agent_id = 3;
+  string name = 4;
+  TaskStatus status = 5;
+  google.protobuf.Struct input = 6;
+  google.protobuf.Struct output = 7;
+  repeated ErrorDetails errors = 8;
+  repeated string tags = 9;
+  google.protobuf.Timestamp scheduled_time = 10;
+  google.protobuf.Timestamp start_time = 11;
+  google.protobuf.Timestamp end_time = 12;
+  google.protobuf.Duration timeout = 14;
+  string correlation_id = 15; // связывание с событиями/запросами
+}
+
+message PlanStep {
+  string id = 1;
+  string task_name = 2;
+  google.protobuf.Struct input = 3;
+  repeated string depends_on = 4;
+  google.protobuf.Duration expected_duration = 5;
+}
+
+message Plan {
+  string id = 1;
+  string agent_id = 2;
+  string goal = 3;
+  repeated PlanStep steps = 4;
+  google.protobuf.Struct context = 5;
+  google.protobuf.Timestamp create_time = 6;
+  string etag = 7;
+}
+
+message Event {
+  string id = 1;
+  EventType type = 2;
+  string agent_id = 3;
+  string subject = 4;                   // например, task_id/plan_id
+  google.protobuf.Struct payload = 5;
+  string correlation_id = 6;
+  string causation_id = 7;
+  map<string, string> attributes = 8;
+  google.protobuf.Timestamp time = 9;
+}
+
+message Memory {
+  string id = 1;
+  string agent_id = 2;
+  MemoryType type = 3;
+  google.protobuf.Struct data = 4;
+  float relevance = 5; // 0..1
+  google.protobuf.Timestamp create_time = 6;
+  google.protobuf.Timestamp expire_time = 7;
+  repeated string tags = 8;
+}
+
+message PolicyRule {
+  string id = 1;
+  string description = 2;
+  // Простая декларация: subject/action/resource -> effect
+  string subject = 3;  // например, "agent:{id}" или "role:admin"
+  string action = 4;   // например, "task.execute"
+  string resource = 5; // например, "plan:{id}" или "task:*"
+  PolicyEffect effect = 6;
+  map<string, string> conditions = 7; // расширяемые условия
+}
+
+message Policy {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  repeated PolicyRule rules = 4;
+  string etag = 5;
+}
+
+// -----------------------------------
+// Запросы/ответы сервиса
+// -----------------------------------
+
+// CRUD Agent
+message CreateAgentRequest {
+  Agent agent = 1;          // без id — генерируется на сервере, если пусто
+  string request_id = 2;    // идемпотентность
+}
+
+message GetAgentRequest {
+  string id = 1;
+}
+
+message UpdateAgentRequest {
+  Agent agent = 1;          // должен содержать id
+  string etag = 2;          // для оптимистической блокировки
+  string request_id = 3;
+}
+
+message DeleteAgentRequest {
+  string id = 1;
+  string etag = 2;
+  string request_id = 3;
+}
+
+message ListAgentsRequest {
+  PageInfo page = 1;
+  // Простой фильтр по меткам (server-side реализация на ваше усмотрение)
+  map<string, string> label_selector = 2;
+  // Поиск по подстроке имени/описания
+  string query = 3;
+}
+
+message ListAgentsResponse {
+  repeated Agent agents = 1;
+  string next_page_token = 2;
+  RateLimitInfo rate_limit = 3;
+}
+
+// Планирование/выполнение
+message PlanRequest {
+  string agent_id = 1;
+  string goal = 2;
+  google.protobuf.Struct context = 3;
+  string request_id = 4;
+}
+
+message PlanResponse {
+  Plan plan = 1;
+}
+
+message ExecuteTaskRequest {
+  // Либо передаём уже созданный task.id, либо описание для создания и запуска.
+  oneof target {
+    string task_id = 1;
+    Task task = 2;
+  }
+  string request_id = 3;
+}
+
+message ExecuteTaskResponse {
+  Task task = 1;
+}
+
+// Память
+message AppendMemoryRequest {
+  Memory memory = 1;    // без id — сервер присвоит
+  string request_id = 2;
+}
+
+message AppendMemoryResponse {
+  Memory memory = 1;
+}
+
+message QueryMemoryRequest {
+  string agent_id = 1;
+  // Семантический запрос/векторный поиск — детали на стороне сервера
+  string query = 2;
+  int32 top_k = 3;
+  repeated string tags = 4;
+  PageInfo page = 5;
+}
+
+message QueryMemoryResponse {
+  repeated Memory memories = 1;
+  string next_page_token = 2;
+}
+
+// Политики
+message EvaluatePolicyRequest {
+  string agent_id = 1;
+  string subject = 2;
+  string action = 3;
+  string resource = 4;
+  map<string, string> context = 5;
+}
+
+message EvaluatePolicyResponse {
+  PolicyEffect effect = 1;
+  repeated PolicyRule matched_rules = 2;
+}
+
+// События
+message StreamEventsRequest {
+  // Фильтрация по агенту/типам/корреляции
+  string agent_id = 1;
+  repeated EventType types = 2;
+  string correlation_id = 3;
+  // Начать стрим с указанного времени
+  google.protobuf.Timestamp since = 4;
+}
+
+// Наблюдения/телеметрия
+message ObserveRequest {
+  string agent_id = 1;
+  Event event = 2; // произвольное внешнее событие
+}
+
+message HeartbeatRequest {
+  string agent_id = 1;
+  google.protobuf.Timestamp time = 2;
+  map<string, string> metrics = 3; // например, cpu, mem, queue_size
+}
+
+message HeartbeatResponse {
+  // Возможные команды управления, если требуется
+  map<string, string> directives = 1;
+}
+
+message HealthStatus {
+  enum ServingStatus {
+    SERVING_STATUS_UNSPECIFIED = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  ServingStatus status = 1;
+  google.protobuf.Timestamp time = 2;
+  string message = 3;
+}
+
+// -----------------------------------
+// gRPC сервис
+// -----------------------------------
+
+service AgentService {
+  // CRUD
+  rpc CreateAgent(CreateAgentRequest) returns (Agent);
+  rpc GetAgent(GetAgentRequest) returns (Agent);
+  rpc UpdateAgent(UpdateAgentRequest) returns (Agent);
+  rpc DeleteAgent(DeleteAgentRequest) returns (google.protobuf.Empty);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+
+  // Планирование и выполнение
+  rpc Plan(PlanRequest) returns (PlanResponse);
+  rpc ExecuteTask(ExecuteTaskRequest) returns (ExecuteTaskResponse);
+
+  // Память
+  rpc AppendMemory(AppendMemoryRequest) returns (AppendMemoryResponse);
+  rpc QueryMemory(QueryMemoryRequest) returns (QueryMemoryResponse);
+
+  // События
+  rpc StreamEvents(StreamEventsRequest) returns (stream Event);
+
+  // Наблюдения/телеметрия
+  rpc Observe(ObserveRequest) returns (google.protobuf.Empty);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Политики
+  rpc EvaluatePolicy(EvaluatePolicyRequest) returns (EvaluatePolicyResponse);
+
+  // Здоровье сервиса
+  rpc Health(google.protobuf.Empty) returns (HealthStatus);
+}

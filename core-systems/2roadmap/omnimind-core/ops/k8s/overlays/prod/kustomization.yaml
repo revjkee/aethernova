@@ -1,0 +1,104 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Базовый слой, содержащий Deployment/Service/и т.д.
+resources:
+  - ../../base
+
+# Продакшн-пространство имён и общие метки/аннотации
+namespace: omnimind-prod
+nameSuffix: -prod
+
+commonLabels:
+  app.kubernetes.io/part-of: omnimind
+  app.kubernetes.io/environment: production
+
+commonAnnotations:
+  owner.team: platform
+  revision.source: github
+  availability.slo: "99.9"
+
+# Генерация prod-конфигурации без хэша в имени (стационарные имена удобны для RBAC/мониторинга).
+configMapGenerator:
+  - name: omnimind-core-config
+    behavior: create
+    literals:
+      - APP_ENV=production
+      - LOG_LEVEL=info
+      - HTTP_PORT=8080
+generatorOptions:
+  disableNameSuffixHash: true
+
+# Образы фиксируются в продакшне явно (замените на ваш реальный реестр/тег).
+images:
+  - name: omnimind-core
+    newName: ghcr.io/your-org/omnimind-core
+    newTag: 1.0.0
+
+# Патчи для продакшн-настроек: реплики/ресурсы/тип Service
+patches:
+  # 1) Реплики и ресурсы контейнера для Deployment/omnimind-core
+  - target:
+      version: v1
+      group: apps
+      kind: Deployment
+      name: omnimind-core
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9090"
+          checksum/config: "use-kustomize-pins-or-ci-to-set"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+      - op: add
+        path: /spec/strategy
+        value:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 25%
+      - op: add
+        path: /spec/template/spec/terminationGracePeriodSeconds
+        value: 30
+
+  # 2) Делает основной Service типом LoadBalancer и добавляет типовые аннотации L4/NLB.
+  - target:
+      version: v1
+      kind: Service
+      name: omnimind-core
+    patch: |
+      - op: replace
+        path: /spec/type
+        value: LoadBalancer
+      - op: add
+        path: /metadata/annotations
+        value:
+          service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+          # Если используете другой провайдер, переопределите аннотации в CI или отдельном оверлее.
+          # cloud.google.com/load-balancer-type: "External"
+          # metallb.universe.tf/allow-shared-ip: "omnimind-prod"
+
+  # 3) Закрепляем селекторы и метки сервиса метрик (на случай будущих изменений компонент).
+  - target:
+      version: v1
+      kind: Service
+      name: omnimind-core-metrics
+    patch: |
+      - op: add
+        path: /metadata/labels/app.kubernetes.io/environment
+        value: production
+
+# Примечание: если используете ServiceMonitor/Ingress/Gateway — добавьте их как отдельные ресурсы
+# или патчи в данном оверлее. Здесь они не заданы, чтобы не предполагать стек.

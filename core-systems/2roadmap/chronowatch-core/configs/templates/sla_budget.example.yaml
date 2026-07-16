@@ -1,0 +1,341 @@
+apiVersion: slo.neurocity.ai/v1
+kind: SLABudget
+metadata:
+  service: chronowatch-core
+  owner: team-chronowatch-sre
+  environment: ${APP_ENV:-production}
+  version: 1.0.0
+  updatedAt: "2025-08-28"
+
+spec:
+  evaluation:
+    step: 5m
+    timezone: Europe/Stockholm
+    # Источники метрик
+    sources:
+      prometheus:
+        url: http://prometheus:9090
+        # Общие селекторы, переопределяются в SLI при необходимости
+        selectors:
+          service: chronowatch-api
+          namespace: chronowatch
+      otel:
+        attributes:
+          service.name: chronowatch-api
+
+  # -------------------------
+  # SLO/SLI цели по объектам
+  # -------------------------
+  objectives:
+
+    # 1) Доступность API (ratio good/total)
+    availability:
+      description: Успешные запросы API (коды не 5xx) на окно 30d
+      windowDays: 30
+      target: 99.9               # 0.1% error budget
+      sli:
+        type: ratio
+        numerator:
+          promQL: |
+            sum(rate(http_requests_total{service="chronowatch-api", code!~"5.."}[5m]))
+        denominator:
+          promQL: |
+            sum(rate(http_requests_total{service="chronowatch-api"}[5m]))
+      exclusions:
+        # Плановые окна не тратят бюджет, но логируются
+        maintenanceWindowsRef: default
+
+    # 2) Латентность API P95
+    api_latency_p95:
+      description: Доля запросов быстрее порога на P95
+      windowDays: 30
+      target: 99.0
+      thresholdMs: 250
+      sli:
+        type: threshold_ratio
+        good:
+          promQL: |
+            sum(rate(http_request_duration_seconds_bucket{
+              service="chronowatch-api", le="0.25"
+            }[5m]))
+        total:
+          promQL: |
+            sum(rate(http_request_duration_seconds_count{
+              service="chronowatch-api"
+            }[5m]))
+
+    # 3) Своевременность планировщика (on-time execution)
+    scheduler_on_time:
+      description: Джобы стартуют и завершаются в SLA-окне (grace учитывается)
+      windowDays: 30
+      target: 99.5
+      graceSeconds: 30
+      sli:
+        type: ratio
+        numerator:
+          promQL: |
+            sum(rate(jobs_completed_on_time_total{
+              service="chronowatch-scheduler"
+            }[5m]))
+        denominator:
+          promQL: |
+            sum(rate(jobs_scheduled_total{
+              service="chronowatch-scheduler"
+            }[5m]))
+
+    # 4) Успех выполнения джоб
+    job_success_rate:
+      description: Доля завершённых без ошибок async-джоб worker'ов
+      windowDays: 30
+      target: 99.0
+      sli:
+        type: ratio
+        numerator:
+          promQL: |
+            sum(rate(job_success_total{service="chronowatch-worker"}[5m]))
+        denominator:
+          promQL: |
+            sum(rate(job_finished_total{service="chronowatch-worker"}[5m]))
+
+    # 5) Бэклог очереди под контролем
+    queue_backlog_control:
+      description: Бэклог ниже порога считается "good"
+      windowDays: 30
+      target: 99.0
+      backlogThreshold: ${BACKLOG_ALERT_THRESHOLD:-1000}
+      sli:
+        type: condition_ratio
+        conditionGood:
+          promQL: |
+            ( ${BACKLOG_ALERT_THRESHOLD:-1000}
+              - max(redis_queue_backlog{queue=~"cron:(default|high|low)"})) > 0
+        total:
+          promQL: "1"
+
+    # 6) Дрейф времени
+    time_drift_guard:
+      description: Узлы в пределах допустимого дрейфа
+      windowDays: 30
+      target: 99.9
+      thresholdMs: ${TIME_DRIFT_MAX_MS:-200}
+      sli:
+        type: ratio
+        numerator:
+          promQL: |
+            sum(time_drift_ok{service="chronowatch-core"})  # 1 если |drift|<=threshold
+        denominator:
+          promQL: |
+            count(time_drift_ok{service="chronowatch-core"})
+
+  # -------------------------------------
+  # Error Budget и вычисления по умолчанию
+  # -------------------------------------
+  errorBudget:
+    # Значения по умолчанию; могут быть переопределены на уровне SLO
+    defaultWindowDays: 28
+    # Для target=99.9 errorFraction=0.001 → 28d * 24h * 60m * 0.001 = 40.32 минут
+    computeAllowedMinutes: true
+    burnRate:
+      # Многооконные политики (MWMB) для разных горизонтов
+      policies:
+        - name: fast_burn
+          windows:
+            short: 5m
+            long: 1h
+          threshold: 14.4
+          appliesTo: [availability, api_latency_p95, scheduler_on_time]
+        - name: mid_burn
+          windows:
+            short: 30m
+            long: 6h
+          threshold: 6
+          appliesTo: [availability, api_latency_p95, scheduler_on_time, job_success_rate]
+        - name: slow_burn
+          windows:
+            short: 2h
+            long: 1d
+          threshold: 3
+          appliesTo: [availability, api_latency_p95, scheduler_on_time, job_success_rate, queue_backlog_control]
+        - name: steady_burn
+          windows:
+            short: 6h
+            long: 3d
+          threshold: 1
+          appliesTo: [availability, scheduler_on_time, job_success_rate, time_drift_guard]
+
+  # -------------------------
+  # Политика алертирования
+  # -------------------------
+  alerting:
+    route:
+      pager:
+        severities: [critical, major]
+      ticket:
+        severities: [minor]
+    rules:
+      - name: SLOFastBurnPage
+        severity: critical
+        for: 5m
+        selector:
+          sloRef: any(appliesTo=fast_burn)
+        condition:
+          type: mwmb_burn_rate
+          params:
+            shortWindow: 5m
+            longWindow: 1h
+            threshold: 14.4
+        labels:
+          team: chronowatch
+          service: chronowatch-core
+        annotations:
+          runbook: https://docs.neurocity.ai/chronowatch/runbooks/incident-slo
+      - name: SLOMidBurnPage
+        severity: major
+        for: 30m
+        selector:
+          sloRef: any(appliesTo=mid_burn)
+        condition:
+          type: mwmb_burn_rate
+          params:
+            shortWindow: 30m
+            longWindow: 6h
+            threshold: 6
+        annotations:
+          runbook: https://docs.neurocity.ai/chronowatch/runbooks/incident-slo
+      - name: SLOSlowBurnTicket
+        severity: minor
+        for: 2h
+        selector:
+          sloRef: any(appliesTo=slow_burn)
+        condition:
+          type: mwmb_burn_rate
+          params:
+            shortWindow: 2h
+            longWindow: 1d
+            threshold: 3
+        annotations:
+          runbook: https://docs.neurocity.ai/chronowatch/runbooks/incident-slo
+
+  # -------------------------
+  # Управление изменениями
+  # -------------------------
+  changeManagement:
+    freeze:
+      # Заморозка релизов при ускоренном сгорании бюджета
+      conditions:
+        - when:
+            burnRateAbove: 1
+            window: 24h
+          action: freeze_releases
+    releaseGates:
+      - name: min_budget_remaining
+        require:
+          errorBudgetRemainingPct: ">=50"
+      - name: slo_no_active_pages
+        require:
+          noActiveAlertsOfSeverity: [critical, major]
+    rolloutPolicy:
+      strategy: progressive
+      steps:
+        - trafficPercent: 5
+          minDuration: 15m
+          guardrails:
+            - latencyP95Ms: "<=250"
+            - errorRatePct: "<=0.2"
+        - trafficPercent: 25
+          minDuration: 30m
+          guardrails:
+            - latencyP95Ms: "<=250"
+            - errorRatePct: "<=0.2"
+        - trafficPercent: 50
+          minDuration: 1h
+          guardrails:
+            - latencyP95Ms: "<=250"
+            - errorRatePct: "<=0.2"
+        - trafficPercent: 100
+          minDuration: 2h
+          guardrails:
+            - latencyP95Ms: "<=250"
+            - errorRatePct: "<=0.2"
+
+  # -------------------------
+  # Окна обслуживания/исключения
+  # -------------------------
+  maintenanceWindows:
+    - name: default
+      schedule:
+        cron: "0 2 * * *"     # ежедневно 02:00 локального TZ
+      duration: 60m
+      budgetExclusion: true
+      notify:
+        channels:
+          - slack:#chronowatch-ops
+          - email:chronowatch@neurocity.ai
+
+  # -------------------------
+  # Зависимости и каскады
+  # -------------------------
+  dependencies:
+    services:
+      - name: postgres
+        sloRef: external_availability
+        target: 99.95
+      - name: redis
+        sloRef: external_availability
+        target: 99.95
+      - name: otel-collector
+        sloRef: telemetry_delivery
+        target: 99.9
+
+  # -------------------------
+  # Отчётность и дашборды
+  # -------------------------
+  reporting:
+    dashboards:
+      grafana:
+        - id: chronowatch/api-overview
+        - id: chronowatch/scheduler
+        - id: chronowatch/slo
+    weeklyReview:
+      dayOfWeek: Mon
+      hour: 10
+      include:
+        - errorBudgetSpentPct
+        - topContributors
+        - actionItems
+    costOfDowntimeUSDPerHour: 5000
+
+  # -------------------------
+  # Триаж и runbooks
+  # -------------------------
+  incidentResponse:
+    oncall:
+      primary: "+46-000-000-000"
+      escalationMinutes: 15
+    severities:
+      mapping:
+        critical:
+          page: true
+          targetMTTA: 5m
+          targetMTTR: 60m
+        major:
+          page: true
+          targetMTTA: 10m
+          targetMTTR: 2h
+        minor:
+          page: false
+          targetMTTA: 30m
+          targetMTTR: 4h
+    runbooks:
+      availability: https://docs.neurocity.ai/chronowatch/runbooks/api
+      scheduler: https://docs.neurocity.ai/chronowatch/runbooks/scheduler
+      worker: https://docs.neurocity.ai/chronowatch/runbooks/worker
+      slo_incident: https://docs.neurocity.ai/chronowatch/runbooks/incident-slo
+
+# -------------------------
+# Примечания:
+# - Пороговые метрики (jobs_completed_on_time_total и т.п.) ожидаются в экспортере.
+# - Для availability=99.9 на окне 28d error budget ~40.32 минут.
+# - Политики MWMB подобраны по SRE-практике; адаптируйте thresholds под ваш трафик.
+# - Селекторы PromQL замените на реальные лейблы из вашей телеметрии.
+# -------------------------

@@ -1,0 +1,551 @@
+// policy-core/schemas/proto/v1/policy/admin.proto
+// SPDX-License-Identifier: Apache-2.0
+//
+// Administrative API for Policy Core.
+// Provides CRUD, lifecycle (approve/publish/rollback) and dry-run evaluation
+// for policy resources and immutable versions.
+//
+// NOTE: This schema uses Google API annotations. Ensure the toolchain includes
+// google/api/*.proto and google/protobuf/*.
+
+syntax = "proto3";
+
+package aethernova.policy.v1;
+
+option go_package = "github.com/aethernova/policy-core/gen/policy/v1;policyv1";
+option java_multiple_files = true;
+option java_package = "io.aethernova.policy.v1";
+option csharp_namespace = "Aethernova.Policy.V1";
+option php_namespace = "Aethernova\\Policy\\V1";
+option ruby_package = "Aethernova::Policy::V1";
+option objc_class_prefix = "ANP";
+
+import "google/api/annotations.proto";
+import "google/api/client.proto";
+import "google/api/field_behavior.proto";
+import "google/api/resource.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// -----------------------------------------------------------------------------
+// Resources
+// -----------------------------------------------------------------------------
+
+// A Policy is a mutable administrative resource describing the latest editable
+// policy definition and metadata. Immutable snapshots are stored as PolicyVersion.
+message Policy {
+  option (google.api.resource) = {
+    type: "aethernova.policy.v1/Policy"
+    pattern: "projects/{project}/policies/{policy}"
+    plural: "policies"
+    singular: "policy"
+  };
+
+  // Resource name: projects/{project}/policies/{policy}
+  string name = 1 [
+    (google.api.field_behavior) = IDENTIFIER
+  ];
+
+  // Human-readable name.
+  string display_name = 2;
+
+  // Free-form description; markdown allowed.
+  string description = 3;
+
+  // Labels for selection, billing or governance.
+  map<string, string> labels = 4;
+
+  // Owners in user/group form ("group:security-core", "user:alice@example.com").
+  repeated string owners = 5;
+
+  // Current editable specification of the policy.
+  PolicySpec spec = 6 [(google.api.field_behavior) = OPTIONAL];
+
+  // Current lifecycle status of the policy (derived from latest version).
+  PolicyStatus status = 7 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // ETag for optimistic concurrency control.
+  string etag = 8;
+
+  // Monotonic revision number incremented on each mutate.
+  int64 revision = 9 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Hash of current spec (e.g., sha256:...).
+  string content_hash = 10 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Detached signature of current spec, if signed.
+  bytes signature = 11 [(google.api.field_behavior) = OPTIONAL];
+
+  // Dependencies (resource names) this policy relies on.
+  repeated string depends_on = 12;
+
+  // Creation/update timestamps.
+  google.protobuf.Timestamp create_time = 13 [(google.api.field_behavior) = OUTPUT_ONLY];
+  google.protobuf.Timestamp update_time = 14 [(google.api.field_behavior) = OUTPUT_ONLY];
+
+  // Arbitrary tags for search.
+  repeated string tags = 15;
+
+  // Reserved for future fields to keep numbering stable.
+  reserved 100 to 119;
+}
+
+// PolicySpec describes the executable content and metadata needed by engines.
+message PolicySpec {
+  // Implementation language of the policy.
+  PolicyLanguage language = 1;
+
+  // Main entry point function/rule (if applicable).
+  string entrypoint = 2;
+
+  // Optional extra entrypoints (e.g., allow/deny paths).
+  map<string, string> entrypoints = 3;
+
+  // One of inline/plain content, external URI, or bundled bytes.
+  oneof source {
+    // Inline source code (e.g., Rego/CEL/DSL). UTF-8 text.
+    string inline = 10;
+
+    // URI to a versioned source (e.g., oci://, https://, s3://).
+    string uri = 11;
+
+    // Engine-consumable bundle/archive (opaque).
+    bytes bundle = 12;
+  }
+
+  // Optional engine-specific settings (opaque to admin API).
+  google.protobuf.Struct settings = 20;
+
+  // Declared external artifacts the policy expects (URIs + expected hashes).
+  repeated Dependency dependencies = 21;
+
+  // If true, 'signature' must be present on Policy or Version.
+  bool require_signature = 22;
+
+  // Reserved for extensibility.
+  reserved 100 to 109;
+}
+
+// External dependency descriptor.
+message Dependency {
+  string uri = 1;    // e.g., oci://registry/org/bundle:tag or https://...
+  string hash = 2;   // e.g., sha256:abc...
+}
+
+// Immutable snapshot of a Policy at a point in time.
+message PolicyVersion {
+  option (google.api.resource) = {
+    type: "aethernova.policy.v1/PolicyVersion"
+    pattern: "projects/{project}/policies/{policy}/versions/{version}"
+    plural: "policyVersions"
+    singular: "policyVersion"
+  };
+
+  // Resource name: projects/{project}/policies/{policy}/versions/{version}
+  string name = 1 [(google.api.field_behavior) = IDENTIFIER];
+
+  // Short version id (e.g., "v1", "2025-08-28-0012").
+  string version_id = 2;
+
+  // Snapshot of the spec (immutable).
+  PolicySpec spec = 3;
+
+  // Lifecycle status of this version.
+  PolicyStatus status = 4;
+
+  // ETag for conditional operations on the version.
+  string etag = 5;
+
+  // Signature over spec (if provided at creation/approval time).
+  bytes signature = 6;
+
+  // Content hash of spec snapshot.
+  string content_hash = 7;
+
+  // Audit metadata.
+  string created_by = 8;
+  google.protobuf.Timestamp create_time = 9;
+
+  string approved_by = 10;
+  google.protobuf.Timestamp approve_time = 11;
+
+  string published_by = 12;
+  google.protobuf.Timestamp publish_time = 13;
+
+  // Release notes / change summary.
+  string release_notes = 14;
+
+  reserved 100 to 109;
+}
+
+// Lifecycle status of a policy or version.
+enum PolicyStatus {
+  POLICY_STATUS_UNSPECIFIED = 0;
+  DRAFT = 1;
+  IN_REVIEW = 2;
+  APPROVED = 3;
+  PUBLISHED = 4;
+  DEPRECATED = 5;
+  ARCHIVED = 6;
+}
+
+// Supported policy languages (engines).
+enum PolicyLanguage {
+  POLICY_LANGUAGE_UNSPECIFIED = 0;
+  REG O = 1; // Open Policy Agent / Rego
+  CEL = 2;   // Common Expression Language
+  DSL_V1 = 3; // Platform custom DSL v1
+  DSL_V2 = 4; // Platform custom DSL v2
+}
+
+// -----------------------------------------------------------------------------
+// Service
+// -----------------------------------------------------------------------------
+
+service PolicyAdminService {
+  option (google.api.default_host) = "policy-core.googleapis.com";
+  option (google.api.oauth_scopes) = "https://www.googleapis.com/auth/cloud-platform";
+
+  // ------------------- Policy CRUD -------------------
+
+  rpc CreatePolicy(CreatePolicyRequest) returns (Policy) {
+    option (google.api.http) = {
+      post: "/v1/{parent=projects/*}/policies"
+      body: "policy"
+    };
+  }
+
+  rpc GetPolicy(GetPolicyRequest) returns (Policy) {
+    option (google.api.http) = {
+      get: "/v1/{name=projects/*/policies/*}"
+    };
+  }
+
+  rpc UpdatePolicy(UpdatePolicyRequest) returns (Policy) {
+    option (google.api.http) = {
+      patch: "/v1/{policy.name=projects/*/policies/*}"
+      body: "policy"
+    };
+  }
+
+  rpc DeletePolicy(DeletePolicyRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      delete: "/v1/{name=projects/*/policies/*}"
+    };
+  }
+
+  rpc ListPolicies(ListPoliciesRequest) returns (ListPoliciesResponse) {
+    option (google.api.http) = {
+      get: "/v1/{parent=projects/*}/policies"
+    };
+  }
+
+  rpc BatchGetPolicies(BatchGetPoliciesRequest) returns (BatchGetPoliciesResponse) {
+    option (google.api.http) = {
+      get: "/v1/{parent=projects/*}/policies:batchGet"
+    };
+  }
+
+  // ------------------- Versioning & Lifecycle -------------------
+
+  rpc CreatePolicyVersion(CreatePolicyVersionRequest) returns (PolicyVersion) {
+    option (google.api.http) = {
+      post: "/v1/{parent=projects/*/policies/*}/versions"
+      body: "policy_version"
+    };
+  }
+
+  rpc GetPolicyVersion(GetPolicyVersionRequest) returns (PolicyVersion) {
+    option (google.api.http) = {
+      get: "/v1/{name=projects/*/policies/*/versions/*}"
+    };
+  }
+
+  rpc ListPolicyVersions(ListPolicyVersionsRequest) returns (ListPolicyVersionsResponse) {
+    option (google.api.http) = {
+      get: "/v1/{parent=projects/*/policies/*}/versions"
+    };
+  }
+
+  rpc DeletePolicyVersion(DeletePolicyVersionRequest) returns (google.protobuf.Empty) {
+    option (google.api.http) = {
+      delete: "/v1/{name=projects/*/policies/*/versions/*}"
+    };
+  }
+
+  rpc ApprovePolicy(ApprovePolicyRequest) returns (PolicyVersion) {
+    option (google.api.http) = {
+      post: "/v1/{name=projects/*/policies/*/versions/*}:approve"
+      body: "*"
+    };
+  }
+
+  rpc PublishPolicy(PublishPolicyRequest) returns (PolicyVersion) {
+    option (google.api.http) = {
+      post: "/v1/{name=projects/*/policies/*/versions/*}:publish"
+      body: "*"
+    };
+  }
+
+  rpc RollbackPolicy(RollbackPolicyRequest) returns (PolicyVersion) {
+    option (google.api.http) = {
+      post: "/v1/{name=projects/*/policies/*}:rollback"
+      body: "*"
+    };
+  }
+
+  // ------------------- Dry-run evaluation -------------------
+
+  rpc DryRunEvaluate(DryRunEvaluateRequest) returns (DryRunEvaluateResponse) {
+    option (google.api.http) = {
+      post: "/v1/{name=projects/*/policies/*}:dryRunEvaluate"
+      body: "*"
+    };
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Requests / Responses
+// -----------------------------------------------------------------------------
+
+message CreatePolicyRequest {
+  // Parent resource: projects/{project}
+  string parent = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // The policy to create.
+  Policy policy = 2 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Optional client-chosen ID for {policy}.
+  string policy_id = 3;
+}
+
+message GetPolicyRequest {
+  // Resource name: projects/{project}/policies/{policy}
+  string name = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+}
+
+message UpdatePolicyRequest {
+  // The policy with updated fields; name must be set.
+  Policy policy = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Fields to update.
+  google.protobuf.FieldMask update_mask = 2;
+
+  // If true, create if missing (upsert).
+  bool allow_missing = 3;
+
+  // Optional precondition: update only if etag matches current.
+  string if_match_etag = 4;
+}
+
+message DeletePolicyRequest {
+  // Resource name: projects/{project}/policies/{policy}
+  string name = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Optional precondition: delete only if etag matches current.
+  string if_match_etag = 2;
+
+  // If true, soft-delete (archival) instead of hard delete.
+  bool allow_archive = 3;
+}
+
+message ListPoliciesRequest {
+  // Parent resource: projects/{project}
+  string parent = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // AIP-160 filter (e.g., 'labels.env="staging" AND status=PUBLISHED').
+  string filter = 2;
+
+  // AIP-132 order_by (e.g., "update_time desc, display_name").
+  string order_by = 3;
+
+  // Pagination
+  int32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListPoliciesResponse {
+  repeated Policy policies = 1;
+  string next_page_token = 2;
+  int32 total_size = 3;
+}
+
+message BatchGetPoliciesRequest {
+  // Parent resource: projects/{project}
+  string parent = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Resource names to fetch.
+  repeated string names = 2 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+}
+
+message BatchGetPoliciesResponse {
+  repeated Policy policies = 1;
+  // Names not found or inaccessible.
+  repeated string missing = 2;
+}
+
+// ------------------- Versions -------------------
+
+message CreatePolicyVersionRequest {
+  // Parent: projects/{project}/policies/{policy}
+  string parent = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Version to create. spec is required; version_id optional (server may assign).
+  PolicyVersion policy_version = 2 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Client-provided short version id. If empty, server generates one.
+  string version_id = 3;
+
+  // Release notes / change summary.
+  string release_notes = 4;
+}
+
+message GetPolicyVersionRequest {
+  // Name: projects/{project}/policies/{policy}/versions/{version}
+  string name = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+}
+
+message ListPolicyVersionsRequest {
+  // Parent: projects/{project}/policies/{policy}
+  string parent = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  string filter = 2;   // e.g., "status=PUBLISHED"
+  string order_by = 3; // e.g., "create_time desc"
+  int32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListPolicyVersionsResponse {
+  repeated PolicyVersion policy_versions = 1;
+  string next_page_token = 2;
+  int32 total_size = 3;
+}
+
+message DeletePolicyVersionRequest {
+  // Name: projects/{project}/policies/{policy}/versions/{version}
+  string name = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Only deletable when not PUBLISHED unless force=true.
+  bool force = 2;
+
+  // Optional precondition.
+  string if_match_etag = 3;
+}
+
+// ------------------- Lifecycle ops -------------------
+
+message ApprovePolicyRequest {
+  // Name of a version to approve.
+  // projects/{project}/policies/{policy}/versions/{version}
+  string name = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Reviewer principal ("user:alice@example.com").
+  string reviewer = 2 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Optional human comment.
+  string comment = 3;
+
+  // Require signature verification if version/spec requires it.
+  bool verify_signature = 4;
+}
+
+message PublishPolicyRequest {
+  // Name of a version to publish.
+  string name = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Activate immediately if true; otherwise schedule at activate_time.
+  bool immediate = 2;
+
+  // Optional scheduled activation time (UTC).
+  google.protobuf.Timestamp activate_time = 3;
+
+  // Optional rollout channel (e.g., "canary", "stable").
+  string channel = 4;
+}
+
+message RollbackPolicyRequest {
+  // Policy name to rollback: projects/{project}/policies/{policy}
+  string name = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Target version id to roll back to.
+  string target_version_id = 2 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Reason for audit log.
+  string reason = 3;
+}
+
+// ------------------- Dry-run evaluation -------------------
+
+message DryRunEvaluateRequest {
+  // Policy name to evaluate. If 'version_id' empty, use latest PUBLISHED.
+  string name = 1 [
+    (google.api.field_behavior) = REQUIRED
+  ];
+
+  // Optional explicit version id.
+  string version_id = 2;
+
+  // Arbitrary input payload for the policy engine.
+  google.protobuf.Struct input = 3;
+
+  // Optional engine overrides/settings.
+  google.protobuf.Struct settings = 4;
+
+  // If true, include engine traces/metrics in the response.
+  bool include_diagnostics = 5;
+}
+
+message DryRunEvaluateResponse {
+  // Engine-specific decision summary (e.g., "allow", "deny", "score:72").
+  string decision = 1;
+
+  // Engine output payload (structured).
+  google.protobuf.Struct result = 2;
+
+  // Optional diagnostics (traces, metrics, timing).
+  google.protobuf.Struct diagnostics = 3;
+
+  // Effective version evaluated.
+  string version_id = 4;
+
+  // Content hash of evaluated spec.
+  string content_hash = 5;
+}

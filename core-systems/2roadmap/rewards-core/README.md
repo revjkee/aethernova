@@ -1,0 +1,3 @@
+# rewards-core
+
+Project Documentation

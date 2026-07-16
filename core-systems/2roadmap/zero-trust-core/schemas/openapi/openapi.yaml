@@ -1,0 +1,879 @@
+openapi: 3.1.0
+info:
+  title: Zero Trust Enforcement API
+  version: 1.0.0
+  description: >
+    REST API для оценки Zero Trust решений (PDP) и вспомогательных операций.
+    Включает одиночную и пакетную оценку, телеметрию аудита, approvals, JWKS и health.
+  termsOfService: https://yourorg.example/terms
+  contact:
+    name: Security Platform Team
+    email: secops@yourorg.example
+servers:
+  - url: https://pdp.prod.yourorg.example
+    description: Production
+  - url: https://pdp.staging.yourorg.example
+    description: Staging
+
+tags:
+  - name: decisions
+    description: Оценка Zero Trust решений
+  - name: telemetry
+    description: Инжест аудита и метрик
+  - name: approvals
+    description: Управление временными approvals
+  - name: jwks
+    description: JWKS для проверки подписей токенов
+  - name: health
+    description: Здоровье и готовность сервиса
+
+paths:
+  /v1/decisions:
+    post:
+      tags: [decisions]
+      operationId: evaluateDecision
+      summary: Оценка Zero Trust решения
+      description: Возвращает решение PDP для одного запроса.
+      security:
+        - mtls: []
+          oauth2:
+            - decisions:write
+        - bearerAuth: []
+      parameters:
+        - in: header
+          name: X-Trace-Id
+          required: false
+          schema: { type: string }
+          description: Внешний trace id (если не задан, будет сгенерирован)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnforcementRequest'
+            examples:
+              example:
+                summary: Базовый пример
+                value:
+                  requestId: "7f5d1e7e-0b3a-4c3b-9a7b-6f4a8ef27c10"
+                  timestamp: "2025-08-20T12:00:00Z"
+                  tenant: "acme"
+                  traceId: "b2e1a9b0c3f64c12"
+                  subject:
+                    type: "HUMAN"
+                    userId: "user:123"
+                    identity:
+                      issuer: "https://idp.yourorg.example/"
+                      subject: "user:123"
+                      aal: 2
+                      mfaMethods: ["webauthn"]
+                      authTime: "2025-08-20T11:55:00Z"
+                      sessionId: "sid-abc"
+                    groups: ["EMPLOYEES"]
+                    roles: ["READER"]
+                  resource:
+                    app: "payments_api"
+                    resourceId: "txn"
+                    labels: ["pci","internal"]
+                    sensitivity: "HIGH"
+                  action:
+                    type: "READ"
+                    method: "GET"
+                    path: "/v1/transactions"
+                  context:
+                    tls:
+                      clientAuth: true
+                      mtlsProfile: "strict"
+                    device:
+                      profile: "managed_mac"
+                      managed: true
+                      edrHealthy: true
+                      diskEncryption: true
+                      secureBoot: true
+                      osPatchStalenessDays: 0
+                    network:
+                      sourceIp: "203.0.113.10"
+                      geoCountry: "SE"
+                      zone: "corp_lan"
+                    risk:
+                      user: 10
+                      device: 5
+                      network: 5
+                      behavior: 0
+                      dataSensitivity: 60
+                      total: 30
+      responses:
+        '200':
+          description: Успешное решение
+          headers:
+            X-ZT-Decision:
+              description: Итоговый эффект
+              schema: { type: string, enum: [ALLOW, DENY, STEP_UP, ISOLATE, CONDITIONAL, ERROR] }
+            X-Trace-Id:
+              description: Идентификатор трассировки
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnforcementResponse'
+              examples:
+                allow:
+                  value:
+                    decision:
+                      requestId: "7f5d1e7e-0b3a-4c3b-9a7b-6f4a8ef27c10"
+                      timestamp: "2025-08-20T12:00:01Z"
+                      effect: "ALLOW"
+                      reason: "risk<=39 and mTLS strict"
+                      riskScore: 30
+                      decisionTtlSeconds: 300
+                      headers:
+                        X-ZT-Decision: "ALLOW"
+                      policyId: "payments_requires_strong_identity"
+                      policyPriority: 20
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/decisions/bulk:
+    post:
+      tags: [decisions]
+      operationId: evaluateDecisionBulk
+      summary: Пакетная оценка решений
+      description: Оценивает массив запросов. Порядок ответов соответствует порядку запросов.
+      security:
+        - mtls: []
+          oauth2:
+            - decisions:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              minItems: 1
+              maxItems: 1000
+              items:
+                $ref: '#/components/schemas/EnforcementRequest'
+      responses:
+        '200':
+          description: Массив результатов
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EnforcementResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/telemetry/audit-events:
+    post:
+      tags: [telemetry]
+      operationId: ingestAudit
+      summary: Инжест аудиторных событий
+      description: Принимает батч событий аудита из PEP. Идемпотентность по eventId.
+      security:
+        - mtls: []
+          oauth2:
+            - telemetry:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              minItems: 1
+              maxItems: 5000
+              items:
+                $ref: '#/components/schemas/AuditEvent'
+      responses:
+        '202':
+          description: Принято на обработку
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          description: Слишком большой батч
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/approvals:
+    post:
+      tags: [approvals]
+      operationId: createApproval
+      summary: Создать временное approval
+      description: Создает approval, которым может воспользоваться PEP при оценке.
+      security:
+        - mtls: []
+          oauth2:
+            - approvals:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalCreate'
+      responses:
+        '201':
+          description: Создано
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Approval'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Конфликт идентификаторов
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [approvals]
+      operationId: revokeApproval
+      summary: Отозвать approval
+      security:
+        - mtls: []
+          oauth2:
+            - approvals:write
+      parameters:
+        - in: query
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Отозвано
+        '404':
+          description: Не найдено
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /.well-known/jwks.json:
+    get:
+      tags: [jwks]
+      operationId: getJWKS
+      summary: JWKS набора публичных ключей
+      security: []
+      responses:
+        '200':
+          description: Текущий JWKS
+          headers:
+            Cache-Control:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JWKSet'
+
+  /v1/healthz:
+    get:
+      tags: [health]
+      operationId: health
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Alive
+  /v1/readyz:
+    get:
+      tags: [health]
+      operationId: ready
+      summary: Readiness probe
+      security: []
+      responses:
+        '200':
+          description: Ready
+        '503':
+          description: Not ready
+
+components:
+  securitySchemes:
+    mtls:
+      type: mutualTLS
+      description: Клиентский сертификат обязателен в проде
+    oauth2:
+      type: oauth2
+      description: OAuth2 Client Credentials
+      flows:
+        clientCredentials:
+          tokenUrl: https://idp.yourorg.example/oauth2/token
+          scopes:
+            decisions:write: Отправка запросов на оценку
+            decisions:read: Чтение решений
+            telemetry:write: Инжест аудита
+            approvals:write: Управление approvals
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Необходима аутентификация
+    Forbidden:
+      description: Доступ запрещен
+    TooManyRequests:
+      description: Превышен лимит запросов
+    InternalError:
+      description: Внутренняя ошибка
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    # ---------- Базовые enum ----------
+    DecisionEffect:
+      type: string
+      enum: [ALLOW, DENY, STEP_UP, ISOLATE, CONDITIONAL, ERROR]
+    ActionType:
+      type: string
+      enum: [READ, LIST, WRITE, DELETE, ADMIN, DEPLOY, EXECUTE, CONNECT]
+    SubjectType:
+      type: string
+      enum: [HUMAN, SERVICE, WORKLOAD]
+    DataSensitivity:
+      type: string
+      enum: [LOW, MEDIUM, HIGH]
+
+    # ---------- Запрос ----------
+    EnforcementRequest:
+      type: object
+      required: [requestId, timestamp, tenant, subject, resource, action]
+      properties:
+        requestId:
+          type: string
+          description: Идемпотентный идентификатор запроса
+        timestamp:
+          type: string
+          format: date-time
+        tenant:
+          type: string
+        traceId:
+          type: string
+        correlationId:
+          type: string
+        subject:
+          $ref: '#/components/schemas/Subject'
+        resource:
+          $ref: '#/components/schemas/Resource'
+        action:
+          $ref: '#/components/schemas/Action'
+        context:
+          $ref: '#/components/schemas/Context'
+        attributes:
+          type: object
+          additionalProperties:
+            type: string
+        purposeOfUse:
+          type: array
+          items: { type: string }
+
+    Action:
+      type: object
+      required: [type]
+      properties:
+        type:
+          $ref: '#/components/schemas/ActionType'
+        method:
+          type: string
+          description: HTTP метод
+        path:
+          type: string
+          description: Путь ресурса
+        extra:
+          type: object
+          additionalProperties: {}
+
+    Subject:
+      type: object
+      required: [type]
+      properties:
+        type:
+          $ref: '#/components/schemas/SubjectType'
+        userId:
+          type: string
+          description: Используется при type=HUMAN
+        serviceId:
+          type: string
+          description: Используется при type=SERVICE или WORKLOAD
+        identity:
+          $ref: '#/components/schemas/Identity'
+        groups:
+          type: array
+          items: { type: string }
+        roles:
+          type: array
+          items: { type: string }
+        claims:
+          type: object
+          additionalProperties:
+            type: string
+        ext:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/AnyValue'
+
+    Identity:
+      type: object
+      properties:
+        issuer: { type: string }
+        subject: { type: string }
+        aal:
+          type: integer
+          minimum: 1
+          maximum: 3
+        mfaMethods:
+          type: array
+          items: { type: string }
+        authTime:
+          type: string
+          format: date-time
+        sessionId:
+          type: string
+
+    Resource:
+      type: object
+      required: [app]
+      properties:
+        app:
+          type: string
+        resourceId:
+          type: string
+        labels:
+          type: array
+          items: { type: string }
+        sensitivity:
+          $ref: '#/components/schemas/DataSensitivity'
+        domain:
+          type: string
+          description: Назначение для CONNECT
+        port:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        category:
+          type: string
+          description: Категория CONNECT (corporate, payments и т. п.)
+        attributes:
+          type: object
+          additionalProperties: {}
+
+    # ---------- Контекст ----------
+    Context:
+      type: object
+      properties:
+        tls:
+          $ref: '#/components/schemas/TLSContext'
+        device:
+          $ref: '#/components/schemas/DevicePosture'
+        network:
+          $ref: '#/components/schemas/NetworkContext'
+        behavior:
+          $ref: '#/components/schemas/BehaviorContext'
+        risk:
+          $ref: '#/components/schemas/RiskScores'
+        data:
+          $ref: '#/components/schemas/DataLabels'
+        approvals:
+          type: array
+          items: { type: string }
+        breakGlass:
+          $ref: '#/components/schemas/BreakGlass'
+        ext:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/AnyValue'
+
+    TLSContext:
+      type: object
+      properties:
+        clientAuth: { type: boolean }
+        svid: { type: string }
+        san:
+          type: array
+          items: { type: string }
+        mtlsProfile: { type: string }
+        revocationChecked: { type: boolean }
+        certFingerprintSha256: { type: string }
+
+    DevicePosture:
+      type: object
+      properties:
+        profile: { type: string }
+        managed: { type: boolean }
+        edrHealthy: { type: boolean }
+        diskEncryption: { type: boolean }
+        secureBoot: { type: boolean }
+        osPatchStalenessDays:
+          type: integer
+          minimum: 0
+        jailbreakRoot: { type: boolean }
+        osName: { type: string }
+        osVersion: { type: string }
+        hardwareModel: { type: string }
+        inventory:
+          type: object
+          additionalProperties:
+            type: string
+        attestation:
+          $ref: '#/components/schemas/Attestation'
+
+    Attestation:
+      type: object
+      properties:
+        tpmPresent: { type: boolean }
+        tpmAttested: { type: boolean }
+        mdmVendor: { type: string }
+        mdmEnrolled: { type: boolean }
+        evidence:
+          type: object
+          additionalProperties: {}
+
+    NetworkContext:
+      type: object
+      properties:
+        sourceIp: { type: string }
+        asn: { type: string }
+        geoCountry: { type: string }
+        zone: { type: string }
+        torProxy: { type: boolean }
+        newAsn: { type: boolean }
+        ipTags:
+          type: array
+          items: { type: string }
+
+    BehaviorContext:
+      type: object
+      properties:
+        impossibleTravel: { type: boolean }
+        burstAccessScore:
+          type: integer
+          minimum: 0
+          maximum: 100
+        recentActivity:
+          type: object
+          additionalProperties: {}
+
+    DataLabels:
+      type: object
+      properties:
+        labels:
+          type: array
+          items: { type: string }
+        sensitivity:
+          $ref: '#/components/schemas/DataSensitivity'
+
+    RiskScores:
+      type: object
+      properties:
+        user: { type: number, minimum: 0, maximum: 100 }
+        device: { type: number, minimum: 0, maximum: 100 }
+        network: { type: number, minimum: 0, maximum: 100 }
+        behavior: { type: number, minimum: 0, maximum: 100 }
+        dataSensitivity: { type: number, minimum: 0, maximum: 100 }
+        total: { type: number, minimum: 0, maximum: 100 }
+
+    BreakGlass:
+      type: object
+      properties:
+        active: { type: boolean }
+        validUntil: { type: string, format: date-time }
+        approvedBy: { type: string }
+        ticket: { type: string }
+
+    # ---------- Ответ ----------
+    EnforcementResponse:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          $ref: '#/components/schemas/EnforcementDecision'
+        ext:
+          type: object
+          additionalProperties: {}
+
+    EnforcementDecision:
+      type: object
+      required: [timestamp, effect]
+      properties:
+        requestId: { type: string }
+        timestamp: { type: string, format: date-time }
+        effect:
+          $ref: '#/components/schemas/DecisionEffect'
+        reason: { type: string }
+        riskScore: { type: number }
+        riskBreakdown:
+          $ref: '#/components/schemas/RiskScores'
+        obligations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Obligation'
+        conditional:
+          $ref: '#/components/schemas/ConditionalAccess'
+        isolation:
+          $ref: '#/components/schemas/Isolation'
+        stepUp:
+          $ref: '#/components/schemas/StepUp'
+        policyId: { type: string }
+        policyPriority: { type: integer }
+        trace:
+          type: array
+          items:
+            $ref: '#/components/schemas/EvaluationTrace'
+        decisionTtlSeconds:
+          type: integer
+          minimum: 0
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        dlp:
+          $ref: '#/components/schemas/DlpOutcome'
+        egress:
+          $ref: '#/components/schemas/EgressDecision'
+        tenant: { type: string }
+        traceId: { type: string }
+        correlationId: { type: string }
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+
+    Obligation:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string }
+        params:
+          type: object
+          additionalProperties: {}
+        ttlSeconds:
+          type: integer
+          minimum: 0
+
+    ConditionalAccess:
+      type: object
+      properties:
+        allowMethods:
+          type: array
+          items: { type: string }
+        denyMethods:
+          type: array
+          items: { type: string }
+        restrictions:
+          type: object
+          additionalProperties: {}
+
+    Isolation:
+      type: object
+      properties:
+        restrictApps:
+          type: array
+          items: { type: string }
+        limitBandwidthKbps:
+          type: integer
+          minimum: 0
+        dlpForceRedact:
+          type: boolean
+        extra:
+          type: object
+          additionalProperties: {}
+
+    StepUp:
+      type: object
+      properties:
+        methods:
+          type: array
+          items: { type: string }
+        maxWindowSeconds:
+          type: integer
+          minimum: 0
+        challenge:
+          type: object
+          additionalProperties: {}
+
+    DlpOutcome:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [block, redact, allow]
+        severity:
+          type: string
+          enum: [low, medium, high]
+        redactedPatterns:
+          type: array
+          items: { type: string }
+        details:
+          type: object
+          additionalProperties: {}
+
+    EgressDecision:
+      type: object
+      properties:
+        allowed: { type: boolean }
+        allowedDomains:
+          type: array
+          items: { type: string }
+        deniedDomains:
+          type: array
+          items: { type: string }
+        allowedPorts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PortRule'
+        details:
+          type: object
+          additionalProperties: {}
+
+    PortRule:
+      type: object
+      properties:
+        proto:
+          type: string
+          enum: [tcp, udp]
+        port:
+          type: integer
+          minimum: 0
+          maximum: 65535
+
+    EvaluationTrace:
+      type: object
+      properties:
+        ruleId: { type: string }
+        effect: { type: string }
+        expr: { type: string }
+        matched: { type: boolean }
+        scoreDelta: { type: number }
+        extras:
+          type: object
+          additionalProperties: {}
+
+    # ---------- Audit ----------
+    AuditEvent:
+      type: object
+      required: [eventId, timestamp, decision]
+      properties:
+        eventId: { type: string }
+        timestamp: { type: string, format: date-time }
+        tenant: { type: string }
+        pepNode: { type: string }
+        request:
+          $ref: '#/components/schemas/EnforcementRequest'
+        decision:
+          $ref: '#/components/schemas/EnforcementDecision'
+        redactions:
+          type: array
+          items: { type: string }
+
+    # ---------- Approvals ----------
+    ApprovalCreate:
+      type: object
+      required: [id, subject, scope, validMinutes]
+      properties:
+        id: { type: string }
+        subject:
+          type: string
+          description: Идентификатор пользователя или сервиса
+        scope:
+          type: object
+          additionalProperties: {}
+        validMinutes:
+          type: integer
+          minimum: 1
+          maximum: 1440
+        reason: { type: string }
+        approvers:
+          type: array
+          items: { type: string }
+
+    Approval:
+      type: object
+      properties:
+        id: { type: string }
+        active: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        validUntil: { type: string, format: date-time }
+        subject: { type: string }
+        scope:
+          type: object
+          additionalProperties: {}
+        approvers:
+          type: array
+          items: { type: string }
+
+    # ---------- JWKS ----------
+    JWKSet:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/JWK'
+
+    JWK:
+      type: object
+      properties:
+        kty: { type: string }
+        kid: { type: string }
+        use: { type: string }
+        alg: { type: string }
+        key_ops:
+          type: array
+          items: { type: string }
+        n: { type: string }
+        e: { type: string }
+        crv: { type: string }
+        x: { type: string }
+        y: { type: string }
+        x5c:
+          type: array
+          items: { type: string }
+        x5t: { type: string }
+        "x5t#S256": { type: string }
+
+    # ---------- Error ----------
+    Error:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }
+        traceId: { type: string }
+        details:
+          type: object
+          additionalProperties: {}
+
+    # ---------- Any ----------
+    AnyValue:
+      description: Универсальная карта значений
+      oneOf:
+        - type: string
+        - type: number
+        - type: integer
+        - type: boolean
+        - type: array
+          items: {}
+        - type: object
+          additionalProperties: {}
+
+x-api-lifecycle:
+  stability: stable
+  breakingChangePolicy: semver

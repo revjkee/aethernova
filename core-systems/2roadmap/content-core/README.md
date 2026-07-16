@@ -1,0 +1,3 @@
+# content-core
+
+Project Documentation

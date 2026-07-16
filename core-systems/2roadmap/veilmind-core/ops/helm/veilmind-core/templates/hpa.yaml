@@ -1,0 +1,203 @@
+{{- /*
+Helm template: HorizontalPodAutoscaler (HPA) for veilmind-core
+Features:
+- autoscaling/v2 (fallback to v2beta2 if v2 not available)
+- Default CPU (avgUtilization=70). Optional Memory (avgUtilization=80).
+- Arbitrary additional metrics (Pods/Object/External) via .Values.hpa.additionalMetrics.*
+- Scale behavior (stabilization windows, policies) configurable; safe defaults included.
+- Full labels/annotations merging with chart helpers.
+
+Expected values (example):
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  # optional; default target = Deployment/{{ include "veilmind-core.fullname" . }}
+  scaleTargetRef:
+    apiVersion: "apps/v1"
+    kind: "Deployment"
+    name: ""   # empty -> fullname
+  labels: {}
+  annotations: {}
+  metrics:
+    cpu:
+      enabled: true
+      targetType: "Utilization"         # Utilization|AverageValue
+      targetUtilization: 70             # used when targetType=Utilization
+      targetAverageValue: ""            # e.g. "500m" when targetType=AverageValue
+    memory:
+      enabled: true
+      targetType: "Utilization"         # or "AverageValue"
+      targetUtilization: 80
+      targetAverageValue: ""            # e.g. "500Mi"
+  additionalMetrics:
+    pods: []       # [{name: "http_requests_per_pod", target: {type: "AverageValue", averageValue: "50"}}]
+    object: []     # [{name: "queue_messages_ready", describedObject: {apiVersion:"v1",kind:"Service",name:"mq"}, target:{type:"Value", value:"30"}}]
+    external: []   # [{name:"sqs_msgs_visible", selector:{matchLabels:{queue:"payments"}}, target:{type:"AverageValue", averageValue:"100"}}]
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: "Max"               # Max|Min|Disabled
+      policies:
+        - type: "Percent"
+          value: 100
+          periodSeconds: 60
+        - type: "Pods"
+          value: 4
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: "Min"
+      policies:
+        - type: "Percent"
+          value: 50
+          periodSeconds: 60
+*/ -}}
+{{- if .Values.hpa.enabled }}
+
+{{- /* Detect supported API version */ -}}
+{{- $hpaApi := "autoscaling/v2" -}}
+{{- if not (has "autoscaling/v2" .Capabilities.APIVersions) -}}
+{{-   $hpaApi = "autoscaling/v2beta2" -}}
+{{- end -}}
+
+{{- /* Helpers and defaults */ -}}
+{{- $fullname := (include "veilmind-core.fullname" . | default (printf "%s-%s" .Release.Name .Chart.Name)) -}}
+{{- $labels := include "veilmind-core.labels" . | fromYaml | default dict -}}
+{{- $selectorLabels := include "veilmind-core.selectorLabels" . | fromYaml | default dict -}}
+{{- $hpa := .Values.hpa -}}
+{{- $metrics := default dict $hpa.metrics -}}
+{{- $cpu := default dict $metrics.cpu -}}
+{{- $mem := default dict $metrics.memory -}}
+{{- $add := default dict $hpa.additionalMetrics -}}
+{{- $addPods := default (list) $add.pods -}}
+{{- $addObj := default (list) $add.object -}}
+{{- $addExt := default (list) $add.external -}}
+
+apiVersion: {{ $hpaApi }}
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ printf "%s-hpa" $fullname | trunc 63 | trimSuffix "-" }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+{{- toYaml $labels | nindent 4 }}
+{{- with $hpa.labels }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+  annotations:
+{{- with $hpa.annotations }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: {{ default "apps/v1" $hpa.scaleTargetRef.apiVersion | quote }}
+    kind: {{ default "Deployment" $hpa.scaleTargetRef.kind | quote }}
+    name: {{ default $fullname $hpa.scaleTargetRef.name | quote }}
+  minReplicas: {{ default 1 $hpa.minReplicas }}
+  maxReplicas: {{ required "hpa.maxReplicas is required" $hpa.maxReplicas }}
+  metrics:
+    {{- /* Default CPU resource metric */ -}}
+    {{- if (default true $cpu.enabled) }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: {{ default "Utilization" $cpu.targetType | quote }}
+          {{- if eq (default "Utilization" $cpu.targetType) "Utilization" }}
+          averageUtilization: {{ default 70 $cpu.targetUtilization }}
+          {{- else }}
+          averageValue: {{ required "hpa.metrics.cpu.targetAverageValue must be set when targetType != Utilization" $cpu.targetAverageValue | quote }}
+          {{- end }}
+    {{- end }}
+    {{- /* Optional Memory resource metric */ -}}
+    {{- if (default false $mem.enabled) }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: {{ default "Utilization" $mem.targetType | quote }}
+          {{- if eq (default "Utilization" $mem.targetType) "Utilization" }}
+          averageUtilization: {{ default 80 $mem.targetUtilization }}
+          {{- else }}
+          averageValue: {{ required "hpa.metrics.memory.targetAverageValue must be set when targetType != Utilization" $mem.targetAverageValue | quote }}
+          {{- end }}
+    {{- end }}
+    {{- /* Additional Pods metrics */ -}}
+    {{- range $i, $m := $addPods }}
+    - type: Pods
+      pods:
+        metric:
+          name: {{ required (printf "hpa.additionalMetrics.pods[%d].name required" $i) $m.name | quote }}
+        target:
+          type: {{ default "AverageValue" $m.target.type | quote }}
+          {{- if eq (default "AverageValue" $m.target.type) "AverageValue" }}
+          averageValue: {{ required (printf "hpa.additionalMetrics.pods[%d].target.averageValue required" $i) $m.target.averageValue | quote }}
+          {{- else }}
+          value: {{ required (printf "hpa.additionalMetrics.pods[%d].target.value required" $i) $m.target.value | quote }}
+          {{- end }}
+    {{- end }}
+    {{- /* Additional Object metrics */ -}}
+    {{- range $i, $m := $addObj }}
+    - type: Object
+      object:
+        describedObject:
+          apiVersion: {{ required (printf "hpa.additionalMetrics.object[%d].describedObject.apiVersion required" $i) $m.describedObject.apiVersion | quote }}
+          kind: {{ required (printf "hpa.additionalMetrics.object[%d].describedObject.kind required" $i) $m.describedObject.kind | quote }}
+          name: {{ required (printf "hpa.additionalMetrics.object[%d].describedObject.name required" $i) $m.describedObject.name | quote }}
+        metric:
+          name: {{ required (printf "hpa.additionalMetrics.object[%d].name required" $i) $m.name | quote }}
+          {{- with $m.selector }}
+          selector:
+{{ toYaml . | nindent 12 }}
+          {{- end }}
+        target:
+          type: {{ default "Value" $m.target.type | quote }}
+          {{- if eq (default "Value" $m.target.type) "AverageValue" }}
+          averageValue: {{ required (printf "hpa.additionalMetrics.object[%d].target.averageValue required" $i) $m.target.averageValue | quote }}
+          {{- else }}
+          value: {{ required (printf "hpa.additionalMetrics.object[%d].target.value required" $i) $m.target.value | quote }}
+          {{- end }}
+    {{- end }}
+    {{- /* Additional External metrics */ -}}
+    {{- range $i, $m := $addExt }}
+    - type: External
+      external:
+        metric:
+          name: {{ required (printf "hpa.additionalMetrics.external[%d].name required" $i) $m.name | quote }}
+          {{- with $m.selector }}
+          selector:
+{{ toYaml . | nindent 12 }}
+          {{- end }}
+        target:
+          type: {{ default "AverageValue" $m.target.type | quote }}
+          {{- if eq (default "AverageValue" $m.target.type) "AverageValue" }}
+          averageValue: {{ required (printf "hpa.additionalMetrics.external[%d].target.averageValue required" $i) $m.target.averageValue | quote }}
+          {{- else }}
+          value: {{ required (printf "hpa.additionalMetrics.external[%d].target.value required" $i) $m.target.value | quote }}
+          {{- end }}
+    {{- end }}
+
+  {{- /* Scale behavior: defaults, overridable via values */ -}}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: {{ default 0 (dig "behavior" "scaleUp" "stabilizationWindowSeconds"  $hpa) }}
+      selectPolicy: {{ default "Max" (dig "behavior" "scaleUp" "selectPolicy" $hpa) | quote }}
+      policies:
+        {{- $upPolicies := (dig "behavior" "scaleUp" "policies" $hpa | default (list (dict "type" "Percent" "value" 100 "periodSeconds" 60) (dict "type" "Pods" "value" 4 "periodSeconds" 60))) -}}
+        {{- range $upPolicies }}
+        - type: {{ .type | quote }}
+          value: {{ .value }}
+          periodSeconds: {{ .periodSeconds }}
+        {{- end }}
+    scaleDown:
+      stabilizationWindowSeconds: {{ default 300 (dig "behavior" "scaleDown" "stabilizationWindowSeconds" $hpa) }}
+      selectPolicy: {{ default "Min" (dig "behavior" "scaleDown" "selectPolicy" $hpa) | quote }}
+      policies:
+        {{- $downPolicies := (dig "behavior" "scaleDown" "policies" $hpa | default (list (dict "type" "Percent" "value" 50 "periodSeconds" 60))) -}}
+        {{- range $downPolicies }}
+        - type: {{ .type | quote }}
+          value: {{ .value }}
+          periodSeconds: {{ .periodSeconds }}
+        {{- end }}
+
+{{- end }}

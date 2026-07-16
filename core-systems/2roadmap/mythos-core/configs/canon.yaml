@@ -1,0 +1,443 @@
+# Canonical, production-grade configuration for Mythos Core
+# All secrets MUST come from environment variables. Non-secret defaults below are safe.
+# Schema is intentionally explicit and stable to allow validation in CI.
+
+schemaVersion: "1.0"
+
+metadata: &meta
+  service: mythos-core
+  # Keep in sync with mythos-core/VERSION during CI
+  version: "0.2.0"
+  owner: "platform"
+  contacts:
+    oncall: "mythos-oncall"
+    security: "security@company.example"
+  labels:
+    app.kubernetes.io/name: mythos-core
+    app.kubernetes.io/part-of: mythos
+
+environment: &env
+  name: ${ENVIRONMENT:-dev}             # dev | staging | prod
+  region: ${REGION:-eu-west-1}
+  timezone: "UTC"
+
+server: &server
+  http:
+    host: "0.0.0.0"
+    port: ${PORT:-8080}
+    basePath: "/"
+    requestTimeoutMs: 15000
+    idleTimeoutMs: 60000
+    maxBodyBytes: 10485760              # 10 MiB
+    compressResponses: true
+    cors:
+      enabled: true
+      allowOrigins: ["https://mythos.example.com", "https://*.mythos.example.com"]
+      allowMethods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+      allowHeaders: ["Authorization","Content-Type","X-Request-ID","X-Client-Version"]
+      exposeHeaders: ["X-Request-ID"]
+      allowCredentials: true
+      maxAgeSeconds: 600
+    securityHeaders:
+      hsts:
+        enabled: true
+        maxAgeSeconds: 63072000
+        includeSubdomains: true
+        preload: true
+      csp: "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' https: wss:"
+      frameOptions: "DENY"
+      referrerPolicy: "strict-origin-when-cross-origin"
+      permissionsPolicy: "geolocation=(), microphone=(), camera=()"
+      crossOriginOpenerPolicy: "same-origin"
+      crossOriginResourcePolicy: "same-origin"
+      crossOriginEmbedderPolicy: "require-corp"
+  admin:
+    enabled: true
+    host: "0.0.0.0"
+    port: ${ADMIN_PORT:-8081}
+    basePath: "/admin"
+    ipAllowList: ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"]  # override in prod
+    authRequired: true
+
+security: &security
+  tls:
+    enforceHttps: true
+    trustProxyHeaders: ${TRUST_PROXY:-true}       # for L7 proxies
+  csrf:
+    enabled: true
+    cookieName: "__Host-mythos-csrf"
+    cookieSecure: true
+    cookieSameSite: "Strict"
+  auth:
+    # Prefer OIDC; JWT secret fallback for tests/tools
+    mode: ${AUTH_MODE:-oidc}                      # oidc | jwt
+    oidc:
+      issuer: ${OIDC_ISSUER_URL:-}
+      clientId: ${OIDC_CLIENT_ID:-}
+      clientSecretEnv: OIDC_CLIENT_SECRET
+      audience: ["mythos-core"]
+      scopes: ["openid","profile","email"]
+      jwksCacheTtl: "10m"
+    jwt:
+      issuer: "mythos-core"
+      audience: ["mythos"]
+      secretEnv: JWT_SECRET
+    tokens:
+      accessTtl: "15m"
+      refreshTtl: "30d"
+      clockSkew: "60s"
+  # Per-tenant RBAC defaults
+  rbac:
+    defaultRole: "viewer"
+    roles:
+      - name: "viewer"
+        perms: ["read:lore","read:package"]
+      - name: "editor"
+        perms: ["read:*","write:lore","write:package"]
+      - name: "admin"
+        perms: ["*"]
+
+database: &database
+  driver: "postgres"
+  url: ${DATABASE_URL:-postgresql://mythos:mythos@localhost:5432/mythos?sslmode=disable}
+  pool:
+    maxOpen: 50
+    maxIdle: 10
+    connMaxLifetime: "30m"
+    connMaxIdleTime: "10m"
+  migrateOnStart: true
+  # Optional read replicas
+  replicas: []
+  # Strong constraints for production safety
+  constraints:
+    statementTimeoutMs: 15000
+    lockTimeoutMs: 5000
+
+cache: &cache
+  redis:
+    url: ${REDIS_URL:-redis://localhost:6379/0}
+    tls: ${REDIS_TLS:-false}
+    poolSize: 100
+    minIdleConns: 10
+    dialTimeoutMs: 3000
+    readTimeoutMs: 1000
+    writeTimeoutMs: 1000
+    keyPrefix: "mythos:"
+
+queue: &queue
+  provider: ${QUEUE_PROVIDER:-sqs}               # sqs | rabbit | memory
+  sqs:
+    queueUrl: ${SQS_QUEUE_URL:-}
+    region: ${AWS_REGION:-eu-west-1}
+    visibilityTimeoutSec: 60
+    maxInFlight: 10
+    longPollSec: 10
+    deadLetter:
+      enabled: true
+      maxReceiveCount: 5
+  rabbit:
+    url: ${RABBITMQ_URL:-amqp://guest:guest@localhost:5672/}
+    prefetch: 32
+  memory:
+    workers: 4
+
+storage: &storage
+  # Artifact registry for lore/packages (see tests/integration expectations)
+  registry:
+    backend: ${REGISTRY_BACKEND:-s3}             # s3 | local
+    versioning: true
+    checksum: "sha256"
+    retention:
+      keepLastVersions: 5
+      maxDays: 180
+    s3:
+      bucket: ${REGISTRY_BUCKET:-mythos-core-registry}
+      region: ${AWS_REGION:-eu-west-1}
+      endpoint: ${S3_ENDPOINT:-}                 # optional for S3-compatible
+      usePathStyle: ${S3_PATH_STYLE:-false}
+      kmsKeyId: ${S3_KMS_KEY_ID:-}
+      acl: "private"
+    local:
+      root: ${REGISTRY_LOCAL_ROOT:-/var/lib/mythos/registry}
+  uploads:
+    backend: ${UPLOADS_BACKEND:-local}
+    local:
+      root: ${UPLOADS_LOCAL_ROOT:-/var/lib/mythos/uploads}
+    s3:
+      bucket: ${UPLOADS_BUCKET:-mythos-core-uploads}
+      region: ${AWS_REGION:-eu-west-1}
+      kmsKeyId: ${S3_KMS_KEY_ID:-}
+  # Optional content-addressable cache for deduplication
+  cac:
+    enabled: true
+    root: ${CAC_ROOT:-/var/lib/mythos/cac}
+    maxSizeBytes: 10737418240                   # 10 GiB
+
+search:
+  provider: ${SEARCH_PROVIDER:-none}            # opensearch | pg | none
+  opensearch:
+    url: ${OPENSEARCH_URL:-https://os.example.com}
+    usernameEnv: OPENSEARCH_USER
+    passwordEnv: OPENSEARCH_PASSWORD
+    indexPrefix: "mythos"
+    shardCount: 3
+    replicaCount: 1
+  pg:
+    # Fallback to Postgres full-text search
+    enabled: true
+
+observability: &obs
+  logging:
+    level: ${LOG_LEVEL:-INFO}
+    json: true
+    redact:
+      email: true
+      phone: true
+      card: true
+      secrets: true
+    sampling:
+      DEBUG: 0.1
+      INFO: 1.0
+  tracing:
+    enabled: true
+    exporter: "otlp"                             # otlp | jaeger | none
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+    protocol: "grpc"
+    sampleRatio: 0.1
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+      port: ${METRICS_PORT:-9090}
+  audit:
+    enabled: true
+    sink: "file"                                 # file | stdout | http
+    filePath: ${AUDIT_LOG_PATH:-/var/log/mythos/audit.jsonl}
+
+features: &features
+  # Feature flags; evaluated at startup and can be hot-reloaded via admin API
+  lore_validation_v2: true
+  registry_presign_urls: true
+  webhook_outbound: true
+  canary_rules: false
+
+limits: &limits
+  payloadBytes:
+    default: 10485760          # 10 MiB
+    importPackage: 52428800    # 50 MiB
+  concurrency:
+    apiWorkers: ${API_WORKERS:-8}
+  pagination:
+    defaultLimit: 50
+    maxLimit: 500
+  rateLimits:
+    default:
+      rps: 50
+      burst: 100
+      windowSec: 1
+    routes:
+      "/api/v1/packages/import":
+        rps: 5
+        burst: 10
+      "/api/v1/registry/upload":
+        rps: 10
+        burst: 20
+
+quotas:
+  enabled: true
+  # Per-tenant quotas; actual limits resolved from DB or this static fallback
+  defaults:
+    storageBytes: 10737418240   # 10 GiB
+    requestsPerDay: 200000
+  overrides: {}                 # { tenant-id: { storageBytes: ..., requestsPerDay: ... } }
+
+validation:
+  # Canonical validation rules for "lore" domain model
+  lore:
+    maxGraphNodes: 50000
+    maxGraphEdges: 200000
+    allowCircularRefs: false
+    allowedMimeTypes: ["application/json","text/markdown"]
+    locale:
+      default: "en"
+      allowed: ["en","ru","de","fr","es","zh"]
+  package:
+    schemaVersion: "2"
+    requireSignature: true
+    acceptedSigners: ["did:key:z6Mk...","key:company-root"]
+    maxAttachments: 32
+
+webhooks:
+  outbound:
+    enabled: true
+    retries:
+      maxAttempts: 6
+      baseDelayMs: 250
+      jitter: true
+    timeoutsMs:
+      connect: 2000
+      read: 4000
+    destinations: []           # [{name,url,secretEnv,events:[package.created,...]}]
+
+scheduler:
+  enabled: true
+  jobs:
+    - name: "registry-retention"
+      cron: "0 3 * * *"
+      task: "registry.applyRetention"
+      timeoutSec: 1800
+    - name: "search-reindex"
+      cron: "0 2 * * 0"
+      task: "search.reindexAll"
+      timeoutSec: 7200
+    - name: "sbom-attest"
+      cron: "30 1 * * *"
+      task: "supplychain.attest"
+      timeoutSec: 1200
+
+migrations:
+  onStartup: true
+  strict: true
+  safeDown: false
+
+slo:
+  # Objectives used by alerting and autoscaling policies
+  apiAvailability:
+    target: 99.90
+    windowDays: 30
+  p99LatencyMs:
+    read: 300
+    write: 800
+
+api:
+  # Explicit API surface and compatibility gates
+  majorVersion: 1
+  deprecations:
+    - route: "/api/v1/export/v1"
+      sunset: "2025-11-01"
+      replacement: "/api/v2/export"
+      status: "scheduled"
+
+# ---------- Profiles (environment overlays) ----------
+profiles:
+  dev:
+    <<: *meta
+    environment:
+      <<: *env
+      name: "dev"
+    server:
+      <<: *server
+      admin:
+        <<: *server.admin
+        ipAllowList: ["0.0.0.0/0"]  # dev convenience
+    security:
+      <<: *security
+      csrf:
+        enabled: false
+      auth:
+        mode: "jwt"                 # local development
+    database:
+      <<: *database
+      url: ${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/mythos?sslmode=disable}
+    cache: *cache
+    queue:
+      <<: *queue
+      provider: "memory"
+    storage:
+      <<: *storage
+      registry:
+        <<: *storage.registry
+        backend: "local"
+      uploads:
+        backend: "local"
+    features:
+      <<: *features
+      canary_rules: true
+
+  staging:
+    <<: *meta
+    environment:
+      <<: *env
+      name: "staging"
+    server: *server
+    security:
+      <<: *security
+      csrf:
+        enabled: true
+      auth:
+        mode: "oidc"
+    database: *database
+    cache: *cache
+    queue:
+      <<: *queue
+      provider: "sqs"
+    storage:
+      <<: *storage
+      registry:
+        <<: *storage.registry
+        backend: "s3"
+      uploads:
+        backend: "s3"
+    observability:
+      <<: *obs
+      tracing:
+        <<: *obs.tracing
+        sampleRatio: 0.2
+    limits: *limits
+    features: *features
+
+  prod:
+    <<: *meta
+    environment:
+      <<: *env
+      name: "prod"
+    server:
+      <<: *server
+      admin:
+        <<: *server.admin
+        ipAllowList: ${ADMIN_IP_ALLOWLIST:-"203.0.113.0/24,198.51.100.0/24"}
+    security:
+      <<: *security
+      csrf:
+        enabled: true
+      auth:
+        mode: "oidc"
+    database:
+      <<: *database
+      pool:
+        maxOpen: 100
+        maxIdle: 20
+        connMaxLifetime: "1h"
+    cache:
+      <<: *cache
+      redis:
+        <<: *cache.redis
+        poolSize: 300
+    queue:
+      <<: *queue
+      provider: "sqs"
+    storage:
+      <<: *storage
+      registry:
+        <<: *storage.registry
+        backend: "s3"
+      uploads:
+        backend: "s3"
+    observability:
+      <<: *obs
+      logging:
+        <<: *obs.logging
+        level: "INFO"
+      tracing:
+        <<: *obs.tracing
+        sampleRatio: 0.05
+    limits:
+      <<: *limits
+      rateLimits:
+        default:
+          rps: 200
+          burst: 400
+          windowSec: 1
+    features:
+      <<: *features
+      canary_rules: false

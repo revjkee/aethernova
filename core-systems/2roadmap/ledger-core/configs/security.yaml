@@ -1,0 +1,376 @@
+# ledger-core/ops/configs/security.yaml
+# 1) Namespace c включённым Pod Security Admission (restricted) и обязательными метками трассируемости.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ledger-prod
+  labels:
+    app.kubernetes.io/part-of: ledger-core
+    app.kubernetes.io/managed-by: ops
+    environment: prod
+    pod-security.kubernetes.io/enforce: "restricted"
+    pod-security.kubernetes.io/enforce-version: "latest"
+    pod-security.kubernetes.io/warn: "restricted"
+    pod-security.kubernetes.io/warn-version: "latest"
+    pod-security.kubernetes.io/audit: "restricted"
+    pod-security.kubernetes.io/audit-version: "latest"
+---
+# 2) Ограничения ресурсов по умолчанию для предотвращения DoS и «no‑limits».
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: ledger-default-limits
+  namespace: ledger-prod
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "1000m"
+        memory: "1Gi"
+      defaultRequest:
+        cpu: "200m"
+        memory: "256Mi"
+      max:
+        cpu: "4000m"
+        memory: "4Gi"
+      min:
+        cpu: "100m"
+        memory: "128Mi"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ledger-prod-quota
+  namespace: ledger-prod
+spec:
+  hard:
+    pods: "500"
+    requests.cpu: "200"
+    requests.memory: "400Gi"
+    limits.cpu: "400"
+    limits.memory: "800Gi"
+    persistentvolumeclaims: "200"
+    services.loadbalancers: "10"
+    services.nodeports: "0"
+---
+# 3) Сетевой периметр: «default deny» + явные egress для DNS/HTTPS; ingress — только из ingress‑ns.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: ledger-prod
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress","Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns-https
+  namespace: ledger-prod
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-from-ingress-nginx
+  namespace: ledger-prod
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: api
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+---
+# 4) Kyverno ClusterPolicies — обязательные требования безопасности для всех нэймспейсов с label environment=prod.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ledger-restrict-pod-security
+  annotations:
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/description: "Обязательные безопасные параметры Pod/Container"
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-seccomp
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              selector:
+                matchLabels:
+                  environment: prod
+      validate:
+        message: "Seccomp profile must be RuntimeDefault."
+        pattern:
+          spec:
+            securityContext:
+              seccompProfile:
+                type: "RuntimeDefault"
+    - name: containers-must-run-as-nonroot
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "Containers must run as non-root with non-zero UID."
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+            containers:
+              - =(securityContext):
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+    - name: drop-all-capabilities
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "ALL Linux capabilities must be dropped; add only required as add list."
+        pattern:
+          spec:
+            containers:
+              - securityContext:
+                  capabilities:
+                    drop: ["ALL"]
+    - name: forbid-privileged-and-host-namespaces
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "Privileged, hostNetwork, hostPID/IPC and hostPath are forbidden."
+        pattern:
+          spec:
+            hostNetwork: "false"
+            hostPID: "false"
+            hostIPC: "false"
+            containers:
+              - securityContext:
+                  privileged: "false"
+            =(volumes):
+              - X(hostPath): "null"
+    - name: disallow-sysctls
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "unsafe sysctls are not allowed."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.securityContext.sysctls[].name || `[]` }}"
+                operator: AnyIn
+                value:
+                  - "kernel.*"
+                  - "net.*"
+                  - "fs.*"
+---
+# 5) Kyverno: мутации — безопасные дефолты (automountServiceAccountToken=false и базовый securityContext).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: ledger-secure-defaults
+  annotations:
+    policies.kyverno.io/category: Defaults
+    policies.kyverno.io/description: "Автомутация безопасных значений по умолчанию"
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: set-automount-sa-token-false
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              selector: { matchLabels: { environment: prod } }
+      mutate:
+        patchStrategicMerge:
+          spec:
+            automountServiceAccountToken: false
+    - name: set-pod-securitycontext
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              selector: { matchLabels: { environment: prod } }
+      mutate:
+        patchStrategicMerge:
+          spec:
+            securityContext:
+              runAsNonRoot: true
+              seccompProfile:
+                type: RuntimeDefault
+---
+# 6) Kyverno: политика источников образов (allowlist) и проверка подписи (cosign).
+apiVersion: kyverno.io/v2
+kind: ClusterPolicy
+metadata:
+  name: ledger-image-security
+  annotations:
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/description: "Разрешенные реестры и верификация подписи образов"
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: allowlist-registries
+      match:
+        any:
+          - resources:
+              kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "Images must come from approved registries."
+        foreach:
+          - list: "request.object.spec.template.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: "^(PLACEHOLDER_REG1|PLACEHOLDER_REG2)\\/.*$"
+    - name: verify-image-signatures
+      match:
+        any:
+          - resources:
+              kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector: { matchLabels: { environment: prod } }
+      verifyImages:
+        - imageReferences:
+            - "PLACEHOLDER_REG1/ledger-core-api:*"
+            - "PLACEHOLDER_REG1/ledger-core-worker:*"
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |
+                      -----BEGIN PUBLIC KEY-----
+                      PLACEHOLDER_COSIGN_PUBKEY
+                      -----END PUBLIC KEY-----
+          repositories: []
+          failureAction: Enforce
+          mutateDigest: true
+---
+# 7) (Опционально) Kyverno: запрет на «latest» и отсутствие digest.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: forbid-latest-and-no-digest
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-latest-tag
+      match:
+        any:
+          - resources:
+              kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "Do not use ':latest' tag."
+        pattern:
+          spec:
+            template:
+              spec:
+                containers:
+                  - image: "!*:latest"
+    - name: require-digest
+      match:
+        any:
+          - resources:
+              kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              selector: { matchLabels: { environment: prod } }
+      validate:
+        message: "Images must be pinned by digest."
+        foreach:
+          - list: "request.object.spec.template.spec.containers[]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.image }}"
+                    operator: NotMatches
+                    value: ".*@sha256:[0-9a-f]{64}$"
+---
+# 8) (Опционально) Политика Kubernetes Audit — хранится в ConfigMap для управления из GitOps.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: audit-policy
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/managed-by: ops
+data:
+  audit-policy.yaml: |
+    apiVersion: audit.k8s.io/v1
+    kind: Policy
+    rules:
+      - level: Metadata
+        verbs: ["get","list","watch"]
+        resources:
+          - group: ""
+            resources: ["pods","services","endpoints","namespaces"]
+      - level: RequestResponse
+        verbs: ["create","update","patch","delete","deletecollection","impersonate","escalate","bind","approve"]
+        resources:
+          - group: "*"
+            resources: ["*"]
+      - level: None
+        users: ["system:kube-proxy","system:kube-controller-manager","system:kube-scheduler"]
+      - level: Metadata
+        nonResourceURLs: ["*"]
+        verbs: ["get","list"]
+---
+# 9) (Опционально) Deny все ServiceAccount токены, кроме явно разрешённых.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deny-serviceaccount-token-mounts
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: deny-sa-token-mount
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              selector: { matchLabels: { environment: prod } }
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.automountServiceAccountToken || false }}"
+            operator: Equals
+            value: true
+      validate:
+        message: "automountServiceAccountToken must be false unless explicitly required."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.annotations.\"security.ops/allow-sa-token\" || `false` }}"
+                operator: Equals
+                value: "false"

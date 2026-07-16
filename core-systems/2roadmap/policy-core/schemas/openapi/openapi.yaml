@@ -1,0 +1,786 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: policy-core API
+  version: 1.0.0
+  description: >
+    Промышленное API управления политиками, бандлами, исключениями (waivers),
+    а также сервисами валидации/компиляции и приёма событий изменений.
+    Спецификация совместима с Zero-Trust практиками и поддерживает строгую
+    идемпотентность запросов.
+
+  termsOfService: https://aethernova.dev/terms
+  contact:
+    name: Aethernova Security
+    email: security@aethernova.dev
+    url: https://aethernova.dev
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://api.policy-core.local
+    description: Production
+  - url: https://staging.api.policy-core.local
+    description: Staging
+  - url: http://localhost:8080
+    description: Local
+
+tags:
+  - name: Health
+  - name: Policies
+  - name: Bundles
+  - name: Waivers
+  - name: Validation
+  - name: Compile
+  - name: Events
+  - name: Schemas
+  - name: System
+
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+  - hmacSig: []
+
+x-idempotency:
+  header: Idempotency-Key
+  ttl: 24h
+
+paths:
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      operationId: getHealth
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      operationId: getReady
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Not ready
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /metrics:
+    get:
+      tags: [System]
+      summary: Prometheus metrics endpoint
+      description: Текстовый экспорт метрик Prometheus.
+      operationId: getMetrics
+      security: [] # обычно открыт внутри кластера/сервис-сети
+      responses:
+        '200':
+          description: Prometheus exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/policies:
+    get:
+      tags: [Policies]
+      summary: Список политик
+      operationId: listPolicies
+      parameters:
+        - $ref: '#/components/parameters/pageCursor'
+        - $ref: '#/components/parameters/pageSize'
+        - name: environment
+          in: query
+          schema: { $ref: '#/components/schemas/Environment' }
+        - name: q
+          in: query
+          description: Поиск по id/name/labels
+          schema: { type: string, maxLength: 256 }
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Next-Cursor:
+              schema: { type: string }
+              description: Курсор следующей страницы.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/PolicySummary' }
+                  nextCursor:
+                    type: string
+                    nullable: true
+    post:
+      tags: [Policies]
+      summary: Создать или обновить политику
+      description: >
+        Идемпотентная операция. Передавайте заголовок `Idempotency-Key`.
+        Для обновления используйте одинаковый `id` в теле.
+      operationId: upsertPolicy
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Policy' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        '400':
+          description: Validation error
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/policies/{id}:
+    parameters:
+      - $ref: '#/components/parameters/policyId'
+    get:
+      tags: [Policies]
+      summary: Получить политику по id
+      operationId: getPolicy
+      parameters:
+        - name: version
+          in: query
+          description: Версия (если не указана — последняя)
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        '404':
+          description: Not found
+    delete:
+      tags: [Policies]
+      summary: Удалить политику (логическое)
+      operationId: deletePolicy
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      responses:
+        '204': { description: Deleted }
+        '404': { description: Not found }
+
+  /v1/policies/{id}:validate:
+    post:
+      tags: [Validation]
+      summary: Валидировать политику
+      operationId: validatePolicy
+      parameters:
+        - $ref: '#/components/parameters/policyId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Policy' }
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationResult' }
+
+  /v1/policies/{id}:compile:
+    post:
+      tags: [Compile]
+      summary: Скомпилировать политику в целевой формат (Rego/CEL/WASM)
+      operationId: compilePolicy
+      parameters:
+        - $ref: '#/components/parameters/policyId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target:
+                  $ref: '#/components/schemas/CompileTarget'
+                options:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Compiled artifact
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompiledArtifact' }
+
+  /v1/bundles:
+    get:
+      tags: [Bundles]
+      summary: Список бандлов
+      operationId: listBundles
+      parameters:
+        - $ref: '#/components/parameters/pageCursor'
+        - $ref: '#/components/parameters/pageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/PolicyBundle' }
+                  nextCursor: { type: string, nullable: true }
+    post:
+      tags: [Bundles]
+      summary: Создать/обновить бандл
+      operationId: upsertBundle
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyBundle' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyBundle' }
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyBundle' }
+
+  /v1/bundles/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, minLength: 3 }
+    get:
+      tags: [Bundles]
+      summary: Получить бандл по id
+      operationId: getBundle
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyBundle' }
+        '404': { description: Not found }
+
+  /v1/waivers:
+    get:
+      tags: [Waivers]
+      summary: Список исключений (waivers)
+      operationId: listWaivers
+      parameters:
+        - $ref: '#/components/parameters/pageCursor'
+        - $ref: '#/components/parameters/pageSize'
+        - name: ruleId
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Waiver' }
+                  nextCursor: { type: string, nullable: true }
+    post:
+      tags: [Waivers]
+      summary: Оформить исключение
+      operationId: createWaiver
+      parameters:
+        - $ref: '#/components/parameters/idempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Waiver' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Waiver' }
+
+  /v1/waivers/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, minLength: 3 }
+    get:
+      tags: [Waivers]
+      summary: Получить исключение
+      operationId: getWaiver
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Waiver' }
+        '404': { description: Not found }
+    delete:
+      tags: [Waivers]
+      summary: Отозвать исключение
+      operationId: revokeWaiver
+      responses:
+        '204': { description: Revoked }
+
+  /v1/events:ingest:
+    post:
+      tags: [Events]
+      summary: Приём событий изменений политик (CloudEvents JSON)
+      operationId: ingestEvents
+      requestBody:
+        required: true
+        content:
+          application/cloudevents+json:
+            schema: { $ref: '#/components/schemas/PolicyChangeEvent' }
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyChangeEvent' }
+      responses:
+        '202':
+          description: Accepted
+        '400':
+          description: Invalid event
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/schemas:
+    get:
+      tags: [Schemas]
+      summary: Список доступных схем (JSON Schema/Avro)
+      operationId: listSchemas
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jsonSchemas:
+                    type: array
+                    items: { $ref: '#/components/schemas/SchemaDescriptor' }
+                  avroSchemas:
+                    type: array
+                    items: { $ref: '#/components/schemas/SchemaDescriptor' }
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT c audience=policy-core и обязательным exp/iat.
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    hmacSig:
+      type: http
+      scheme: signature
+      description: >
+        HMAC подписи запросов по заголовку `Signature: keyId=...,algorithm=hmac-sha256,headers=...,signature=...`.
+        Тело подписывается в соответствии с draft-cavage-http-signatures.
+
+  parameters:
+    pageCursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Курсор постраничной навигации.
+    pageSize:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      description: Размер страницы.
+    idempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, minLength: 8, maxLength: 128 }
+      description: Ключ идемпотентности запроса.
+    policyId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, minLength: 3 }
+
+  schemas:
+
+    Environment:
+      type: string
+      enum: [DEV, STAGING, PROD, OTHER]
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              status: { type: string }
+              detail: { type: string }
+      required: [status]
+
+    Problem:
+      type: object
+      description: RFC 7807 Problem Details
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string, format: uri }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              message: { type: string }
+              path: { type: string }
+      required: [title, status]
+
+    LabelMap:
+      type: object
+      additionalProperties:
+        type: string
+        maxLength: 128
+
+    PolicySummary:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        version: { type: string }
+        environment: { $ref: '#/components/schemas/Environment' }
+        labels: { $ref: '#/components/schemas/LabelMap' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [id, version, createdAt, updatedAt]
+
+    Policy:
+      type: object
+      description: >
+        Политика в формате DSL YAML/JSON (см. example.policy.yaml). Поле `spec`
+        допускает произвольную структуру согласно версии DSL.
+      properties:
+        apiVersion:
+          type: string
+          example: policy.aethernova.io/v1alpha3
+        kind:
+          type: string
+          example: Policy
+        metadata:
+          type: object
+          properties:
+            id: { type: string, minLength: 3 }
+            name: { type: string }
+            version: { type: string }
+            labels: { $ref: '#/components/schemas/LabelMap' }
+            owners:
+              type: array
+              items:
+                type: object
+                properties:
+                  team: { type: string }
+                  contact: { type: string, format: email }
+        spec:
+          type: object
+          additionalProperties: true
+        signature:
+          type: object
+          properties:
+            format: { type: string, enum: [COSIGN, X509, PGP, JWS] }
+            value: { type: string }
+            keyId: { type: string }
+        createdAt: { type: string, format: date-time, readOnly: true }
+        updatedAt: { type: string, format: date-time, readOnly: true }
+      required: [apiVersion, kind, metadata, spec]
+
+    PolicyBundle:
+      type: object
+      description: Пакет политик (см. example.policy.yaml — PolicyBundle).
+      properties:
+        apiVersion: { type: string, example: policy.aethernova.io/v1alpha3 }
+        kind: { type: string, example: PolicyBundle }
+        metadata:
+          type: object
+          properties:
+            id: { type: string }
+            name: { type: string }
+            version: { type: string }
+            labels: { $ref: '#/components/schemas/LabelMap' }
+        spec:
+          type: object
+          additionalProperties: true
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Policy' }
+      required: [apiVersion, kind, metadata, spec]
+
+    Waiver:
+      type: object
+      description: Исключение из правил с TTL и ссылками на риск.
+      properties:
+        id: { type: string }
+        rule: { type: string }
+        scope:
+          type: object
+          properties:
+            kind: { type: string }
+            namespace: { type: string }
+            name: { type: string }
+        reason: { type: string }
+        risk:
+          type: object
+          properties:
+            id: { type: string }
+            residualSeverity:
+              type: string
+              enum: [low, medium, high, critical]
+        ticket:
+          type: object
+          properties:
+            url: { type: string, format: uri }
+        grantedBy: { type: string }
+        grantedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        labels: { $ref: '#/components/schemas/LabelMap' }
+      required: [rule, scope, reason, grantedBy, expiresAt]
+
+    ValidationResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              code: { type: string }
+              message: { type: string }
+              path: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
+        metrics:
+          type: object
+          additionalProperties: { type: number }
+      required: [ok]
+
+    CompileTarget:
+      type: string
+      enum: [rego, cel, wasm]
+
+    CompiledArtifact:
+      type: object
+      properties:
+        target: { $ref: '#/components/schemas/CompileTarget' }
+        moduleName: { type: string }
+        uri: { type: string, format: uri }
+        sha256: { type: string }
+        sizeBytes: { type: integer }
+        createdAt: { type: string, format: date-time }
+      required: [target, uri, sha256]
+
+    SchemaDescriptor:
+      type: object
+      properties:
+        name: { type: string }
+        version: { type: string }
+        type:
+          type: string
+          enum: [jsonschema, avro]
+        uri: { type: string, format: uri }
+
+    # Согласовано с avro policy_changes.avsc и CloudEvents ядром
+    PolicyChangeEvent:
+      type: object
+      properties:
+        event_schema_version: { type: string, default: '1.0.0' }
+        event_id: { type: string, format: uuid }
+        event_time: { type: string, format: date-time }
+        specversion: { type: string, default: '1.0' }
+        source: { type: string }
+        type: { type: string, default: 'policy-core.PolicyChange' }
+        subject: { type: string, nullable: true }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        environment: { $ref: '#/components/schemas/Environment' }
+        correlation:
+          type: object
+          nullable: true
+          properties:
+            request_id: { type: string, format: uuid, nullable: true }
+            trace_id: { type: string, nullable: true }
+            parent_id: { type: string, nullable: true }
+        actor:
+          type: object
+          nullable: true
+          properties:
+            id: { type: string, nullable: true }
+            type:
+              type: string
+              enum: [USER, SERVICE, SYSTEM, ROBOT]
+              nullable: true
+            name: { type: string, nullable: true }
+            roles:
+              type: array
+              items: { type: string }
+              nullable: true
+        target:
+          type: object
+          properties:
+            kind:
+              type: string
+              enum: [POLICY, BUNDLE, RULE, EXCEPTION, WAIVER]
+            id: { type: string }
+            name: { type: string, nullable: true }
+            version: { type: string, nullable: true }
+            previous_version: { type: string, nullable: true }
+            path: { type: string, nullable: true }
+            repo: { type: string, nullable: true }
+            digest: { type: string, nullable: true }
+            previous_digest: { type: string, nullable: true }
+            labels: { $ref: '#/components/schemas/LabelMap' }
+          required: [kind, id]
+        change:
+          type: object
+          properties:
+            action:
+              type: string
+              enum: [CREATE, UPDATE, DELETE, PUBLISH, REVOKE, ENABLE, DISABLE]
+            reason: { type: string, nullable: true }
+            breaking_change: { type: boolean, nullable: true }
+            is_revert: { type: boolean, nullable: true }
+            enforcement_mode:
+              type: string
+              enum: [DENY, WARN, DRYRUN]
+              nullable: true
+            severity:
+              type: string
+              enum: [LOW, MEDIUM, HIGH, CRITICAL]
+              nullable: true
+            risk_ids:
+              type: array
+              items: { type: string }
+              nullable: true
+            standards:
+              type: array
+              items: { type: string }
+              nullable: true
+            approvals:
+              type: array
+              nullable: true
+              items:
+                type: object
+                properties:
+                  approver: { type: string }
+                  role: { type: string, nullable: true }
+                  time: { type: string, format: date-time, nullable: true }
+          required: [action]
+        diff:
+          type: object
+          nullable: true
+          properties:
+            format: { type: string, enum: [JSONPATCH, UNIFIED, TEXT] }
+            added_paths:
+              type: array
+              items: { type: string }
+              nullable: true
+            removed_paths:
+              type: array
+              items: { type: string }
+              nullable: true
+            modified_paths:
+              type: array
+              items: { type: string }
+              nullable: true
+            ops:
+              type: array
+              items: { type: string }
+              nullable: true
+        validation: { $ref: '#/components/schemas/ValidationResult' }
+        artifacts:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              kind:
+                type: string
+                enum: [POLICY_YAML, BUNDLE_YAML, REGO, CEL, WASM, SIGNATURE, SBOM]
+              uri: { type: string }
+              storage:
+                type: string
+                enum: [GIT, OCI, S3, GCS, FILE, HTTP]
+                nullable: true
+              digest: { type: string, nullable: true }
+              size_bytes: { type: integer, nullable: true }
+        signatures:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              format: { type: string, enum: [COSIGN, X509, PGP, JWS] }
+              algorithm: { type: string }
+              key_id: { type: string, nullable: true }
+              issuer: { type: string, nullable: true }
+              subject: { type: string, nullable: true }
+              signature: { type: string, nullable: true }
+              valid: { type: boolean, nullable: true }
+              verified_at: { type: string, format: date-time, nullable: true }
+        snapshot: { type: boolean, nullable: true }
+        expires_at: { type: string, format: date-time, nullable: true }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+          nullable: true
+        partition_key: { type: string, nullable: true }
+      required: [event_id, event_time, source, type, target, change]
+
+externalDocs:
+  description: Политики и схемы — документация проекта
+  url: https://aethernova.dev/policy-core/docs

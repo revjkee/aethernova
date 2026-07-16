@@ -1,0 +1,223 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Базовый слой
+resources:
+  - ../../base
+
+# Dev namespace и унификация метаданных
+namespace: ztc-dev
+namePrefix: dev-
+commonLabels:
+  app.kubernetes.io/part-of: core-systems
+  app.kubernetes.io/name: zero-trust-core
+  app.kubernetes.io/component: service
+  environment: dev
+commonAnnotations:
+  deploy.neurocity.io/owner: "platform-team"
+  deploy.neurocity.io/purpose: "dev"
+  deploy.neurocity.io/last-reviewed: "2025-08-19"
+
+# Обновление образов (kustomize автоматически заменит в Deployment)
+images:
+  - name: registry.example.com/core-systems/zero-trust-core
+    newName: registry.example.com/core-systems/zero-trust-core
+    newTag: dev-2025-08-19
+  # либо закрепите digest:
+  # - name: registry.example.com/core-systems/zero-trust-core
+  #   newName: registry.example.com/core-systems/zero-trust-core@sha256
+  #   newTag: "<digest>"
+
+# Генераторы конфигов/секретов (хеш в имени => контролируемый rollout)
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    config.neurocity.io/managed-by: kustomize
+  annotations:
+    config.neurocity.io/environment: dev
+
+configMapGenerator:
+  - name: avm-core-config
+    literals:
+      - AVM_ENV=dev
+      - AVM_LOG_LEVEL=DEBUG
+      - AVM_LOG_JSON=1
+      - AVM_HTTP_TIMEOUT=10
+      - AVM_HTTP_RETRIES=2
+      - AVM_OTEL_ENABLED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability:4317
+      - FEATURE_FLAGS_DEV_VERBOSE_ERRORS=true
+    # при наличии общего dev‑конфига — подключите файл:
+    # files:
+    #   - ../../../../configs/env/dev.yaml
+
+secretGenerator:
+  - name: avm-core-secrets
+    type: Opaque
+    # Для dev допустимы literals; в CI/Prod используйте внешние SecretStores
+    literals:
+      - database_url=postgresql+asyncpg://ztc:ztc@postgres.observability:5432/ztc
+      - redis_url=redis://:ztc@redis.observability:6379/2
+    # или файлы (kustomize подставит содержимое):
+    # files:
+    #   - jwt_signing_key_pem=../../../../secrets/dev/jwt_signing_key.pem
+
+# Реплики для dev и упрощённые ресурсы
+replicas:
+  - name: avm-core
+    count: 1
+
+# Патчи: strategic merge (Deployment) и JSON6902 для точечных правок
+patches:
+  # 1) Strategic‑merge: dev‑ресурсы/пробы/безопасность/монтирование конфигов и секретов
+  - target:
+      version: v1
+      kind: Deployment
+      name: avm-core
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: avm-core
+      spec:
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxSurge: 1
+            maxUnavailable: 0
+        template:
+          metadata:
+            labels:
+              observability.neurocity.io/tier: dev
+          spec:
+            serviceAccountName: avm-core
+            enableServiceLinks: false
+            nodeSelector:
+              kubernetes.io/os: linux
+            tolerations:
+              - key: "workload"
+                operator: "Equal"
+                value: "dev"
+                effect: "NoSchedule"
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 10001
+              runAsGroup: 10001
+              fsGroup: 10001
+              seccompProfile:
+                type: RuntimeDefault
+            containers:
+              - name: app
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: AVM_ENV
+                    value: "dev"
+                  - name: AVM_OTEL_ENABLED
+                    value: "1"
+                  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+                    valueFrom:
+                      configMapKeyRef:
+                        name: avm-core-config
+                        key: OTEL_EXPORTER_OTLP_ENDPOINT
+                        optional: true
+                  - name: AVM_DB_URL
+                    valueFrom:
+                      secretKeyRef:
+                        name: avm-core-secrets
+                        key: database_url
+                        optional: true
+                  - name: AVM_REDIS_URL
+                    valueFrom:
+                      secretKeyRef:
+                        name: avm-core-secrets
+                        key: redis_url
+                        optional: true
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "192Mi"
+                  limits:
+                    cpu: "300m"
+                    memory: "384Mi"
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                ports:
+                  - name: http
+                    containerPort: 8080
+                readinessProbe:
+                  httpGet:
+                    path: /healthz/ready
+                    port: http
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  failureThreshold: 6
+                livenessProbe:
+                  httpGet:
+                    path: /healthz/live
+                    port: http
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                startupProbe:
+                  httpGet:
+                    path: /healthz/startup
+                    port: http
+                  failureThreshold: 30
+                  periodSeconds: 3
+                  timeoutSeconds: 2
+                volumeMounts:
+                  - name: config
+                    mountPath: /app/configs
+                    readOnly: true
+                  - name: secrets
+                    mountPath: /app/secrets
+                    readOnly: true
+                  - name: tmp
+                    mountPath: /tmp
+                    readOnly: false
+            volumes:
+              - name: config
+                configMap:
+                  name: avm-core-config
+                  optional: true
+              - name: secrets
+                secret:
+                  secretName: avm-core-secrets
+                  optional: true
+              - name: tmp
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: "64Mi"
+
+  # 2) JSON6902: гарантировать namespace для Service/Deployment/HPA (если база не задаёт)
+  - target:
+      group: ""
+      version: v1
+      kind: Service
+      name: avm-core
+    patch: |
+      - op: replace
+        path: /metadata/namespace
+        value: ztc-dev
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: avm-core
+    patch: |
+      - op: replace
+        path: /metadata/namespace
+        value: ztc-dev
+  - target:
+      group: autoscaling
+      version: v2
+      kind: HorizontalPodAutoscaler
+      name: avm-core
+    patch: |
+      - op: replace
+        path: /metadata/namespace
+        value: ztc-dev

@@ -1,0 +1,3 @@
+# campaign-core
+
+Project Documentation

@@ -1,0 +1,209 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chronowatch-core-config
+  labels:
+    app.kubernetes.io/name: chronowatch-core
+    app.kubernetes.io/instance: chronowatch-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: chronowatch
+    app.kubernetes.io/version: "v0.1.0"
+    app.kubernetes.io/managed-by: kustomize
+    # Доп. операционные метки
+    topology.kubernetes.io/region: eu
+    chrono.aethernova.io/tier: core
+  annotations:
+    # Если используется Stakater Reloader — автоматический рестарт Pod при изменении ConfigMap
+    reloader.stakater.com/search: "true"
+    # Место для командной «живой» документации
+    docs.aethernova.io/purpose: "Base runtime config for ChronoWatch Core (safe defaults; override in overlays)"
+data:
+  # Главная конфигурация приложения: безопасные дефолты, переопределяются через оверлеи
+  application.yaml: |
+    app:
+      name: chronowatch-core
+      environment: production
+      # Внимание: секретные значения (токены/пароли) должны храниться в Secrets/Env, а не в ConfigMap.
+
+    server:
+      http:
+        port: 8080
+        # Таймауты и лимиты — для устойчивости под нагрузкой
+        readTimeoutMs: 10000
+        writeTimeoutMs: 15000
+        idleTimeoutMs: 60000
+        maxHeaderBytes: 1048576
+      gracefulShutdownMs: 20000
+      compression:
+        enabled: true
+        minBytes: 1024
+
+    security:
+      cors:
+        enabled: true
+        allowedOrigins:
+          - "https://chronowatch.app"
+          - "https://*.chronowatch.app"
+        allowedMethods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+        allowedHeaders: ["Content-Type","Authorization","X-Request-ID"]
+        allowCredentials: true
+        maxAgeSeconds: 600
+      headers:
+        # Базовая защита от XSS/clickjacking; тонкая настройка в Ingress/Envoy
+        contentSecurityPolicy: "default-src 'self'; frame-ancestors 'none'"
+        frameOptions: "DENY"
+        xssProtection: "1; mode=block"
+        referrerPolicy: "no-referrer"
+        strictTransportSecurity: "max-age=31536000; includeSubDomains"
+      auth:
+        mode: "oidc"   # oidc|token|none — переопределяйте в dev/qa
+        oidc:
+          issuer: "https://id.aethernova.io"
+          audience: "chronowatch-core"
+          jwksCacheTtlSec: 600
+          clockSkewSec: 60
+        token:
+          # Для сервисных токенов через Env/Secret; здесь только политика
+          acceptedAlgorithms: ["RS256","ES256"]
+      rateLimiting:
+        # Базовый лимитер на процесс (внешний слой — API GW)
+        enabled: true
+        strategy: "tokenBucket"
+        requestsPerSecond: 100.0
+        burst: 200
+
+    telemetry:
+      opentelemetry:
+        enabled: true
+        serviceName: "chronowatch-core"
+        exporter: "otlp"              # otlp|logging|none
+        endpoint: "http://otel-collector:4317"
+        protocol: "grpc"              # grpc|http/protobuf
+        sampling:
+          # 0.0..1.0; для продакшена 0.1–0.3 + head-based sampling на gateway
+          probability: 0.2
+        resource:
+          attributes:
+            deployment.environment: "production"
+            service.namespace: "chronowatch"
+            service.version: "v0.1.0"
+            region: "eu-north"
+      metrics:
+        prometheus:
+          enabled: true
+          path: "/metrics"
+          # label-карта для экспозиции; полезно в мульти-тенант окружениях
+          staticLabels:
+            app: "chronowatch-core"
+            tier: "core"
+      logging:
+        level:
+          root: "INFO"
+          # Точечное повышение уровня для диагностики
+          overrides:
+            "io.chronowatch.core": "INFO"
+            "org.apache.kafka": "WARN"
+        json: true
+        includeTraceIds: true
+        includeSpanIds: true
+
+    health:
+      livenessPath: "/health/live"
+      readinessPath: "/health/ready"
+      startupPath: "/health/startup"
+      # Дополнительные пробы зависят от БД/кэша
+      checks:
+        database: true
+        cache: true
+        messageBroker: true
+        objectStorage: false
+
+    features:
+      enableRealtimeAlerts: true
+      enableAnomalyDetector: true
+      enableExportReports: true
+      # Стратегии выката — для progressive delivery
+      rollout:
+        strategy: "blue-green"   # canary|blue-green|rolling
+        canary:
+          initialPercent: 5
+          stepPercent: 10
+          intervalSeconds: 300
+
+    clients:
+      httpDefaults:
+        connectTimeoutMs: 2000
+        requestTimeoutMs: 8000
+        maxIdleConns: 100
+        keepAliveMs: 60000
+        retry:
+          attempts: 3
+          backoffMs: 100
+          maxBackoffMs: 1000
+      postgres:
+        host: "postgres"
+        port: 5432
+        db: "chronowatch"
+        sslMode: "require"
+        # user/password из Secret
+        pool:
+          maxOpen: 50
+          maxIdle: 10
+          connMaxLifetimeSec: 3600
+      redis:
+        addr: "redis:6379"
+        db: 0
+        tls: false
+        poolSize: 200
+      kafka:
+        brokers: ["kafka-0.kafka:9092","kafka-1.kafka:9092"]
+        acks: "all"
+        compression: "snappy"
+        topicPrefix: "chrono."
+      s3:
+        endpoint: "http://minio.minio:9000"
+        bucket: "chronowatch"
+        pathStyle: true
+        # ключи — в Secret
+
+    schedules:
+      retentionCleanup:
+        cron: "0 3 * * *"   # ежедневно в 03:00
+        batchSize: 5000
+        ttlDays: 30
+      metricsRollup:
+        cron: "*/5 * * * *" # каждые 5 минут
+      anomalyScan:
+        cron: "*/2 * * * *" # каждые 2 минуты
+
+    api:
+      pagination:
+        defaultLimit: 50
+        maxLimit: 1000
+      defaults:
+        timezone: "Europe/Stockholm"
+        currency: "SEK"
+
+    i18n:
+      defaultLocale: "en"
+      supportedLocales: ["en","ru","sv"]
+
+    # Карта переменных окружения, которые сервис может читать как переопределения
+    envOverrides:
+      # пример: если переменная присутствует — она перекрывает значение из конфига
+      - name: "OTEL_EXPORTER_OTLP_ENDPOINT"
+        path: "telemetry.opentelemetry.endpoint"
+      - name: "CHRONO_POSTGRES_HOST"
+        path: "clients.postgres.host"
+      - name: "CHRONO_REDIS_ADDR"
+        path: "clients.redis.addr"
+
+  # Лёгкий артефакт для UI/health-страниц
+  version.json: |
+    {
+      "service": "chronowatch-core",
+      "version": "v0.1.0",
+      "build": "unknown",
+      "commit": "unknown",
+      "environment": "production"
+    }

@@ -1,0 +1,378 @@
+// File: zero-trust-core/schemas/proto/v1/zero_trust/session.proto
+syntax = "proto3";
+
+package zero_trust.v1;
+
+option go_package = "github.com/aethernova/zero-trust-core/gen/go/zero_trust/v1;ztv1";
+option java_multiple_files = true;
+option java_package = "com.aethernova.zerotrust.v1";
+option java_outer_classname = "ZeroTrustSessionProto";
+option csharp_namespace = "Aethernova.ZeroTrust.V1";
+
+// External well-knowns
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// ======================================================
+// Core session model
+// ======================================================
+
+message Session {
+  // Уникальный идентификатор сессии (ksuid/uuidv7). Не содержит PII.
+  string session_id = 1;
+
+  // Текущее состояние сессии.
+  SessionState state = 2;
+
+  // Кто аутентифицирован.
+  Subject subject = 3;
+
+  // Метаданные времени жизни сессии.
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  google.protobuf.Timestamp expires_at = 6;        // абсолютный TTL
+  google.protobuf.Timestamp idle_expires_at = 7;   // idle-таймаут (inactivity)
+
+  // Решение риск-движка для этой сессии (может влиять на step-up/deny).
+  RiskDecision risk = 8;
+
+  // Поза устройства и результаты аттестаций.
+  DevicePosture posture = 9;
+
+  // Привязка доказательства владения ключом (cnf): DPoP JKT / mTLS x5t#S256 / JWK thumbprint.
+  KeyBinding binding = 10;
+
+  // Текущий access-токен (метаданные, без «сырого» значения).
+  AccessToken access_token = 11;
+
+  // Текущий refresh-токен (метаданные, без «сырого» значения).
+  RefreshToken refresh_token = 12;
+
+  // Шаговая аутентификация (если требуется).
+  StepUp step_up = 13;
+
+  // Сервисные счетчики.
+  Counters counters = 14;
+
+  // Контекст сети и клиента при создании/последнем касании.
+  NetworkContext network = 15;
+  ClientContext client = 16;
+
+  // Низкокардинальные метки (tenant_id, request_id, endpoint и т.д.).
+  map<string, string> labels = 17;
+
+  // Расширяемые атрибуты (доп. контекст, не PII; следите за кардинальностью).
+  map<string, string> attributes = 18;
+
+  // Зарезервируйте диапазон под будущее расширение (без ломающих изменений).
+  reserved 100 to 199;
+}
+
+// Состояние сессии.
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_ACTIVE            = 1;
+  SESSION_PENDING_STEP_UP   = 2;
+  SESSION_REVOKED           = 3;
+  SESSION_EXPIRED           = 4;
+  SESSION_LOCKED            = 5; // временно заблокирована политикой/лимитами.
+}
+
+// Субъект аутентификации.
+message Subject {
+  string subject_id = 1;               // sub (строка)
+  string tenant_id  = 2;               // мульти-арендность
+  repeated string amr = 3;             // методы аутентификации (pwd, webauthn, totp, mfa, tls и т.д.)
+  repeated string roles = 4;           // авторизационные роли (низкокардинальные)
+  map<string, string> attributes = 5;  // дополнительные метки (низкокардинальные)
+}
+
+// Решение риск-движка.
+message RiskDecision {
+  // Интегральный риск 0..100 (0 — низкий риск).
+  int32 risk_score = 1;
+
+  // Рекомендуемое действие.
+  RiskAction action = 2;
+
+  // Причины (короткие, для UI/логов).
+  repeated string reasons = 3;
+
+  // Вклад отдельных сигналов: <signal_name, score (0..100)>.
+  map<string, int32> contributors = 4;
+}
+
+enum RiskAction {
+  RISK_ACTION_UNSPECIFIED = 0;
+  RISK_ACTION_ALLOW       = 1;
+  RISK_ACTION_STEP_UP     = 2;
+  RISK_ACTION_DENY        = 3;
+}
+
+// Привязка сессии к ключу клиента/каналу (cnf).
+message KeyBinding {
+  BindingType type = 1;
+  // Значение привязки:
+  // - при DPOP_JKT: base64url SHA-256 от JWK (jkt).
+  // - при MTLS_X5T_S256: base64url SHA-256 от сертификата клиента (x5t#S256).
+  // - при JWK_THUMBPRINT: base64url thumbprint RFC 7638.
+  string value = 2;
+  // Требуется ли привязка для всех запросов с этим токеном.
+  bool required = 3;
+
+  enum BindingType {
+    BINDING_TYPE_UNSPECIFIED = 0;
+    BINDING_NONE             = 1;
+    BINDING_DPOP_JKT         = 2;
+    BINDING_MTLS_X5T_S256    = 3;
+    BINDING_JWK_THUMBPRINT   = 4;
+  }
+}
+
+// Метаданные access-токена.
+// В целях безопасности хранится только идентификатор/хэш, не само значение.
+message AccessToken {
+  string token_id   = 1;                       // внутренний ID/handle
+  string sha256     = 2;                       // HEX/SRI хэш «сырого» токена
+  string issuer     = 3;                       // iss
+  string audience   = 4;                       // aud
+  string kid        = 5;                       // ключ подписи
+  bool   stateless  = 6;                       // true, если токен — JWT без state в хранилище
+  bool   dpop       = 7;                       // true, если PoP/DPoP-режим
+  repeated string scope = 8;                   // согласованные области
+  google.protobuf.Timestamp issued_at   = 9;   // iat
+  google.protobuf.Timestamp not_before  = 10;  // nbf
+  google.protobuf.Timestamp expires_at  = 11;  // exp
+  string subject     = 12;                     // продублированный sub (ускорение поиска)
+  string tenant_id   = 13;                     // продублированный tenant (ускорение поиска)
+}
+
+// Метаданные refresh-токена (ротация с защитой от повторов).
+message RefreshToken {
+  string token_id  = 1;                        // внутренний ID/handle
+  string sha256    = 2;                        // HEX/SRI хэш «сырого» токена
+  bool   one_time  = 3;                        // одноразовый (rotation: one_time)
+  int32  rotation_counter = 4;                 // инкремент
+  string parent_id = 5;                        // для цепочки ротаций
+  google.protobuf.Timestamp issued_at  = 6;
+  google.protobuf.Timestamp expires_at = 7;
+}
+
+// Требование step-up (доп. аутентификация).
+message StepUp {
+  bool required = 1;
+  // Список допустимых методов (webauthn/totp/u2f/smartcard и т.д.).
+  repeated string methods = 2;
+  // Крайний срок завершения step-up.
+  google.protobuf.Timestamp until = 3;
+}
+
+// Счетчики активности.
+message Counters {
+  uint64 logins    = 1;
+  uint64 refreshes = 2;
+  uint64 stepups   = 3;
+}
+
+// Контекст сети на момент создания/каcания.
+message NetworkContext {
+  string ip             = 1; // клиентский IP (после нормализации/маскирования)
+  string forward_chain  = 2; // XFF цепочка (по необходимости)
+  string asn            = 3;
+  string country_iso    = 4; // ISO 3166-1 alpha-2
+  bool via_corp_vpn     = 5;
+}
+
+// Контекст клиента/агента.
+message ClientContext {
+  string user_agent     = 1;
+  string client_version = 2; // версия фронтенда/моб. приложения
+  string platform       = 3; // браузер/OS/SDK
+  bool app_attested     = 4; // наличие платформенной/SDK аттестации
+  map<string, string> extra = 5;
+}
+
+// Поза устройства и аттестации.
+message DevicePosture {
+  string platform = 1;   // windows|macos|linux|ios|android
+  OS os = 2;
+
+  bool disk_encryption = 3;
+  bool firewall_enabled = 4;
+  int32 screen_lock_timeout_seconds = 5;
+
+  bool secure_boot = 6;   // для Windows/UEFI
+  bool tpm_present = 7;   // TPM/TEE наличие
+
+  string model = 8;       // модель устройства (низкокардинальная)
+  string os_build = 9;    // сборка/билд
+
+  EDR edr = 10;
+  AV  av  = 11;
+  MDM mdm = 12;
+
+  Attestation attest = 13;
+
+  bool rooted = 14;       // Android/Linux рут
+  bool jailbroken = 15;   // iOS джейлбрейк
+
+  map<string, string> extra = 99; // для вендор-специфичных атрибутов
+
+  message OS {
+    string name = 1;
+    string version = 2;
+    int32 patch_age_days = 3;
+  }
+
+  message EDR {
+    Status status = 1;
+    string vendor = 2;
+    enum Status {
+      STATUS_UNSPECIFIED = 0;
+      STATUS_HEALTHY     = 1;
+      STATUS_DEGRADED    = 2;
+      STATUS_MISSING     = 3;
+    }
+  }
+
+  message AV {
+    bool enabled = 1;
+    int32 definitions_age_days = 2;
+  }
+
+  message MDM {
+    bool managed = 1;
+    string vendor = 2;
+  }
+
+  message Attestation {
+    MDMProof mdm = 1;
+    WebAuthn webauthn = 2;
+    MTLS mtls = 3;
+
+    message MDMProof {
+      bool valid = 1;
+      google.protobuf.Timestamp ts = 2;
+    }
+
+    message WebAuthn {
+      bool attested = 1;
+      string aaguid = 2;
+    }
+
+    message MTLS {
+      string subject_dn = 1;
+      string spki_sha256 = 2; // base64/HEX; договоритесь о формате в реализации
+    }
+  }
+}
+
+// ======================================================
+–// Revocation / audit events (для потоков отзыва)
+// ======================================================
+
+message RevocationEvent {
+  string session_id = 1;
+  RevocationReason reason = 2;
+  string by = 3; // кто инициировал (system/admin/user)
+  map<string, string> labels = 4; // tenant_id, request_id, endpoint
+  google.protobuf.Timestamp at = 5;
+}
+
+enum RevocationReason {
+  REVOCATION_REASON_UNSPECIFIED = 0;
+  REVOCATION_USER_LOGOUT        = 1;
+  REVOCATION_ADMIN_FORCE        = 2;
+  REVOCATION_RISK_DENY          = 3;
+  REVOCATION_TOKEN_REPLAY       = 4;
+  REVOCATION_KEY_ROLLOVER       = 5;
+}
+
+// ======================================================
+// gRPC Service (опционально; используйте при необходимости)
+// ======================================================
+
+service SessionService {
+  // Интроспекция по session_id или по хэшу токена.
+  rpc Introspect (IntrospectRequest) returns (IntrospectResponse);
+
+  // Мягкое касание (продлевает idle TTL согласно политике).
+  rpc Touch (TouchRequest) returns (TouchResponse);
+
+  // Пометка step-up как завершенного (успешная дополнительная проверка).
+  rpc StepUpComplete (StepUpCompleteRequest) returns (StepUpCompleteResponse);
+
+  // Отзыв активной сессии.
+  rpc Revoke (RevokeRequest) returns (RevokeResponse);
+
+  // (Опционально) Пагинированный список сессий субъекта/арендатора.
+  rpc List (ListSessionsRequest) returns (ListSessionsResponse);
+}
+
+message IntrospectRequest {
+  // Один из идентификаторов (заполните только одно поле).
+  oneof target {
+    string session_id = 1;
+    string token_sha256 = 2; // HEX/SRI хэш access/refresh токена
+  }
+  // Требовать жесткую проверку привязки PoP (если применимо).
+  bool enforce_binding = 3;
+}
+
+message IntrospectResponse {
+  bool found = 1;
+  Session session = 2;
+  // Эффективное действие с учетом политики на момент запроса.
+  RiskAction effective_action = 3;
+}
+
+message TouchRequest {
+  string session_id = 1;
+  // Если true — касание возможно только для ACTIVE (иначе 412/FAILED_PRECONDITION).
+  bool only_if_active = 2;
+  // Доп. контекст для обновления (например, смена IP/UA).
+  NetworkContext network = 3;
+  ClientContext client = 4;
+}
+
+message TouchResponse {
+  Session session = 1;
+}
+
+message StepUpCompleteRequest {
+  string session_id = 1;
+  string method = 2; // фактически примененный метод (webauthn/totp/etc.)
+}
+
+message StepUpCompleteResponse {
+  Session session = 1;
+}
+
+message RevokeRequest {
+  string session_id = 1;
+  RevocationReason reason = 2;
+  // Немедленно сделать невалидной всю «семью» refresh-цепочки.
+  bool revoke_family = 3;
+}
+
+message RevokeResponse {
+  bool ok = 1;
+  google.protobuf.Timestamp revoked_at = 2;
+}
+
+message ListSessionsRequest {
+  // Фильтры (любые комбинации).
+  string subject_id = 1;
+  string tenant_id = 2;
+  SessionState state = 3;
+
+  // Пагинация.
+  int32 page_size = 10;
+  string page_token = 11;
+}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+  string next_page_token = 2;
+}

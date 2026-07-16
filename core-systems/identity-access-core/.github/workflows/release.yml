@@ -1,0 +1,223 @@
+# core-systems/identity-access-core/.github/workflows/release.yml
+name: Release (Identity Access Core)
+
+on:
+  push:
+    tags:
+      # Рекомендуемый формат тега для моно-репо: identity-access-core/v1.2.3
+      - "identity-access-core/v*"
+      # Если вы используете общий формат: v1.2.3 (оставлено как опция)
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write          # нужно для создания GitHub Release и загрузки ассетов
+  actions: read
+  checks: read
+  id-token: write          # нужно для современных аттестаций (если добавите позже)
+  attestations: write      # зарезервировано под attestations (не ломает, даже если не используется)
+
+env:
+  PYTHON_VERSION: "3.12"
+  MODULE_DIR: "core-systems/identity-access-core"
+  DIST_DIR: "dist"
+  # Если ваш пакет называется иначе, замените.
+  PACKAGE_NAME: "identity-access-core"
+
+jobs:
+  validate_tag:
+    name: Validate tag and derive version
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      version: ${{ steps.meta.outputs.version }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      is_scoped_tag: ${{ steps.meta.outputs.is_scoped_tag }}
+    steps:
+      - name: Compute tag metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # Допускаем:
+          # 1) identity-access-core/v1.2.3
+          # 2) v1.2.3
+          if [[ "$TAG" =~ ^identity-access-core/v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z\.-]+)?$ ]]; then
+            VER="${BASH_REMATCH[1]}${BASH_REMATCH[2]:-}"
+            echo "is_scoped_tag=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z\.-]+)?$ ]]; then
+            VER="${BASH_REMATCH[1]}${BASH_REMATCH[2]:-}"
+            echo "is_scoped_tag=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Invalid tag format: $TAG"
+            echo "Expected: identity-access-core/vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH"
+            exit 2
+          fi
+
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "release_name=Identity Access Core v${VER}" >> "$GITHUB_OUTPUT"
+
+  test_build:
+    name: QA, tests, build (wheel/sdist)
+    runs-on: ubuntu-latest
+    needs: validate_tag
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.MODULE_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: |
+            ${{ env.MODULE_DIR }}/pyproject.toml
+            ${{ env.MODULE_DIR }}/requirements.txt
+            ${{ env.MODULE_DIR }}/requirements-dev.txt
+
+      - name: Upgrade packaging tooling
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade build wheel
+
+      - name: Install project (dev)
+        run: |
+          set -euo pipefail
+          if [[ -f "pyproject.toml" ]]; then
+            python -m pip install -e ".[dev]" || python -m pip install -e "."
+          elif [[ -f "requirements-dev.txt" ]]; then
+            python -m pip install -r requirements-dev.txt
+          elif [[ -f "requirements.txt" ]]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "No dependency manifest found in ${MODULE_DIR}."
+            exit 3
+          fi
+
+      - name: Lint (ruff) if available
+        run: |
+          set -euo pipefail
+          if python -c "import ruff" >/dev/null 2>&1; then
+            ruff check .
+          else
+            echo "ruff not installed; skipping."
+          fi
+
+      - name: Typecheck (mypy) if available
+        run: |
+          set -euo pipefail
+          if python -c "import mypy" >/dev/null 2>&1; then
+            mypy .
+          else
+            echo "mypy not installed; skipping."
+          fi
+
+      - name: Tests (pytest) if available
+        run: |
+          set -euo pipefail
+          if python -c "import pytest" >/dev/null 2>&1; then
+            pytest -q
+          else
+            echo "pytest not installed; skipping."
+          fi
+
+      - name: Build sdist and wheel
+        run: |
+          set -euo pipefail
+          rm -rf "${DIST_DIR}"
+          python -m build --sdist --wheel --outdir "${DIST_DIR}"
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: |
+            ${{ env.MODULE_DIR }}/${{ env.DIST_DIR }}/*
+          if-no-files-found: error
+          retention-days: 30
+
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: test_build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: sbom_input/dist
+
+      - name: SBOM (repository)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom-repo.spdx.json
+
+      - name: SBOM (dist artifacts)
+        uses: anchore/sbom-action@v0
+        with:
+          path: sbom_input/dist
+          format: spdx-json
+          output-file: sbom-dist.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom-repo.spdx.json
+            sbom-dist.spdx.json
+          if-no-files-found: error
+          retention-days: 90
+
+  github_release:
+    name: Create GitHub Release and upload assets
+    runs-on: ubuntu-latest
+    needs: [validate_tag, test_build, sbom]
+
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: release_assets/dist
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: release_assets/sbom
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate_tag.outputs.tag_name }}
+          name: ${{ needs.validate_tag.outputs.release_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.validate_tag.outputs.version, '-') }}
+          files: |
+            release_assets/dist/*
+            release_assets/sbom/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

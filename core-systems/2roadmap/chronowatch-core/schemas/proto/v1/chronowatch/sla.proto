@@ -1,0 +1,359 @@
+syntax = "proto3";
+
+package chronowatch.v1;
+
+option go_package = "github.com/chronowatch/chronowatch-core/schemas/proto/v1/chronowatch;chronowatchv1";
+option java_package = "com.chronowatch.v1";
+option java_multiple_files = true;
+option csharp_namespace = "ChronoWatch.V1";
+option php_namespace = "ChronoWatch\\V1";
+option objc_class_prefix = "CWX";
+option optimize_for = SPEED;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/field_mask.proto";
+// Опционально раскомментируйте при использовании gRPC-HTTP и ресурсных аннотаций:
+// import "google/api/annotations.proto";
+// import "google/api/resource.proto";
+// Опционально раскомментируйте при использовании protoc-gen-validate (PGV):
+// import "validate/validate.proto";
+
+//------------------------------------------------------------------------------
+// Базовые перечисления и вспомогательные типы
+//------------------------------------------------------------------------------
+
+enum SLIType {
+  SLI_TYPE_UNSPECIFIED = 0;
+  SLI_TYPE_AVAILABILITY = 1;   // доля успешных событий
+  SLI_TYPE_LATENCY = 2;        // доля запросов быстрее порога
+  SLI_TYPE_ERROR_RATE = 3;     // доля ошибочных событий
+  SLI_TYPE_THROUGHPUT = 4;     // событий в единицу времени (целевой минимум)
+  SLI_TYPE_CUSTOM = 5;         // кастомные критерии (через атрибуты/запрос)
+}
+
+enum Comparator {
+  COMPARATOR_UNSPECIFIED = 0;
+  COMPARATOR_LT = 1;
+  COMPARATOR_LTE = 2;
+  COMPARATOR_GT = 3;
+  COMPARATOR_GTE = 4;
+  COMPARATOR_EQ = 5;
+  COMPARATOR_NEQ = 6;
+}
+
+enum CalendarPeriod {
+  CALENDAR_PERIOD_UNSPECIFIED = 0;
+  CALENDAR_PERIOD_DAY = 1;
+  CALENDAR_PERIOD_WEEK = 2;
+  CALENDAR_PERIOD_MONTH = 3;
+  CALENDAR_PERIOD_QUARTER = 4;
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO = 1;
+  SEVERITY_WARNING = 2;
+  SEVERITY_CRITICAL = 3;
+}
+
+enum ChannelType {
+  CHANNEL_TYPE_UNSPECIFIED = 0;
+  CHANNEL_TYPE_PAGERDUTY = 1;
+  CHANNEL_TYPE_SLACK = 2;
+  CHANNEL_TYPE_EMAIL = 3;
+  CHANNEL_TYPE_WEBHOOK = 4;
+}
+
+//------------------------------------------------------------------------------
+// Фильтры и спецификации SLI
+//------------------------------------------------------------------------------
+
+message LabelSet {
+  map<string, string> labels = 1;
+}
+
+// Универсальный фильтр для выделения потока событий/запросов, к которым применяется SLI.
+message SLIFilter {
+  // Логические метки для сервиса/роута/операции (service.name, http.route и т.п.)
+  map<string, string> attribute_equals = 1;
+
+  // Дополнительные частичные совпадения (regex, если поддерживается поставщиком данных).
+  map<string, string> attribute_matches = 2;
+
+  // Произвольные примечания/подсказки (не управляющее поле).
+  string comment = 10;
+}
+
+// Специфично для разных типов SLI
+message AvailabilitySpec {
+  // HTTP статусы, считающиеся успешными (например, 2xx и 3xx).
+  repeated int32 success_statuses = 1; // пустой => 200..399
+  // Если указано, выражение в терминах атрибутов события, возвращающее true/false (провайдер-агностично).
+  string success_expr = 2;
+}
+
+message LatencySpec {
+  // Порог латентности, для SLI считается успехом "duration <= threshold".
+  google.protobuf.Duration threshold = 1;       // например, 300ms
+  // Квантиль для оценки (обычно p90/p95/p99) как доля быстрее порога.
+  double percentile = 2;                         // 0.0..1.0; напр., 0.95
+}
+
+message ErrorRateSpec {
+  // Атрибут/признак ошибки (например, http.status_code >= 500).
+  string error_expr = 1;
+}
+
+message ThroughputSpec {
+  // Минимально ожидаемая пропускная способность.
+  double min_events_per_minute = 1;
+}
+
+message CustomSpec {
+  // Пользовательская логика в абстрактном выражении (провайдер-агностично).
+  string success_expr = 1;
+}
+
+// Объединённая спецификация SLI.
+message SLISpec {
+  SLIType type = 1;
+  SLIFilter filter = 2;
+
+  oneof spec {
+    AvailabilitySpec availability = 10;
+    LatencySpec latency = 11;
+    ErrorRateSpec error_rate = 12;
+    ThroughputSpec throughput = 13;
+    CustomSpec custom = 14;
+  }
+}
+
+//------------------------------------------------------------------------------
+// Окна измерения и целевые значения SLO
+//------------------------------------------------------------------------------
+
+message RollingWindow {
+  // Роллинг-окно (например, 30d).
+  google.protobuf.Duration length = 1;
+}
+
+message CalendarWindow {
+  CalendarPeriod period = 1; // WEEK/MONTH/QUARTER
+}
+
+message TimeWindow {
+  oneof kind {
+    RollingWindow rolling = 1;
+    CalendarWindow calendar = 2;
+  }
+}
+
+// Цель SLO: какая доля успеха ожидается в выбранном окне.
+message SLOTarget {
+  // Например, 0.999 для 99.9%
+  double objective = 1; // 0.0..1.0
+  TimeWindow window = 2;
+
+  // Доп. граничные условия (для Throughput и др.)
+  message Threshold {
+    Comparator comparator = 1;
+    double value = 2;
+  }
+  repeated Threshold additional_thresholds = 10;
+
+  // Описание цели (для документации).
+  string description = 20;
+}
+
+//------------------------------------------------------------------------------
+// Error Budget policy и алертинг (multi-window multi-burn)
+//------------------------------------------------------------------------------
+
+message BurnWindow {
+  // Смотрим за этот lookback.
+  google.protobuf.Duration lookback = 1;
+  // Порог скорости расхода (например, 14.4 для «2ч/30д»).
+  double burn_rate = 2;
+  Severity severity = 3;
+}
+
+message ErrorBudgetPolicy {
+  // Набор окон для стратегии multi-window multi-burn.
+  repeated BurnWindow windows = 1;
+  // Минимальная длительность подтверждения нарушений (anti-flapping).
+  google.protobuf.Duration minimum_violation_duration = 2;
+}
+
+// Правила оповещений на основе ошибок SLO и интеграции с каналами
+message AlertPolicy {
+  string name = 1;
+  ErrorBudgetPolicy budget_policy = 2;
+
+  // Статический приоритет/эскалация
+  Severity default_severity = 3;
+
+  // Привязанные каналы (по имени).
+  repeated string channel_refs = 4;
+
+  // Условные подавления (например, если падает ingress/DNS — не тревожить прикладной SLO)
+  repeated string suppress_when_failed_refs = 5;
+}
+
+// Конфиг канала оповещений
+message NotificationChannel {
+  string name = 1;
+  ChannelType type = 2;
+
+  message PagerDutyConfig {
+    string routing_key = 1;
+  }
+  message SlackConfig {
+    string webhook_url = 1;
+    string channel = 2;
+  }
+  message EmailConfig {
+    repeated string to = 1;
+  }
+  message WebhookConfig {
+    string url = 1;
+    map<string, string> headers = 2;
+  }
+
+  oneof config {
+    PagerDutyConfig pagerduty = 10;
+    SlackConfig slack = 11;
+    EmailConfig email = 12;
+    WebhookConfig webhook = 13;
+  }
+}
+
+//------------------------------------------------------------------------------
+// Основной ресурс SLA и связанная модель
+//------------------------------------------------------------------------------
+
+message Sla {
+  // Идентификатор по AIP-стилю (пример): projects/{project}/locations/{location}/slas/{sla}
+  string name = 1;
+
+  string display_name = 2;
+  string description = 3;
+  LabelSet labels = 4;
+
+  // Владелец/контакт (группа/почта/идентификатор команды).
+  string owner = 5;
+
+  // Что измеряем (SLI) и как оцениваем (одна или несколько SLO целей).
+  SLISpec sli = 10;
+  repeated SLOTarget slo_targets = 11;
+
+  // Политика и алертинг.
+  repeated AlertPolicy alert_policies = 20;
+  repeated NotificationChannel channels = 21;
+
+  // Аудитные поля.
+  google.protobuf.Timestamp create_time = 100;
+  google.protobuf.Timestamp update_time = 101;
+  string etag = 102;
+}
+
+// Результаты оценки (Evaluate) для конкретного окна.
+message EvaluationWindow {
+  TimeWindow window = 1;
+  // Фактическая доля успеха.
+  double attained_objective = 2;    // 0.0..1.0
+  // Цель из SLO.
+  double target_objective = 3;      // 0.0..1.0
+  // Остаток error budget (0..1 от бюджета окна).
+  double error_budget_remaining = 4;
+  // Текущая оценка расхода (burn rate).
+  double burn_rate = 5;
+  // Был ли breach по политике.
+  bool breached = 6;
+  Severity severity = 7;
+}
+
+message EvaluationResult {
+  string sla_name = 1;
+  repeated EvaluationWindow windows = 2;
+  google.protobuf.Timestamp evaluated_at = 3;
+}
+
+//------------------------------------------------------------------------------
+// Запросы/ответы сервиса
+//------------------------------------------------------------------------------
+
+message CreateSlaRequest {
+  string parent = 1; // projects/{project}/locations/{location}
+  Sla sla = 2;
+}
+
+message GetSlaRequest {
+  string name = 1;
+}
+
+message ListSlasRequest {
+  string parent = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  // Фильтр по меткам/владельцу/типу SLI (реализация-зависимый синтаксис).
+  string filter = 4;
+}
+
+message ListSlasResponse {
+  repeated Sla slas = 1;
+  string next_page_token = 2;
+}
+
+message UpdateSlaRequest {
+  Sla sla = 1;
+  google.protobuf.FieldMask update_mask = 2;
+}
+
+message DeleteSlaRequest {
+  string name = 1;
+  // Защита от гонок.
+  string etag = 2;
+}
+
+message EvaluateSlaRequest {
+  string name = 1;
+  // Необязательная «сейчас» для воспроизводимых расчётов.
+  google.protobuf.Timestamp as_of = 2;
+}
+
+message EvaluateSlaResponse {
+  EvaluationResult result = 1;
+}
+
+//------------------------------------------------------------------------------
+// Сервис управления SLA/SLO
+//------------------------------------------------------------------------------
+
+service SlaService {
+  rpc CreateSla(CreateSlaRequest) returns (Sla) {
+    // option (google.api.http) = {
+    //   post: "/v1/{parent=projects/*/locations/*}/slas"
+    //   body: "sla"
+    // };
+  }
+  rpc GetSla(GetSlaRequest) returns (Sla) {
+    // option (google.api.http) = { get: "/v1/{name=projects/*/locations/*/slas/*}" };
+  }
+  rpc ListSlas(ListSlasRequest) returns (ListSlasResponse) {
+    // option (google.api.http) = { get: "/v1/{parent=projects/*/locations/*}/slas" };
+  }
+  rpc UpdateSla(UpdateSlaRequest) returns (Sla) {
+    // option (google.api.http) = {
+    //   patch: "/v1/{sla.name=projects/*/locations/*/slas/*}"
+    //   body: "sla"
+    // };
+  }
+  rpc DeleteSla(DeleteSlaRequest) returns (.google.protobuf.Struct) {
+    // option (google.api.http) = { delete: "/v1/{name=projects/*/locations/*/slas/*}" };
+  }
+  rpc EvaluateSla(EvaluateSlaRequest) returns (EvaluateSlaResponse) {
+    // option (google.api.http) = { post: "/v1/{name=projects/*/locations/*/slas/*}:evaluate" };
+  }
+}

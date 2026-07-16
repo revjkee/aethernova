@@ -1,0 +1,299 @@
+name: csmarket
+
+x-logging: &logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-default-security: &default_security
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+x-service-common: &service_common
+  restart: unless-stopped
+  networks:
+    - csmarket-backend
+  logging: *logging
+  <<: *default_security
+  environment:
+    APP_ENV: ${APP_ENV:-prod}
+    TZ: ${TZ:-Europe/Stockholm}
+
+x-healthcheck-common: &hc_common
+  interval: 10s
+  timeout: 5s
+  retries: 20
+  start_period: 20s
+
+x-app-env: &app_env
+  DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://csmarket:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-csmarket}
+  JWT_ISSUER: ${JWT_ISSUER:-csmarket}
+  JWT_AUDIENCE: ${JWT_AUDIENCE:-csmarket-users}
+  JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+  JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private_key
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: csmarket-postgres
+    restart: unless-stopped
+    networks:
+      - csmarket-backend
+    logging: *logging
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-csmarket}
+      POSTGRES_USER: ${POSTGRES_USER:-csmarket}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: ${TZ:-Europe/Stockholm}
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h 127.0.0.1 -p 5432"]
+      <<: *hc_common
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "effective_cache_size=768MB"
+      - "-c"
+      - "work_mem=8MB"
+      - "-c"
+      - "maintenance_work_mem=64MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "wal_compression=on"
+      - "-c"
+      - "log_min_duration_statement=500"
+      - "-c"
+      - "log_statement=none"
+      - "-c"
+      - "log_line_prefix=%m [%p] %u@%d "
+      - "-c"
+      - "idle_in_transaction_session_timeout=60000"
+      - "-c"
+      - "statement_timeout=60000"
+      - "-c"
+      - "jit=off"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.00"
+          memory: 2048M
+        reservations:
+          cpus: "0.50"
+          memory: 512M
+
+  redis:
+    image: redis:7-alpine
+    container_name: csmarket-redis
+    restart: unless-stopped
+    networks:
+      - csmarket-backend
+    logging: *logging
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
+      - "--save"
+      - "900"
+      - "1"
+      - "--save"
+      - "300"
+      - "10"
+      - "--save"
+      - "60"
+      - "10000"
+      - "--protected-mode"
+      - "yes"
+      - "--bind"
+      - "0.0.0.0"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *hc_common
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+
+  csmarket-api:
+    container_name: csmarket-api
+    <<: *service_common
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_ENV: ${APP_ENV:-prod}
+    environment:
+      <<: *app_env
+      UVICORN_HOST: "0.0.0.0"
+      UVICORN_PORT: "8080"
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-2}
+    secrets:
+      - jwt_public_key
+      - jwt_private_key
+      - postgres_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      <<: *hc_common
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+    volumes:
+      - type: bind
+        source: ./configs
+        target: /app/configs
+        read_only: true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.00"
+          memory: 1024M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  csmarket-worker:
+    container_name: csmarket-worker
+    <<: *service_common
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_ENV: ${APP_ENV:-prod}
+    environment:
+      <<: *app_env
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+    secrets:
+      - jwt_public_key
+      - jwt_private_key
+      - postgres_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "app.worker"]
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "2.00"
+          memory: 1024M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  csmarket-migrate:
+    container_name: csmarket-migrate
+    <<: *service_common
+    profiles: ["migrate"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_ENV: ${APP_ENV:-prod}
+    environment:
+      <<: *app_env
+    secrets:
+      - postgres_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.migrate"]
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: csmarket-nginx
+    restart: unless-stopped
+    networks:
+      - csmarket-backend
+      - csmarket-edge
+    logging: *logging
+    <<: *default_security
+    depends_on:
+      csmarket-api:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-8088}:8088"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    volumes:
+      - type: bind
+        source: ./deploy/nginx/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+      - type: bind
+        source: ./deploy/nginx/conf.d
+        target: /etc/nginx/conf.d
+        read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8088/healthz || exit 1"]
+      <<: *hc_common
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 256M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+
+networks:
+  csmarket-backend:
+    driver: bridge
+    internal: true
+  csmarket-edge:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  jwt_public_key:
+    file: ./secrets/jwt_public_key.pem
+  jwt_private_key:
+    file: ./secrets/jwt_private_key.pem

@@ -1,0 +1,3 @@
+# fraud-core
+
+Project Documentation

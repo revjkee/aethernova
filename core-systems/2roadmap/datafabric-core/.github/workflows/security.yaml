@@ -1,0 +1,244 @@
+name: security
+
+on:
+  push:
+    branches: [ main, release/* ]
+  pull_request:
+    branches: [ main, release/* ]
+  schedule:
+    - cron: "17 3 * * 2"        # еженедельно по вторникам 03:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  FORCE_COLOR: "1"
+
+jobs:
+  prepare:
+    name: Prepare / Filters
+    runs-on: ubuntu-latest
+    outputs:
+      has_dockerfile: ${{ steps.detect.outputs.has_dockerfile }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          if git ls-files | grep -E '(^|/)(Dockerfile|dockerfile)(\..*)?$' >/dev/null; then
+            echo "has_dockerfile=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  codeql:
+    name: CodeQL (Python)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-and-quality
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install deps (best-effort)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          if [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install -e . || true; fi
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  dep_review:
+    name: Dependency Review (PR only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          allow-ghsas: true
+
+  pip_audit:
+    name: Python deps (pip-audit)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [ "3.10", "3.11" ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: "pip"
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install -e .; fi
+      - name: pip-audit
+        run: |
+          python -m pip install pip-audit
+          # генерируем SBOM‑совместимый отчёт и SARIF
+          pip-audit -r requirements.txt -f sarif -o pip-audit.sarif || true
+          if [ -f pyproject.toml ]; then pip-audit -f sarif -o pip-audit-pyproject.sarif || true; fi
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pip-audit.sarif
+      - name: Upload SARIF (pyproject)
+        if: hashFiles('pyproject.toml') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pip-audit-pyproject.sarif
+
+  bandit:
+    name: Bandit (SAST Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - name: Install bandit
+        run: python -m pip install bandit
+      - name: Run bandit
+        run: |
+          bandit -r engine-core -f sarif -o bandit.sarif || true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+
+  semgrep:
+    name: Semgrep (rules: auto + ci)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: returntocorp/semgrep-action@v1
+        with:
+          auditOn: push
+          config: >-
+            p/ci
+          generateSarif: true
+          publishToken: ${{ secrets.SEMGREP_APP_TOKEN }}
+          uploadSarif: true
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+  gitleaks:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --report-format sarif --report-path gitleaks.sarif || true
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+
+  trivy_fs:
+    name: Trivy FS (IaC + deps + secrets)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+  trivy_image:
+    name: Trivy Image (Docker)
+    needs: prepare
+    if: needs.prepare.outputs.has_dockerfile == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (dev)
+        run: |
+          img="ghcr.io/${{ github.repository }}:security-scan"
+          docker build -t "$img" .
+          echo "IMAGE=$img" >> $GITHUB_ENV
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: sarif
+          output: trivy-image.sarif
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+  sbom:
+    name: SBOM (Syft)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: sbom.spdx.json
+
+  pr_labels:
+    name: Label PR on security changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add label if security-relevant files changed
+        uses: actions-ecosystem/action-add-labels@v1
+        with:
+          labels: security
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

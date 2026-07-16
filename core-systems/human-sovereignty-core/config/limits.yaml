@@ -1,0 +1,296 @@
+# human-sovereignty-core/config/limits.yaml
+#
+# Purpose:
+#   Central source of truth for safety limits (rate, size, concurrency, timeouts, quotas)
+#   for Human Sovereignty Core.
+#
+# Design principles:
+#   - Deterministic, explicit units (ms, s, bytes, KB/MB, counts)
+#   - Fail-closed where security is impacted
+#   - Separate limits by surface (public API, auth, admin, webhooks, jobs)
+#   - Defaults are conservative; environment overlays (dev/stage/prod) may relax/tighten
+#
+# Notes:
+#   - Values are policy defaults; enforcement is implemented in gateways/middlewares/workers.
+#   - Keep this file stable; changes should be audited in version control.
+
+version: 1
+
+metadata:
+  owner: human-sovereignty-core
+  policy_id: HSC-LIMITS-0001
+  change_control:
+    requires_review: true
+    requires_security_review: true
+  units:
+    time: [ms, s]
+    size: [bytes, KB, MB]
+    rate: [per_second, per_minute, per_hour]
+    count: [items]
+
+global:
+  enforcement:
+    mode: strict
+    fail_closed:
+      rate_limit_backend_unavailable: true
+      quota_backend_unavailable: true
+      token_introspection_unavailable: true
+      policy_engine_unavailable: true
+  timeouts:
+    # Hard ceilings; individual subsystems should be lower.
+    request_hard_timeout_ms: 30000
+    upstream_connect_timeout_ms: 3000
+    upstream_read_timeout_ms: 10000
+    upstream_write_timeout_ms: 10000
+  payloads:
+    max_request_body_bytes: 1048576        # 1 MB
+    max_response_body_bytes: 2097152       # 2 MB
+    max_header_bytes: 32768                # 32 KB
+    max_headers_count: 100
+    max_query_string_bytes: 8192           # 8 KB
+    max_path_bytes: 2048                   # 2 KB
+  parsing:
+    json:
+      max_depth: 64
+      max_keys: 4096
+      max_string_bytes: 262144            # 256 KB
+      max_array_length: 100000
+      reject_nan_inf: true
+    multipart:
+      max_parts: 50
+      max_part_name_bytes: 256
+      max_part_header_bytes: 8192
+  concurrency:
+    max_in_flight_requests_per_instance: 512
+    max_in_flight_requests_per_ip: 32
+    max_in_flight_requests_per_token: 64
+
+network:
+  ip_reputation:
+    enabled: true
+  allowlist:
+    enabled: false
+    cidrs: []
+  blocklist:
+    enabled: true
+    cidrs: []
+  geo_policy:
+    enabled: false
+    allow_countries: []
+    deny_countries: []
+
+auth:
+  password_policy:
+    min_length: 12
+    max_length: 128
+    max_attempts_per_identity_per_hour: 10
+    lockout_seconds: 900
+  mfa:
+    otp:
+      max_attempts_per_window: 5
+      window_seconds: 300
+  sessions:
+    max_sessions_per_user: 10
+    session_idle_timeout_seconds: 3600
+    session_absolute_timeout_seconds: 86400
+  tokens:
+    access_token_ttl_seconds: 900
+    refresh_token_ttl_seconds: 2592000
+    max_token_size_bytes: 4096
+    max_scopes_per_token: 128
+    max_audiences_per_token: 16
+    max_custom_claims: 64
+    introspection_timeout_ms: 1500
+  device_trust:
+    max_devices_per_user: 25
+
+api:
+  public:
+    rate_limits:
+      # Applied at edge. Burst is short-term allowance.
+      anonymous:
+        per_ip:
+          per_minute: 60
+          burst: 30
+      authenticated:
+        per_token:
+          per_minute: 600
+          burst: 120
+      write_operations:
+        per_token:
+          per_minute: 120
+          burst: 30
+    idempotency:
+      enabled: true
+      key_max_bytes: 128
+      cache_ttl_seconds: 86400
+    pagination:
+      default_limit: 50
+      max_limit: 200
+      max_offset: 100000
+    search:
+      max_query_bytes: 512
+      max_filters: 32
+      max_sort_fields: 5
+      max_expand_fields: 20
+
+  internal:
+    rate_limits:
+      service_to_service:
+        per_minute: 6000
+        burst: 1000
+    timeouts:
+      request_soft_timeout_ms: 8000
+    pagination:
+      max_limit: 1000
+
+admin:
+  enabled: true
+  rate_limits:
+    per_admin_token:
+      per_minute: 300
+      burst: 60
+  actions:
+    destructive:
+      require_step_up_auth: true
+      max_per_hour: 30
+    exports:
+      max_rows: 200000
+      max_bytes: 52428800                 # 50 MB
+      timeout_ms: 30000
+
+webhooks:
+  outbound:
+    enabled: true
+    delivery:
+      max_attempts: 10
+      initial_backoff_seconds: 5
+      max_backoff_seconds: 3600
+      timeout_ms: 5000
+      max_payload_bytes: 262144           # 256 KB
+    rate_limits:
+      per_destination_host:
+        per_minute: 600
+        burst: 120
+      per_tenant:
+        per_minute: 3000
+        burst: 600
+    signing:
+      enabled: true
+      algorithm: hmac-sha256
+      signature_header: X-HSC-Signature
+      timestamp_header: X-HSC-Timestamp
+      max_clock_skew_seconds: 300
+
+uploads:
+  enabled: true
+  max_file_bytes: 10485760               # 10 MB
+  allowed_content_types:
+    - application/json
+    - text/plain
+    - application/pdf
+    - image/png
+    - image/jpeg
+  antivirus:
+    required: true
+    scan_timeout_ms: 10000
+  rate_limits:
+    per_token:
+      per_hour: 120
+      burst: 10
+
+jobs:
+  background:
+    max_concurrent_jobs_per_instance: 32
+    max_job_runtime_seconds: 600
+    max_job_payload_bytes: 262144         # 256 KB
+    retries:
+      max_attempts: 8
+      initial_backoff_seconds: 2
+      max_backoff_seconds: 600
+  schedulers:
+    max_cron_expressions_per_tenant: 50
+    min_interval_seconds: 60
+
+queues:
+  enabled: true
+  broker:
+    publish_timeout_ms: 1500
+    consume_prefetch: 100
+  limits:
+    max_queue_depth_per_tenant: 100000
+    max_message_bytes: 262144             # 256 KB
+    max_messages_per_second_per_tenant: 500
+  dlq:
+    enabled: true
+    max_redeliveries: 5
+
+storage:
+  quotas:
+    per_tenant:
+      max_objects: 1000000
+      max_total_bytes: 10737418240        # 10 GB
+    per_user:
+      max_objects: 100000
+      max_total_bytes: 2147483648         # 2 GB
+  retention:
+    audit_logs_days: 365
+    decision_packets_days: 365
+    ephemeral_cache_seconds: 3600
+
+observability:
+  logging:
+    max_log_event_bytes: 16384            # 16 KB
+    rate_limits:
+      per_instance_per_second: 2000
+  tracing:
+    enabled: true
+    sampling:
+      default_rate: 0.05
+      error_rate: 1.0
+  metrics:
+    max_label_key_bytes: 64
+    max_label_value_bytes: 256
+    max_labels_per_metric: 20
+
+security:
+  input_validation:
+    reject_unknown_fields_by_default: true
+    max_field_name_bytes: 128
+  secrets:
+    max_secret_bytes: 8192
+    max_secrets_per_tenant: 500
+  cryptography:
+    min_key_bits_rsa: 3072
+    min_key_bits_ec: 256
+    allowed_hashes:
+      - sha256
+      - sha512
+      - sha3_256
+      - sha3_512
+      - blake2b
+  anomaly_controls:
+    enabled: true
+    thresholds:
+      # Triggers are handled by the enforcement layer; values are policy knobs.
+      suspicious_4xx_rate_per_minute_per_ip: 120
+      suspicious_auth_failures_per_hour_per_identity: 10
+      suspicious_payload_rejects_per_minute_per_ip: 30
+
+tenancy:
+  enabled: true
+  limits:
+    max_tenants: 1000000
+    max_users_per_tenant: 200000
+    max_roles_per_tenant: 5000
+    max_policies_per_tenant: 20000
+  isolation:
+    require_tenant_id_on_all_requests: true
+    deny_cross_tenant_access: true
+
+compatibility:
+  legacy:
+    enabled: false
+  deprecations:
+    max_supported_api_versions: 3
+    min_supported_api_version: 1

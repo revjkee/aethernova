@@ -1,0 +1,866 @@
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+"========================== SCALARS =========================="
+scalar DateTime
+scalar Date
+scalar Time
+scalar UUID
+scalar JSON
+scalar Email
+scalar URL
+scalar IP
+scalar CIDR
+"SafeString: trimmed, no control chars; server enforces policy."
+scalar SafeString
+
+"========================== DIRECTIVES =========================="
+"Access control (RBAC/ABAC) — evaluate required scopes and optional ABAC context."
+directive @auth(
+  requires: [AuthScope!]
+  anyScope: Boolean = false
+  abacContext: JSON
+) on OBJECT | FIELD_DEFINITION
+
+"Structured audit logging for read/write operations."
+directive @audit(
+  action: AuditAction!
+  resource: String
+  redactArgs: [String!]
+) on FIELD_DEFINITION
+
+"Mark field as sensitive; server may mask/redact and restrict selection."
+directive @sensitive(
+  policy: MaskingStrategy = DEFAULT
+  classification: DataClassification = CONFIDENTIAL
+) on FIELD_DEFINITION | OBJECT
+
+"Basic token-bucket rate limiting per identity."
+directive @rateLimit(
+  max: Int!
+  window: String!    # e.g. '1s', '1m', '1h'
+  identityArgs: [String!]
+) on FIELD_DEFINITION
+
+"Cache hints — to be mapped to your gateway/cache layer."
+enum CacheControlScope { PUBLIC PRIVATE }
+directive @cacheControl(
+  maxAge: Int
+  scope: CacheControlScope = PRIVATE
+  inheritMaxAge: Boolean = false
+) on FIELD_DEFINITION | OBJECT | INTERFACE | UNION
+
+"========================== COMMON ENUMS =========================="
+enum SortOrder { ASC DESC }
+
+enum DataClassification { PUBLIC INTERNAL CONFIDENTIAL SECRET RESTRICTED }
+
+enum Severity { LOW MEDIUM HIGH CRITICAL }
+
+enum Outcome { ALLOW DENY ERROR }
+
+enum ErrorCode {
+  UNAUTHENTICATED UNAUTHORIZED INVALID_INPUT NOT_FOUND CONFLICT
+  RATE_LIMITED INTERNAL TIMEOUT UNSUPPORTED BAD_STATE
+}
+
+enum UserStatus { ACTIVE SUSPENDED DELETED }
+
+enum SessionStatus { ACTIVE REVOKED EXPIRED }
+
+enum AlertStatus { OPEN ACKNOWLEDGED MUTED RESOLVED }
+
+enum IncidentStatus { OPEN TRIAGE IN_PROGRESS CONTAINED ERADICATED CLOSED }
+
+enum AuditAction {
+  AUTH_LOGIN AUTH_LOGOUT SESSION_REVOKE
+  USER_CREATE USER_UPDATE USER_DEACTIVATE
+  ROLE_CREATE ROLE_UPDATE ROLE_DELETE ROLE_ASSIGN ROLE_UNASSIGN
+  POLICY_CREATE POLICY_UPDATE POLICY_DELETE POLICY_ATTACH POLICY_DETACH POLICY_EVALUATE
+  SECRET_CREATE SECRET_PUT SECRET_ROTATE SECRET_DELETE
+  KEY_CREATE KEY_IMPORT KEY_ROTATE KEY_ENABLE KEY_DISABLE KEY_DESTROY KEY_SIGN KEY_VERIFY KEY_ENCRYPT KEY_DECRYPT
+  CERT_CSR_CREATE CERT_ISSUE CERT_REVOKE CA_CREATE
+  ALERT_ACK ALERT_MUTE INCIDENT_CREATE INCIDENT_UPDATE INCIDENT_RESOLVE
+  ACCESS_REQUEST_CREATE ACCESS_REQUEST_DECIDE
+  APIKEY_CREATE APIKEY_REVOKE
+}
+
+enum ResourceType {
+  USER ROLE PERMISSION POLICY
+  SECRET SECRET_VERSION
+  KEY KEY_VERSION
+  CERTIFICATE CERTIFICATE_REQUEST CA
+  SESSION MFA_DEVICE API_KEY SERVICE_ACCOUNT
+  TENANT PROJECT DEVICE
+  AUDIT_EVENT SECURITY_ALERT INCIDENT
+  ACCESS_REQUEST
+}
+
+enum Action {
+  CREATE READ UPDATE DELETE LIST
+  APPROVE REVOKE ROTATE ISSUE SIGN VERIFY ENCRYPT DECRYPT
+  LOGIN LOGOUT ELEVATE EXECUTE ATTACH DETACH
+}
+
+enum AuthScope {
+  SECURITY_ADMIN SECURITY_AUDITOR SECURITY_OPERATOR
+  IAM_ADMIN IAM_READ
+  SECRETS_ADMIN SECRETS_READ
+  KMS_ADMIN KMS_CRYPTO
+  PKI_ADMIN PKI_READ
+  ALERTS_READ ALERTS_WRITE
+  INCIDENTS_READ INCIDENTS_WRITE
+  AUDIT_READ
+  SESSION_ADMIN
+  TENANT_ADMIN
+  SELF   # acts on own principal, enforced server-side
+}
+
+enum PolicyEffect { ALLOW DENY }
+
+enum ConditionOperator {
+  EQ NEQ IN NOT_IN GT GTE LT LTE CONTAINS STARTS_WITH ENDS_WITH MATCHES CIDR_MATCHES
+}
+
+enum AttributeSource { SUBJECT RESOURCE ENVIRONMENT }
+
+enum KeyAlgorithm { RSA_2048 RSA_3072 RSA_4096 EC_P256 EC_P384 EC_P521 ED25519 X25519 }
+
+enum KeyUsage { SIGN VERIFY ENCRYPT DECRYPT WRAP UNWRAP AUTH }
+
+enum KeyProtection { HSM SOFTWARE }
+
+enum KeyStatus { ENABLED DISABLED COMPROMISED PENDING_ROTATION DESTROYED }
+
+enum CertificateStatus { GOOD REVOKED EXPIRED UNKNOWN }
+
+enum CSRStatus { PENDING APPROVED REJECTED ISSUED }
+
+enum MfaType { TOTP WEBAUTHN U2F PASSKEY }
+
+enum MaskingStrategy { DEFAULT PARTIAL FULL NONE }
+
+enum ApprovalDecision { APPROVED DENIED }
+
+enum AccessRequestStatus { OPEN ESCALATED APPROVED DENIED EXPIRED CANCELED }
+
+enum DevicePlatform { WINDOWS LINUX MACOS ANDROID IOS OTHER }
+
+enum DevicePostureStatus { COMPLIANT NON_COMPLIANT UNKNOWN }
+
+"========================== INTERFACES =========================="
+interface Node { id: ID! }
+
+interface Principal { id: ID! name: String! displayName: String createdAt: DateTime! }
+
+"========================== CORE TYPES =========================="
+type Tenant implements Node {
+  id: ID!
+  name: String!
+  createdAt: DateTime!
+  updatedAt: DateTime
+  owners(first: Int, after: String): UserConnection @auth(requires:[TENANT_ADMIN, IAM_READ])
+}
+
+type Project implements Node {
+  id: ID!
+  tenant: Tenant!
+  key: SafeString!
+  name: String!
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+type User implements Node & Principal {
+  id: ID!
+  name: String!
+  displayName: String
+  email: Email @sensitive(policy: PARTIAL, classification: INTERNAL)
+  status: UserStatus!
+  mfaEnabled: Boolean!
+  primaryTenant: Tenant!
+  tenants(first: Int, after: String): TenantConnection @auth(requires:[IAM_READ])
+  roles(first: Int, after: String): RoleConnection @auth(requires:[IAM_READ])
+  policies(first: Int, after: String): PolicyConnection @auth(requires:[IAM_READ])
+  apiKeys(first: Int, after: String): ApiKeyConnection @auth(requires:[IAM_ADMIN])
+  mfaDevices(first: Int, after: String): MfaDeviceConnection @auth(requires:[IAM_ADMIN])
+  sessions(first: Int, after: String): SessionConnection @auth(requires:[SESSION_ADMIN])
+  lastLoginAt: DateTime
+  riskScore: Float @auth(requires:[SECURITY_AUDITOR])
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+type ServiceAccount implements Node & Principal {
+  id: ID!
+  name: String!
+  displayName: String
+  owner: User @auth(requires:[IAM_READ])
+  roles(first: Int, after: String): RoleConnection @auth(requires:[IAM_READ])
+  policies(first: Int, after: String): PolicyConnection @auth(requires:[IAM_READ])
+  apiKeys(first: Int, after: String): ApiKeyConnection @auth(requires:[IAM_ADMIN])
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+type Role implements Node {
+  id: ID!
+  name: String!
+  description: String
+  system: Boolean!
+  scopes: [AuthScope!]!
+  permissions: [Permission!]!
+  assignedPrincipalsCount: Int!
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+type Permission {
+  resource: ResourceType!
+  action: Action!
+  "Optional ABAC guard"
+  condition: String
+}
+
+type Policy implements Node {
+  id: ID!
+  name: String!
+  description: String
+  isEnabled: Boolean!
+  priority: Int!
+  effect: PolicyEffect!
+  rules: [PolicyRule!]!
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+type PolicyRule {
+  id: ID!
+  effect: PolicyEffect!
+  actions: [Action!]!
+  resources: [ResourcePattern!]!
+  where: [AttributeCondition!]
+}
+
+type ResourcePattern { type: ResourceType!, id: ID, pattern: String }
+
+type AttributeCondition {
+  source: AttributeSource!
+  attribute: String!
+  op: ConditionOperator!
+  value: JSON
+}
+
+"========================== SECRETS / KMS / PKI =========================="
+type Secret implements Node {
+  id: ID!
+  tenant: Tenant!
+  name: String!
+  description: String
+  classification: DataClassification!
+  status: String!
+  currentVersion: SecretVersion
+  versions(first: Int, after: String): SecretVersionConnection
+  rotationPolicy: RotationPolicy
+  createdBy: Principal
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+type SecretVersion implements Node {
+  id: ID!
+  secretId: ID!
+  version: Int!
+  createdAt: DateTime!
+  createdBy: Principal
+  checksum: String
+  stagedState: String
+  value: SafeString @sensitive(policy: FULL)
+}
+
+type RotationPolicy { intervalDays: Int!, maxVersions: Int = 10, lastRotatedAt: DateTime, nextRotationAt: DateTime }
+
+type Key implements Node {
+  id: ID!
+  tenant: Tenant!
+  name: String!
+  algorithm: KeyAlgorithm!
+  usage: [KeyUsage!]!
+  protection: KeyProtection!
+  status: KeyStatus!
+  rotationPolicy: RotationPolicy
+  fingerprint: String
+  versions(first: Int, after: String): KeyVersionConnection
+  createdAt: DateTime!
+  updatedAt: DateTime
+}
+
+type KeyVersion implements Node {
+  id: ID!
+  keyId: ID!
+  version: Int!
+  createdAt: DateTime!
+  status: KeyStatus!
+  publicKeyPem: String
+  jwk: JSON
+  attestation: JSON
+}
+
+type Certificate implements Node {
+  id: ID!
+  serial: String!
+  subject: String!
+  issuer: String!
+  notBefore: DateTime!
+  notAfter: DateTime!
+  status: CertificateStatus!
+  fingerprint: String
+  sanDNS: [String!]
+  sanIP: [IP!]
+  ocspStatus: String
+  pem: String @sensitive(policy: PARTIAL)
+  createdAt: DateTime!
+}
+
+type CertificateRequest implements Node {
+  id: ID!
+  csrPem: String @sensitive(policy: PARTIAL)
+  subject: String!
+  sanDNS: [String!]
+  sanIP: [IP!]
+  status: CSRStatus!
+  requestedBy: Principal
+  requestedAt: DateTime!
+  approvedAt: DateTime
+  rejectedReason: String
+  issuedCertificate: Certificate
+}
+
+type CaAuthority implements Node {
+  id: ID!
+  name: String!
+  subject: String!
+  isRoot: Boolean!
+  parent: CaAuthority
+  pathLen: Int
+  crlUrl: URL
+  ocspUrl: URL
+  status: String!
+  createdAt: DateTime!
+}
+
+"========================== SESSIONS / MFA / API KEYS =========================="
+type Session implements Node {
+  id: ID!
+  principal: Principal!
+  status: SessionStatus!
+  ip: IP
+  userAgent: String
+  geo: String
+  createdAt: DateTime!
+  expiresAt: DateTime!
+  revokedAt: DateTime
+  riskScore: Float
+  device: Device
+}
+
+type MfaDevice implements Node {
+  id: ID!
+  type: MfaType!
+  label: String
+  createdAt: DateTime!
+  lastUsedAt: DateTime
+  backupCodesEnabled: Boolean!
+}
+
+type ApiKey implements Node {
+  id: ID!
+  principal: Principal!
+  prefix: String!        # visible prefix only
+  scopes: [AuthScope!]!
+  createdAt: DateTime!
+  lastUsedAt: DateTime
+  expiresAt: DateTime
+  status: String!
+}
+
+"========================== ZERO-TRUST CONTEXT =========================="
+type Device implements Node {
+  id: ID!
+  platform: DevicePlatform!
+  osVersion: String
+  posture: DevicePostureStatus!
+  compliant: Boolean!
+  attested: Boolean!
+  lastSeen: DateTime
+  riskScore: Float
+  owner: Principal
+}
+
+"========================== AUDIT / ALERTS / INCIDENTS =========================="
+type AuditEvent implements Node {
+  id: ID!
+  time: DateTime!
+  tenantId: ID
+  action: AuditAction!
+  actor: Principal
+  resourceType: ResourceType
+  resourceId: ID
+  outcome: Outcome!
+  ip: IP
+  userAgent: String
+  requestId: String
+  correlationId: String
+  details: JSON
+}
+
+type SecurityAlert implements Node {
+  id: ID!
+  type: String!
+  severity: Severity!
+  status: AlertStatus!
+  description: String
+  detectedAt: DateTime!
+  source: String
+  relatedResources: [ResourceRef!]
+  riskScore: Float
+  tags: [String!]
+}
+
+type Incident implements Node {
+  id: ID!
+  title: String!
+  severity: Severity!
+  status: IncidentStatus!
+  createdAt: DateTime!
+  updatedAt: DateTime
+  owner: Principal
+  alerts(first: Int, after: String): SecurityAlertConnection
+  timeline(first: Int, after: String): IncidentEventConnection
+  resolutionSummary: String
+}
+
+type IncidentEvent implements Node {
+  id: ID!
+  time: DateTime!
+  type: String!
+  message: String
+  author: Principal
+  meta: JSON
+}
+
+"========================== ACCESS REQUESTS =========================="
+type AccessRequest implements Node {
+  id: ID!
+  requester: Principal!
+  resource: ResourceRef!
+  action: Action!
+  justification: String!
+  status: AccessRequestStatus!
+  createdAt: DateTime!
+  expiresAt: DateTime
+  decisions(first: Int, after: String): AccessDecisionConnection
+  approvers(first: Int, after: String): UserConnection
+}
+
+type AccessDecision implements Node {
+  id: ID!
+  approver: Principal!
+  decision: ApprovalDecision!
+  reason: String
+  decidedAt: DateTime!
+}
+
+input ResourceRefInput { type: ResourceType!, id: ID! }
+type ResourceRef { type: ResourceType!, id: ID! }
+
+"========================== PAGINATION =========================="
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+type UserEdge { node: User!, cursor: String! }
+type UserConnection { edges: [UserEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type TenantEdge { node: Tenant!, cursor: String! }
+type TenantConnection { edges: [TenantEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type RoleEdge { node: Role!, cursor: String! }
+type RoleConnection { edges: [RoleEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type PolicyEdge { node: Policy!, cursor: String! }
+type PolicyConnection { edges: [PolicyEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type SecretEdge { node: Secret!, cursor: String! }
+type SecretConnection { edges: [SecretEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type SecretVersionEdge { node: SecretVersion!, cursor: String! }
+type SecretVersionConnection { edges: [SecretVersionEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type KeyEdge { node: Key!, cursor: String! }
+type KeyConnection { edges: [KeyEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type KeyVersionEdge { node: KeyVersion!, cursor: String! }
+type KeyVersionConnection { edges: [KeyVersionEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type CertificateEdge { node: Certificate!, cursor: String! }
+type CertificateConnection { edges: [CertificateEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type CertificateRequestEdge { node: CertificateRequest!, cursor: String! }
+type CertificateRequestConnection { edges: [CertificateRequestEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type CaAuthorityEdge { node: CaAuthority!, cursor: String! }
+type CaAuthorityConnection { edges: [CaAuthorityEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type AuditEventEdge { node: AuditEvent!, cursor: String! }
+type AuditEventConnection { edges: [AuditEventEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type SecurityAlertEdge { node: SecurityAlert!, cursor: String! }
+type SecurityAlertConnection { edges: [SecurityAlertEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type IncidentEdge { node: Incident!, cursor: String! }
+type IncidentConnection { edges: [IncidentEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type IncidentEventEdge { node: IncidentEvent!, cursor: String! }
+type IncidentEventConnection { edges: [IncidentEventEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type SessionEdge { node: Session!, cursor: String! }
+type SessionConnection { edges: [SessionEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type MfaDeviceEdge { node: MfaDevice!, cursor: String! }
+type MfaDeviceConnection { edges: [MfaDeviceEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type ApiKeyEdge { node: ApiKey!, cursor: String! }
+type ApiKeyConnection { edges: [ApiKeyEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type DeviceEdge { node: Device!, cursor: String! }
+type DeviceConnection { edges: [DeviceEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type AccessRequestEdge { node: AccessRequest!, cursor: String! }
+type AccessRequestConnection { edges: [AccessRequestEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type AccessDecisionEdge { node: AccessDecision!, cursor: String! }
+type AccessDecisionConnection { edges: [AccessDecisionEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+type ProjectEdge { node: Project!, cursor: String! }
+type ProjectConnection { edges: [ProjectEdge!]!, pageInfo: PageInfo!, totalCount: Int! }
+
+"========================== FILTER INPUTS =========================="
+input DateRange { from: DateTime, to: DateTime }
+
+input UserFilter { q: String, status: [UserStatus!], tenantId: ID }
+
+input SecretFilter { q: String, classification: [DataClassification!], tenantId: ID }
+
+input KeyFilter { q: String, algorithm: [KeyAlgorithm!], usage: [KeyUsage!], status: [KeyStatus!], tenantId: ID }
+
+input CertificateFilter { q: String, status: [CertificateStatus!], issuer: String, validAt: DateTime }
+
+input AuditFilter {
+  action: [AuditAction!]
+  actorId: ID
+  resourceType: [ResourceType!]
+  outcome: [Outcome!]
+  time: DateRange
+  tenantId: ID
+}
+
+input AlertFilter { status: [AlertStatus!], severity: [Severity!], type: [String!], since: DateTime, tags: [String!] }
+
+input IncidentFilter { status: [IncidentStatus!], severity: [Severity!], since: DateTime }
+
+input SessionFilter { status: [SessionStatus!], principalId: ID, ip: IP }
+
+input DeviceFilter { platform: [DevicePlatform!], posture: [DevicePostureStatus!], ownerId: ID }
+
+input AccessRequestFilter { status: [AccessRequestStatus!], requesterId: ID, resourceType: [ResourceType!], since: DateTime }
+
+"========================== ERROR / RESULT =========================="
+type Error { code: ErrorCode!, message: String!, details: JSON }
+
+interface MutationResult { ok: Boolean!, error: Error }
+
+type OperationOk implements MutationResult { ok: Boolean!, error: Error }
+
+"Entity-wrapping results"
+type UserResult implements MutationResult { ok: Boolean!, error: Error, user: User }
+type RoleResult implements MutationResult { ok: Boolean!, error: Error, role: Role }
+type PolicyResult implements MutationResult { ok: Boolean!, error: Error, policy: Policy }
+type SecretResult implements MutationResult { ok: Boolean!, error: Error, secret: Secret }
+type SecretVersionResult implements MutationResult { ok: Boolean!, error: Error, version: SecretVersion }
+type KeyResult implements MutationResult { ok: Boolean!, error: Error, key: Key }
+type CertificateResult implements MutationResult { ok: Boolean!, error: Error, certificate: Certificate }
+type CertificateRequestResult implements MutationResult { ok: Boolean!, error: Error, request: CertificateRequest }
+type SessionResult implements MutationResult { ok: Boolean!, error: Error, session: Session }
+type ApiKeyResult implements MutationResult { ok: Boolean!, error: Error, apiKey: ApiKey }
+type AccessRequestResult implements MutationResult { ok: Boolean!, error: Error, accessRequest: AccessRequest }
+type IncidentResult implements MutationResult { ok: Boolean!, error: Error, incident: Incident }
+type SecurityAlertResult implements MutationResult { ok: Boolean!, error: Error, alert: SecurityAlert }
+
+"========================== QUERIES =========================="
+type Query {
+  "Relay node resolver"
+  node(id: ID!): Node
+
+  "Current authenticated user"
+  me: User @auth(requires:[SELF, IAM_READ])
+
+  # IAM
+  users(first: Int = 20, after: String, filter: UserFilter, orderBy: SortOrder = ASC): UserConnection @auth(requires:[IAM_READ])
+  user(id: ID!): User @auth(requires:[IAM_READ])
+  roles(first: Int = 20, after: String): RoleConnection @auth(requires:[IAM_READ])
+  role(id: ID!): Role @auth(requires:[IAM_READ])
+  policies(first: Int = 20, after: String): PolicyConnection @auth(requires:[IAM_READ])
+  policy(id: ID!): Policy @auth(requires:[IAM_READ])
+
+  # Secrets / KMS / PKI
+  secrets(first: Int = 20, after: String, filter: SecretFilter): SecretConnection @auth(requires:[SECRETS_READ])
+  secret(id: ID!): Secret @auth(requires:[SECRETS_READ])
+
+  keys(first: Int = 20, after: String, filter: KeyFilter): KeyConnection @auth(requires:[KMS_ADMIN, KMS_CRYPTO])
+  key(id: ID!): Key @auth(requires:[KMS_ADMIN, KMS_CRYPTO])
+
+  certificates(first: Int = 20, after: String, filter: CertificateFilter): CertificateConnection @auth(requires:[PKI_READ])
+  certificate(id: ID!): Certificate @auth(requires:[PKI_READ])
+  certificateRequests(first: Int = 20, after: String): CertificateRequestConnection @auth(requires:[PKI_READ])
+  cas(first: Int = 20, after: String): CaAuthorityConnection @auth(requires:[PKI_READ])
+
+  # Audit / Alerts / Incidents
+  auditEvents(first: Int = 50, after: String, filter: AuditFilter): AuditEventConnection @auth(requires:[AUDIT_READ])
+  securityAlerts(first: Int = 50, after: String, filter: AlertFilter): SecurityAlertConnection @auth(requires:[ALERTS_READ])
+  incidents(first: Int = 50, after: String, filter: IncidentFilter): IncidentConnection @auth(requires:[INCIDENTS_READ])
+  incident(id: ID!): Incident @auth(requires:[INCIDENTS_READ])
+
+  # Sessions / Devices / API Keys
+  sessions(first: Int = 50, after: String, filter: SessionFilter): SessionConnection @auth(requires:[SESSION_ADMIN])
+  session(id: ID!): Session @auth(requires:[SESSION_ADMIN])
+  devices(first: Int = 50, after: String, filter: DeviceFilter): DeviceConnection @auth(requires:[SECURITY_AUDITOR])
+
+  # Access Requests
+  accessRequests(first: Int = 50, after: String, filter: AccessRequestFilter): AccessRequestConnection @auth(requires:[IAM_READ])
+  accessRequest(id: ID!): AccessRequest @auth(requires:[IAM_READ])
+
+  # Tenancy / Projects
+  tenants(first: Int = 50, after: String): TenantConnection @auth(requires:[TENANT_ADMIN])
+  tenant(id: ID!): Tenant @auth(requires:[TENANT_ADMIN])
+  projects(first: Int = 50, after: String, tenantId: ID): ProjectConnection @auth(requires:[TENANT_ADMIN])
+  project(id: ID!): Project @auth(requires:[TENANT_ADMIN])
+
+  # Policy evaluation (what-if)
+  evaluatePolicy(input: PolicyEvaluationInput!): PolicyEvaluationResult! @auth(requires:[POLICY_EVALUATE, SECURITY_AUDITOR])
+}
+
+"========================== MUTATION INPUTS =========================="
+# IAM
+input CreateUserInput { name: SafeString!, displayName: String, email: Email, tenantId: ID! }
+input UpdateUserInput { id: ID!, displayName: String, email: Email, status: UserStatus }
+input AssignRoleInput { principalId: ID!, roleId: ID! }
+input UnassignRoleInput { principalId: ID!, roleId: ID! }
+
+input CreateRoleInput { name: SafeString!, description: String, scopes: [AuthScope!]!, permissions: [PermissionInput!]! }
+input UpdateRoleInput { id: ID!, description: String, scopes: [AuthScope!], permissions: [PermissionInput!] }
+
+input PermissionInput { resource: ResourceType!, action: Action!, condition: String }
+
+input CreatePolicyInput {
+  name: SafeString!, description: String, isEnabled: Boolean = true, priority: Int = 100,
+  effect: PolicyEffect!, rules: [PolicyRuleInput!]!
+}
+input UpdatePolicyInput {
+  id: ID!, name: SafeString, description: String, isEnabled: Boolean, priority: Int,
+  effect: PolicyEffect, rules: [PolicyRuleInput!]
+}
+input PolicyRuleInput {
+  effect: PolicyEffect!, actions: [Action!]!, resources: [ResourcePatternInput!]!, where: [AttributeConditionInput!]
+}
+input ResourcePatternInput { type: ResourceType!, id: ID, pattern: String }
+input AttributeConditionInput { source: AttributeSource!, attribute: String!, op: ConditionOperator!, value: JSON }
+
+# Secrets / KMS / PKI
+input CreateSecretInput { tenantId: ID!, name: SafeString!, description: String, classification: DataClassification = CONFIDENTIAL, rotationPolicy: RotationPolicyInput }
+input PutSecretValueInput { secretId: ID!, value: SafeString! }
+input RotateSecretInput { secretId: ID! }
+input RotationPolicyInput { intervalDays: Int!, maxVersions: Int }
+
+input CreateKeyInput {
+  tenantId: ID!, name: SafeString!, algorithm: KeyAlgorithm!, usage: [KeyUsage!]!, protection: KeyProtection = SOFTWARE,
+  rotationPolicy: RotationPolicyInput
+}
+input ImportKeyInput { tenantId: ID!, name: SafeString!, jwk: JSON!, protection: KeyProtection = SOFTWARE }
+input RotateKeyInput { keyId: ID! }
+input CryptoSignInput { keyId: ID!, data: String!, digestAlgorithm: String }
+input CryptoVerifyInput { keyId: ID!, data: String!, signature: String!, digestAlgorithm: String }
+input CryptoEncryptInput { keyId: ID!, plaintext: String! }
+input CryptoDecryptInput { keyId: ID!, ciphertext: String! }
+
+input CreateCsrInput { subject: String!, sanDNS: [String!], sanIP: [IP!], caId: ID }
+input ApproveCsrInput { requestId: ID!, caId: ID!, notAfter: DateTime }
+input RevokeCertificateInput { certificateId: ID!, reason: String }
+
+# Sessions / MFA / API Keys
+input RevokeSessionInput { sessionId: ID! }
+input RevokeAllSessionsInput { principalId: ID! }
+input RegisterMfaDeviceInput { principalId: ID!, type: MfaType!, label: String }
+input RemoveMfaDeviceInput { deviceId: ID! }
+input CreateApiKeyInput { principalId: ID!, scopes: [AuthScope!]!, expiresAt: DateTime }
+
+# Alerts / Incidents
+input AcknowledgeAlertInput { alertId: ID! }
+input MuteAlertInput { alertId: ID!, until: DateTime }
+input CreateIncidentInput { title: String!, severity: Severity!, alertIds: [ID!] }
+input UpdateIncidentStatusInput { incidentId: ID!, status: IncidentStatus!, resolutionSummary: String }
+input AddIncidentEventInput { incidentId: ID!, type: String!, message: String }
+
+# Access Requests
+input CreateAccessRequestInput { resource: ResourceRefInput!, action: Action!, justification: String! }
+input DecideAccessRequestInput { requestId: ID!, decision: ApprovalDecision!, reason: String }
+
+# Tenancy / Projects
+input CreateTenantInput { name: SafeString! }
+input CreateProjectInput { tenantId: ID!, key: SafeString!, name: SafeString! }
+
+# Policy Evaluation
+input PolicyEvaluationInput {
+  subjectId: ID!
+  action: Action!
+  resource: ResourceRefInput!
+  environment: JSON
+}
+type PolicyEvaluationResult { allowed: Boolean!, effect: PolicyEffect!, matchedPolicyIds: [ID!]!, reasons: [String!] }
+
+"========================== MUTATIONS =========================="
+type Mutation {
+  # IAM
+  createUser(input: CreateUserInput!): UserResult
+    @auth(requires:[IAM_ADMIN]) @audit(action: USER_CREATE, resource:"USER")
+  updateUser(input: UpdateUserInput!): UserResult
+    @auth(requires:[IAM_ADMIN]) @audit(action: USER_UPDATE, resource:"USER")
+  deactivateUser(id: ID!): UserResult
+    @auth(requires:[IAM_ADMIN]) @audit(action: USER_DEACTIVATE, resource:"USER")
+
+  createRole(input: CreateRoleInput!): RoleResult
+    @auth(requires:[IAM_ADMIN]) @audit(action: ROLE_CREATE, resource:"ROLE")
+  updateRole(input: UpdateRoleInput!): RoleResult
+    @auth(requires:[IAM_ADMIN]) @audit(action: ROLE_UPDATE, resource:"ROLE")
+  deleteRole(id: ID!): OperationOk
+    @auth(requires:[IAM_ADMIN]) @audit(action: ROLE_DELETE, resource:"ROLE")
+
+  assignRole(input: AssignRoleInput!): OperationOk
+    @auth(requires:[IAM_ADMIN]) @audit(action: ROLE_ASSIGN, resource:"ROLE")
+  unassignRole(input: UnassignRoleInput!): OperationOk
+    @auth(requires:[IAM_ADMIN]) @audit(action: ROLE_UNASSIGN, resource:"ROLE")
+
+  createPolicy(input: CreatePolicyInput!): PolicyResult
+    @auth(requires:[IAM_ADMIN]) @audit(action: POLICY_CREATE, resource:"POLICY")
+  updatePolicy(input: UpdatePolicyInput!): PolicyResult
+    @auth(requires:[IAM_ADMIN]) @audit(action: POLICY_UPDATE, resource:"POLICY")
+  deletePolicy(id: ID!): OperationOk
+    @auth(requires:[IAM_ADMIN]) @audit(action: POLICY_DELETE, resource:"POLICY")
+
+  # Secrets
+  createSecret(input: CreateSecretInput!): SecretResult
+    @auth(requires:[SECRETS_ADMIN]) @audit(action: SECRET_CREATE, resource:"SECRET")
+  putSecretValue(input: PutSecretValueInput!): SecretVersionResult
+    @auth(requires:[SECRETS_ADMIN]) @audit(action: SECRET_PUT, resource:"SECRET") @sensitive(policy: FULL)
+  rotateSecret(input: RotateSecretInput!): SecretResult
+    @auth(requires:[SECRETS_ADMIN]) @audit(action: SECRET_ROTATE, resource:"SECRET")
+  deleteSecret(id: ID!): OperationOk
+    @auth(requires:[SECRETS_ADMIN]) @audit(action: SECRET_DELETE, resource:"SECRET")
+
+  # KMS
+  createKey(input: CreateKeyInput!): KeyResult
+    @auth(requires:[KMS_ADMIN]) @audit(action: KEY_CREATE, resource:"KEY")
+  importKey(input: ImportKeyInput!): KeyResult
+    @auth(requires:[KMS_ADMIN]) @audit(action: KEY_IMPORT, resource:"KEY")
+  rotateKey(input: RotateKeyInput!): KeyResult
+    @auth(requires:[KMS_ADMIN]) @audit(action: KEY_ROTATE, resource:"KEY")
+  enableKey(id: ID!): KeyResult
+    @auth(requires:[KMS_ADMIN]) @audit(action: KEY_ENABLE, resource:"KEY")
+  disableKey(id: ID!): KeyResult
+    @auth(requires:[KMS_ADMIN]) @audit(action: KEY_DISABLE, resource:"KEY")
+  destroyKey(id: ID!): OperationOk
+    @auth(requires:[KMS_ADMIN]) @audit(action: KEY_DESTROY, resource:"KEY")
+
+  cryptoSign(input: CryptoSignInput!): String
+    @auth(requires:[KMS_CRYPTO]) @audit(action: KEY_SIGN, resource:"KEY") @rateLimit(max: 50, window:"1m")
+  cryptoVerify(input: CryptoVerifyInput!): Boolean
+    @auth(requires:[KMS_CRYPTO]) @audit(action: KEY_VERIFY, resource:"KEY") @rateLimit(max: 200, window:"1m")
+  cryptoEncrypt(input: CryptoEncryptInput!): String
+    @auth(requires:[KMS_CRYPTO]) @audit(action: KEY_ENCRYPT, resource:"KEY") @rateLimit(max: 100, window:"1m")
+  cryptoDecrypt(input: CryptoDecryptInput!): String
+    @auth(requires:[KMS_CRYPTO]) @audit(action: KEY_DECRYPT, resource:"KEY") @rateLimit(max: 100, window:"1m")
+
+  # PKI
+  createCertificateRequest(input: CreateCsrInput!): CertificateRequestResult
+    @auth(requires:[PKI_ADMIN]) @audit(action: CERT_CSR_CREATE, resource:"CERTIFICATE_REQUEST")
+  approveCertificateRequest(input: ApproveCsrInput!): CertificateResult
+    @auth(requires:[PKI_ADMIN]) @audit(action: CERT_ISSUE, resource:"CERTIFICATE")
+  revokeCertificate(input: RevokeCertificateInput!): OperationOk
+    @auth(requires:[PKI_ADMIN]) @audit(action: CERT_REVOKE, resource:"CERTIFICATE")
+
+  # Sessions / MFA / API Keys
+  revokeSession(input: RevokeSessionInput!): SessionResult
+    @auth(requires:[SESSION_ADMIN]) @audit(action: SESSION_REVOKE, resource:"SESSION")
+  revokeAllSessions(input: RevokeAllSessionsInput!): OperationOk
+    @auth(requires:[SESSION_ADMIN]) @audit(action: SESSION_REVOKE, resource:"SESSION")
+  registerMfaDevice(input: RegisterMfaDeviceInput!): OperationOk
+    @auth(requires:[IAM_ADMIN]) @audit(action: USER_UPDATE, resource:"MFA_DEVICE")
+  removeMfaDevice(input: RemoveMfaDeviceInput!): OperationOk
+    @auth(requires:[IAM_ADMIN]) @audit(action: USER_UPDATE, resource:"MFA_DEVICE")
+  createApiKey(input: CreateApiKeyInput!): ApiKeyResult
+    @auth(requires:[IAM_ADMIN]) @audit(action: APIKEY_CREATE, resource:"API_KEY")
+  revokeApiKey(id: ID!): OperationOk
+    @auth(requires:[IAM_ADMIN]) @audit(action: APIKEY_REVOKE, resource:"API_KEY")
+
+  # Alerts / Incidents
+  acknowledgeAlert(input: AcknowledgeAlertInput!): SecurityAlertResult
+    @auth(requires:[ALERTS_WRITE]) @audit(action: ALERT_ACK, resource:"SECURITY_ALERT")
+  muteAlert(input: MuteAlertInput!): SecurityAlertResult
+    @auth(requires:[ALERTS_WRITE]) @audit(action: ALERT_MUTE, resource:"SECURITY_ALERT")
+  createIncident(input: CreateIncidentInput!): IncidentResult
+    @auth(requires:[INCIDENTS_WRITE]) @audit(action: INCIDENT_CREATE, resource:"INCIDENT")
+  updateIncidentStatus(input: UpdateIncidentStatusInput!): IncidentResult
+    @auth(requires:[INCIDENTS_WRITE]) @audit(action: INCIDENT_UPDATE, resource:"INCIDENT")
+  addIncidentEvent(input: AddIncidentEventInput!): IncidentResult
+    @auth(requires:[INCIDENTS_WRITE]) @audit(action: INCIDENT_UPDATE, resource:"INCIDENT")
+  resolveIncident(id: ID!, resolutionSummary: String): IncidentResult
+    @auth(requires:[INCIDENTS_WRITE]) @audit(action: INCIDENT_RESOLVE, resource:"INCIDENT")
+
+  # Access Requests
+  createAccessRequest(input: CreateAccessRequestInput!): AccessRequestResult
+    @auth(requires:[IAM_READ, SECURITY_OPERATOR]) @audit(action: ACCESS_REQUEST_CREATE, resource:"ACCESS_REQUEST")
+  decideAccessRequest(input: DecideAccessRequestInput!): AccessRequestResult
+    @auth(requires:[SECURITY_OPERATOR]) @audit(action: ACCESS_REQUEST_DECIDE, resource:"ACCESS_REQUEST")
+
+  # Tenancy / Projects
+  createTenant(input: CreateTenantInput!): Tenant
+    @auth(requires:[TENANT_ADMIN]) @audit(action: ROLE_CREATE, resource:"TENANT")
+  createProject(input: CreateProjectInput!): Project
+    @auth(requires:[TENANT_ADMIN]) @audit(action: ROLE_CREATE, resource:"PROJECT")
+}
+
+"========================== SUBSCRIPTIONS =========================="
+type Subscription {
+  auditEventCreated(filter: AuditFilter): AuditEvent @auth(requires:[AUDIT_READ])
+  alertRaised(filter: AlertFilter): SecurityAlert @auth(requires:[ALERTS_READ])
+  incidentUpdated(id: ID): Incident @auth(requires:[INCIDENTS_READ])
+  keyRotationProgress(keyId: ID!): KeyRotationEvent @auth(requires:[KMS_ADMIN])
+}
+
+type KeyRotationEvent {
+  keyId: ID!
+  startedAt: DateTime!
+  state: String!
+  progress: Int!   # 0..100
+  message: String
+  completedAt: DateTime
+}
+
+"========================== RESOLUTION MAPS / UNIONS (if needed) =========================="
+# Extend or add unions as your server implementation requires.

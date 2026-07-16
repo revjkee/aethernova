@@ -1,0 +1,124 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: policy-core
+  labels:
+    app.kubernetes.io/name: policy-core
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/component: policy
+    monitoring: enabled
+    # Если используете kube-prometheus-stack (Helm), метка release должна совпадать с именем релиза Prometheus:
+    # release: prometheus
+spec:
+  # Имя job в Prometheus. По умолчанию формируется автоматически; фиксируем, чтобы избежать дрейфа.
+  jobLabel: app.kubernetes.io/name
+
+  # Переносим стабильные сервисные метки в series, чтобы унифицировать дашборды и алерты.
+  targetLabels:
+    - app.kubernetes.io/name
+    - app.kubernetes.io/instance
+    - app.kubernetes.io/component
+    - app.kubernetes.io/part-of
+
+  # Базовый слой разрешает сбор из любого namespace. В проде сузьте через overlays (matchNames).
+  namespaceSelector:
+    any: true
+    # matchNames:
+    #   - policy-core
+    #   - observability
+
+  # Выбираем только нужные сервисы.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: policy-core
+      monitoring: enabled
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["policy"]
+
+  # Точки сбора метрик. Имена портов должны совпадать с портами в Service.
+  endpoints:
+    # HTTP без TLS — для внутренних стендов.
+    - port: http-metrics
+      scheme: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true
+      honorTimestamps: true
+      sampleLimit: 10000
+      labelLimit: 65
+      labelNameLengthLimit: 120
+      labelValueLengthLimit: 2048
+      followRedirects: false
+      relabelings:
+        # Стабилизируем набор лейблов. Пример: переносим namespace в отдельный лейбл, если нужно.
+        - action: replace
+          sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: k8s_namespace
+        # Явно задаем job, если требуются жёсткие соответствия в алертах.
+        - action: replace
+          targetLabel: job
+          replacement: policy-core
+      metricRelabelings:
+        # Пример безопасной нормализации имен метрик (опционально).
+        # - action: replace
+        #   sourceLabels: [__name__]
+        #   regex: "policy_core_(.*)"
+        #   targetLabel: __name__
+        #   replacement: "policy_core_$1"
+        # Удаляем заведомо шумные label'ы приложений, если такие присутствуют (пример).
+        # - action: labeldrop
+        #   regex: "build_sha|git_tag"
+
+    # HTTPS с mTLS — продовый путь. Требует заранее созданных Secret/ConfigMap.
+    - port: https-metrics
+      scheme: https
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 7s
+      honorLabels: true
+      honorTimestamps: true
+      sampleLimit: 12000
+      labelLimit: 65
+      labelNameLengthLimit: 120
+      labelValueLengthLimit: 2048
+      followRedirects: false
+      # Авторизация токеном (опционально). Секрет должен содержать ключ "token".
+      bearerTokenSecret:
+        name: policy-core-metrics-bearer
+        key: token
+      # Настройка mTLS через типизированные поля Prometheus Operator (SafeTLSConfig).
+      tlsConfig:
+        serverName: policy-core.metrics.svc
+        insecureSkipVerify: false
+        minVersion: TLS12
+        ca:
+          # Один из вариантов: корневой сертификат в ConfigMap.
+          # Если храните в Secret — используйте поле "secret" ниже.
+          configMap:
+            name: policy-core-metrics-ca
+            key: ca.crt
+        cert:
+          secret:
+            name: policy-core-metrics-client
+            key: tls.crt
+        keySecret:
+          name: policy-core-metrics-client
+          key: tls.key
+      relabelings:
+        - action: replace
+          sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_instance]
+          targetLabel: app_kubernetes_io_instance
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+      metricRelabelings:
+        # Пример аккуратного отсева очень редких внутренних метрик конкретного сервиса.
+        # - action: drop
+        #   sourceLabels: [__name__]
+        #   regex: "policy_core_debug_.*"
+
+  # Политика выбора портов/эндпоинтов по умолчанию.
+  # endpointSelector: {}  # не используем; все управляется через endpoints выше.

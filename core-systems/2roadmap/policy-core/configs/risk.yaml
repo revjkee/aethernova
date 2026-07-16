@@ -1,0 +1,283 @@
+# =============================================================================
+# policy-core Risk Configuration
+# Индустриальная модель управления рисками: таксономия, матрица, реестр, SLAs
+# =============================================================================
+
+version: "1.0.0"
+metadata:
+  id: "policy-core.risk-profile"
+  updated_at: "2025-08-28T00:00:00Z"
+  owner:
+    team: "GRC"
+    contact: "security@aethernova.dev"
+  scope:
+    product: "policy-core"
+    environments: ["dev", "staging", "prod"]
+  hashing:
+    algorithm: "SHA256"
+    file_digest: "<fill-by-CI>"          # Заполняется пайплайном
+  signature:
+    algo: "ed25519"
+    signer: "grc-signer"
+    signature_b64: "<fill-by-CI>"
+
+# -----------------------------------------------------------------------------
+# Нормативы и справочники
+# -----------------------------------------------------------------------------
+standards:
+  mappings:
+    - id: "ISO27001:2022"
+      controls: ["A.5.*","A.8.*","A.8.16","A.8.23","A.8.28","A.8.32","A.8.34","A.8.35"]
+    - id: "NIST.SP.800-53r5"
+      controls: ["AC-*","AU-*","CM-*","CP-*","IR-*","RA-*","SC-*","SI-*"]
+    - id: "CIS.K8s.v1.25"
+      controls: ["1.*","2.*","5.*","6.*"]
+
+taxonomies:
+  assets:
+    - id: "svc.policy-api"       # микросервис API политики
+      type: "service"
+      criticality: "high"
+      owner: "policy-core-team"
+    - id: "db.policy-storage"
+      type: "data-store"
+      criticality: "high"
+      owner: "platform-db"
+    - id: "ci.pipeline"
+      type: "process"
+      criticality: "medium"
+      owner: "devops"
+  threat_categories:
+    - id: "T.PRIV_ESC"    # повышение привилегий
+    - id: "T.DATA_LEAK"
+    - id: "T.SUPPLY_CHAIN"
+    - id: "T.DOS"
+    - id: "T.MISCONFIG"
+    - id: "T.SSRF_EGRESS"
+  treatments: ["accept", "mitigate", "transfer", "avoid"]
+  severities: ["low","medium","high","critical"]
+
+# -----------------------------------------------------------------------------
+# Модель оценки риска (Likelyhood × Impact) с матрицей и порогами
+# -----------------------------------------------------------------------------
+scoring:
+  scale:
+    likelihood:
+      # Значения можно валидировать схемой JSON в CI
+      - {level: 1, label: "rare",       description: "≤1 раз в 5 лет"}
+      - {level: 2, label: "unlikely",   description: "ежегодно-редко"}
+      - {level: 3, label: "possible",   description: "ежегодно"}
+      - {level: 4, label: "likely",     description: "ежеквартально"}
+      - {level: 5, label: "almost_certain", description: "ежемесячно/чаще"}
+    impact:
+      - {level: 1, label: "negligible",  description: "нет заметного эффекта"}
+      - {level: 2, label: "minor",       description: "локальные нарушения"}
+      - {level: 3, label: "moderate",    description: "остановка части функций"}
+      - {level: 4, label: "major",       description: "остановка сервиса, утечка PII"}
+      - {level: 5, label: "catastrophic",description: "системный сбой/регуляторный ущерб"}
+  compute:
+    method: "LxI"        # произведение L*I
+    bands:
+      - {range: "1..4",      severity: "low"}
+      - {range: "5..9",      severity: "medium"}
+      - {range: "10..16",    severity: "high"}
+      - {range: "17..25",    severity: "critical"}
+  sla_by_severity:
+    low:      {treatment_due: "90d",  review_due: "180d"}
+    medium:   {treatment_due: "60d",  review_due: "120d"}
+    high:     {treatment_due: "30d",  review_due: "60d"}
+    critical: {treatment_due: "7d",   review_due: "30d"}
+  risk_appetite:
+    overall: "medium"    # приемлемый суммарный уровень
+    exceptions_cap:
+      count_max: 20
+      total_risk_score_max: 120
+    notes: "Критический резидуальный риск не допускается в prod."
+
+# -----------------------------------------------------------------------------
+# Контрольные меры (каталог) — переиспользуются в рисках
+# -----------------------------------------------------------------------------
+controls:
+  - id: "CTRL.NET.ZT.01"
+    name: "Zero-Trust сетевые политики"
+    refs: ["CIS.K8s.v1.25:5.*","NIST.SP.800-53r5:SC-*"]
+    description: "Default-deny ingress/egress, allowlist DNS/HTTPS, anti-SSRF ipBlock."
+    owner: "platform-security"
+    evidence:
+      - type: "k8s"
+        location: "ops/k8s/base/networkpolicy.yaml"
+    status: "deployed"
+  - id: "CTRL.SCM.SIG.01"
+    name: "Подпись артефактов и политик"
+    refs: ["NIST:CM-5","ISO27001:A.8.28"]
+    description: "Подпись Rego/YAML и контейнеров (cosign), верификация в CI/CD."
+    owner: "devsecops"
+    evidence:
+      - type: "ci"
+        location: ".github/workflows/verify-attestations.yaml"
+    status: "partial"
+  - id: "CTRL.SECLOG.OTEL.01"
+    name: "Централизованные логи/метрики/трейсы"
+    refs: ["NIST:AU-*","ISO27001:A.8.15"]
+    description: "Loki + Promtail, kube-prom-stack, Tempo, OTEL Collector."
+    owner: "observability"
+    evidence:
+      - type: "tf"
+        location: "ops/terraform/modules/observability/main.tf"
+    status: "deployed"
+  - id: "CTRL.RUNTIME.PSP.01"
+    name: "Контейнерные гарантии выполнения"
+    refs: ["NIST:CM-7","CIS:5.*"]
+    description: "readOnlyRootFS, drop ALL caps, non-root, seccomp, AppArmor."
+    owner: "platform-security"
+    status: "planned"
+
+# -----------------------------------------------------------------------------
+# Политики эскалации и мониторинга KRIs/KSIs
+# -----------------------------------------------------------------------------
+monitoring:
+  kpis:
+    - id: "KPI.RISK.TREATMENT.ON_TIME"
+      target: "≥90%"
+      source: "GRC-tool"
+  kris:
+    - id: "KRI.OPEN_CRITICAL"
+      threshold: {operator: ">", value: 0}
+      action: "page:oncall-security"
+    - id: "KRI.EXCEPTIONS_NEAR_CAP"
+      threshold: {operator: ">=", value: 0.8}   # 80% лимита
+      action: "notify:grc"
+  escalation:
+    - when: "severity == 'critical'"
+      notify: ["oncall-security","cto"]
+      deadline: "24h"
+    - when: "severity == 'high'"
+      notify: ["oncall-security"]
+      deadline: "72h"
+
+# -----------------------------------------------------------------------------
+# Реестр рисков (пример заполнения; расширяйте списком)
+# -----------------------------------------------------------------------------
+risks:
+  - id: "RISK-0001"
+    title: "Egress SSRF к внутренним сетям из policy-core"
+    asset: "svc.policy-api"
+    category: "T.SSRF_EGRESS"
+    description: "Возможность обхода фильтров и обращения к внутренним адресам/метаданным."
+    likelihood: 4
+    impact: 4
+    initial_score: 16                       # 4×4
+    initial_severity: "high"
+    controls_applied: ["CTRL.NET.ZT.01","CTRL.SECLOG.OTEL.01"]
+    residual:
+      likelihood: 2
+      impact: 3
+      score: 6
+      severity: "medium"
+    treatment: "mitigate"
+    owner: "policy-core-team"
+    due: "2025-09-27"                       # SLA по severity=high → 30d
+    environment:
+      include: ["prod","staging"]
+    verification:
+      methods:
+        - type: "policy-test"
+          ref: "tests/net/egress_ssrf_denied.rego"
+        - type: "chaos-probe"
+          ref: "experiments/egress-block.yaml"
+      cadence: "30d"
+    evidence:
+      - type: "k8s"
+        ref: "ops/k8s/base/networkpolicy.yaml#policy-core-allow-public-https-egress"
+    status: "open"
+
+  - id: "RISK-0002"
+    title: "Supply-chain: неподписанные образы контейнеров"
+    asset: "ci.pipeline"
+    category: "T.SUPPLY_CHAIN"
+    description: "Отсутствует обязательная проверка подписи образов в admission."
+    likelihood: 3
+    impact: 5
+    initial_score: 15
+    initial_severity: "high"
+    controls_applied: ["CTRL.SCM.SIG.01"]
+    residual:
+      likelihood: 2
+      impact: 4
+      score: 8
+      severity: "medium"
+    treatment: "mitigate"
+    plan:
+      steps:
+        - "Включить cosign-verify в CI и в Gatekeeper/PolicyController."
+        - "Публиковать attestations (SLSA provenance)."
+      owners: ["devsecops"]
+    due: "2025-09-27"
+    environment:
+      include: ["prod"]
+    status: "open"
+
+  - id: "RISK-0003"
+    title: "Misconfiguration: отсутствие readOnlyRootFS"
+    asset: "svc.policy-api"
+    category: "T.MISCONFIG"
+    description: "Контейнер может модифицировать файловую систему во время рантайма."
+    likelihood: 3
+    impact: 3
+    initial_score: 9
+    initial_severity: "medium"
+    controls_applied: ["CTRL.RUNTIME.PSP.01"]
+    residual:
+      likelihood: 2
+      impact: 2
+      score: 4
+      severity: "low"
+    treatment: "mitigate"
+    due: "2025-11-26"
+    environment:
+      include: ["dev","staging","prod"]
+    status: "planned"
+
+# -----------------------------------------------------------------------------
+# Исключения (Risk Acceptance) с жесткими сроками пересмотра
+# -----------------------------------------------------------------------------
+exceptions:
+  policy:
+    review_interval: "90d"
+    require_compensating_controls: true
+    approvers: ["CISO","CTO","GRC-lead"]
+  items:
+    - id: "EXC-1001"
+      risk_id: "RISK-0002"
+      environment: "prod"
+      granted_until: "2025-10-31"
+      justification: "Временная несовместимость плагина admission в кластере prod."
+      compensating_controls: ["CTRL.SECLOG.OTEL.01"]
+      approver: "CISO"
+      created_at: "2025-08-28T00:00:00Z"
+
+# -----------------------------------------------------------------------------
+# Верификация конфигурации и требования к CI
+# -----------------------------------------------------------------------------
+validation:
+  schema: "internal://schemas/risk.schema.json"   # ссылка на JSON Schema в репозитории
+  rules:
+    - id: "RISK-SLA-DUE"
+      description: "due соответствует SLA из scoring.sla_by_severity"
+      severity: "high"
+    - id: "RESIDUAL-NOT-CRIT-IN-PROD"
+      description: "Резидуальный риск уровня critical запрещен в prod"
+      severity: "critical"
+    - id: "EXCEPTIONS-CAP"
+      description: "Количество и сумма баллов исключений не превышают лимиты"
+      severity: "high"
+
+# -----------------------------------------------------------------------------
+# Отчётность
+# -----------------------------------------------------------------------------
+reporting:
+  cadence: "monthly"
+  recipients: ["security@aethernova.dev","cto@aethernova.dev"]
+  exports:
+    - {format: "pdf",  template: "reports/risk-summary.md"}
+    - {format: "json", path: "out/risk-summary.json"}

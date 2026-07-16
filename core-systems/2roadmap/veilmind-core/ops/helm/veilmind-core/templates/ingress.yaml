@@ -1,0 +1,216 @@
+# File: veilmind-core/ops/helm/veilmind-core/templates/ingress.yaml
+{{- /*
+Industrial-grade Ingress for veilmind-core
+Values contract (examples):
+ingress:
+  enabled: true
+  className: "nginx"                    # or "traefik" | "alb" | custom
+  annotations: {}                       # merged as-is (tpl-processed)
+  externalDNS:
+    enabled: true
+    hostname: "api.example.com"
+  tls:
+    enabled: true
+    secretName: ""                      # if empty and certManager.issuer set, it will be created by cert-manager
+    minTLS: "TLSv1.2"
+    certManager:
+      issuer: ""                        # e.g. "letsencrypt-prod" (ClusterIssuer or Issuer)
+      issuerKind: "ClusterIssuer"
+  canary:
+    enabled: false
+    weight: "20"                        # or header/cookie strategy via annotationsOverride
+    annotationsOverride: {}             # raw canary annotations if strategy differs
+  hosts:
+    - host: "api.example.com"
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: ""                    # default: <release>-api
+            port: 8000
+  nginx:
+    securityHeaders:
+      enabled: true
+      contentSecurityPolicy: "default-src 'self'; frame-ancestors 'none';"
+      strictTransportSecurity: "max-age=31536000; includeSubDomains; preload"
+      xContentTypeOptions: "nosniff"
+      xFrameOptions: "DENY"
+      referrerPolicy: "no-referrer"
+    rateLimit:
+      enabled: false
+      rate: "20"                        # requests per second per IP
+      burst: "40"
+    timeouts:
+      proxyRead: "60s"
+      proxySend: "60s"
+      proxyConnect: "15s"
+    bodySize: "8m"
+    waf:
+      modsecurityEnabled: false
+      owaspCrs: false
+      customRules: ""                   # multiline string of rules
+    mTLS:
+      enabled: false
+      clientCASecret: ""                # Secret with CA bundle (key: ca.crt)
+      verifyDepth: "1"
+  providerAnnotations:
+    alb: {}     # e.g. { alb.ingress.kubernetes.io/scheme: internet-facing, ... }
+    traefik: {} # e.g. { traefik.ingress.kubernetes.io/router.entrypoints: websecure, ... }
+  extraAnnotations: {}  # appended last (highest precedence)
+*/ -}}
+
+{{- if .Values.ingress.enabled }}
+{{- $fullName := include "veilmind-core.fullname" . | default (printf "%s" .Release.Name) -}}
+{{- $svcDefault := printf "%s-api" $fullName -}}
+{{- $className := .Values.ingress.className | default "nginx" -}}
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ printf "%s" $fullName | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "veilmind-core.labels" . | nindent 4 | default "" }}
+    app.kubernetes.io/name: {{ include "veilmind-core.name" . | default "veilmind-core" }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+  annotations:
+    {{- /* Base annotations from values */}}
+    {{- with .Values.ingress.annotations }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+
+    {{- /* ExternalDNS */}}
+    {{- if .Values.ingress.externalDNS.enabled }}
+    external-dns.alpha.kubernetes.io/hostname: {{ .Values.ingress.externalDNS.hostname | quote }}
+    {{- end }}
+
+    {{- /* Ingress class (for legacy controllers that need annotation) */}}
+    {{- if not (hasKey .Values.ingress "className") }}
+    kubernetes.io/ingress.class: {{ $className | quote }}
+    {{- end }}
+
+    {{- /* cert-manager */}}
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.certManager.issuer }}
+    cert-manager.io/{{ if eq (default "ClusterIssuer" .Values.ingress.tls.certManager.issuerKind) "Issuer" }}issuer{{ else }}cluster-issuer{{ end }}: {{ .Values.ingress.tls.certManager.issuer | quote }}
+    {{- end }}
+
+    {{- /* Controller-specific helper annotations (optional) */}}
+    {{- with .Values.ingress.providerAnnotations.alb }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+    {{- with .Values.ingress.providerAnnotations.traefik }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+
+    {{- /* NGINX hardening */}}
+    {{- if eq $className "nginx" }}
+    {{- with .Values.ingress.nginx.bodySize }}
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.ingress.nginx.timeouts.proxyRead }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.ingress.nginx.timeouts.proxySend }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.ingress.nginx.timeouts.proxyConnect }}
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: {{ . | quote }}
+    {{- end }}
+
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.minTLS }}
+    nginx.ingress.kubernetes.io/ssl-protocols: {{ .Values.ingress.tls.minTLS | quote }}
+    {{- end }}
+
+    {{- if .Values.ingress.nginx.securityHeaders.enabled }}
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      {{- with .Values.ingress.nginx.securityHeaders.contentSecurityPolicy }}
+      add_header Content-Security-Policy "{{ . }}";
+      {{- end }}
+      {{- with .Values.ingress.nginx.securityHeaders.strictTransportSecurity }}
+      add_header Strict-Transport-Security "{{ . }}";
+      {{- end }}
+      {{- with .Values.ingress.nginx.securityHeaders.xContentTypeOptions }}
+      add_header X-Content-Type-Options "{{ . }}";
+      {{- end }}
+      {{- with .Values.ingress.nginx.securityHeaders.xFrameOptions }}
+      add_header X-Frame-Options "{{ . }}";
+      {{- end }}
+      {{- with .Values.ingress.nginx.securityHeaders.referrerPolicy }}
+      add_header Referrer-Policy "{{ . }}";
+      {{- end }}
+    {{- end }}
+
+    {{- if .Values.ingress.nginx.rateLimit.enabled }}
+    nginx.ingress.kubernetes.io/limit-rps: {{ .Values.ingress.nginx.rateLimit.rate | quote }}
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "1"
+    nginx.ingress.kubernetes.io/limit-burst: {{ .Values.ingress.nginx.rateLimit.burst | quote }}
+    nginx.ingress.kubernetes.io/limit-exempt: "127.0.0.1"
+    {{- end }}
+
+    {{- if .Values.ingress.nginx.waf.modsecurityEnabled }}
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/enable-owasp-core-rules: {{ ternary "true" "false" .Values.ingress.nginx.waf.owaspCrs | quote }}
+    {{- with .Values.ingress.nginx.waf.customRules }}
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      {{- . | nindent 6 }}
+    {{- end }}
+    {{- end }}
+
+    {{- if .Values.ingress.nginx.mTLS.enabled }}
+    nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
+    nginx.ingress.kubernetes.io/auth-tls-secret: "{{ .Release.Namespace }}/{{ .Values.ingress.nginx.mTLS.clientCASecret }}"
+    nginx.ingress.kubernetes.io/auth-tls-verify-depth: {{ .Values.ingress.nginx.mTLS.verifyDepth | quote }}
+    nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream: "true"
+    {{- end }}
+    {{- end }}
+
+    {{- /* Canary */}}
+    {{- if .Values.ingress.canary.enabled }}
+    nginx.ingress.kubernetes.io/canary: "true"
+    {{- if .Values.ingress.canary.weight }}
+    nginx.ingress.kubernetes.io/canary-weight: {{ .Values.ingress.canary.weight | quote }}
+    {{- end }}
+    {{- with .Values.ingress.canary.annotationsOverride }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+    {{- end }}
+
+    {{- /* Extra annotations (highest precedence) */}}
+    {{- with .Values.ingress.extraAnnotations }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+  {{- if and .Values.ingress.tls.enabled (or .Values.ingress.tls.secretName .Values.ingress.hosts) }}
+  tls:
+    - {{- if .Values.ingress.tls.secretName }}
+      secretName: {{ .Values.ingress.tls.secretName | quote }}
+      {{- end }}
+      hosts:
+      {{- range .Values.ingress.hosts }}
+        - {{ .host | quote }}
+      {{- end }}
+  {{- end }}
+  rules:
+    {{- range $h := .Values.ingress.hosts }}
+    - host: {{ $h.host | quote }}
+      http:
+        paths:
+          {{- range $p := $h.paths }}
+          - path: {{ $p.path | default "/" }}
+            pathType: {{ $p.pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ default $svcDefault $p.service.name | default $svcDefault | quote }}
+                port:
+                  {{- if $p.service.portName }}
+                  name: {{ $p.service.portName | quote }}
+                  {{- else }}
+                  number: {{ default 8000 $p.service.port | int }}
+                  {{- end }}
+          {{- end }}
+    {{- end }}
+{{- end }}

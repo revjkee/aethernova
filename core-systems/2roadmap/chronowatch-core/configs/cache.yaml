@@ -1,0 +1,444 @@
+# ==============================================================================
+# ChronoWatch-Core Cache Configuration
+# Versioned, profile-aware, provider-agnostic policies.
+# ==============================================================================
+
+version: 1
+schema: "https://aethernova.io/schemas/chronowatch/cache.v1.json"
+
+# ------------------------------------------------------------------------------
+# Общие анкоры (DRY)
+# ------------------------------------------------------------------------------
+anchors:
+  backoff_linear: &backoff_linear
+    strategy: linear
+    base_ms: 50
+    max_ms: 500
+    jitter: true
+
+  backoff_expo: &backoff_expo
+    strategy: exponential
+    base_ms: 25
+    factor: 2.0
+    max_ms: 5000
+    jitter: true
+
+  retry_safe: &retry_safe
+    max_attempts: 3
+    backoff: *backoff_expo
+    retry_on:
+      - timeout
+      - connection_error
+      - read_error
+    respect_retry_after: true
+
+  circuit_breaker_strict: &cb_strict
+    enabled: true
+    failure_rate_threshold: 25        # %
+    slow_call_rate_threshold: 25      # %
+    slow_call_duration_ms: 150
+    minimum_calls: 50
+    sliding_window:
+      type: count
+      size: 100
+    wait_duration_in_open_state_ms: 20000
+    permitted_number_of_calls_in_half_open_state: 10
+    automatic_transition_from_open_to_half_open: true
+
+  tls_defaults: &tls_defaults
+    enabled: true
+    verify_peer: true
+    ca_file: "${CACHE_TLS_CA_FILE:-/etc/ssl/certs/ca-bundle.crt}"
+    cert_file: "${CACHE_TLS_CERT_FILE:-}"
+    key_file: "${CACHE_TLS_KEY_FILE:-}"
+    min_version: "TLS1.2"
+
+  compression_defaults: &compression_defaults
+    enabled: true
+    algorithm: "zstd"                 # zstd|lz4|gzip
+    level: 3                          # баланс скорость/сжатие
+    min_bytes: 512                    # не сжимать мелкие объекты
+
+  serializer_json: &serializer_json
+    name: "json"
+    options:
+      ensure_ascii: false
+      allow_nan: false
+
+  serializer_msgpack: &serializer_msgpack
+    name: "msgpack"
+    options:
+      use_bin_type: true
+      strict_map_key: true
+
+  stampede_default: &stampede_default
+    single_flight:
+      enabled: true
+      max_wait_ms: 2000
+    early_refresh:
+      enabled: true
+      prob_strategy: "delta"          # алгоритм SRE: p = beta * (now - (ttl - delta)) / delta
+      beta: 0.2
+      delta_ratio: 0.1                # delta = ttl * ratio
+    soft_ttl_ratio: 0.8               # после 80% TTL допускается фон-обновление
+
+  negative_cache_default: &negative_cache_default
+    enabled: true
+    ttl: "10s"
+    max_size: 10000
+    codes: [ "not_found", "empty" ]
+
+  eviction_defaults: &eviction_defaults
+    policy: "allkeys-lru"             # для Redis; для Memcached — lru
+    high_watermark: 0.85              # начать агрессивную выборку
+    low_watermark: 0.75
+
+  pool_defaults: &pool_defaults
+    max_connections: 512
+    min_idle: 16
+    max_idle: 128
+    max_lifetime_ms: 600000
+    idle_timeout_ms: 90000
+
+  metrics_defaults: &metrics_defaults
+    prometheus:
+      enabled: true
+      namespace: "chronowatch_cache"
+      labels:
+        service: "chronowatch-core"
+    opentelemetry:
+      enabled: true
+      exporter_otlp:
+        endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}"
+        timeout_ms: 3000
+        insecure: true
+
+# ------------------------------------------------------------------------------
+# Поставщики кэша (бэкенды) — можно ссылаться по имени из политик
+# ------------------------------------------------------------------------------
+providers:
+  redis_primary:
+    kind: redis
+    mode: standalone
+    endpoints:
+      - host: "${REDIS_HOST:-redis-primary}"
+        port: ${REDIS_PORT:-6379}
+    db: ${REDIS_DB:-0}
+    auth:
+      username: "${REDIS_USERNAME:-}"
+      password: "${REDIS_PASSWORD:-}"
+    tls: *tls_defaults
+    pool: *pool_defaults
+    timeouts:
+      connect_ms: 100
+      read_ms: 50
+      write_ms: 50
+    retry: *retry_safe
+    circuit_breaker: *cb_strict
+    eviction: *eviction_defaults
+    metrics: *metrics_defaults
+
+  redis_sentinel:
+    kind: redis
+    mode: sentinel
+    master_set: "${REDIS_MASTER_SET:-mymaster}"
+    sentinels:
+      - host: "${REDIS_SENTINEL_1:-redis-sentinel-0}"
+        port: ${REDIS_SENTINEL_PORT:-26379}
+      - host: "${REDIS_SENTINEL_2:-redis-sentinel-1}"
+        port: ${REDIS_SENTINEL_PORT:-26379}
+      - host: "${REDIS_SENTINEL_3:-redis-sentinel-2}"
+        port: ${REDIS_SENTINEL_PORT:-26379}
+    db: ${REDIS_DB:-0}
+    auth:
+      username: "${REDIS_USERNAME:-}"
+      password: "${REDIS_PASSWORD:-}"
+      sentinel_password: "${REDIS_SENTINEL_PASSWORD:-}"
+    tls: *tls_defaults
+    pool: *pool_defaults
+    timeouts:
+      connect_ms: 150
+      read_ms: 60
+      write_ms: 60
+    retry: *retry_safe
+    circuit_breaker: *cb_strict
+    eviction: *eviction_defaults
+    metrics: *metrics_defaults
+
+  redis_cluster:
+    kind: redis
+    mode: cluster
+    endpoints:
+      - host: "${REDIS_CLUSTER_1:-redis-cluster-0}"
+        port: 6379
+      - host: "${REDIS_CLUSTER_2:-redis-cluster-1}"
+        port: 6379
+      - host: "${REDIS_CLUSTER_3:-redis-cluster-2}"
+        port: 6379
+    auth:
+      username: "${REDIS_USERNAME:-}"
+      password: "${REDIS_PASSWORD:-}"
+    tls: *tls_defaults
+    pool: *pool_defaults
+    topology_refresh:
+      enabled: true
+      period_ms: 30000
+    timeouts:
+      connect_ms: 120
+      read_ms: 60
+      write_ms: 60
+    retry: *retry_safe
+    circuit_breaker: *cb_strict
+    eviction: *eviction_defaults
+    metrics: *metrics_defaults
+
+  memcached_main:
+    kind: memcached
+    endpoints:
+      - host: "${MEMCACHED_HOST:-memcached}"
+        port: ${MEMCACHED_PORT:-11211}
+    sasl:
+      enabled: "${MEMCACHED_SASL_ENABLED:-false}"
+      username: "${MEMCACHED_USERNAME:-}"
+      password: "${MEMCACHED_PASSWORD:-}"
+    pool: *pool_defaults
+    timeouts:
+      connect_ms: 80
+      read_ms: 40
+      write_ms: 40
+    retry: *retry_safe
+    circuit_breaker: *cb_strict
+    metrics: *metrics_defaults
+
+# ------------------------------------------------------------------------------
+# Политики кэширования по неймспейсам (keyspace → backend + параметры)
+# ------------------------------------------------------------------------------
+policies:
+  defaults: &policy_defaults
+    provider: "redis_primary"
+    key_version: 1
+    namespace_prefix: "cw"
+    serializer: *serializer_msgpack
+    compression: *compression_defaults
+    stampede: *stampede_default
+    negative_cache: *negative_cache_default
+    ttl: "300s"
+    max_object_bytes: 1048576     # 1 MiB
+    max_namespace_bytes: 2147483648  # 2 GiB (soft limit; зависит от backend)
+    write_policy:
+      write_through: true
+      write_behind:
+        enabled: false
+        queue_max: 50000
+        flush_interval_ms: 200
+    consistency:
+      read_fallback_to_stale: true
+      allow_stale_ms: 500
+    observability:
+      key_cardinality_sampling:
+        enabled: true
+        sample_rate: 0.01
+      log_slow_ops_ms: 25
+
+  namespaces:
+    sessions:
+      <<: *policy_defaults
+      ttl: "7200s"
+      serializer: *serializer_json
+      compression:
+        enabled: true
+        algorithm: "lz4"
+        level: 0
+        min_bytes: 0
+      max_object_bytes: 262144
+      provider: "redis_sentinel"
+      namespace_prefix: "cw:sess"
+      negative_cache:
+        enabled: false
+
+    auth_tokens:
+      <<: *policy_defaults
+      ttl: "900s"
+      key_version: 2
+      provider: "redis_primary"
+      namespace_prefix: "cw:auth"
+      negative_cache:
+        enabled: true
+        ttl: "30s"
+
+    rate_limits:
+      <<: *policy_defaults
+      ttl: "60s"
+      provider: "redis_cluster"
+      namespace_prefix: "cw:ratelimit"
+      serializer: *serializer_msgpack
+      stampede:
+        single_flight:
+          enabled: false
+        early_refresh:
+          enabled: false
+
+    objects:
+      <<: *policy_defaults
+      ttl: "600s"
+      namespace_prefix: "cw:obj"
+      max_object_bytes: 2097152
+      compression: *compression_defaults
+
+    pages:
+      <<: *policy_defaults
+      ttl: "120s"
+      namespace_prefix: "cw:page"
+      provider: "memcached_main"
+      serializer: *serializer_msgpack
+      compression:
+        enabled: true
+        algorithm: "zstd"
+        level: 2
+        min_bytes: 256
+
+# ------------------------------------------------------------------------------
+# Шардирование (опционально): распределение неймспейсов по провайдерам
+# ------------------------------------------------------------------------------
+sharding:
+  enabled: true
+  strategy: "namespace-hash"  # namespace-hash|key-hash|round-robin
+  rings:
+    - name: "primary-ring"
+      hash: "xxhash64"
+      buckets:
+        - match: "objects:*"
+          provider: "redis_cluster"
+          weight: 3
+        - match: "pages:*"
+          provider: "memcached_main"
+          weight: 2
+        - match: "*"
+          provider: "redis_primary"
+          weight: 5
+
+# ------------------------------------------------------------------------------
+# Здоровье/проверки и warmup
+# ------------------------------------------------------------------------------
+health:
+  startup_checks:
+    timeout_ms: 3000
+    providers: [ "redis_primary", "redis_sentinel", "memcached_main" ]
+  liveness:
+    ping_interval_ms: 10000
+    max_failures: 3
+  readiness:
+    min_successes: 2
+    window: 5
+
+warmup:
+  enabled: true
+  sources:
+    - kind: "file"
+      path: "/etc/chronowatch/cache_warm_keys.txt"
+      namespace: "pages"
+      max_keys: 5000
+    - kind: "sql"
+      dsn_env: "WARMUP_DSN"
+      query: "select cache_key from cw_popular_keys limit 10000"
+      namespace: "objects"
+
+# ------------------------------------------------------------------------------
+# Профили сред: переопределяют провайдеры/политики точечно
+# Выбор профиля осуществляется переменной окружения CHRONOWATCH_ENV (dev|staging|prod)
+# ------------------------------------------------------------------------------
+profiles:
+  dev:
+    providers:
+      redis_primary:
+        endpoints:
+          - host: "${REDIS_HOST:-localhost}"
+            port: 6379
+        tls:
+          enabled: false
+      memcached_main:
+        endpoints:
+          - host: "localhost"
+            port: 11211
+    policies:
+      namespaces:
+        pages:
+          ttl: "10s"
+        rate_limits:
+          ttl: "5s"
+
+  staging:
+    providers:
+      redis_primary:
+        tls:
+          enabled: true
+          verify_peer: true
+      redis_sentinel:
+        sentinels:
+          - host: "stg-redis-sentinel-0"
+            port: 26379
+          - host: "stg-redis-sentinel-1"
+            port: 26379
+          - host: "stg-redis-sentinel-2"
+            port: 26379
+    policies:
+      namespaces:
+        sessions:
+          provider: "redis_sentinel"
+        pages:
+          provider: "redis_primary"
+
+  prod:
+    providers:
+      redis_primary:
+        pool:
+          max_connections: 2048
+          min_idle: 64
+          max_idle: 256
+        timeouts:
+          connect_ms: 80
+          read_ms: 40
+          write_ms: 40
+      redis_cluster:
+        topology_refresh:
+          enabled: true
+          period_ms: 15000
+    policies:
+      defaults:
+        ttl: "300s"
+      namespaces:
+        pages:
+          provider: "memcached_main"
+          ttl: "60s"
+        rate_limits:
+          provider: "redis_cluster"
+          ttl: "60s"
+
+# ------------------------------------------------------------------------------
+# SLO/алерты (ориентирами пользуются observability-пайплайны)
+# ------------------------------------------------------------------------------
+slo:
+  hit_ratio:
+    target: 0.9
+    window: "5m"
+    alert_after: "15m"
+  p99_latency_ms:
+    get: 15
+    set: 20
+  error_rate:
+    target: 0.005
+
+# ------------------------------------------------------------------------------
+# Безопасность и аудит
+# ------------------------------------------------------------------------------
+security:
+  redact_keys:
+    - "*password*"
+    - "*secret*"
+    - "*token*"
+  audit:
+    enabled: true
+    sample_rate: 0.01
+    include:
+      - "admin:*"
+      - "auth_tokens:*"

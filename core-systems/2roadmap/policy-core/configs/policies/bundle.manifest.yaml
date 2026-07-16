@@ -1,0 +1,261 @@
+# policy-core/configs/policies/bundle.manifest.yaml
+# Единый манифест поставки политик. Совместим с OPA Bundle (roots/revision) и CI/CD пайплайнами.
+apiVersion: policy.aethernova.io/v1
+kind: PolicyBundle
+
+metadata:
+  name: policy-core
+  description: Политики доступа, комплаенса и валидации входных данных для компонентов policy-core.
+  labels:
+    project: policy-core
+    environment: dev
+    managed-by: policy-bundler
+  annotations:
+    # Произвольные ссылки на репозиторий и пайплайн
+    vcs.url: "${GIT_URL:-https://example.com/policy-core.git}"
+    vcs.revision: "${GIT_COMMIT:-unknown}"
+    build.id: "${CI_PIPELINE_ID:-local}"
+    build.date: "${BUILD_DATE:-1970-01-01T00:00:00Z}"
+
+spec:
+  schemaVersion: "1.0"
+
+  # ---- Блок совместимости с OPA Bundle ----
+  opa:
+    revision: "${GIT_TAG:-0.1.0}-${GIT_COMMIT:-dev}"
+    roots:
+      - "policy_core"
+      - "rbac"
+      - "admission"
+      - "validate"
+      - "system"
+    capabilities:
+      minOPA: ">=0.63.0"     # требуется autoscaler-friendly/decision-logs и пр.
+      regoVersion: "v1"      # синтаксис и встроенные функции
+
+  # ---- Описание содержимого пакета ----
+  contents:
+    # Якорь для общих свойств артефактов
+    defaults: &artifact_defaults
+      license: "Apache-2.0"
+      integrity:
+        algo: "sha256"
+      annotations:
+        owner: "secops@policy-core.example.com"
+        review.required: "true"
+
+    modules:
+      # Регламент: каждый модуль указывает пакет, путь и контрольную сумму.
+      - id: "rbac.core"
+        type: "rego"
+        package: "policy_core.rbac"
+        path: "policies/rbac/rbac_core.rego"
+        digest: "sha256:${RBAC_CORE_SHA256:-UNSET}"
+        <<: *artifact_defaults
+      - id: "admission.k8s"
+        type: "rego"
+        package: "admission.kubernetes"
+        path: "policies/admission/k8s_validations.rego"
+        digest: "sha256:${ADMISSION_K8S_SHA256:-UNSET}"
+        <<: *artifact_defaults
+      - id: "validate.schemas"
+        type: "rego"
+        package: "validate.schemas"
+        path: "policies/validate/schema_checks.rego"
+        digest: "sha256:${VALIDATE_SCHEMAS_SHA256:-UNSET}"
+        <<: *artifact_defaults
+      - id: "system.main"
+        type: "rego"
+        package: "system.main"
+        path: "policies/system/main.rego"
+        digest: "sha256:${SYSTEM_MAIN_SHA256:-UNSET}"
+        <<: *artifact_defaults
+
+    data:
+      # Произвольные JSON/YAML данные, доступные как data.*
+      - id: "rbac.map"
+        type: "data"
+        path: "data/rbac/map.json"
+        digest: "sha256:${RBAC_MAP_SHA256:-UNSET}"
+        <<: *artifact_defaults
+      - id: "schemas.k8s.v1"
+        type: "data"
+        path: "data/schemas/k8s.admission.v1.json"
+        digest: "sha256:${SCHEMA_K8S_V1_SHA256:-UNSET}"
+        <<: *artifact_defaults
+
+    entrypoints:
+      # Точки принятия решений. Формат: <package>.<rule>
+      - id: "authz.allow"
+        rule: "policy_core.rbac.allow"
+        inputSchemaRef: "data.schemas.k8s.v1"   # пример привязки к схеме
+        decision: "allow"
+      - id: "admission.deny"
+        rule: "admission.kubernetes.deny"
+        inputSchemaRef: "data.schemas.k8s.v1"
+        decision: "deny"
+
+  # ---- Подписи, аттестации, цепочки доверия ----
+  verification:
+    # Поддержка Sigstore/cosign (DSSE), PGP и статических ключей JWKS
+    cosign:
+      enabled: true
+      predicateTypes:
+        - "https://cyclonedx.org/bom"
+        - "https://slsa.dev/provenance/v1"
+      identities:
+        # Разрешенные идентичности для keyless-подписей
+        - issuer: "https://token.actions.githubusercontent.com"
+          subjectPattern: "repo:org/policy-core:*"
+        - issuer: "https://accounts.google.com"
+          subjectPattern: "email:secops@policy-core.example.com"
+    pgp:
+      enabled: false
+      publicKeys: []
+    jwks:
+      enabled: false
+      urls: []
+    signatures:
+      # Пути до файлов подписей (если используются подписи артефактов файлами)
+      - path: "signatures/bundle.sig"
+        for: "bundle.tar.gz"
+        algo: "sha256"
+        digest: "sha256:${BUNDLE_SHA256:-UNSET}"
+    attestations:
+      sbom:
+        type: "cyclonedx-json"
+        path: "attestations/sbom.cdx.json"
+        required: true
+        digest: "sha256:${SBOM_SHA256:-UNSET}"
+      provenance:
+        type: "slsa-v1"
+        path: "attestations/provenance.intoto.jsonl"
+        required: true
+        digest: "sha256:${PROVENANCE_SHA256:-UNSET}"
+
+  # ---- Качество и воркфлоу ----
+  quality:
+    lint:
+      rego:
+        enabled: true
+        failOnWarn: false
+        configPath: "tools/opa/.regolint.yaml"
+    tests:
+      regoUnit:
+        enabled: true
+        paths:
+          - "tests/rego/"
+        minCoverage: 0.85
+      conftest:
+        enabled: true
+        targets:
+          - "samples/k8s/*.yaml"
+        policyPaths:
+          - "policies/admission/"
+    policySets:
+      # Логическая группировка для поэтапной валидации/раскатки
+      - name: "admission-baseline"
+        include:
+          - "admission.k8s"
+          - "validate.schemas"
+      - name: "rbac-core"
+        include:
+          - "rbac.core"
+
+  # ---- Соответствие стандартам и трассировка требований ----
+  compliance:
+    mappings:
+      - control: "CIS Kubernetes Benchmark 1.25"
+        section: "5.2.5"
+        rules:
+          - "admission.kubernetes.deny:hostPath"
+          - "admission.kubernetes.deny:privileged"
+      - control: "NIST 800-53 rev5"
+        section: "AC-6"
+        rules:
+          - "policy_core.rbac.allow"
+      - control: "ISO 27001:2022"
+        section: "A.8.16"
+        rules:
+          - "validate.schemas"
+    evidence:
+      # Путь к отчетам проверки, которые генерит CI
+      - type: "opa-test-report"
+        path: "reports/opa-tests.json"
+      - type: "coverage"
+        path: "reports/coverage.json"
+
+  # ---- Параметры выполнения и интеграции ----
+  runtime:
+    engine: "opa"             # opa | gatekeeper | styra-das | custom
+    decisionLogs:
+      enabled: true
+      maskPII: true
+      sink: "stdout"          # stdout | otlp | http
+    bundles:
+      discovery: false
+      polling:
+        minDelaySeconds: 10
+        maxDelaySeconds: 30
+    inputs:
+      defaultSchemaRef: "data.schemas.k8s.v1"
+      rejectUnknownFields: true
+    failurePolicy:
+      # fail-open допустим только в dev
+      admission:
+        failOpen: false
+      authz:
+        failOpen: false
+
+  # ---- Параметры раскатки и обратимой активации ----
+  rollout:
+    strategy: "canary"
+    steps:
+      - name: "10%"
+        trafficPercent: 10
+        pauseSeconds: 300
+      - name: "50%"
+        trafficPercent: 50
+        pauseSeconds: 600
+      - name: "100%"
+        trafficPercent: 100
+    gates:
+      # Гейты основаны на метриках и алертах
+      - name: "error-rate"
+        metric: "policy_decision_errors_total"
+        window: "5m"
+        threshold: "rate < 0.1/s"
+      - name: "deny-spike"
+        metric: "policy_denies_total"
+        window: "5m"
+        threshold: "rate < 5/s"
+    rollback:
+      onGateFailure: true
+      onQualityFailure: true
+
+  # ---- Зависимости и внешние бандлы ----
+  dependencies:
+    # Пример подключения внешнего бандла правил (версионируется и пинится по digest)
+    - name: "k8s-hardening"
+      service: "https://policies.example.com/bundles"
+      bundle: "k8s-hardening"
+      revision: "1.12.3"
+      digest: "sha256:${K8S_HARDENING_BUNDLE_SHA256:-UNSET}"
+      required: false
+
+  # ---- Матрица таргетов развёртывания ----
+  targets:
+    - name: "k8s-admission-dev"
+      platform: "kubernetes"
+      namespace: "policy-core"
+      entrypoints:
+        - "admission.deny"
+      annotations:
+        ingress.class: "nginx"
+        cluster.name: "${CLUSTER_NAME:-policy-core-dev}"
+    - name: "api-gateway-authz"
+      platform: "envoy-ext-authz"
+      entrypoints:
+        - "authz.allow"
+
+# Конец манифеста

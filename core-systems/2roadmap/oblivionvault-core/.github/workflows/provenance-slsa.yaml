@@ -1,0 +1,106 @@
+# oblivionvault-core/.github/workflows/provenance-slsa.yaml
+name: provenance-slsa
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Минимально необходимые привилегии на уровень workflow
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+  attestations: write
+
+# Исключаем гонки по одной и той же ссылке
+concurrency:
+  group: provenance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCHIVE_NAME: ${{ github.event.repository.name }}-${{ github.ref_name }}.tar.gz
+  DIST_DIR: dist
+
+jobs:
+  build:
+    name: Build artifact
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      artifact-name: ${{ steps.pack.outputs.archive }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Create source archive
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${DIST_DIR}"
+          git rev-parse --verify HEAD > BUILD_REVISION
+          # архив без .git
+          tar --exclude-vcs -czf "${DIST_DIR}/${ARCHIVE_NAME}" \
+              --owner=0 --group=0 --numeric-owner \
+              --sort=name --mtime='UTC 2020-01-01' .
+          echo "archive=${DIST_DIR}/${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "${DIST_DIR}/${ARCHIVE_NAME}" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: ${{ steps.pack.outputs.archive }}
+          retention-days: 30
+          if-no-files-found: error
+
+  attest:
+    name: Generate SLSA provenance (GitHub Attestations)
+    needs: build
+    runs-on: ubuntu-24.04
+    # Аттестации требуют записи в attestations и OIDC
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: ${{ env.DIST_DIR }}
+
+      - name: List artifact
+        run: ls -l "${DIST_DIR}"
+
+      - name: Generate build provenance (SLSA v1)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "${{ env.DIST_DIR }}/*.tar.gz"
+
+  # Пример публикации артефакта в Release и привязки к нему аттестации.
+  # Раскомментируйте блок ниже, если хотите автоматически прикладывать архив к релизу.
+  # release-upload:
+  #   name: Attach artifact to Release
+  #   needs: [build, attest]
+  #   runs-on: ubuntu-24.04
+  #   if: github.event_name == 'release'
+  #   permissions:
+  #     contents: write
+  #   steps:
+  #     - name: Download artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: ${{ env.ARCHIVE_NAME }}
+  #         path: ${{ env.DIST_DIR }}
+  #     - name: Upload to Release
+  #       uses: softprops/action-gh-release@v2
+  #       with:
+  #         files: ${{ env.DIST_DIR }}/*.tar.gz

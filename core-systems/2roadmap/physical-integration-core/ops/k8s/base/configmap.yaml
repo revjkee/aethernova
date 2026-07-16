@@ -1,0 +1,195 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: physical-integration-core-config
+  namespace: physical-integration
+  labels:
+    app.kubernetes.io/name: physical-integration-core
+    app.kubernetes.io/instance: physical-integration-core
+    app.kubernetes.io/component: core
+    app.kubernetes.io/part-of: neurocity
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: kustomize
+    environment: production
+  annotations:
+    # Удобно для автоматического перезапуска подов инструментами типа Reloader (если используется)
+    reloader.stakater.com/search: "true"
+    # Документация: конфиг монтируется в /etc/physical-integration-core
+    k8s.v1.cni.cncf.io/networks-status: "N/A"
+immutable: true
+data:
+  # Основная конфигурация сервиса
+  app.yaml: |-
+    app:
+      name: "physical-integration-core"
+      mode: "production"
+      instanceIdEnv: "POD_NAME"
+      gracefulShutdownSeconds: 20
+
+    http:
+      host: "0.0.0.0"
+      port: 8080
+      readTimeoutSeconds: 10
+      writeTimeoutSeconds: 20
+      idleTimeoutSeconds: 60
+      cors:
+        enabled: false
+        allowOrigins: []
+        allowMethods: ["GET","POST","PUT","DELETE"]
+        allowHeaders: ["Content-Type","Authorization"]
+
+    grpc:
+      host: "0.0.0.0"
+      port: 9090
+      maxRecvMsgSizeBytes: 8388608
+      maxSendMsgSizeBytes: 8388608
+      reflection: false
+      healthService: true
+
+    # Интеграция с оборудованием
+    hardware:
+      ioTimeoutMs: 2000
+      retry:
+        attempts: 3
+        backoffMs: 200
+        jitter: true
+      drivers:
+        - id: "modbus-tcp"
+          enabled: true
+          endpoint: "tcp://modbus-gateway:502"
+          unitId: 1
+          connectTimeoutMs: 1500
+        - id: "opc-ua"
+          enabled: false
+          endpoint: "opc.tcp://opcua-endpoint:4840"
+          securityMode: "SignAndEncrypt"
+          securityPolicy: "Basic256Sha256"
+        - id: "serial-rs485"
+          enabled: false
+          device: "/dev/ttyUSB0"
+          baudRate: 9600
+          dataBits: 8
+          stopBits: 1
+          parity: "None"
+
+    ingestion:
+      batching:
+        maxRecords: 500
+        flushIntervalMs: 2000
+      validation:
+        schema: "strict"
+      deduplication:
+        windowSeconds: 10
+        keyFields: ["deviceId","metric","ts"]
+
+    # Наблюдаемость
+    observability:
+      logging:
+        level: "INFO"
+        format: "json"   # json|text
+        samplingRatio: 0.01
+        fields:
+          service: "physical-integration-core"
+          env: "prod"
+      metrics:
+        enabled: true
+        promEndpoint: "/metrics"
+        histogramBoundaries: [0.005,0.01,0.025,0.05,0.1,0.25,0.5,1,2.5,5,10]
+      tracing:
+        enabled: true
+        sampler: "parentbased_traceidratio"
+        samplerArg: 0.05
+        exporter: "otlp"   # только endpoint, креды передаются через Secret/Env
+        otlp:
+          endpoint: "otel-collector:4317"
+          protocol: "grpc"
+
+    # Безопасность (без секретов)
+    security:
+      zeroTrust:
+        intentValidation: true
+        rbacMode: "strict"
+      network:
+        allowlistCIDRs: ["10.0.0.0/8","192.168.0.0/16"]
+      tls:
+        mTLS: true
+        minTLSVersion: "1.2"
+        cipherSuites:
+          - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+          - "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+      pii:
+        redaction: true
+        auditTrail: "hash-chain"
+      rateLimit:
+        enabled: true
+        qps: 100
+        burst: 200
+
+    # Фичи
+    featureFlags:
+      enableShadowDrivers: false
+      enableFirmwareSimulation: false
+      enableDriverHotReload: true
+
+    # Политики конфигурации
+    configPolicy:
+      hotReload:
+        files:
+          - "/etc/physical-integration-core/app.yaml"
+          - "/etc/physical-integration-core/logging.json"
+        intervalSeconds: 10
+      failFastOnInvalidConfig: true
+
+  # Конфигурация логирования (обогащение и маршрутизация)
+  logging.json: |-
+    {
+      "sinks": [
+        { "type": "stdout" }
+      ],
+      "processors": [
+        {
+          "type": "redact",
+          "rules": [
+            { "name": "email", "pattern": "\\b[\\w.%+-]+@[\\w.-]+\\.[A-Za-z]{2,24}\\b", "replacement": "[redacted:email]" },
+            { "name": "phone", "pattern": "\\b\\+?\\d[\\d\\s().-]{7,}\\b", "replacement": "[redacted:phone]" }
+          ]
+        },
+        {
+          "type": "enrich",
+          "fields": {
+            "service": "physical-integration-core",
+            "env": "prod",
+            "component": "core"
+          }
+        }
+      ]
+    }
+
+  # Профили драйверов для быстрых переключений
+  drivers-profile.yaml: |-
+    profiles:
+      default:
+        enable: ["modbus-tcp"]
+        disable: ["opc-ua","serial-rs485"]
+      diagnostics:
+        enable: ["modbus-tcp","serial-rs485"]
+        disable: ["opc-ua"]
+      high-security:
+        enable: ["modbus-tcp"]
+        disable: ["opc-ua","serial-rs485"]
+        tlsOverrides:
+          mTLS: true
+          minTLSVersion: "1.3"
+
+  # Переменные окружения по умолчанию (могут быть переопределены через Deployment env)
+  env.defaults: |-
+    OTEL_TRACES_EXPORTER=otlp
+    OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
+    GODEBUG=x509sha1=0
+    GRPC_GO_REQUIREHANDSHAKE=true
+    LOG_LEVEL=INFO
+    HTTP_PORT=8080
+    GRPC_PORT=9090
+
+  # Версионный манифест конфигурации
+  config.version: "2025-08-21T00:00:00Z"

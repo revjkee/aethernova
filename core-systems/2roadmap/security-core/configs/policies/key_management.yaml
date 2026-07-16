@@ -1,0 +1,298 @@
+apiVersion: security.neurocity/v1
+kind: KeyManagementPolicy
+metadata:
+  name: key-management
+  version: "1.0.0"
+  updated: "2025-08-19T00:00:00Z"
+  owner: "security-core@neurocity"
+  labels:
+    app.kubernetes.io/name: security-core
+    app.kubernetes.io/component: security
+    app.kubernetes.io/part-of: neurocity
+    security.neurocity.io/policy: key-management
+spec:
+  compliance:
+    fips140_3: true
+    references:
+      - "NIST SP 800-57 Part 1"
+      - "NIST SP 800-131A"
+      - "FIPS 140-3"
+      - "ISO/IEC 19790"
+  governance:
+    separationOfDuties:
+      generate:   ["KMSAdmin","CryptoOfficer"]
+      activate:   ["CryptoOfficer","ServiceOwner"]
+      rotate:     ["CryptoOfficer","ServiceOwner"]
+      export:     ["KMSAdmin","SecurityOfficer"]
+      destroy:    ["KMSAdmin","SecurityOfficer","Auditor"]
+    approvals:
+      min_approvals: 2
+      required_roles: ["SecurityOfficer","Auditor"]
+      change_control:
+        require_ticket: true
+        require_linked_commit: true
+    key_naming:
+      format: "nc::{env}::{tenant}::{system}::{purpose}::{class}::{region}"
+      examples:
+        - "nc::prod::core::security-core::mtls::service_tls::eu-central-1"
+  crypto:
+    defaults:
+      hash: "SHA-256"
+      aead: "AES-256-GCM"
+      rng: "OS-CSPRNG"
+      fips_mode_required: true
+    signing:
+      prefer: ["Ed25519","ECDSA_P-256","ECDSA_P-384"]
+      rsa:
+        min_modulus_bits: 3072
+        prefer_modulus_bits: 4096
+        padding: ["PSS","PKCS1v15-sign"]   # PSS предпочтителен
+    key_agreement:
+      curves: ["X25519","secp256r1","secp384r1"]
+    tls:
+      min_version: "TLSv1.3"
+      allow_tls12_fallback: false
+      suites_tls13: ["TLS_AES_256_GCM_SHA384","TLS_CHACHA20_POLY1305_SHA256","TLS_AES_128_GCM_SHA256"]
+    anti_downgrade:
+      deny_algorithms: ["MD5","SHA1","DSA","RC4","3DES","RSA-1024","RSA-2048"]
+  providers:
+    order: ["aws_kms","vault","pkcs11_hsm","local_vault"]
+    aws_kms:
+      enabled: true
+      regions_allowed: ["eu-central-1","eu-west-1"]
+      multi_region_keys: true
+      default_rotation_days: 90
+      key_policy_scope:
+        allow_principals_arns: []  # заполняется в окружениях
+    vault:
+      enabled: true
+      transit_mount: "transit/"
+      kv_mount: "kv/"
+      min_version: "1.14"
+      key_rotation_days: 90
+    pkcs11_hsm:
+      enabled: false
+      module_path: "/usr/lib/pkcs11.so"
+      slot_id: 0
+      token_label: "NC-HSM"
+    local_vault:
+      enabled: false      # разрешено только в dev/test
+      path: "/var/lib/security-core/keys/local_vault.json"
+  accessControl:
+    roles:
+      KMSAdmin:
+        allow: ["create","schedule-rotate","disable","destroy","import","export-wrapped"]
+      CryptoOfficer:
+        allow: ["generate","activate","rotate","wrap","unwrap","sign","verify"]
+      SecurityOfficer:
+        allow: ["approve","revoke","quarantine","audit-read"]
+      ServiceOwner:
+        allow: ["use-encrypt","use-decrypt","sign","verify"]
+      Auditor:
+        allow: ["audit-read","inventory-read","evidence-export"]
+    abac:
+      rules:
+        - name: "prod-only-from-ci"
+          expr: "context.env == 'prod' => context.caller in ['ci-runner','k8s:controller']"
+        - name: "eu-data-sovereignty"
+          expr: "resource.region in ['eu-central-1','eu-west-1'] and subject.region == 'eu'"
+    mfa:
+      required_for: ["export-wrapped","destroy","revoke","breakglass-open"]
+  lifecycle:
+    states: ["proposed","pre-active","active","suspended","compromised","expired","destroyed"]
+    transitions_allowed:
+      proposed:   ["pre-active","destroyed"]
+      pre-active: ["active","destroyed"]
+      active:     ["suspended","compromised","expired","destroyed"]
+      suspended:  ["active","destroyed"]
+      compromised:["destroyed"]
+      expired:    ["destroyed"]
+    rotation:
+      jitter_percent: 10
+      enforce_before_expiry_days: 7
+      max_parallel_rotations: 10
+    destruction:
+      method: "crypto-erase"     # zeroize key material
+      require_attestation: true
+      evidence_artifacts: ["audit-chain","destroy-certificate"]
+  classes:
+    # ===== Certification Authorities =====
+    - id: "root_ca"
+      purpose: "offline root"
+      algorithm: "ECDSA_P-384"
+      storage: "pkcs11_hsm"
+      export_policy: "non-exportable"
+      rotation:
+        max_lifetime_days: 3650
+        renew_before_days: 365
+      approvals_required: 3
+      ceremonies:
+        offline_only: true
+        witnesses_min: 2
+    - id: "intermediate_ca"
+      purpose: "issuing CA"
+      algorithm: "ECDSA_P-256"
+      storage: "pkcs11_hsm"
+      export_policy: "non-exportable"
+      rotation:
+        max_lifetime_days: 1825
+        renew_before_days: 90
+    # ===== Service TLS / mTLS =====
+    - id: "service_tls"
+      purpose: "mTLS service certificates"
+      algorithm: "ECDSA_P-256"
+      storage: "aws_kms"
+      key_usage: ["digitalSignature","keyEncipherment"]
+      rotation:
+        max_lifetime_days: 90
+        renew_before_days: 15
+      pinning:
+        spki_sha256_required: true
+    # ===== JWT/OIDC signing =====
+    - id: "jwt_signing"
+      purpose: "JWT access/refresh"
+      algorithm: "Ed25519"
+      storage: "aws_kms"
+      rotation:
+        max_lifetime_days: 30
+        renew_before_days: 5
+      versioning:
+        allow_old_keys_grace_minutes: 30
+    # ===== Code signing =====
+    - id: "code_signing"
+      purpose: "artifact/container signing"
+      algorithm: "ECDSA_P-256"
+      storage: "aws_kms"
+      rotation:
+        max_lifetime_days: 180
+        renew_before_days: 21
+      attest:
+        supply_chain_provenance: true
+    # ===== Database / KV encryption (KEK) =====
+    - id: "data_at_rest_kek"
+      purpose: "KEK for envelope encryption"
+      algorithm: "AES-256"
+      mode: "wrap/unwrap"
+      storage: "aws_kms"
+      rotation:
+        max_lifetime_days: 365
+        renew_before_days: 30
+      export_policy: "non-exportable"
+    # ===== Data Encryption Keys (DEK) =====
+    - id: "dek"
+      purpose: "per-object/file DEK"
+      algorithm: "AES-256-GCM"
+      storage: "vault"
+      rotation:
+        max_lifetime_hours: 24
+      wrapping:
+        kek_class_ref: "data_at_rest_kek"
+        wrap_algorithm: "RSA-OAEP-SHA256|KMS-wrap"    # зависит от провайдера
+    # ===== Backup encryption =====
+    - id: "backup_kek"
+      purpose: "backup/media encryption"
+      algorithm: "AES-256"
+      storage: "aws_kms"
+      rotation:
+        max_lifetime_days: 365
+        renew_before_days: 30
+      s3_object_lock_compliance: true
+    # ===== Ephemeral session keys =====
+    - id: "session_key"
+      purpose: "short-lived channel encryption"
+      algorithm: "X25519+AES-256-GCM"
+      storage: "memory-only"
+      rotation:
+        max_lifetime_minutes: 60
+      export_policy: "ephemeral-non-exportable"
+  escrow:
+    enabled: true
+    scheme: "shamir"
+    threshold: "2-of-5"
+    shareholders_roles: ["CISO","SecurityOfficer","CTO","Legal","Auditor"]
+    allowed_classes: ["backup_kek","data_at_rest_kek"]
+    storage:
+      location: "offline-vault"
+      encryption: "AES-256-GCM"
+  backup:
+    schedule_cron: "0 2 * * *"
+    retention_days: 180
+    immutable_storage: true
+    location:
+      s3_bucket_arn: "arn:aws:s3:::nc-security-backups"
+      kms_key_arn: "arn:aws:kms:eu-central-1:ACCOUNT:key/KEY-ID"
+    restore_test_days: 30
+  attestation:
+    require_tpm_or_enclave_for:
+      - "jwt_signing"
+      - "code_signing"
+    enclave:
+      types_allowed: ["AWS-Nitro-Enclaves"]
+      evidence_must_include: ["PCRs","SignerHash","Nonce"]
+  audit:
+    events_required:
+      - "key.create"
+      - "key.import"
+      - "key.activate"
+      - "key.rotate.schedule"
+      - "key.rotate.complete"
+      - "key.export.wrapped"
+      - "key.revoke"
+      - "key.destroy"
+      - "breakglass.open"
+      - "breakglass.auto-revoke"
+    sink: "tamper-evident-chain"
+    redact_material: true
+    include_context_fields: ["request_id","subject","tenant","env","region","service"]
+  metrics:
+    exporters: ["prometheus"]
+    thresholds:
+      key_expiry_soon_days: 14
+      rotation_lag_max_hours: 24
+      anomalous_use_rate_per_min: 100
+  incident_response:
+    compromise:
+      actions:
+        - "mark-compromised"
+        - "disable-key"
+        - "force-rotate"
+        - "reissue-certificates"
+        - "invalidate-tokens"
+        - "notify-owners"
+      sla_minutes: 15
+      evidence:
+        collect: ["audit-window-24h","access-logs","attestation-proofs"]
+  breakglass:
+    enabled: true
+    conditions:
+      severity_min: "SEV-1"
+      allowed_operations: ["decrypt-once","unwrap-once"]
+      ttl_minutes: 30
+    controls:
+      require_mfa: true
+      approvals: 3
+      auto_revoke: true
+      labels:
+        tag: "BREAKGLASS"
+        reason_mandatory: true
+  environments:
+    prod:
+      provider_order: ["aws_kms","vault","pkcs11_hsm"]
+      overrides:
+        providers:
+          local_vault:
+            enabled: false
+        crypto:
+          tls:
+            allow_tls12_fallback: false
+    stage:
+      provider_order: ["vault","aws_kms"]
+    dev:
+      provider_order: ["local_vault","vault"]
+      overrides:
+        providers:
+          local_vault:
+            enabled: true
+        governance:
+          approvals:
+            min_approvals: 1

@@ -1,0 +1,285 @@
+name: security-core • Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write      # attach assets / create release
+  id-token: write      # OIDC for Sigstore
+  attestations: write  # provenance attestations
+  actions: read
+  checks: read
+  packages: read
+  security-events: write
+
+env:
+  POETRY_VERSION: "1.8.3"
+  PYTHON_VERSION: "3.11"
+  PACKAGE_DIR: "src/security_core"
+  DIST_DIR: "dist"
+
+jobs:
+  test:
+    name: Quality & Security Checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install Poetry
+        run: |
+          pipx install "poetry==${POETRY_VERSION}"
+          poetry --version
+
+      - name: Configure Poetry
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry config installer.max-workers 10
+
+      - name: Cache Poetry virtualenv
+        id: cache-poetry
+        uses: actions/cache@v4
+        with:
+          path: ./.venv
+          key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Validate pyproject / lock consistency
+        run: |
+          poetry lock --check
+          poetry check
+
+      - name: Install deps (main+dev+test+audit)
+        run: |
+          poetry install --with dev,test,audit --no-interaction --no-root
+
+      - name: Ruff Lint
+        run: |
+          ./.venv/bin/ruff --version
+          ./.venv/bin/ruff check .
+
+      - name: Black Check
+        run: ./.venv/bin/black --check .
+
+      - name: Mypy (strict)
+        run: ./.venv/bin/mypy --strict --pretty --config-file mypy.ini || ./.venv/bin/mypy --strict --pretty
+
+      - name: PyTest (unit+integration)
+        env:
+          PYTHONHASHSEED: "0"
+        run: |
+          ./.venv/bin/pytest -q --maxfail=1 --disable-warnings --strict-markers
+
+      - name: Coverage XML
+        run: ./.venv/bin/coverage xml -o coverage.xml || true
+
+      - name: Bandit SAST
+        run: ./.venv/bin/bandit -r src -q -f json -o bandit-report.json || (echo "Bandit issues found" && exit 1)
+
+      - name: pip-audit (vulns in deps)
+        run: ./.venv/bin/pip-audit -r requirements.txt || ./.venv/bin/pip-audit -P || (echo "Vulnerabilities detected" && exit 1)
+
+      - name: Safety (best-effort)
+        continue-on-error: true
+        run: ./.venv/bin/safety check --full-report || true
+
+      - name: Upload QA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-${{ matrix.python-version }}
+          path: |
+            bandit-report.json
+            coverage.xml
+          if-no-files-found: ignore
+          retention-days: 10
+
+  build:
+    name: Build sdist/wheel (Poetry)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: [test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Poetry
+        run: |
+          pipx install "poetry==${POETRY_VERSION}"
+
+      - name: Configure Poetry
+        run: |
+          poetry config virtualenvs.in-project true
+          poetry lock --check
+          poetry check
+
+      - name: Install (no dev)
+        run: poetry install --no-interaction --only main
+
+      - name: Build
+        run: |
+          poetry build
+          ls -al dist
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  sbom:
+    name: Generate SBOM (CycloneDX)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: [build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install Poetry + cyclonedx-bom deps
+        run: |
+          pipx install "poetry==${POETRY_VERSION}"
+          poetry install --with audit --only audit --no-interaction
+
+      - name: CycloneDX SBOM
+        run: |
+          ./.venv/bin/cyclonedx-bom -o sbom.cdx.json -e
+          jq -r '.metadata | {timestamp, tools, component}' sbom.cdx.json || true
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 30
+
+  sign:
+    name: Sigstore Sign Artifacts (keyless)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: [build]
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist
+
+      - name: Sigstore sign
+        uses: sigstore/gh-action-sigstore@v2.1.1
+        with:
+          inputs: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          upload-signing-artifacts: true
+
+      - name: Upload signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: signatures
+          path: |
+            *.sig
+            *.crt
+            **/*.sig
+            **/*.crt
+          if-no-files-found: ignore
+          retention-days: 30
+
+  provenance:
+    name: Generate Build Provenance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: [build]
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: [build, sbom, sign, provenance]
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: dist
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: rel
+
+      - name: Download signatures
+        uses: actions/download-artifact@v4
+        with:
+          name: signatures
+          path: rel/signatures
+        continue-on-error: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+            rel/sbom.cdx.json
+            rel/signatures/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

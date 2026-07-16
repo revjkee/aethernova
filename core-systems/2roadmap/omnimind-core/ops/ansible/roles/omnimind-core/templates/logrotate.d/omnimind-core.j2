@@ -1,0 +1,115 @@
+# Managed by Ansible (role: omnimind-core)
+# Шаблон logrotate для файловых логов приложения Omnimind Core.
+#
+# Поддерживаемые переменные роли (с дефолтами):
+# omnimind_logrotate_paths: ["/var/log/omnimind/*.log"]
+# omnimind_logrotate_frequency: "daily"        # daily|weekly|monthly|size-only
+# omnimind_logrotate_size: "256M"              # при frequency=size-only или как дополнительный триггер
+# omnimind_logrotate_rotate: 14                # количество файлов в ротации
+# omnimind_logrotate_maxage: 30                # дни хранения (дополнительно к rotate)
+# omnimind_logrotate_compress: true
+# omnimind_logrotate_compresscmd: ""           # напр. "/usr/bin/pigz"
+# omnimind_logrotate_compressoptions: ""       # напр. "-9"
+# omnimind_logrotate_dateext: true
+# omnimind_logrotate_dateformat: ".%Y-%m-%d"
+# omnimind_logrotate_copytruncate: true        # если false — используем reopen через PID/systemd
+# omnimind_logrotate_create_mode: "0640"
+# omnimind_logrotate_create_user: "{{ omnimind_user | default('omnimind') }}"
+# omnimind_logrotate_create_group: "{{ omnimind_group | default('omnimind') }}"
+# omnimind_logrotate_su_user: "root"           # для доступа к файлам
+# omnimind_logrotate_su_group: "adm"
+# omnimind_logrotate_sharedscripts: true
+# omnimind_logrotate_missingok: true
+# omnimind_logrotate_notifempty: true
+# omnimind_logrotate_postrotate_timeout: 10    # сек ожидания после сигнала
+# omnimind_pid_file: ""                        # путь к PID файлу для HUP
+# omnimind_systemd_unit: ""                    # имя systemd unit для сигнала/перезагрузки
+
+{% set paths = omnimind_logrotate_paths | default(['/var/log/omnimind/*.log']) %}
+{% set frequency = omnimind_logrotate_frequency | default('daily') %}
+{% set size = omnimind_logrotate_size | default('256M') %}
+{% set rotate = omnimind_logrotate_rotate | default(14) %}
+{% set maxage = omnimind_logrotate_maxage | default(30) %}
+{% set compress = omnimind_logrotate_compress | default(true) %}
+{% set compresscmd = omnimind_logrotate_compresscmd | default('') %}
+{% set compressoptions = omnimind_logrotate_compressoptions | default('') %}
+{% set dateext = omnimind_logrotate_dateext | default(true) %}
+{% set dateformat = omnimind_logrotate_dateformat | default('.%Y-%m-%d') %}
+{% set copytruncate = omnimind_logrotate_copytruncate | default(true) %}
+{% set create_mode = omnimind_logrotate_create_mode | default('0640') %}
+{% set create_user = omnimind_logrotate_create_user | default('omnimind') %}
+{% set create_group = omnimind_logrotate_create_group | default('omnimind') %}
+{% set su_user = omnimind_logrotate_su_user | default('root') %}
+{% set su_group = omnimind_logrotate_su_group | default('adm') %}
+{% set sharedscripts = omnimind_logrotate_sharedscripts | default(true) %}
+{% set missingok = omnimind_logrotate_missingok | default(true) %}
+{% set notifempty = omnimind_logrotate_notifempty | default(true) %}
+{% set postrotate_timeout = omnimind_logrotate_postrotate_timeout | default(10) %}
+{% set pid_file = omnimind_pid_file | default('') %}
+{% set systemd_unit = omnimind_systemd_unit | default('') %}
+
+{% for p in paths %}
+{{ p }} {
+    {% if missingok %}missingok{% endif %}
+    {% if notifempty %}notifempty{% endif %}
+
+    {% if frequency == 'daily' %}daily{% elif frequency == 'weekly' %}weekly{% elif frequency == 'monthly' %}monthly{% endif %}
+    {% if frequency == 'size-only' %}
+    size {{ size }}
+    {% else %}
+    # Дополнительный триггер по размеру — защищает от всплесков между периодами
+    size {{ size }}
+    {% endif %}
+
+    rotate {{ rotate }}
+    maxage {{ maxage }}
+    {% if compress %}compress{% else %}nocompress{% endif %}
+    {% if compress and compresscmd %}compresscmd {{ compresscmd }}{% endif %}
+    {% if compress and compressoptions %}compressoptions {{ compressoptions }}{% endif %}
+    delaycompress
+
+    {% if dateext %}dateext{% endif %}
+    {% if dateext and dateformat %}dateformat {{ dateformat }}{% endif %}
+
+    # Обеспечиваем корректные владельца/права у новых файлов
+    create {{ create_mode }} {{ create_user }} {{ create_group }}
+    su {{ su_user }} {{ su_group }}
+
+    {% if sharedscripts %}sharedscripts{% endif %}
+
+    {% if copytruncate %}
+    # Классический безопасный сценарий без сигналов приложению
+    copytruncate
+    {% else %}
+    # Режим с reopen логов — необходим сигнал приложению
+    nocopytruncate
+    {% endif %}
+
+    {% if not copytruncate %}
+    postrotate
+        set -e
+        {% if pid_file %}
+        if [ -s "{{ pid_file }}" ]; then
+            pid="$(cat {{ pid_file }})"
+            # Пытаемся послать SIGHUP для reopen логов
+            kill -HUP "$pid" 2>/dev/null || true
+            # Небольшая пауза на reopen
+            sleep {{ postrotate_timeout }}
+        fi
+        {% elif systemd_unit %}
+        # Используем systemd для аккуратного reopen (если реализовано в сервисе)
+        if command -v systemctl >/dev/null 2>&1; then
+            # Предпочтительно послать сигнал через systemd
+            systemctl kill -s HUP {{ systemd_unit }} || true
+            sleep {{ postrotate_timeout }}
+            # Fallback: мягкий reload, если HUP не поддержан
+            systemctl reload {{ systemd_unit }} >/dev/null 2>&1 || true
+        fi
+        {% else %}
+        # Нет PID и systemd_unit — ничего не делаем
+        :
+        {% endif %}
+    endscript
+    {% endif %}
+}
+{% endfor %}

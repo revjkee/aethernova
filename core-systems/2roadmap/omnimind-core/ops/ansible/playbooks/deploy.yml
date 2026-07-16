@@ -1,0 +1,262 @@
+---
+# omnimind-core / ops / ansible / playbooks / deploy.yml
+# Профиль: промышленный раскат контейнерного приложения с поэтапным обновлением и авто-rollback.
+
+############################################
+# ПЛЕЙ 0: Preflight на контроллере Ansible
+############################################
+- name: "Preflight | Validate release parameters on controller"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    required_vars:
+      - app_version
+      - image_repo
+      - image_tag
+  tasks:
+    - name: "Preflight | Check required variables are provided"
+      ansible.builtin.assert:
+        that:
+          - app_version is defined
+          - image_repo is defined
+          - image_tag is defined
+        fail_msg: >-
+          Missing required variables. Provide: app_version, image_repo, image_tag
+        quiet: true
+
+    - name: "Preflight | Print release context"
+      ansible.builtin.debug:
+        msg:
+          project: "omnimind-core"
+          version: "{{ app_version }}"
+          image: "{{ image_repo }}:{{ image_tag }}"
+          inventory: "{{ inventory_file | default('dynamic') }}"
+          environment: "{{ env_name | default('staging') }}"
+
+############################################
+# ПЛЕЙ 1: Baseline подготовка узлов
+############################################
+- name: "Prepare | Baseline hardening and runtime"
+  hosts: omnimind_core_targets
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  tags: [baseline, prepare]
+  vars:
+    container_runtime: "{{ container_runtime | default('docker') }}"
+  roles:
+    # Роли предполагаются в репозитории ops/ansible/roles/...
+    - role: omnimind-core  # общая роль; использует tasks/directories.yml и templates/config.yaml.j2
+  tasks:
+    - name: "Prepare | Ensure container runtime is present"
+      when: container_runtime == 'docker'
+      block:
+        - name: "Install Docker (if not present)"
+          ansible.builtin.package:
+            name:
+              - docker.io
+              - docker-compose-plugin
+            state: present
+          when: ansible_facts.pkg_mgr in ['apt','dnf','yum']
+        - name: "Start & enable Docker"
+          ansible.builtin.service:
+            name: docker
+            state: started
+            enabled: true
+
+    - name: "Prepare | Create application directories (idempotent)"
+      ansible.builtin.include_role:
+        name: omnimind-core
+        tasks_from: directories.yml
+      tags: [directories]
+
+    - name: "Prepare | Render application config"
+      ansible.builtin.template:
+        src: "roles/omnimind-core/templates/config.yaml.j2"
+        dest: "{{ app_home | default('/opt/omnimind/omnimind-core') }}/config.yaml"
+        owner: "{{ app_run_user | default('omnimind') }}"
+        group: "{{ app_run_group | default('omnimind') }}"
+        mode: "0640"
+      notify: ["omnimind-core :: config rendered"]
+      tags: [config]
+
+  handlers:
+    - name: "omnimind-core :: config rendered"
+      ansible.builtin.debug:
+        msg: "Application config rendered"
+
+############################################
+# ПЛЕЙ 2: Поэтапный раскат контейнера
+############################################
+- name: "Deploy | Rolling update omnimind-core container with health checks and rollback"
+  hosts: omnimind_core_targets
+  become: true
+  gather_facts: false
+  serial: 25%                  # поэтапный раскат
+  max_fail_percentage: 20
+  any_errors_fatal: true
+  vars:
+    app_name: "omnimind-core"
+    container_name: "omnimind-core"
+    image_repo: "{{ image_repo }}"
+    image_tag: "{{ image_tag }}"
+    image_ref: "{{ image_repo }}:{{ image_tag }}"
+    app_network: "omnimind-net"
+    app_user: "{{ app_run_user | default('omnimind') }}"
+    app_group: "{{ app_run_group | default('omnimind') }}"
+    app_home: "{{ app_home | default('/opt/omnimind/omnimind-core') }}"
+    app_data_dir: "{{ app_data_dir | default('/var/lib/omnimind') }}"
+    app_log_dir: "{{ app_log_dir | default('/var/log/omnimind') }}"
+    app_tmp_dir: "{{ app_tmp_dir | default('/var/tmp/omnimind') }}"
+    http_port: "{{ app_port_http | default(8080) }}"
+    metrics_port: "{{ app_port_metrics | default(http_port) }}"
+    health_ready_path: "{{ app_health_ready_path | default('/healthz/ready') }}"
+    health_live_path: "{{ app_health_live_path | default('/healthz/live') }}"
+    health_timeout: 30
+    health_retries: 15
+    docker_labels:
+      "com.omnimind.project": "omnimind-core"
+      "com.omnimind.env": "{{ env_name | default('staging') }}"
+      "com.omnimind.version": "{{ app_version }}"
+      "com.omnimind.role": "api"
+  pre_tasks:
+    - name: "Deploy | Create dedicated Docker network"
+      community.docker.docker_network:
+        name: "{{ app_network }}"
+        state: present
+
+    - name: "Deploy | Capture current running container info (if any)"
+      community.docker.docker_container_info:
+        name: "{{ container_name }}"
+      register: current_container
+      failed_when: false
+
+    - name: "Deploy | Pull target image"
+      community.docker.docker_image:
+        name: "{{ image_repo }}"
+        tag: "{{ image_tag }}"
+        source: pull
+        force_source: true
+      register: pulled
+
+  tasks:
+    - name: "Deploy | Rolling block with automatic rollback on failure"
+      block:
+
+        - name: "Deploy | Start new container with updated image (create or replace)"
+          community.docker.docker_container:
+            name: "{{ container_name }}"
+            image: "{{ image_ref }}"
+            hostname: "{{ inventory_hostname }}"
+            user: "{{ app_user }}:{{ app_group }}"
+            networks:
+              - name: "{{ app_network }}"
+            env:
+              APP_NAME: "{{ app_name }}"
+              APP_ENV: "{{ env_name | default('staging') }}"
+              LOG_LEVEL: "{{ app_env.LOG_LEVEL | default('INFO') }}"
+            labels: "{{ docker_labels }}"
+            mounts:
+              - type: bind
+                source: "{{ app_home }}"
+                target: "/app"
+                read_only: false
+              - type: bind
+                source: "{{ app_data_dir }}"
+                target: "/var/lib/omnimind"
+                read_only: false
+              - type: bind
+                source: "{{ app_log_dir }}"
+                target: "/var/log/omnimind"
+                read_only: false
+              - type: bind
+                source: "{{ app_tmp_dir }}"
+                target: "/tmp"
+                read_only: false
+            published_ports:
+              - "{{ http_port }}:{{ http_port }}/tcp"
+            restart_policy: unless-stopped
+            stop_timeout: 25
+            state: started
+            recreate: true
+            pull: false
+            memory: "1024m"
+            memory_reservation: "512m"
+            cpus: 1.0
+            ulimits:
+              - nofile=65535:65535
+            read_only: true
+            tmpfs:
+              - /run:size=64M,mode=0755,uid={{ (ansible_facts.uid | default(1000)) }},gid={{ (ansible_facts.gid | default(1000)) }}
+            healthcheck:
+              test: ["CMD-SHELL", "wget -q -T 2 -O- http://127.0.0.1:{{ http_port }}{{ health_live_path }} || exit 1"]
+              interval: 10s
+              timeout: 3s
+              retries: 3
+              start_period: 20s
+
+        - name: "Deploy | Wait for readiness endpoint"
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ http_port }}{{ health_ready_path }}"
+            method: GET
+            status_code: 200
+            return_content: false
+            validate_certs: false
+          register: _health
+          retries: "{{ health_retries }}"
+          delay: 2
+          until: _health.status == 200
+          timeout: "{{ health_timeout }}"
+
+        - name: "Deploy | Mark release success on host"
+          ansible.builtin.copy:
+            dest: "{{ app_home }}/.release-{{ app_version }}.ok"
+            content: "image={{ image_ref }} time={{ ansible_date_time.iso8601 if ansible_date_time is defined else '' }}\n"
+            owner: "{{ app_user }}"
+            group: "{{ app_group }}"
+            mode: "0640"
+
+      rescue:
+        - name: "Rollback | Determine previous image if container existed"
+          ansible.builtin.set_fact:
+            previous_image: "{{ current_container.containers[0].Config.Image if (current_container is defined and current_container.containers|length>0) else omit }}"
+
+        - name: "Rollback | Stop failed container"
+          community.docker.docker_container:
+            name: "{{ container_name }}"
+            state: stopped
+          ignore_errors: true
+
+        - name: "Rollback | Restore previous container image"
+          when: previous_image is defined
+          community.docker.docker_container:
+            name: "{{ container_name }}"
+            image: "{{ previous_image }}"
+            networks:
+              - name: "{{ app_network }}"
+            restart_policy: unless-stopped
+            state: started
+            recreate: true
+
+        - name: "Rollback | Fail deployment for this host"
+          ansible.builtin.fail:
+            msg: >-
+              Deployment failed on {{ inventory_hostname }}. Previous image {{ previous_image | default('n/a') }} restored.
+
+      always:
+        - name: "Deploy | Prune dangling images (safe)"
+          community.docker.docker_prune:
+            images: true
+            images_filters:
+              dangling: true
+          changed_when: false
+
+  post_tasks:
+    - name: "Deploy | Print container status"
+      community.docker.docker_container_info:
+        name: "{{ container_name }}"
+      register: status_out
+    - name: "Deploy | Status summary"
+      ansible.builtin.debug:
+        var: status_out.containers[0].Config.Image
+      when: status_out.containers | length > 0

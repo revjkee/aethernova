@@ -1,0 +1,368 @@
+syntax = "proto3";
+
+package veilmind.v1;
+
+option go_package = "github.com/your-org/veilmind-core/gen/go/veilmind/v1;veilmindv1";
+option java_package = "io.veilmind.core.v1";
+option java_multiple_files = true;
+option csharp_namespace = "Veilmind.Core.V1";
+option php_namespace = "Veilmind\\Core\\V1";
+option objc_class_prefix = "VM";
+option ruby_package = "Veilmind::Core::V1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+// Категории персональных/чувствительных данных.
+enum PiiCategory {
+  PII_CATEGORY_UNSPECIFIED = 0;
+  PII_EMAIL = 1;
+  PII_PHONE = 2;
+  PII_IPV4 = 3;
+  PII_IPV6 = 4;
+  PII_NAT_ID = 5;          // национальные идентификаторы: SSN, SNILS, personnummer и т.п.
+  PII_CREDIT_CARD = 6;
+  PII_BANK_ACCOUNT = 7;
+  PII_IBAN = 8;
+  PII_SWIFT = 9;
+  PII_NAME_PERSON = 10;
+  PII_NAME_ORG = 11;
+  PII_GOV_ID = 12;         // паспорт, водительское удостоверение и т.п.
+  PII_LICENSE_PLATE = 13;
+  PII_DATE_OF_BIRTH = 14;
+  PII_AGE = 15;
+  PII_ADDRESS = 16;
+  PII_GEO_COORDINATES = 17;
+  PII_EMAIL_CREDENTIAL = 18; // логины/пароли email-аккаунтов (эвристики)
+  PII_SECRET_KEY = 19;       // приватные ключи/токены (AWS, OAuth и пр.)
+  PII_PASSWORD = 20;
+}
+
+// Уровень серьезности обнаруженного фрагмента.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_LOW = 1;
+  SEVERITY_MEDIUM = 2;
+  SEVERITY_HIGH = 3;
+  SEVERITY_CRITICAL = 4;
+}
+
+// Тип детектора, выдавшего находку.
+enum DetectorType {
+  DETECTOR_TYPE_UNSPECIFIED = 0;
+  DETECTOR_REGEX = 1;
+  DETECTOR_ML = 2;
+  DETECTOR_HEURISTIC = 3;
+  DETECTOR_COMPOSITE = 4;
+}
+
+// Действие по редактированию.
+enum RedactionAction {
+  REDACTION_ACTION_UNSPECIFIED = 0;
+  REDACTION_REPLACE = 1;    // заменить на маску/заменитель
+  REDACTION_REMOVE = 2;     // удалить фрагмент
+  REDACTION_HASH_SHA256 = 3;// захэшировать (детерминированно)
+  REDACTION_TOKENIZE = 4;   // токенизация (детерминированный токен)
+}
+
+// Стиль маскирования (используется при REPLACE).
+enum MaskStyle {
+  MASK_STYLE_UNSPECIFIED = 0;
+  MASK_FIXED_TOKEN = 1;      // [REDACTED-PII], [REDACTED-SECRET] и пр.
+  MASK_ASTERISKS = 2;        // ********
+  MASK_PARTIAL_PRESERVE_LEN = 3; // сохранить длину с подстановкой символов
+  MASK_NULL = 4;             // пустая строка
+}
+
+// -----------------------------------------------------------------------------
+// BASE TYPES
+// -----------------------------------------------------------------------------
+
+// Диапазон в UTF-16 колонках (совместим с большинством редакторов).
+message Span {
+  // Индексы начала/конца (включительно/исключительно) относительно исходного текста.
+  int32 start = 1;
+  int32 end = 2;
+}
+
+// Один артефакт/вложение для бинарных источников (используйте потоковый RPC для больших файлов).
+message Attachment {
+  string filename = 1;
+  string mime_type = 2;
+  bytes  content = 3;
+  // Хэш полезен для дедупликации и аудита.
+  bytes sha256 = 4;
+}
+
+// Источник данных: текст или набор вложений (для простых случаев).
+message InputContent {
+  oneof payload {
+    string text = 1;
+    BinarySet binaries = 2;
+  }
+  // Язык/локаль входного текста (например, "en", "ru", "sv"); может улучшить детекцию.
+  string locale = 10;
+}
+
+message BinarySet {
+  repeated Attachment items = 1;
+}
+
+// Правило редактирования/редакции.
+message RedactionRule {
+  // Уникальный идентификатор правила (например, "pii-email-v1").
+  string id = 1;
+
+  // Приоритет (большее значение исполняется раньше при конфликте).
+  int32 priority = 2;
+
+  // Набор категорий, на которые действует правило.
+  repeated PiiCategory categories = 3;
+
+  // Действие по умолчанию для этого правила.
+  RedactionAction action = 4;
+
+  // Порог уверенности для включения (0..1).
+  double min_confidence = 5;
+
+  // Стиль маски (актуально для REPLACE).
+  MaskStyle mask_style = 6;
+
+  // При True блокировать выдачу целиком при попадании (для критических секретов).
+  bool deny_immediately = 7;
+
+  // Ограничения по локали (пусто = любые).
+  repeated string allowed_locales = 8;
+
+  // Размер контекстного окна для ML/эвристик (символы).
+  int32 context_window = 9;
+
+  // Пользовательские параметры детекторов/пре‑ и пост‑процессоров.
+  google.protobuf.Struct parameters = 10;
+
+  // Зарезервировано для будущих полей.
+  reserved 11, 12;
+}
+
+// Политика, агрегирующая правила.
+message RedactionPolicy {
+  string version = 1;                 // версия политики, например "1.3"
+  RedactionAction default_action = 2; // действие по умолчанию, если нет попаданий
+  bool preserve_length = 3;           // сохранять длину при маскировании
+  bool annotate = 4;                  // окружать маски префиксами/суффиксами
+  string annotation_prefix = 5;       // например "[REDACTED:"
+  string annotation_suffix = 6;       // "]"
+  int32 max_findings = 7;             // 0 = без ограничений
+  repeated RedactionRule rules = 8;
+  // Фолбэк‑действие, когда правило указало REMOVE/HASH, но запрещено политикой.
+  RedactionAction fallback_action = 9;
+
+  // Зарезервировано для совместимости.
+  reserved 10, 11, 12;
+}
+
+// Описание одной находки.
+message Finding {
+  string id = 1;                      // ULID/UUID находки
+  PiiCategory category = 2;
+  Severity severity = 3;
+  DetectorType detector = 4;
+  double confidence = 5;              // 0..1
+  Span span = 6;                      // позиция в исходном тексте
+
+  // Текст совпадения может быть опущен по требованиям безопасности.
+  string matched_text = 7;
+
+  // Текст замены/маски в итоговом документе (если применимо).
+  string replacement_text = 8;
+
+  // Правило, породившее решение.
+  string rule_id = 9;
+
+  // Дополнительные метаданные.
+  google.protobuf.Struct metadata = 10;
+
+  // Зарезервировано.
+  reserved 11, 12;
+}
+
+// Диагностика/проблемы при обработке.
+message Problem {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    CODE_INVALID_ARGUMENT = 1;
+    CODE_POLICY_ERROR = 2;
+    CODE_DETECTOR_TIMEOUT = 3;
+    CODE_INTERNAL = 4;
+    CODE_PARTIAL_RESULT = 5;
+  }
+  Code code = 1;
+  string message = 2;
+  // Поля/пути (например, "policy.rules[2].min_confidence").
+  repeated string fields = 3;
+  // Нефатальная проблема (результат частичный).
+  bool non_fatal = 4;
+}
+
+// Статистика обработки.
+message Stats {
+  int32 input_chars = 1;
+  int32 output_chars = 2;
+  int32 total_findings = 3;
+  int32 redacted_findings = 4;
+  google.protobuf.Duration total_time = 5;
+  // Латентности по детекторам, мс.
+  map<string, double> detector_latency_ms = 6;
+  // Распределение находок по категориям.
+  map<string, int32> findings_by_category = 7;
+}
+
+// -----------------------------------------------------------------------------
+// REQUESTS / RESPONSES
+// -----------------------------------------------------------------------------
+
+// Запрос на редактирование/редакцию.
+message RedactRequest {
+  // Идентификатор запроса (ULID/UUID); если пусто — генерируется на сервере.
+  string request_id = 1;
+
+  // Идентификатор арендатора/клиента.
+  string tenant_id = 2;
+
+  // Содержимое на входе.
+  InputContent content = 3;
+
+  // Политика редактирования.
+  RedactionPolicy policy = 4;
+
+  // Только детектировать, без модификации текста.
+  bool detect_only = 5;
+
+  // Вернуть diff (удобно для пост‑обработки).
+  bool return_diff = 6;
+
+  // Разрешить частичный результат при ошибках детекторов.
+  bool allow_partial = 7;
+
+  // Доп. метки для трассировки/биллинга.
+  map<string, string> labels = 8;
+
+  // Момент запроса (если клиент хочет зафиксировать свой ts).
+  google.protobuf.Timestamp ts = 9;
+
+  // Зарезервировано для расширений.
+  reserved 10, 11, 12;
+}
+
+// Ответ сервиса.
+message RedactResponse {
+  string request_id = 1;
+  string tenant_id = 2;
+
+  // Итоговый отредактированный текст (если content был текстовым).
+  string redacted_text = 3;
+
+  // Находки (как применённые, так и обнаруженные при detect_only).
+  repeated Finding findings = 4;
+
+  // Опционально: унифицированный diff (например, RFC6902-подобная строка).
+  string diff_text = 5;
+
+  // Проблемы/диагностика.
+  repeated Problem problems = 6;
+
+  // Статистика выполнения.
+  Stats stats = 7;
+
+  // Чейн‑хэш для журналирования (если включен tamper‑evident аудит).
+  string chain_hash = 8;
+
+  // Время обработки на сервере.
+  google.protobuf.Timestamp processed_at = 9;
+
+  reserved 10, 11, 12;
+}
+
+// -----------------------------------------------------------------------------
+// STREAMING (для больших документов/байтовых источников)
+// -----------------------------------------------------------------------------
+
+// Конфигурация потока — отправляется первой в bidi‑сеансе.
+message StreamConfig {
+  string request_id = 1;
+  string tenant_id = 2;
+  RedactionPolicy policy = 3;
+  bool detect_only = 4;
+  bool return_diff = 5;
+  bool allow_partial = 6;
+  map<string, string> labels = 7;
+  // Язык/локаль документа.
+  string locale = 8;
+}
+
+// Фрагмент содержимого.
+message ContentChunk {
+  // Последовательный номер фрагмента, начиная с 0.
+  int32 seq = 1;
+  // MIME‑тип контента в потоке (например, "text/plain; charset=utf-8" или "application/pdf").
+  string mime_type = 2;
+  // Полезная нагрузка (текст в UTF‑8 или бинарные данные).
+  bytes data = 3;
+  // Хэш для контроля целостности.
+  bytes sha256 = 4;
+}
+
+// Запросы в потоковом режиме.
+message RedactStreamRequest {
+  oneof payload {
+    StreamConfig config = 1;
+    ContentChunk chunk = 2;
+    // Сигнал завершения потока ввода.
+    bool end_of_stream = 3;
+  }
+}
+
+// Частичный результат.
+message PartialRedaction {
+  // Инкрементальный редактированный фрагмент (delta).
+  string redacted_delta = 1;
+  // Новые находки, появившиеся с последнего сообщения.
+  repeated Finding findings = 2;
+}
+
+// Финализация потока (итоговый ответ).
+message Finalize {
+  RedactResponse result = 1;
+}
+
+// Ответы в потоковом режиме.
+message RedactStreamResponse {
+  oneof payload {
+    // Для ранней диагностики.
+    Problem problem = 1;
+    // Инкрементальные данные.
+    PartialRedaction partial = 2;
+    // Финальный результат.
+    Finalize finalize = 3;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// SERVICE
+// -----------------------------------------------------------------------------
+
+service RedactionService {
+  // Обычная синхронная обработка.
+  rpc Redact (RedactRequest) returns (RedactResponse);
+
+  // Потоковая обработка крупных документов (bidi stream).
+  rpc RedactStream (stream RedactStreamRequest) returns (stream RedactStreamResponse);
+
+  // Прогон политики без модификации данных; удобно для валидации и оценки правилами.
+  rpc DryRun (RedactRequest) returns (RedactResponse);
+}

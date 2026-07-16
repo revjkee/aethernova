@@ -1,0 +1,327 @@
+# ======================================================================
+# policy-core / caches.yaml — Industrial-grade cache configuration
+# ======================================================================
+
+version: 1
+app: policy-core
+env: ${APP_ENV:-prod}  # prod|staging|dev
+
+global:
+  defaults:
+    ttl: 300s                   # базовый TTL
+    soft_ttl: 60s               # окно "stale-while-revalidate"
+    max_ttl: 3600s              # предельный TTL
+    ttl_jitter: 0.15            # 15% для равномерного распределения истечения
+    compression:
+      enabled: true
+      algorithm: zstd           # zstd|gzip|none
+      level: 3
+      min_bytes: 512
+    serializer:
+      format: msgpack           # msgpack|json|pickle (pickle запрещен по умолчанию)
+      forbid_pickle: true
+      schema_version: 1
+    hashing:
+      algorithm: xxhash64       # быстрый и коллизионно-устойчивый для ключей
+      namespace_prefix: "pc:"   # глобальный префикс ключей
+      tenant_scoping: true      # префикс <tenant_id> автоматически
+    stampede_protection:
+      singleflight: true        # коалесcинг запросов к одному ключу
+      lock_backend: redis
+      lock_ttl: 5s
+      lock_backoff: "10ms..200ms jitter"
+    negative_cache:
+      enabled: true
+      ttl: 90s                  # кэшируем "пустые"/404 ответы
+    refresh_ahead:
+      enabled: true
+      window: 20%               # при остатке TTL < window — фоновое обновление
+      concurrency: 8            # ограничение фоновых воркеров
+    fallback:
+      on_backend_error: serve_stale_up_to # serve_stale_up_to|fail_open|fail_closed
+      serve_stale_up_to: 120s
+    quotas:
+      max_object_bytes: 1048576   # 1 MiB на объект
+      namespace_soft_limit_mb: 256
+      namespace_hard_limit_mb: 512
+    consistency:
+      mode: eventual            # eventual|strong (для Redis cluster eventual)
+    observability:
+      metrics:
+        prometheus:
+          enabled: true
+          endpoint: /metrics
+          port: ${METRICS_PORT:-8080}
+      tracing:
+        otlp:
+          enabled: true
+          endpoint: ${OTLP_ENDPOINT:-http://otel-collector:4317}
+          sample_ratio: 0.1
+      logs:
+        level: ${LOG_LEVEL:-INFO}
+        sample_rate: 1.0
+  security:
+    tls:
+      enabled: true
+      verify_peer: true
+      min_version: TLS1_2
+      ca_cert_path: ${REDIS_CA_CERT_PATH:-/etc/ssl/certs/ca-bundle.crt}
+    auth:
+      username: ${REDIS_USERNAME:-}
+      password: ${REDIS_PASSWORD:-}     # подтягивается из Secret/Env
+      acl_profile: "policy-core-runtime" # логический профиль
+    encryption_at_rest:
+      enabled: false                     # включайте на бекенде (EBS/KMS/Redis-Enterprise)
+    pii_redaction:
+      enabled: true
+      fields: ["email", "phone", "ssn", "token", "cookie", "address"]
+    key_policies:
+      deny_patterns:                     # запреты для ключей
+        - ".*\\.pickle$"
+        - "^tmp:.*"
+      allow_patterns: []                 # опционально белый список
+  reliability:
+    circuit_breaker:
+      failure_rate_threshold: 0.3
+      min_requests: 50
+      open_state_duration: 30s
+      half_open_max_calls: 10
+    timeouts:
+      connect: 1500ms
+      read: 50ms
+      write: 50ms
+      operation: 150ms
+    retries:
+      max_attempts: 2
+      backoff: "10ms..80ms jitter"
+  # Системные SLA/SLO цели для мониторинга
+  slo:
+    get_p95_ms: 5
+    get_p99_ms: 20
+    hit_rate_target: 0.85
+    error_rate_max: 0.005
+
+# ----------------------------------------------------------------------
+# Backends (tiers)
+# ----------------------------------------------------------------------
+backends:
+  l1_memory:
+    type: memory
+    engine: "arc"                      # lru|lfu|arc
+    shards: 8
+    capacity:
+      max_items: 50000
+      max_bytes: 268435456             # 256 MiB
+    eviction:
+      policy: lru
+      admit: tiny-lfu                  # политика допуска
+    housekeeper:
+      sweep_interval: 5s
+      metrics: true
+
+  l2_redis:
+    type: redis
+    mode: cluster                      # cluster|sentinel|single
+    endpoints:
+      - ${REDIS_ENDPOINTS:-"redisc://redis-0:6379,redisc://redis-1:6379,redisc://redis-2:6379"}
+      # redisc:// включает TLS
+    db: 0
+    pool:
+      max_connections: 512
+      min_idle: 8
+      health_check_interval: 5s
+    topology:
+      refresh_interval: 30s
+      auto_eject_hosts: true
+    timeouts:
+      connect: ${REDIS_CONNECT_TIMEOUT_MS:-1500}ms
+      read: ${REDIS_READ_TIMEOUT_MS:-50}ms
+      write: ${REDIS_WRITE_TIMEOUT_MS:-50}ms
+    pubsub:
+      channel: "pc.invalidate"         # канал для событий инвалидации
+    tls:
+      enabled: ${REDIS_TLS_ENABLED:-true}
+      insecure_skip_verify: false
+
+  # Пример дополнительного уровня (опционально)
+  # l3_memcached:
+  #   type: memcached
+  #   endpoints: ["memc-0:11211","memc-1:11211"]
+  #   timeouts: { connect: 200ms, read: 20ms, write: 20ms }
+
+# ----------------------------------------------------------------------
+# Namespaces — переопределяют global.defaults под конкретные домены
+# ----------------------------------------------------------------------
+namespaces:
+
+  policy_eval_results:
+    description: "Результаты вычисления политик (policy evaluation)"
+    routing:
+      read: [l1_memory, l2_redis]
+      write: [l1_memory, l2_redis]     # write-through
+    ttl: 300s
+    soft_ttl: 45s
+    refresh_ahead: { enabled: true, window: 25%, concurrency: 16 }
+    fallback:
+      on_backend_error: serve_stale_up_to
+      serve_stale_up_to: 180s
+    negative_cache: { enabled: true, ttl: 60s }
+    quotas:
+      namespace_soft_limit_mb: 512
+      namespace_hard_limit_mb: 1024
+    key:
+      template: "pe:{tenant}:{policy}:{subject}:{resource}:{action}"
+    invalidation:
+      pubsub_channels: ["pc.invalidate", "pc.policy.updated"]
+      on_events:
+        - match: "policy.updated"
+          purge_patterns:
+            - "pe:{tenant}:{policy}:*"
+        - match: "role.updated"
+          purge_patterns:
+            - "pe:{tenant}:*"
+    security:
+      fail_closed: true                 # при сомнениях — не выдаем решение
+      redact_values: false
+
+  authz_decisions:
+    description: "Финальные authZ решения для PDP/PDP-lite"
+    routing:
+      read: [l1_memory, l2_redis]
+      write: [l1_memory, l2_redis]
+    ttl: 30s
+    soft_ttl: 10s
+    refresh_ahead: { enabled: true, window: 40% }
+    fallback:
+      on_backend_error: fail_closed     # безопасность приоритетнее доступности
+    negative_cache: { enabled: true, ttl: 10s }
+    slo:
+      get_p95_ms: 2
+      hit_rate_target: 0.9
+    key:
+      template: "az:{tenant}:{subject}:{resource}:{action}"
+
+  feature_flags:
+    description: "FF/конфиги фичей"
+    routing:
+      read: [l1_memory, l2_redis]
+      write: [l2_redis]                 # write-around в Redis, L1 обновится через инвалидацию
+    ttl: 30s
+    soft_ttl: 10s
+    refresh_ahead: { enabled: true, window: 50% }
+    invalidation:
+      pubsub_channels: ["pc.invalidate", "pc.flags.updated"]
+      on_events:
+        - match: "flag.updated"
+          purge_patterns: ["ff:{tenant}:*"]
+    key:
+      template: "ff:{tenant}:{flag}"
+
+  jwks_public_keys:
+    description: "JWKS публичные ключи внешних IdP"
+    routing:
+      read: [l1_memory, l2_redis]
+      write: [l2_redis]
+    ttl: 3600s
+    soft_ttl: 600s
+    refresh_ahead: { enabled: true, window: 20% }
+    negative_cache: { enabled: true, ttl: 120s }
+    key:
+      template: "jwks:{issuer_hash}"
+    security:
+      fail_closed: true                 # нельзя выдавать просроченные ключи
+
+  user_profile_cache:
+    description: "Непривилегированная справочная информация профиля"
+    routing:
+      read: [l1_memory, l2_redis]
+      write: [l1_memory, l2_redis]
+    ttl: 900s
+    soft_ttl: 120s
+    negative_cache: { enabled: true, ttl: 120s }
+    pii:
+      contains_personal_data: true
+      redact_fields: ["email", "phone", "address"]
+    key:
+      template: "up:{tenant}:{user_id}"
+    security:
+      fail_closed: false                # допустимо fail-open со строгой маскировкой
+
+  templates_rendered:
+    description: "Шаблоны/рендеры для уведомлений и политических сообщений"
+    routing:
+      read: [l1_memory, l2_redis]
+      write: [l2_redis]
+    ttl: 3600s
+    soft_ttl: 300s
+    compression:
+      enabled: true
+      algorithm: zstd
+      level: 5
+      min_bytes: 256
+    key:
+      template: "tpl:{tenant}:{name}:{lang}:{hash}"
+
+# ----------------------------------------------------------------------
+# Prefetch / Warmup
+# ----------------------------------------------------------------------
+warmup:
+  enabled: true
+  timeout: 5s
+  items:
+    - namespace: feature_flags
+      keys:
+        - "ff:{tenant:default}:policy-core.dynamic-constraints"
+        - "ff:{tenant:default}:policy-core.audit-enhanced"
+    - namespace: jwks_public_keys
+      keys_from:
+        endpoint: "${JWKS_LIST_ENDPOINT:-}"
+        format: json
+        jsonpath: "$.issuers[*].hash"   # при необходимости рантайм выполнит запрос
+
+# ----------------------------------------------------------------------
+# Rate limits per namespace (защита бекенда от бурстов)
+# ----------------------------------------------------------------------
+rate_limits:
+  enabled: true
+  buckets:
+    - namespace: policy_eval_results
+      rps: 20000
+      burst: 2000
+    - namespace: authz_decisions
+      rps: 30000
+      burst: 3000
+    - namespace: user_profile_cache
+      rps: 5000
+      burst: 500
+
+# ----------------------------------------------------------------------
+# Testing / Debug (в проде держать выключенным)
+# ----------------------------------------------------------------------
+debug:
+  enabled: ${CACHE_DEBUG:-false}
+  sample_keys: true
+  log_values: false
+  dry_run_mode: false
+
+# ----------------------------------------------------------------------
+# Health checks / Self-test
+# ----------------------------------------------------------------------
+health:
+  l1_memory:
+    enabled: true
+    allocate_probe_bytes: 1048576   # попытка выделения 1 MiB для проверки
+  l2_redis:
+    enabled: true
+    ping_interval: 5s
+    latency_budget_ms: 10
+
+# ----------------------------------------------------------------------
+# Compliance / Audit
+# ----------------------------------------------------------------------
+audit:
+  enabled: true
+  log_key_access: hashed_only      # none|hashed_only|full_key
+  redact_values: true
+  sink: file
+  path: /var/log/policy-core/cache-audit.log

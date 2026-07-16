@@ -1,0 +1,257 @@
+{{- /*
+Helm helpers (локально, без _helpers.tpl)
+*/ -}}
+{{- define "vmc.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "vmc.fullname" -}}
+{{- $name := include "vmc.name" . -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "vmc.labels" -}}
+app.kubernetes.io/name: {{ include "vmc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | default .Chart.Version | quote }}
+app.kubernetes.io/part-of: veilmind
+app.kubernetes.io/component: api
+{{- end -}}
+
+{{- define "vmc.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "vmc.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- /*
+Утилита для детерминированных checksum аннотаций по значениям.
+Меняет Pod при правках конфигов/секретов в values.
+*/ -}}
+{{- define "vmc.checksum" -}}
+{{- toJson . | sha256sum -}}
+{{- end -}}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vmc.fullname" . }}
+  labels:
+    {{- include "vmc.labels" . | nindent 4 }}
+    {{- with .Values.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.deploymentAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount | default 2 }}
+  {{- end }}
+  minReadySeconds: {{ .Values.minReadySeconds | default 10 }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit | default 10 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.rollingUpdate.maxUnavailable | default "25%" | quote }}
+      maxSurge: {{ .Values.rollingUpdate.maxSurge | default "25%" | quote }}
+  selector:
+    matchLabels:
+      {{- include "vmc.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vmc.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Перезапуск Pod при изменении значимых данных
+        checksum/config: {{ include "vmc.checksum" (default dict .Values.config) | quote }}
+        checksum/secret: {{ include "vmc.checksum" (default dict .Values.secrets) | quote }}
+        prometheus.io/scrape: {{ ternary "true" "false" (.Values.metrics.enabled | default true) | quote }}
+        prometheus.io/port: {{ .Values.metrics.port | default 9090 | quote }}
+        prometheus.io/path: {{ .Values.metrics.path | default "/metrics" | quote }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      serviceAccountName: {{ .Values.serviceAccountName | default (printf "%s-sa" (include "vmc.fullname" .)) }}
+      dnsPolicy: ClusterFirst
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      securityContext:
+        {{- /* PodSecurityContext */ -}}
+        runAsNonRoot: true
+        fsGroup: {{ .Values.podSecurityContext.fsGroup | default 2000 }}
+        seccompProfile:
+          type: RuntimeDefault
+        supplementalGroups:
+          - {{ .Values.podSecurityContext.supplementalGroup | default 2000 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ .Values.topologyKey | default "kubernetes.io/hostname" | quote }}
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "vmc.selectorLabels" . | nindent 14 }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "vmc.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: {{ include "vmc.name" . }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          {{- with .Values.command }}
+          command: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.args }}
+          args: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port | default 8080 }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled | default true }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port | default 9090 }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.grpc.enabled }}
+            - name: grpc
+              containerPort: {{ .Values.grpc.port | default 9091 }}
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: TZ
+              value: {{ .Values.timezone | default "UTC" | quote }}
+            {{- range $k, $v := .Values.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- with .Values.envRaw }}
+          envFrom:
+            {{- range . }}
+            - {{- toYaml . | nindent 14 }}
+            {{- end }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path | default "/readyz" | quote }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 5 }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 5 }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path | default "/healthz" | quote }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 10 }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 2 }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
+          {{- if .Values.probes.startup.enabled | default true }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path | default "/healthz" | quote }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds | default 0 }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds | default 5 }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold | default 30 }}
+          {{- end }}
+          securityContext:
+            runAsUser: {{ .Values.containerSecurityContext.runAsUser | default 10001 }}
+            runAsGroup: {{ .Values.containerSecurityContext.runAsGroup | default 10001 }}
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            {{- toYaml .Values.resources | default (dict "limits" (dict "cpu" "500m" "memory" "512Mi") "requests" (dict "cpu" "100m" "memory" "256Mi")) | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.mounts.config }}
+            - name: app-config
+              mountPath: {{ .mountPath | default "/etc/veilmind" | quote }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.mounts.secrets }}
+            - name: app-secret
+              mountPath: {{ .mountPath | default "/var/run/veilmind-secrets" | quote }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.containerLifecycle }}
+          lifecycle:
+            {{- toYaml .Values.containerLifecycle | nindent 12 }}
+          {{- end }}
+
+        {{- with .Values.sidecars }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.mounts.config }}
+        - name: app-config
+          configMap:
+            name: {{ .name | default (printf "%s-config" (include "vmc.fullname" $)) | quote }}
+            optional: {{ .optional | default false }}
+        {{- end }}
+        {{- with .Values.mounts.secrets }}
+        - name: app-secret
+          secret:
+            secretName: {{ .name | default (printf "%s-secret" (include "vmc.fullname" $)) | quote }}
+            optional: {{ .optional | default false }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

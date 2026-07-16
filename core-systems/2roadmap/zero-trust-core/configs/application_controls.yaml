@@ -1,0 +1,439 @@
+# zero-trust-core/configs/application_controls.yaml
+
+schema_version: 1.0
+metadata:
+  id: application_controls_default
+  description: >
+    Политики Zero Trust для контроля доступа к приложениям и данным.
+    Включают идентичность пользователя/сервиса, постуру устройства, сетевые сигналы,
+    контентные контроли (DLP), требования mTLS, step-up аутентификацию, egress контроль,
+    а также аудит и workflow утверждения.
+  owners:
+    - secops@yourorg.example
+    - platform@yourorg.example
+  environment: prod
+  updated_at: "2025-08-20T00:00:00Z"
+
+defaults:
+  enforcement_mode: enforce   # enforce|report|disabled
+  decision_ttl_seconds: 300   # кэширование принятых решений (soft TTL)
+  risk_thresholds:
+    allow_max: 39     # итоговый риск <= 39 -> allow
+    stepup_min: 40    # 40..69 -> требовать step-up
+    stepup_max: 69
+    deny_min: 70      # >= 70 -> deny
+  step_up_methods: [webauthn, totp, push]
+  session_lifetime:
+    max_hours: 8
+    idle_minutes: 30
+  mtls:
+    require_svid: true                   # требовать SPIFFE SVID для workload-идентичности
+    client_auth: require                 # require|prefer|off
+    accepted_roots_bundle: spiffe://yourorg.example/bundles/prod
+    cert_policies_oids: ["2.23.140.1.1"] # пример (CA/B базовые)
+  dlp:
+    enabled: true
+    max_severity_allow: medium
+    redact_instead_of_block: false
+  edr:
+    required_signals: [realtime_protection_on, no_active_threats]
+    vendor: any                          # any|crowdstrike|defender|sentinelone...
+  audit:
+    level: detailed                      # minimal|normal|detailed
+    tamper_evident_chain: true
+    sinks: [stdout, file]
+  approval:
+    enabled: true
+    max_validity_minutes: 60
+
+objects:
+  # Каталог приложений/сервисов
+  applications:
+    # якорь для типовых настроек внутренних HTTP приложений
+    - &tmpl_internal_http
+      id: tmpl_internal_http
+      type: http
+      name: "TEMPLATE Internal HTTP App"
+      protocols: [https]
+      ports: [443]
+      mtls_profile: strict
+      data_tags: [internal]
+      egress_profile: default_deny
+      authz:
+        path_policies: []   # можно переопределять в конкретных приложениях
+
+    - id: payments_api
+      <<: *tmpl_internal_http
+      name: "Payments API"
+      domains: ["payments.api.prod.yourorg.example"]
+      data_tags: [pci, pii]
+      authz:
+        path_policies:
+          - path: "^/v1/admin/.*"
+            methods: ["POST","PUT","DELETE"]
+            required_roles: ["PAYMENTS_ADMIN"]
+            dlp_override:
+              enabled: true
+              max_severity_allow: low
+          - path: "^/v1/transactions/.*"
+            methods: ["GET"]
+            required_scopes: ["transactions:read"]
+
+    - id: hr_portal
+      <<: *tmpl_internal_http
+      name: "HR Portal"
+      domains: ["hr.internal.yourorg.example"]
+      data_tags: [pii, confidential]
+      authz:
+        path_policies:
+          - path: "^/admin/.*"
+            methods: ["GET","POST","DELETE"]
+            required_groups: ["HR-Admin"]
+
+    - id: git_forge
+      <<: *tmpl_internal_http
+      name: "Git Forge"
+      domains: ["git.yourorg.example"]
+      data_tags: [code, internal]
+      authz:
+        path_policies:
+          - path: "^/api/v4/projects/.*/repository/commits"
+            methods: ["POST"]
+            step_up_required: true
+
+  # Зоны, по которым можно сегментировать правила
+  zones:
+    - id: corp_lan
+      cidr: ["10.0.0.0/8","192.168.0.0/16"]
+    - id: public_internet
+      cidr: ["0.0.0.0/0"]
+    - id: vendor_vpn
+      cidr: ["172.16.10.0/24"]
+
+  # Классы данных и политика DLP
+  data_tags:
+    - id: pci
+      dlp:
+        patterns: ["PAN","Track2","PCI_REGEX"]
+        severity: high
+    - id: pii
+      dlp:
+        patterns: ["EMAIL","NATIONAL_ID","PHONE"]
+        severity: medium
+    - id: code
+      dlp:
+        patterns: ["SECRET_KEY","PRIVATE_KEY","TOKEN"]
+        severity: high
+    - id: confidential
+      dlp:
+        patterns: ["INTERNAL_ONLY"]
+        severity: low
+    - id: internal
+      dlp:
+        patterns: []
+        severity: low
+
+  # Профили устройств
+  device_profiles:
+    - id: managed_win11
+      os: ["Windows 11"]
+      posture:
+        disk_encryption: true
+        secure_boot: true
+        os_patch_stale_days_max: 14
+        edr: {vendor: any, status: healthy}
+        jailbreak_root: false
+      attestation:
+        tpm: required
+        mdm: required
+    - id: managed_mac
+      os: ["macOS 13","macOS 14","macOS 15"]
+      posture:
+        disk_encryption: true
+        secure_boot: true
+        os_patch_stale_days_max: 14
+        edr: {vendor: any, status: healthy}
+      attestation:
+        tpm: optional
+        mdm: required
+    - id: unmanaged
+      os: ["*"]
+      posture: {}
+
+  # Группы пользователей и их атрибуты (OIDC/SAML claims mapping)
+  user_groups:
+    - id: employees
+      oidc:
+        claim: "groups"
+        values: ["EMPLOYEES"]
+    - id: contractors
+      oidc:
+        claim: "groups"
+        values: ["CONTRACTORS"]
+    - id: finance
+      oidc:
+        claim: "groups"
+        values: ["FINANCE"]
+    - id: hr_admin
+      oidc:
+        claim: "groups"
+        values: ["HR-Admin"]
+    - id: payments_admin
+      oidc:
+        claim: "roles"
+        values: ["PAYMENTS_ADMIN"]
+
+  # Профили egress (куда могут обращаться приложения/клиенты)
+  egress_profiles:
+    - id: default_deny
+      allow:
+        - dst: "*.yourorg.example"
+          ports: ["443/tcp"]
+      deny:
+        - dst: "*.pastebin.com"
+        - dst: "*.anonfiles.com"
+    - id: payments_strict
+      allow:
+        - dst: "api.stripe.com"
+          ports: ["443/tcp"]
+      deny:
+        - dst: "*"
+
+  # Профили mTLS
+  mtls_profiles:
+    - id: strict
+      client_auth: require
+      accepted_roots_bundle: spiffe://yourorg.example/bundles/prod
+      san_requirements:
+        spiffe_id_prefix: "spiffe://yourorg.example/"
+      revocation:
+        crl: true
+        ocsp: true
+
+risk_model:
+  # Веса факторов для итогового риска. Итог нормируется в 0..100.
+  weights:
+    user_risk_score: 0.35       # от IdP/UEBA 0..100
+    device_posture_score: 0.25  # 0..100 (0 лучше)
+    network_risk_score: 0.15    # гео, аномалии ASN/прокси
+    behavior_anomaly_score: 0.15
+    data_sensitivity_score: 0.10
+  # Нормализация частных метрик в шкалу 0..100
+  normalization:
+    device_posture:
+      unmanaged_penalty: 40
+      missing_edr_penalty: 30
+      stale_patch_penalty_per_day: 2   # cap 30
+    network:
+      geo_blocklist: ["RU","KP","IR"]
+      tor_proxy_penalty: 40
+      new_asn_penalty: 15
+    behavior:
+      impossible_travel_penalty: 35
+      burst_access_penalty: 20
+    data:
+      severity_map: {low: 10, medium: 30, high: 60}
+
+workflows:
+  # Workflow утверждения временного доступа/исключений
+  approvals:
+    - id: finance_month_end_stepup
+      description: "Утверждение доступа бухгалтерии на закрытие месяца"
+      approvers: ["finlead@yourorg.example","secops@yourorg.example"]
+      applies_to:
+        apps: ["payments_api"]
+        groups: ["finance"]
+        paths: ["^/v1/close-books"]
+      valid_minutes: 60
+  break_glass:
+    enabled: true
+    accounts: ["bg-controller@yourorg.example"]
+    ttl_minutes: 30
+    controls:
+      enforce_mfa: true
+      record_full_session: true
+
+rules:
+  # Порядок важен: первые срабатывающие правила могут выставлять решение или повышать требования.
+  - id: deny_geo_block
+    description: "Блокируем доступ из запрещенных стран, кроме break-glass"
+    priority: 10
+    when:
+      geoip_country_in: ["RU","KP","IR"]
+      not_principal_in: ["bg-controller@yourorg.example"]
+    action:
+      decision: deny
+      reason: "geoip blocked"
+      audit: high
+
+  - id: payments_requires_strong_identity
+    description: "Payments API требует AAL2+ (MFA/WebAuthn) и управляемое устройство"
+    priority: 20
+    applies_to:
+      apps: ["payments_api"]
+      paths: ["^/v1/.*"]
+      methods: ["GET","POST","PUT","DELETE"]
+    when:
+      user_group_in_any: ["employees","finance","payments_admin"]
+      device_profile_in_any: ["managed_win11","managed_mac"]
+      mfa_methods_any: ["webauthn","totp","push"]
+      mtls_profile: strict
+    effects:
+      # Мягкая валидация постуры и EDR
+      posture_requirements:
+        edr_healthy: true
+        max_patch_staleness_days: 14
+      egress_profile: payments_strict
+    action:
+      decision: allow
+      audit: detailed
+
+  - id: payments_admin_admin_paths_stepup
+    description: "Админ-пути в Payments требуют принудительный step-up"
+    priority: 30
+    applies_to:
+      apps: ["payments_api"]
+      paths: ["^/v1/admin/.*"]
+      methods: ["POST","PUT","DELETE"]
+    when:
+      user_group_in_any: ["payments_admin"]
+    action:
+      decision: step_up
+      step_up_methods: ["webauthn"]
+      reason: "admin path step-up"
+      audit: detailed
+
+  - id: hr_portal_contractors_restricted
+    description: "Подрядчики имеют доступ только read‑only к HR порталу"
+    priority: 40
+    applies_to:
+      apps: ["hr_portal"]
+      paths: ["^/.*"]
+    when:
+      user_group_in_any: ["contractors"]
+    action:
+      decision: conditional
+      allow_methods: ["GET"]
+      deny_methods: ["POST","PUT","DELETE"]
+      reason: "contractor read-only"
+      audit: normal
+
+  - id: unmanaged_device_quarantine
+    description: "Неподконтрольные устройства — в карантинный режим (ограниченный доступ)"
+    priority: 50
+    when:
+      device_profile_in_any: ["unmanaged"]
+    action:
+      decision: isolate
+      isolation:
+        restrict_apps: ["git_forge"]      # например, разрешить только git (RO)
+        limit_bandwidth_kbps: 256
+        dlp_force_redact: true
+      reason: "unmanaged device"
+      audit: detailed
+
+  - id: dynamic_risk_gate
+    description: "Динамический шлюз по итоговому риску"
+    priority: 90
+    when:
+      # всегда — действует как общий «фолбек»
+      any: true
+    action:
+      # Движок вычислит итоговый риск (0..100) по risk_model и thresholds в defaults
+      risk_gate:
+        allow_threshold: 39
+        stepup_range: [40, 69]
+        deny_threshold: 70
+      step_up_methods: ["webauthn","totp"]
+      audit: normal
+
+  - id: final_deny
+    description: "Явный запрет по умолчанию"
+    priority: 99
+    when:
+      any: true
+    action:
+      decision: deny
+      reason: "default deny"
+      audit: minimal
+
+post_policies:
+  # Политики после принятия решения: DLP/тэггинг ответов, маскирование.
+  response_controls:
+    dlp:
+      redact_patterns: ["EMAIL","NATIONAL_ID","SECRET_KEY","PRIVATE_KEY"]
+      redact_placeholder: "[REDACTED]"
+    headers:
+      add:
+        X-ZT-Decision: "{{decision}}"
+        X-ZT-Trace-Id: "{{trace_id}}"
+      remove: ["Server","X-Powered-By"]
+  logging:
+    include_request_body: false
+    include_response_body: false
+    redact_keys: ["authorization","cookie","set-cookie","token","secret_key","password"]
+
+exemptions:
+  # Точечные исключения с TTL и утверждением
+  - id: finance_month_end
+    description: "Временное разрешение на закрытие месяца"
+    applies_to:
+      apps: ["payments_api"]
+      paths: ["^/v1/close-books"]
+      methods: ["POST"]
+      groups: ["finance"]
+    approver_policy: finance_month_end_stepup
+    valid_until: "2025-12-31T23:59:59Z"
+
+telemetry:
+  export:
+    sinks:
+      - type: stdout
+      - type: file
+        path: "/var/log/zero-trust/application_controls.jsonl"
+        rotate_mb: 512
+        keep: 10
+        gzip: true
+    fields:
+      include: ["principal","device","app","path","decision","risk","reason","trace_id","geoip","asn"]
+      exclude_values:
+        keys: ["authorization","cookie","token","password","secret"]
+  metrics:
+    prometheus:
+      enabled: true
+      endpoint: "0.0.0.0:9095"
+    counters:
+      - name: zt_decisions_total
+        labels: ["app","decision"]
+      - name: zt_risk_score
+        type: histogram
+        buckets: [10,20,30,40,50,60,70,80,90,100]
+
+canary:
+  rollout:
+    enabled: true
+    percentage: 10           # применять новые правила к 10% трафика
+    match_by: user_hash      # user_hash|device_hash|random
+    fallback_on_error: true
+  validation:
+    dry_run_compare_minutes: 30
+    discrepancy_alert_pct: 5
+
+# Приложение правил к конкретным приложениям по умолчанию (map: app_id -> rule_ids override)
+overrides:
+  hr_portal:
+    add_rules: []
+    disable_rules: ["deny_geo_block"]  # пример: HR-portal доступен из гео X (только пример; оцените риски)
+
+documentation:
+  # Встроенные подсказки для операторов (не читаются движком)
+  glossary:
+    decision:
+      allow: "Разрешить запрос."
+      deny: "Запретить запрос."
+      step_up: "Требовать дополнительную аутентификацию."
+      isolate: "Перевести в карантинный режим с ограничениями."
+      conditional: "Разрешить только подмножество методов/путей."
+  change_process:
+    - "Изменения проходят через PR, обязательен dry-run и canary rollout."
+    - "Безопасники одобряют изменение high‑risk правил (приоритет <= 30)."

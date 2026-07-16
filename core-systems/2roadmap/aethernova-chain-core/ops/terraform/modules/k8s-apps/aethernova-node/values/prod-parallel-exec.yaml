@@ -1,0 +1,203 @@
+# ------------------------------------------------------------------------------
+# Production values for parallel StatefulSet execution of aethernova-node
+# ------------------------------------------------------------------------------
+controller:
+  type: statefulset
+
+replicaCount: 7
+
+image:
+  repository: ghcr.io/aethernova/aethernova-node
+  tag: "SET_BY_CI"
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Labels/Selectors kept consistent for scheduling & monitoring
+podLabels:
+  app.kubernetes.io/name: aethernova-node
+  app.kubernetes.io/part-of: aethernova-chain-core
+  app.kubernetes.io/component: node
+  app.kubernetes.io/managed-by: helm
+
+podAnnotations: {}
+
+statefulset:
+  # Parallel pod management to allow faster scale/rollout where ordering is not required
+  # Kubernetes docs: StatefulSet podManagementPolicy=Parallel. 
+  # Ref: k8s docs & tutorial. 
+  # (Template must pass this into spec.podManagementPolicy)
+  podManagementPolicy: Parallel  # :contentReference[oaicite:2]{index=2}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+
+  # Persistent data (template should map to volumeClaimTemplates)
+  volumeClaimTemplates:
+    enabled: true
+    storageClassName: "fast-ssd"
+    accessModes: ["ReadWriteOnce"]
+    resources:
+      requests:
+        storage: 500Gi
+
+# Service exposure (template should create ports with these names)
+service:
+  enabled: true
+  type: ClusterIP
+  ports:
+    - name: p2p
+      port: 30303
+      targetPort: p2p
+    - name: rpc
+      port: 8545
+      targetPort: rpc
+    - name: metrics
+      port: 9100
+      targetPort: metrics
+
+# Container ports (the chart template should wire these into the container spec)
+ports:
+  p2p: 30303
+  rpc: 8545
+  metrics: 9100
+
+resources:
+  # Resource requests/limits per Kubernetes best practices
+  # Ref: k8s docs (manage resources).
+  # Tune based on SLOs and real usage.
+  limits:
+    cpu: "4"
+    memory: 8Gi
+  requests:
+    cpu: "2"
+    memory: 4Gi
+
+priorityClassName: "aethernova-prod-high"  # Ref: PriorityClass concept. :contentReference[oaicite:3]{index=3}
+
+# Pod security and runtime hardening (generic, app-agnostic)
+podSecurityContext:
+  fsGroup: 2000
+  runAsUser: 10001
+  runAsGroup: 10001
+  runAsNonRoot: true
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# Probes are provided but disabled by default to avoid assuming app endpoints.
+# Enable and tune once health endpoints are known. Ref: probes docs.
+probes:
+  liveness:
+    enabled: false   # set true when endpoint is known
+    httpGet:
+      path: /healthz
+      port: rpc
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: false   # set true when endpoint is known
+    httpGet:
+      path: /readyz
+      port: rpc
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  startup:
+    enabled: false   # set true for slow start binaries
+    httpGet:
+      path: /startupz
+      port: rpc
+    failureThreshold: 30
+    periodSeconds: 10
+# :contentReference[oaicite:4]{index=4}
+
+# Graceful shutdown for chain nodes (connection draining)
+terminationGracePeriodSeconds: 120
+
+# Scheduling for HA: spread across zones and nodes + anti-affinity
+# Ref: topologySpreadConstraints & best practices.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: aethernova-node
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: aethernova-node
+# :contentReference[oaicite:5]{index=5}
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values: ["aethernova-node"]
+        topologyKey: kubernetes.io/hostname
+
+nodeSelector: {}
+tolerations: []
+
+# Disruption Budget to keep quorum/availability during voluntary disruptions
+pdb:
+  enabled: true
+  maxUnavailable: 1
+  # If chart supports it, prefer AlwaysAllow to enable eviction of unhealthy pods during drain
+  # per Kubernetes guidance. 
+  unhealthyPodEvictionPolicy: "AlwaysAllow"
+# :contentReference[oaicite:6]{index=6}
+
+# Prometheus Operator scraping via ServiceMonitor (if CRDs present)
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  namespace: ""
+  labels: {}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aethernova-node
+  endpoints:
+    - port: metrics
+      path: /metrics
+      scheme: http
+# :contentReference[oaicite:7]{index=7}
+
+# Optional autoscaling (only if chart/templates support HPA for this controller)
+autoscaling:
+  enabled: false
+  minReplicas: 7
+  maxReplicas: 15
+  targetCPUUtilizationPercentage: 70
+  behavior:
+    scaleUp:
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+
+# Extra containers/initContainers are off by default to avoid app assumptions
+extraContainers: []
+initContainers: []
+
+# Extra volumes/mounts (e.g., for TLS keys, extra configs)
+extraVolumes: []
+extraVolumeMounts: []

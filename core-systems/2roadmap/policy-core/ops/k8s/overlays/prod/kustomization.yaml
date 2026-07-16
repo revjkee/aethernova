@@ -1,0 +1,131 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Подключаем базовые ресурсы (Deployment/Service/и т.п.)
+resources:
+  - ../../base
+
+namespace: policy-core
+
+# Общие prod-метки/аннотации
+commonLabels:
+  app.kubernetes.io/env: prod
+  environment: prod
+  tier: backend
+
+commonAnnotations:
+  policy-core/runbook: https://runbooks.example.com/policy-core/prod
+  policy-core/owner: platform-security
+  policy-core/contact: secops@example.com
+
+# Генераторы: включаем nameSuffixHash (по умолчанию включен) — это важно для автоматического rollout
+configMapGenerator:
+  - name: policy-core-config
+    behavior: merge
+    literals:
+      - APP_MODE=prod
+      - LOG_LEVEL=INFO
+    options:
+      disableNameSuffixHash: false
+      labels:
+        app.kubernetes.io/name: policy-core
+        app.kubernetes.io/component: api
+      annotations:
+        policy-core/config-purpose: runtime
+
+secretGenerator:
+  - name: policy-core-secrets
+    behavior: merge
+    literals:
+      # Заглушки; в CI замените через kustomize edit или патчи из Vault/SealedSecrets
+      - PLACEHOLDER=replace-in-ci
+    options:
+      disableNameSuffixHash: false
+      labels:
+        app.kubernetes.io/name: policy-core
+        app.kubernetes.io/component: api
+      annotations:
+        policy-core/secret-purpose: runtime
+
+generatorOptions:
+  labels:
+    managed-by: kustomize
+  annotations:
+    policy-core/generated: "true"
+
+# Фиксация образа и масштаба для prod
+images:
+  - name: ghcr.io/your-org/policy-core
+    newName: ghcr.io/your-org/policy-core
+    # Тег может игнорироваться, если указан digest; оставляем для читаемости
+    newTag: v0.1.0
+    digest: sha256:REPLACED_BY_CI_IMAGE_DIGEST
+
+replicas:
+  - name: policy-core
+    count: 5
+
+# Продакшн-патчи (пример: увеличим ресурсы и ужесточим pullPolicy)
+patches:
+  - target:
+      kind: Deployment
+      name: policy-core
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+      - op: add
+        path: /spec/strategy/rollingUpdate/maxSurge
+        value: 1
+      - op: add
+        path: /spec/strategy/rollingUpdate/maxUnavailable
+        value: 0
+
+# Автоматическая подстановка «захешированных» имен генераторов в Pod template и checksum-аннотаций
+# Примечание: в путях аннотаций символ '/' экранируется как '~1'
+replacements:
+  # 1) ConfigMap name (с хешем) -> в envFrom и checksum-аннотацию
+  - source:
+      kind: ConfigMap
+      name: policy-core-config
+      fieldPath: metadata.name
+    targets:
+      - select:
+          kind: Deployment
+          name: policy-core
+        fieldPaths:
+          - spec/template/spec/containers/0/envFrom/0/configMapRef/name
+      - select:
+          kind: Deployment
+          name: policy-core
+        fieldPaths:
+          - spec/template/metadata/annotations/policy-core~1checksum-config
+
+  # 2) Secret name (с хешем) -> в envFrom и checksum-аннотацию
+  - source:
+      kind: Secret
+      name: policy-core-secrets
+      fieldPath: metadata.name
+    targets:
+      - select:
+          kind: Deployment
+          name: policy-core
+        fieldPaths:
+          - spec/template/spec/containers/0/envFrom/1/secretRef/name
+      - select:
+          kind: Deployment
+          name: policy-core
+        fieldPaths:
+          - spec/template/metadata/annotations/policy-core~1checksum-secrets
+
+# Дополнительно: принудительный приоритет prod при конфликтах генераторов/патчей
+# (оставляем умолчания Kustomize; при необходимости можно добавить transformers/patchesJson6902)

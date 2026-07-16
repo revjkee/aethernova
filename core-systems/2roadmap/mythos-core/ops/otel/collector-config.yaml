@@ -1,0 +1,226 @@
+# mythos-core/ops/otel/collector-config.yaml
+# Требуется образ opentelemetry-collector-contrib.
+# Все endpoints и токены задаются через env с безопасными дефолтами.
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+receivers:
+  # Универсальный вход для приложений (SDK OTLP)
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 32
+      http:
+        endpoint: 0.0.0.0:4318
+        max_request_body_size: 33554432
+
+  # Совместимость с существующей экосистемой трейсинга
+  jaeger:
+    protocols:
+      grpc:
+      thrift_http:
+  zipkin:
+
+  # Метрики Kubelet (узел/поды/контейнеры)
+  kubeletstats:
+    collection_interval: 30s
+    auth_type: serviceAccount
+    endpoint: ${env:KUBELET_ENDPOINT:}
+    insecure_skip_verify: true
+    metric_groups: [ node, pod, container ]
+
+  # Контейнерные логи (CRI формат) — требует доступ к /var/log/containers
+  filelog:
+    include:
+      - /var/log/containers/*.log
+    start_at: beginning
+    include_file_path: false
+    include_file_name: false
+    operators:
+      - type: regex_parser
+        regex: '^(?P<time>[^ ]+) (?P<stream>stdout|stderr) (?P<flags>[^ ]*) (?P<log>.*)$'
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.999999999Z07:00'
+      - type: move
+        from: attributes.log
+        to: body
+      - type: remove
+        field: attributes.time
+      - type: remove
+        field: attributes.flags
+      - type: severity_parser
+        parse_from: attributes.stream
+
+processors:
+  # Жёсткие пределы по памяти (адаптируйте лимиты под k8s requests/limits)
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: 75
+    spike_limit_percentage: 30
+
+  # Обогащение k8s-метаданными (namespace/pod/node/workload/labels)
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    filter:
+      node_from_env_var: KUBE_NODE_NAME
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.node.name
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - k8s.job.name
+        - k8s.cronjob.name
+      labels:
+        - key: app.kubernetes.io/name
+        - key: app.kubernetes.io/component
+        - key: app.kubernetes.io/instance
+        - key: app.kubernetes.io/version
+        - key: app
+
+  # Общая детекция ресурса (хост/система/переменные окружения)
+  resourcedetection:
+    detectors: [ env, system, host ]
+    timeout: 5s
+    override: false
+
+  # Семплинг трасс на "хвосте" (умный отбор для экономии бюджета)
+  tail_sampling:
+    decision_wait: 30s
+    expected_new_traces_per_sec: ${env:TS_EXPECTED_TPS:1000}
+    num_traces: ${env:TS_NUM_TRACES:50000}
+    policies:
+      - name: errors-first
+        type: status_code
+        status_code:
+          status_codes: [ ERROR ]
+      - name: high-latency
+        type: latency
+        latency:
+          threshold_ms: ${env:TS_LATENCY_MS:500}
+      - name: important-services
+        type: string_attribute
+        string_attribute:
+          key: service.name
+          values: ${env:TS_IMPORTANT_SERVICES:mythos-core-api,mythos-core-worker}
+          enabled_regex_matching: true
+      - name: probabilistic-backstop
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: ${env:TS_SAMPLING_PERCENT:10}
+
+  # Батчирование для повышения пропускной способности
+  batch:
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+    timeout: 5s
+
+  # (Необязательно) лёгкая фильтрация шумных healthcheck-запросов
+  # filter:
+  #   metrics:
+  #     exclude:
+  #       match_type: regexp
+  #       metric_names:
+  #         - "http.server.duration{.*path=.*(/healthz|/livez|/readyz).*}"
+
+exporters:
+  # OTLP для трасс
+  otlp/traces:
+    endpoint: ${env:OTLP_TRACES_ENDPOINT:tempo:4317}
+    tls:
+      insecure: ${env:OTLP_TRACES_INSECURE:false}
+    headers:
+      Authorization: ${env:OTLP_TRACES_AUTH:}
+    compression: gzip
+    sending_queue:
+      enabled: true
+      num_consumers: 8
+      queue_size: 8192
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  # OTLP для логов
+  otlp/logs:
+    endpoint: ${env:OTLP_LOGS_ENDPOINT:otel-logs:4317}
+    tls:
+      insecure: ${env:OTLP_LOGS_INSECURE:false}
+    headers:
+      Authorization: ${env:OTLP_LOGS_AUTH:}
+    compression: gzip
+    sending_queue:
+      enabled: true
+      num_consumers: 8
+      queue_size: 8192
+    retry_on_failure:
+      enabled: true
+
+  # OTLP для метрик (универсальный backend)
+  otlp/metrics:
+    endpoint: ${env:OTLP_METRICS_ENDPOINT:otel-metrics:4317}
+    tls:
+      insecure: ${env:OTLP_METRICS_INSECURE:false}
+    headers:
+      Authorization: ${env:OTLP_METRICS_AUTH:}
+    compression: gzip
+    sending_queue:
+      enabled: true
+      num_consumers: 8
+      queue_size: 8192
+    retry_on_failure:
+      enabled: true
+
+  # Прямая отправка метрик в Prometheus Remote Write
+  prometheusremotewrite:
+    endpoint: ${env:PROM_REMOTEWRITE_ENDPOINT:}
+    tls:
+      insecure: ${env:PROM_REMOTEWRITE_INSECURE:false}
+    headers:
+      Authorization: ${env:PROM_REMOTEWRITE_AUTH:}
+    external_labels:
+      cluster: ${env:CLUSTER_NAME:unknown}
+      namespace: ${env:NAMESPACE:default}
+
+  # Диагностический экспортёр (не включён по умолчанию)
+  logging:
+    loglevel: warn
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888
+
+  extensions: [ health_check, pprof, zpages ]
+
+  pipelines:
+    traces:
+      receivers: [ otlp, jaeger, zipkin ]
+      processors: [ memory_limiter, k8sattributes, resourcedetection, tail_sampling, batch ]
+      exporters: [ otlp/traces ]
+    metrics:
+      receivers: [ otlp, kubeletstats ]
+      processors: [ memory_limiter, k8sattributes, resourcedetection, batch ]
+      exporters: [ otlp/metrics, prometheusremotewrite ]
+    logs:
+      receivers: [ otlp, filelog ]
+      processors: [ memory_limiter, k8sattributes, resourcedetection, batch ]
+      exporters: [ otlp/logs ]

@@ -1,0 +1,520 @@
+syntax = "proto3";
+
+package aethernova.security.v1;
+
+option go_package               = "github.com/aethernova/security-core/gen/go/aethernova/security/v1;securityv1";
+option java_multiple_files      = true;
+option java_package             = "org.aethernova.security.v1";
+option java_outer_classname     = "TokenProto";
+option csharp_namespace         = "Aethernova.Security.V1";
+option objc_class_prefix        = "AVS";
+option php_namespace            = "Aethernova\\Security\\V1";
+option swift_prefix             = "AVS";
+
+// Well-knowns
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/struct.proto";
+
+// ==============================
+// Core enums
+// ==============================
+
+enum TokenFormat {
+  TOKEN_FORMAT_UNSPECIFIED = 0;
+  TOKEN_FORMAT_PROTOBUF    = 1;  // Native protobuf envelope (this schema)
+  TOKEN_FORMAT_JWT         = 2;  // JOSE JWS-based
+  TOKEN_FORMAT_PASETO      = 3;  // Platform-Agnostic SEcurity TOkens
+  TOKEN_FORMAT_CWT         = 4;  // CBOR Web Token (COSE)
+  TOKEN_FORMAT_MACAROON    = 5;  // Macaroons with caveats
+}
+
+enum Serialization {
+  SERIALIZATION_UNSPECIFIED = 0;
+  SERIALIZATION_COMPACT     = 1; // e.g. JWT compact or PASETO vX
+  SERIALIZATION_JSON        = 2; // JOSE JSON, debug flows
+  SERIALIZATION_CBOR        = 3; // COSE/CWT style
+  SERIALIZATION_PROTOBUF    = 4; // Deterministic protobuf bytes
+  SERIALIZATION_MSGPACK     = 5; // Optional, set if used
+}
+
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_NONE        = 1;
+  COMPRESSION_DEFLATE     = 2; // RFC 1951/JOSE "DEF"
+  COMPRESSION_ZSTD        = 3;
+}
+
+enum SignatureAlgorithm {
+  SIG_ALG_UNSPECIFIED = 0;
+  SIG_ALG_ED25519     = 1;
+  SIG_ALG_ED448       = 2;
+  SIG_ALG_ECDSA_P256  = 3;
+  SIG_ALG_ECDSA_P384  = 4;
+  SIG_ALG_ECDSA_P521  = 5;
+  SIG_ALG_RSA_PSS_2048= 6;
+  SIG_ALG_RSA_PSS_3072= 7;
+  SIG_ALG_RSA_PSS_4096= 8;
+
+  // PQ-safe (hybrid welcome in MultiSignature)
+  SIG_ALG_DILITHIUM2  = 20;
+  SIG_ALG_DILITHIUM3  = 21;
+  SIG_ALG_DILITHIUM5  = 22;
+  SIG_ALG_FALCON512   = 23;
+  SIG_ALG_FALCON1024  = 24;
+  SIG_ALG_SPHINCS_SHA2_128S = 25;
+}
+
+enum AeadCipher {
+  AEAD_UNSPECIFIED     = 0;
+  AEAD_AES_GCM_128     = 1;
+  AEAD_AES_GCM_256     = 2;
+  AEAD_CHACHA20_POLY1305 = 3;
+  // HPKE AEAD IDs may be negotiated via HpkeSuite
+}
+
+enum EncryptionMode {
+  ENC_MODE_UNSPECIFIED = 0;
+  ENC_MODE_NONE        = 1; // Sign-only
+  ENC_MODE_AEAD        = 2; // Raw AEAD over payload
+  ENC_MODE_JWE         = 3; // JOSE JWE
+  ENC_MODE_HPKE        = 4; // RFC 9180
+  ENC_MODE_PASETO_LOCAL= 5; // PASETO local mode
+}
+
+enum HpkeKem {
+  HPKE_KEM_UNSPECIFIED = 0;
+  HPKE_DHKEM_P256      = 16;
+  HPKE_DHKEM_P384      = 17;
+  HPKE_DHKEM_P521      = 18;
+  HPKE_DHKEM_X25519    = 32;
+  HPKE_DHKEM_X448      = 33;
+  // PQ KEMs can be added in future revisions
+}
+
+enum HpkeKdf {
+  HPKE_KDF_UNSPECIFIED = 0;
+  HPKE_HKDF_SHA256     = 1;
+  HPKE_HKDF_SHA384     = 2;
+  HPKE_HKDF_SHA512     = 3;
+}
+
+enum HashAlgorithm {
+  HASH_UNSPECIFIED = 0;
+  HASH_SHA256      = 1;
+  HASH_SHA384      = 2;
+  HASH_SHA512      = 3;
+  HASH_BLAKE2B_256 = 10;
+  HASH_BLAKE3_256  = 11;
+}
+
+// Key origin / custody to trace trust anchors and ops controls.
+enum KeyOrigin {
+  KEY_ORIGIN_UNSPECIFIED = 0;
+  KEY_ORIGIN_LOCAL       = 1;  // Local software KMS
+  KEY_ORIGIN_HSM         = 2;  // Hardware Security Module (PKCS#11)
+  KEY_ORIGIN_AWS_KMS     = 3;
+  KEY_ORIGIN_GCP_KMS     = 4;
+  KEY_ORIGIN_AZURE_KV    = 5;
+  KEY_ORIGIN_HASHICORP_VAULT = 6;
+  KEY_ORIGIN_TPM         = 7;
+  KEY_ORIGIN_TEE         = 8;  // SGX/TDX/SEV-SNP enclave
+}
+
+// Evidence source for hardware/software attestation.
+enum AttestationType {
+  ATTESTATION_UNSPECIFIED = 0;
+  ATTESTATION_TPM         = 1; // TPM2 quote
+  ATTESTATION_INTEL_SGX   = 2;
+  ATTESTATION_INTEL_TDX   = 3;
+  ATTESTATION_AMD_SEV_SNP = 4;
+  ATTESTATION_ARM_TRUSTZONE = 5;
+  ATTESTATION_APPLE_DEVICECHECK = 6;
+  ATTESTATION_ANDROID_KEY   = 7;
+  ATTESTATION_FIDO_U2F      = 8;
+}
+
+// ==============================
+// Token envelope (unified model)
+// ==============================
+
+message TokenEnvelope {
+  // Stable ID for revocation/track (maps to "jti" where relevant).
+  string token_id = 1;
+
+  TokenFormat       format       = 2;
+  Serialization     serialization= 3;
+  Compression       compression  = 4;
+
+  // Producer and versioning
+  TokenHeader       header       = 5;
+
+  // Core claims set (Registered + private).
+  Claims            claims       = 6;
+
+  // Fine-grained authorization and resource scoping.
+  repeated Scope    scopes       = 7;
+
+  // Optional capability-style delegations (Macaroons-like caveats).
+  repeated Delegation delegations = 8;
+
+  // Proof-of-Possession binding (DPoP/cnf/holder-of-key).
+  KeyBinding        key_binding  = 9;
+
+  // Hardware/software attestation (optional).
+  AttestationBundle attestation  = 10;
+
+  // Multi-signature support incl. hybrid (classical + PQ).
+  MultiSignature    signatures   = 11;
+
+  // Encryption parameters when payload is confidential.
+  Encryption        encryption   = 12;
+
+  // Deterministic canonical bytes for auditing (post-serialization/compression).
+  bytes canonical_bytes          = 13;
+
+  // Hash of canonical_bytes for OPA/caches/CDN keys.
+  Digest             digest      = 14;
+
+  // Issuance/runtime diagnostics for observability and policy.
+  TokenMeta          meta        = 15;
+
+  // Reserved for future wire-level compatibility fields.
+  reserved 1000 to 1999;
+}
+
+// ==============================
+// Headers, claims, scopes
+// ==============================
+
+message TokenHeader {
+  // "typ" in JOSE or logical token type.
+  string type = 1;
+
+  // Logical issuer (URI or DNS name). Mirrors "iss".
+  string issuer = 2;
+
+  // Logical key identifier (kid) used for signature/encryption.
+  string key_id = 3;
+
+  // Signing algorithm hint when applicable.
+  SignatureAlgorithm sig_alg = 4;
+
+  // Optional certificate chain in DER (for x5c-like flows).
+  repeated bytes x5c_chain_der = 5;
+
+  // Deterministic serializer hint (e.g. JSON canonicalization strategy).
+  string canonicalization = 6;
+
+  // Free-form protected headers for JOSE/COSE interop.
+  map<string, google.protobuf.Value> protected_headers = 7;
+
+  // Non-protected headers (transport or debug), not covered by signature.
+  map<string, google.protobuf.Value> unprotected_headers = 8;
+
+  // Spec/contract version for this envelope schema.
+  string schema_version = 9;
+
+  reserved 100 to 199;
+}
+
+message Claims {
+  // Registered claims (RFC 7519 aligned).
+  string iss = 1;
+  string sub = 2;
+  repeated string aud = 3;
+
+  google.protobuf.Timestamp exp = 4;
+  google.protobuf.Timestamp nbf = 5;
+  google.protobuf.Timestamp iat = 6;
+
+  string jti = 7;
+
+  // Subject context & risk for policy engines (OPA/Cedar).
+  SubjectContext subject_context = 10;
+
+  // Authorization convenience fields.
+  repeated string roles       = 20; // high-level roles
+  repeated string permissions = 21; // verb:resource dotted strings
+  repeated string groups      = 22;
+
+  // Arbitrary private claims.
+  map<string, google.protobuf.Value> private = 50;
+
+  reserved 100 to 199;
+}
+
+message SubjectContext {
+  // Tenant/project isolation.
+  string tenant_id   = 1;
+  // Human or service principal identifiers.
+  string user_id     = 2;
+  string service_id  = 3;
+
+  // Session/device details.
+  string session_id  = 10;
+  string device_id   = 11;
+  string user_agent  = 12;
+  string ip_address  = 13;
+
+  // Coarse geolocation and platform hints.
+  string region      = 20;
+  string locale      = 21;
+  string platform    = 22; // ios/android/linux/windows/...
+  string mfa_level   = 23; // none/sms/totp/webauthn
+
+  // Risk signals (range and sources are system-specific).
+  double risk_score  = 30;
+  map<string, google.protobuf.Value> risk_factors = 31;
+
+  reserved 100 to 199;
+}
+
+// Scope can be as simple as "resource:verb" or structured below.
+message Scope {
+  string name = 1;         // e.g., "orders:read"
+  string resource = 2;     // e.g., "orders/*" or ARN/URI
+  repeated string actions = 3; // ["read","list"]
+  google.protobuf.Timestamp not_before = 4;
+  google.protobuf.Timestamp not_after  = 5;
+  map<string, google.protobuf.Value> constraints = 10;
+}
+
+// ==============================
+// Delegations & Caveats (capabilities)
+// ==============================
+
+message Delegation {
+  string grant_id = 1;             // Stable ID of delegation
+  Principal grantor = 2;           // Who grants
+  Principal grantee = 3;           // Who receives
+  repeated Scope scopes = 4;       // Granted scopes
+  repeated Caveat caveats = 5;     // Constraints (Macaroons-like)
+  uint32 max_hops = 6;             // Anti-amplification
+  google.protobuf.Timestamp issued_at = 7;
+  google.protobuf.Timestamp expires_at= 8;
+}
+
+message Principal {
+  string type  = 1; // "user","service","device","role"
+  string id    = 2; // Subject identifier
+  map<string, google.protobuf.Value> attributes = 3;
+}
+
+message Caveat {
+  string id    = 1; // Identifier of caveat
+  string kind  = 2; // "time", "ip", "geo", "rate", "aud", "nonce", "predicate"
+  // Expression or structured rule evaluated by PDP (e.g., CEL/Rego).
+  string expression = 3;
+  // External verifier location if third-party caveat.
+  string location = 4;
+  // Optional binder digest to chain caveats.
+  Digest binder = 5;
+}
+
+// ==============================
+// Proof-of-Possession (holder-of-key)
+// ==============================
+
+message KeyBinding {
+  // Public key material (e.g., JWK thumbprint or raw SPKI).
+  bytes public_key_spki = 1;
+  string key_id         = 2;
+
+  // For JOSE/CWT interop: "cnf" claim as generic Any.
+  google.protobuf.Any cnf = 3;
+
+  // DPoP/JWT-POP proof (detached). Verifier uses it alongside the token.
+  repeated Proof proof_chain = 4;
+}
+
+message Proof {
+  string media_type = 1; // e.g., "jws", "cose-sign1"
+  bytes  data       = 2; // raw bytes of detached proof
+  google.protobuf.Timestamp created_at = 3;
+}
+
+// ==============================
+// Attestation (hardware/software trust)
+// ==============================
+
+message AttestationBundle {
+  repeated Attestation evidence = 1;
+  // Optional verifier results captured at issuance time.
+  repeated AttestationResult results = 2;
+}
+
+message Attestation {
+  AttestationType type = 1;
+  bytes evidence = 2; // Raw quote/report as issued by platform
+  bytes nonce   = 3;  // Freshness
+  map<string, google.protobuf.Value> params = 4; // PCR list, policies, MRENCLAVE, etc.
+}
+
+message AttestationResult {
+  AttestationType type = 1;
+  bool   valid = 2;
+  string verifier = 3;   // service performing verification
+  string policy_id = 4;  // evaluated policy id/version
+  string reason = 5;     // failure detail if any
+  google.protobuf.Timestamp verified_at = 6;
+}
+
+// ==============================
+// Signatures (single / multi / hybrid)
+// ==============================
+
+message MultiSignature {
+  // Canonical signable bytes are defined by (serialization, compression).
+  repeated Signature signatures = 1;
+}
+
+message Signature {
+  SignatureAlgorithm algorithm = 1;
+  string key_id                = 2;
+  KeyOrigin origin             = 3;
+  bytes signature              = 4;  // Raw signature bytes
+  google.protobuf.Timestamp created_at = 5;
+
+  // Optional certificate/public key material for path building/pinning.
+  bytes public_key_spki        = 10;
+  repeated bytes x5c_chain_der = 11;
+
+  // KMS locator (ARN/URI/resource path) if applicable.
+  string kms_uri               = 12;
+
+  // Critical header subset used in JOSE/COSE contexts (encoded bytes).
+  bytes protected_headers      = 20;
+
+  // Annotation tags for policy/rotation (e.g., "primary", "pq-hybrid").
+  repeated string tags         = 30;
+}
+
+// ==============================
+// Encryption (AEAD/JWE/HPKE/PASETO local)
+// ==============================
+
+message Encryption {
+  EncryptionMode mode   = 1;
+
+  // Raw AEAD parameters (ENC_MODE_AEAD)
+  AeadCipher aead       = 2;
+  bytes iv              = 3;
+  bytes salt            = 4;
+  bytes aad             = 5;
+
+  // JWE compact/JSON structures when used, stored as raw bytes.
+  bytes jwe_compact     = 10; // If the envelope is a JWE container externally
+  bytes jwe_protected   = 11; // Protected headers (JSON)
+  bytes jwe_recipient   = 12; // Per-recipient info if JSON serialization
+
+  // HPKE suite and material (ENC_MODE_HPKE)
+  HpkeSuite hpke        = 20;
+  bytes recipient_pubkey = 21; // static recipient public key (SPKI)
+  bytes ephemeral_pubkey = 22; // sender ephemeral public key (SPKI)
+  bytes enc             = 23;  // HPKE encapsulated key (ct)
+  bytes info            = 24;  // Context string
+
+  // PASETO local mode metadata (version-specific)
+  string paseto_version  = 30; // e.g., "v4"
+  bytes paseto_footer    = 31;
+
+  // CEK locator if managed by an external KMS.
+  string cek_kid         = 40;
+  string cek_kms_uri     = 41;
+}
+
+message HpkeSuite {
+  HpkeKem kem = 1;
+  HpkeKdf kdf = 2;
+  AeadCipher aead = 3;
+}
+
+// ==============================
+// Hash/Digest utility
+// ==============================
+
+message Digest {
+  HashAlgorithm algorithm = 1;
+  bytes value = 2;
+}
+
+// ==============================
+// Metadata and policy hooks
+// ==============================
+
+message TokenMeta {
+  // Issuance provenance
+  string issuer_service  = 1;
+  string issuer_instance = 2;
+  string issuer_region   = 3;
+
+  // Policy and lifecycle
+  string policy_id       = 10;
+  google.protobuf.Duration default_ttl = 11;
+  bool   one_time_use    = 12;
+  bool   non_transferrable = 13;
+
+  // Observability (for secure logs)
+  string trace_id        = 20;
+  string span_id         = 21;
+
+  // Client hints
+  string client_app      = 30;
+  string client_version  = 31;
+
+  // Extra
+  map<string, google.protobuf.Value> annotations = 100;
+}
+
+// ==============================
+// Status / revocation (optional API payloads)
+// ==============================
+
+message TokenStatus {
+  string token_id = 1;
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_ACTIVE      = 1;
+    STATE_REVOKED     = 2;
+    STATE_EXPIRED     = 3;
+    STATE_NOT_YET_VALID = 4;
+  }
+  State state = 2;
+  string reason = 3;
+  google.protobuf.Timestamp as_of = 4;
+}
+
+// ==============================
+// Wire helpers for transport
+// ==============================
+
+message PackedToken {
+  // Self-contained wire object for transport or storage.
+  TokenEnvelope envelope = 1;
+
+  // If the application needs to ship an external detached proof or
+  // compact serialization alongside (e.g., JWT compact string).
+  bytes detached_compact = 10;
+}
+
+// ==============================
+// Reserved names/numbers for forward compatibility
+// ==============================
+
+/*
+Design notes:
+
+- The envelope allows representing JWT/PASETO/CWT without lossy
+  transformations by preserving protected/unprotected headers and
+  compact/CBOR encodings when needed.
+- MultiSignature enables hybrid crypto (e.g., Ed25519 + Dilithium2)
+  to support PQ migration. Verifiers can require any- or all-of policies.
+- KeyBinding and Proof chain support DPoP/JWT‑PoP with detached proofs.
+- AttestationBundle stores raw evidence plus verification results for
+  audit. Policy is externalized (Rego/Cedar/CEL), yet hooks exist.
+- Claims.private and header maps provide safe extension points
+  without schema churn. Numbers 1000–1999 are reserved for future
+  wire-level extensions.
+*/

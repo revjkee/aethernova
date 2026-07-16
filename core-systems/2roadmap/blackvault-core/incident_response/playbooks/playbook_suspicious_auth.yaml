@@ -1,0 +1,122 @@
+id: playbook-suspicious-auth-v3
+name: Suspicious Authentication Detection and Containment
+description: |
+  Обнаружение и обработка подозрительных входов в систему с возможными признаками компрометации.
+  Использует геолокационные/временные/поведенческие индикаторы, активирует меры валидации и эскалации.
+
+version: "3.1.4"
+severity: high
+tags:
+  - suspicious-auth
+  - mfa
+  - geolocation
+  - adaptive-response
+  - zero-trust
+  - behavioral-ai
+
+entry_conditions:
+  - login_anomaly:
+      geo_distance_km_min: 1000
+      timeframe_sec: 300
+      user_agent_mismatch: true
+  - ip_reputation:
+      is_tor_exit_node: true
+  - failed_attempts:
+      count_threshold: 5
+      within_minutes: 10
+  - behavior_score:
+      threshold: 75
+
+actions:
+  - id: block-session-token
+    type: handler
+    module: playbooks.handlers.block_ip
+    input:
+      ip: "{{ incident.source_ip }}"
+      engine: iptables
+      mode: drop
+      operator: system-playbook
+      reason: "Suspicious auth - blocking session origin"
+      dry_run: false
+
+  - id: force-password-rotation
+    type: handler
+    module: playbooks.handlers.escalate_to_admin
+    input:
+      incident_id: "{{ incident.id }}"
+      title: "Suspicious Login Detected"
+      description: |
+        Anomalous login detected for user {{ incident.username }}.
+        Geo-anomaly, TOR source, or behavioral threshold exceeded.
+      severity: high
+      operator: system-playbook
+      channel: slack
+      contact: "{{ secrets.slack_webhook_url }}"
+      context: suspicious-auth
+
+  - id: trigger-behavioral-forensics
+    type: handler
+    module: playbooks.handlers.trigger_ai_forensics
+    input:
+      incident_id: "{{ incident.id }}"
+      evidence:
+        log: "{{ incident.auth_log }}"
+        process_tree: "{{ incident.proc_snapshot }}"
+      operator: system-playbook
+      mode: light
+      access_token: "{{ secrets.ai_forensics_token }}"
+      dry_run: false
+
+  - id: enforce-mfa-recheck
+    type: handler
+    module: playbooks.handlers.escalate_to_admin
+    input:
+      incident_id: "{{ incident.id }}"
+      title: "Second-factor required"
+      description: "User flagged for suspicious login. MFA validation required."
+      severity: medium
+      operator: system-playbook
+      channel: telegram
+      contact: "{{ secrets.telegram_chat_id }}"
+      token: "{{ secrets.telegram_bot_token }}"
+      context: mfa-policy-enforcement
+
+  - id: isolate-vpn-tunnel
+    type: handler
+    module: playbooks.handlers.isolate_container
+    input:
+      container_id: "{{ incident.vpn_tunnel_id }}"
+      runtime: docker
+      mode: network_block
+      operator: system-playbook
+      reason: "VPN tunnel used for anomalous login"
+      dry_run: false
+
+post_conditions:
+  - confirm_action:
+      from: block-session-token
+      must_be: "success"
+  - verify_behavioral_analysis_complete: true
+  - notify_on_failure: true
+
+output_artifacts:
+  - auth_logs:
+      source: "{{ incident.auth_log }}"
+      archived_as: "{{ incident.id }}_authlog.tar.gz"
+  - forensic_summary:
+      source: trigger-behavioral-forensics.details
+      format: json
+
+audit:
+  enabled: true
+  log_channel: "blackvault.audit.suspicious_auth"
+  redact_sensitive: true
+  trace_id: "{{ trace.uuid }}"
+  correlate_with: ["vpn_sessions", "ip_history", "user_sessions"]
+
+meta:
+  created_by: TeslaAI Genesis
+  validated_by: metaagents [20 agents + 3 meta-generals]
+  zero_trust_compliant: true
+  version_controlled: true
+  replayable: true

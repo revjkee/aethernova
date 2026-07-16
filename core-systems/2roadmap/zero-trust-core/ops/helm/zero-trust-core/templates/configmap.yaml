@@ -1,0 +1,137 @@
+{{- /*
+  zero-trust-core: ConfigMap (industrial-grade)
+
+  Values contract (пример):
+  config:
+    enabled: true
+    immutable: true
+    nameSuffixHash: true
+    data:
+      APP_ENV: "staging"
+      LOG_LEVEL: "INFO"
+    inline:
+      config.yaml: |
+        apiVersion: "aethernova.io/config/v1"
+        kind: SecurityCoreConfig
+        server:
+          http:
+            bind: "0.0.0.0:8080"
+    files:
+      - name: "authz.yaml"
+        path: "configs/authz.yaml"
+      - name: "staging.yaml"
+        path: "configs/env/staging.yaml"
+    binaryFiles:
+      - name: "ca.pem"
+        path: "certs/ca.pem"
+    extraLabels: {}
+    extraAnnotations: {}
+
+  ПРИМЕЧАНИЕ: Все пути в .Values.config.files/binaryFiles читаются из Chart .Files.
+*/ -}}
+
+{{- if not (hasKey .Values "config") -}}
+  {{- fail "missing .Values.config block" -}}
+{{- end -}}
+
+{{- $cfg := .Values.config -}}
+{{- if not (hasKey $cfg "enabled") -}}
+  {{- $_ := set $cfg "enabled" true -}}
+{{- end -}}
+{{- if not $cfg.enabled -}}
+  {{- /* Конфиг отключен — ресурс не рендерим */ -}}
+  {{- return -}}
+{{- end -}}
+
+{{- /* Безопасные дефолты */ -}}
+{{- $_ := set $cfg "immutable" (default true $cfg.immutable) -}}
+{{- $_ := set $cfg "nameSuffixHash" (default true $cfg.nameSuffixHash) -}}
+
+{{- /* Имя/Fullname без зависимости от _helpers.tpl */ -}}
+{{- $nameDefault := default .Chart.Name .Values.nameOverride -}}
+{{- $fullname := (default (printf "%s-%s" .Release.Name $nameDefault) .Values.fullnameOverride) | trunc 63 | trimSuffix "-" -}}
+
+{{- /* Собираем содержимое ConfigMap в словари */ -}}
+{{- $data := dict -}}
+{{- $bin := dict -}}
+
+{{- if $cfg.data }}
+  {{- range $k, $v := $cfg.data }}
+    {{- /* tpl позволяет параметризовать строки, если они содержат шаблоны */ -}}
+    {{- $_ := set $data $k (tpl (toString $v) $) -}}
+  {{- end }}
+{{- end }}
+
+{{- if $cfg.inline }}
+  {{- range $k, $v := $cfg.inline }}
+    {{- $_ := set $data $k (tpl (toString $v) $) -}}
+  {{- end }}
+{{- end }}
+
+{{- if $cfg.files }}
+  {{- range $i, $f := $cfg.files }}
+    {{- if not (hasKey $f "name") }}{{ fail "config.files[] requires 'name'" }}{{ end -}}
+    {{- if not (hasKey $f "path") }}{{ fail "config.files[] requires 'path'" }}{{ end -}}
+    {{- $content := .Files.Get $f.path | default "" -}}
+    {{- if eq $content "" }}{{ fail (printf "config.files[%d] path not found: %s" $i $f.path) }}{{ end -}}
+    {{- $_ := set $data $f.name (tpl $content $) -}}
+  {{- end }}
+{{- end }}
+
+{{- if $cfg.binaryFiles }}
+  {{- range $i, $f := $cfg.binaryFiles }}
+    {{- if not (hasKey $f "name") }}{{ fail "config.binaryFiles[] requires 'name'" }}{{ end -}}
+    {{- if not (hasKey $f "path") }}{{ fail "config.binaryFiles[] requires 'path'" }}{{ end -}}
+    {{- $raw := .Files.GetBytes $f.path -}}
+    {{- if not $raw }}{{ fail (printf "config.binaryFiles[%d] path not found or empty: %s" $i $f.path) }}{{ end -}}
+    {{- $_ := set $bin $f.name ($raw | b64enc) -}}
+  {{- end }}
+{{- end }}
+
+{{- if and (eq (len $data) 0) (eq (len $bin) 0) -}}
+  {{- fail "config requires at least one of: data, inline, files, binaryFiles" -}}
+{{- end -}}
+
+{{- /* Хэш содержимого для детерминированного имени (перекатка Pod при изменении) */ -}}
+{{- $serialized := printf "%s\n%s" ($data | toYaml) ($bin | toYaml) -}}
+{{- $sum := (sha256sum $serialized | trunc 8) -}}
+{{- $cmName := ternary (printf "%s-%s" $fullname $sum) $fullname $cfg.nameSuffixHash -}}
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $cmName }}
+  labels:
+    app.kubernetes.io/name: {{ $nameDefault | quote }}
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/part-of: "zero-trust-core"
+    app.kubernetes.io/component: "service"
+    app.kubernetes.io/managed-by: "Helm"
+{{- with .Values.commonLabels }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+{{- with $cfg.extraLabels }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+  annotations:
+    config.aethernova/strategy: "hash-name"
+    config.aethernova/content-sha256: {{ $sum | quote }}
+{{- with .Values.commonAnnotations }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+{{- with $cfg.extraAnnotations }}
+{{ toYaml . | nindent 4 }}
+{{- end }}
+{{- if $cfg.immutable }}
+immutable: true
+{{- end }}
+data:
+{{- if gt (len $data) 0 }}
+{{ toYaml $data | nindent 2 }}
+{{- else }}
+  {}
+{{- end }}
+{{- if gt (len $bin) 0 }}
+binaryData:
+{{ toYaml $bin | nindent 2 }}
+{{- end }}

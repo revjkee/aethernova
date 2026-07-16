@@ -1,0 +1,339 @@
+# core-systems/security-core/configs/pki.yaml
+# Schema: security-core/pki/v1
+version: 1
+schema: security-core/pki/v1
+updated_at: "2025-08-19T00:00:00Z"
+
+metadata:
+  system: core-systems
+  module: security-core
+  owner_team: security-engineering
+  environment: prod
+  tags:
+    zero_trust: "true"
+    managed_by: "IaC"
+    compliance: ["iso27001", "soc2", "gdpr", "nist-800-53"]
+
+defaults: &defaults
+  crypto:
+    digest: "SHA256"
+    # Разрешенные алгоритмы и размеры ключей
+    key_algorithms:
+      - { alg: "ECDSA", curve: "P-256" }
+      - { alg: "ECDSA", curve: "P-384" }
+      - { alg: "RSA", key_bits: 3072 }
+    # Минимальные требования
+    min_key_bits:
+      rsa: 3072
+    min_curve: "P-256"
+  validity:
+    root_days: 3650         # 10 лет
+    intermediate_days: 1095  # 3 года
+    ocsp_days: 90
+  issuance:
+    allow_wildcards: false
+    require_san: true
+    allow_cn: false
+    name_constraints:
+      permitted_dns: [".svc.cluster.local", ".example.internal"]
+      excluded_dns: [".local", ".home"]
+    default_crl_distribution_points:
+      - "http://pki.CHANGE_ME.internal/crl/root.crl"
+    default_aia_issuers:
+      - "http://pki.CHANGE_ME.internal/aia/issuer.cer"
+    ocsp_responder_url: "http://ocsp.CHANGE_ME.internal"
+    must_staple: true
+
+authorities:
+  root:
+    id: "root-ca-1"
+    offline: true
+    subject: "CN=Core Systems Root CA,O=CHANGE_ME,L=CHANGE_ME,C=US"
+    key:
+      alg: "ECDSA"
+      curve: "P-384"
+      storage_ref: "hsm:root-ca-1"
+    validity_days: *defaults.validity.root_days
+    basic_constraints:
+      is_ca: true
+      path_len: 2
+    key_usage: ["keyCertSign", "cRLSign"]
+    certificate_policies:
+      - oid: "2.23.140.1.2.1"
+        cps_uri: "https://pki.CHANGE_ME.com/cps"
+    crl:
+      full_crl_publish_interval_minutes: 60
+      delta_crl: false
+  intermediates:
+    - id: "int-ca-svc-1"
+      parent: "root-ca-1"
+      subject: "CN=Core Systems Service Intermediate CA,O=CHANGE_ME,C=US"
+      key:
+        alg: "ECDSA"
+        curve: "P-256"
+        storage_ref: "hsm:int-ca-svc-1"
+      validity_days: *defaults.validity.intermediate_days
+      basic_constraints:
+        is_ca: true
+        path_len: 1
+      key_usage: ["keyCertSign", "cRLSign"]
+      eku: []  # пусто для CA
+      aia:
+        issuers: *defaults.issuance.default_aia_issuers
+      crl:
+        full_crl_publish_interval_minutes: 30
+        delta_crl: true
+        delta_interval_minutes: 10
+    - id: "int-ca-user-1"
+      parent: "root-ca-1"
+      subject: "CN=Core Systems User Intermediate CA,O=CHANGE_ME,C=US"
+      key:
+        alg: "RSA"
+        key_bits: 3072
+        storage_ref: "hsm:int-ca-user-1"
+      validity_days: *defaults.validity.intermediate_days
+      basic_constraints:
+        is_ca: true
+        path_len: 1
+      key_usage: ["keyCertSign", "cRLSign"]
+      eku: []
+      aia:
+        issuers: *defaults.issuance.default_aia_issuers
+      crl:
+        full_crl_publish_interval_minutes: 60
+        delta_crl: true
+        delta_interval_minutes: 15
+
+storage:
+  ca_keys:
+    provider: "hsm"   # hsm|cloud-kms
+    selected_backend: "cloudhsm"
+    backends:
+      cloudhsm:
+        cluster_id: "CHANGE_ME"
+        key_labels:
+          root-ca-1: "ckn-root-ca-1"
+          int-ca-svc-1: "ckn-int-svc-1"
+          int-ca-user-1: "ckn-int-user-1"
+      keyvault-hsm:
+        vault_uri: "https://CHANGE_ME.vault.azure.net/"
+      cloudkms-hsm:
+        project_id: "CHANGE_ME"
+        location: "CHANGE_ME"
+        keyring: "pki-core"
+  db:
+    provider: "postgres"
+    dsn: "postgres://pki:CHANGE_ME@pg.CHANGE_ME.internal/pki"
+    audit_worm: true
+
+distribution:
+  aia_base: "http://pki.CHANGE_ME.internal/aia/"
+  crl_base: "http://pki.CHANGE_ME.internal/crl/"
+  ocsp:
+    url: "http://ocsp.CHANGE_ME.internal"
+    signer_profile: "ocsp_signer"
+    nonce: true
+    max_age_seconds: 300
+
+enrollment:
+  methods:
+    csr_api:
+      url: "https://pki-api.CHANGE_ME.internal"
+      auth:
+        mtls_required: true
+        oidc_issuer: "https://auth.CHANGE_ME.com"
+    acme:
+      enabled: true
+      directory_url: "https://acme.CHANGE_ME.internal/directory"
+      require_mtls: true
+      eab:
+        required: true
+        key_id_header: "kid"
+    spire:
+      enabled: true
+      trust_domain: "example.internal"
+      svid_ttl_seconds: 3600
+  authorization:
+    policy_engine: "opa"
+    rego_bundle_url: "https://opa-bundles.CHANGE_ME.com/pki-authz.tar.gz"
+    fail_closed: true
+  csr_validation:
+    require_basic_constraints_ca_false: true
+    require_key_usages_present: true
+    allowed_san_types: ["dns", "uri", "ip", "email"]
+    forbidden_extensions: ["subjectDirAttrs"]
+    max_san_entries: 20
+    forbid_wildcards: true
+
+profiles:
+  # Листовые профили
+  tls_server_internal:
+    issuer: "int-ca-svc-1"
+    subject: ""  # пусто, идентификация через SAN
+    san:
+      dns_patterns: ["*.svc.cluster.local", "*.example.internal"]
+      ip_allow: []
+    validity_hours: 2160   # 90 дней
+    key:
+      alg: "RSA"
+      key_bits: 3072
+    key_usage: ["digitalSignature", "keyEncipherment"]
+    eku: ["serverAuth"]
+    ca: false
+    aia:
+      issuers: *defaults.issuance.default_aia_issuers
+    crl_distribution_points: *defaults.issuance.default_crl_distribution_points
+    ocsp_must_staple: true
+    name_constraints: *defaults.issuance.name_constraints
+
+  tls_client_internal:
+    issuer: "int-ca-svc-1"
+    validity_hours: 24
+    key:
+      alg: "ECDSA"
+      curve: "P-256"
+    san:
+      uri_patterns: ["spiffe://example.internal/ns/*/sa/*"]
+    key_usage: ["digitalSignature", "keyAgreement"]
+    eku: ["clientAuth"]
+    ca: false
+    ocsp_must_staple: true
+
+  svid_service:
+    issuer: "int-ca-svc-1"
+    validity_hours: 1
+    key:
+      alg: "ECDSA"
+      curve: "P-256"
+    san:
+      uri_patterns: ["spiffe://example.internal/ns/*/sa/*"]
+    key_usage: ["digitalSignature", "keyAgreement"]
+    eku: ["clientAuth", "serverAuth"]
+    ca: false
+
+  kubelet_serving:
+    issuer: "int-ca-svc-1"
+    validity_hours: 720
+    key:
+      alg: "RSA"
+      key_bits: 3072
+    san:
+      dns_patterns: ["system:node:*", "*.node.cluster.local"]
+      ip_allow: ["10.0.0.0/8", "fd00::/8"]
+    key_usage: ["digitalSignature", "keyEncipherment"]
+    eku: ["serverAuth"]
+    ca: false
+
+  user_oidc_clientauth:
+    issuer: "int-ca-user-1"
+    validity_hours: 8
+    key:
+      alg: "ECDSA"
+      curve: "P-256"
+    san:
+      email_allow: ["*@CHANGE_ME.com"]
+      upn_allow: ["*@CHANGE_ME.com"]
+    key_usage: ["digitalSignature"]
+    eku: ["clientAuth"]
+    ca: false
+    mfa_required: true
+
+  ocsp_signer:
+    issuer: "int-ca-svc-1"
+    validity_hours: 2160
+    key:
+      alg: "ECDSA"
+      curve: "P-256"
+    key_usage: ["digitalSignature"]
+    eku: ["OCSPSigning"]
+    ca: false
+
+  # Профиль выпуска промежуточного ЦС (для ротации/делегации)
+  intermediate_ca:
+    issuer: "root-ca-1"
+    validity_days: *defaults.validity.intermediate_days
+    key:
+      alg: "ECDSA"
+      curve: "P-256"
+      storage_ref: "hsm:new-int-ca-CHANGE_ME"
+    basic_constraints:
+      is_ca: true
+      path_len: 1
+    key_usage: ["keyCertSign", "cRLSign"]
+    ca: true
+
+revocation:
+  crl:
+    full_publish_interval_minutes: 30
+    delta_publish_interval_minutes: 10
+    next_update_skew_minutes: 5
+    url: "http://pki.CHANGE_ME.internal/crl/current.crl"
+  ocsp:
+    freshness_seconds: 300
+    max_clock_skew_seconds: 60
+    sign_with_profile: "ocsp_signer"
+  reasons_allowed: ["keyCompromise", "caCompromise", "affiliationChanged", "superseded", "cessationOfOperation"]
+
+rotation:
+  root:
+    enabled: true
+    notice_days: 180
+    overlap_days: 90
+  intermediate:
+    enabled: true
+    notice_days: 60
+    overlap_days: 30
+  leaf:
+    auto_renew_before_expiry_seconds: 86400  # 24 часа
+    jitter_seconds: 600
+
+logging:
+  audit:
+    enabled: true
+    sink: "tls://audit-pki.CHANGE_ME.internal:6514"
+    redact_fields: ["csr", "private_key_ref", "token"]
+    retention_days: 365
+  metrics:
+    exporter: "prometheus"
+    endpoint: "0.0.0.0:9465"
+  tracing:
+    enabled: true
+    endpoint: "http://otel-collector.CHANGE_ME.svc:4317"
+
+governance:
+  approvals:
+    required_for_profiles: ["intermediate_ca", "ocsp_signer"]
+    approvers_groups: ["security-admin", "crypto-officers"]
+    quorum: 2
+  dual_control:
+    key_activation:
+      roles: ["crypto-officers"]
+      m_of_n: "2/3"
+  key_ceremony:
+    documented: true
+    location: "CHANGE_ME"
+    witnesses_required: 2
+
+compliance_mapping:
+  iso27001_annex_a:
+    A_10_Cryptography: "HSM, key management, rotation"
+    A_12_Operations_Security: "audit, logging, monitoring"
+    A_14_System_Acquisition: "crypto requirements in design"
+  nist_800_57:
+    part1: "key lifetimes, algorithm strengths"
+  cab_forum_baseline:
+    internal_use_only: true
+
+bootstrap_checks:
+  require_items:
+    - "authorities.root.offline == true"
+    - "storage.ca_keys.provider in ['hsm','cloud-kms']"
+    - "profiles.svid_service.validity_hours <= 24"
+    - "defaults.issuance.allow_cn == false"
+    - "distribution.ocsp.url startswith 'http'"
+    - "revocation.crl.full_publish_interval_minutes <= 60"
+
+notes:
+  - "Все значения CHANGE_ME заменить через секрет-менеджер и переменные CI."
+  - "Root CA хранится офлайн, операции подписания выполняются на изолированном HSM."
+  - "Листовые сертификаты не содержат CN; идентификация через SAN."

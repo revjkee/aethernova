@@ -1,0 +1,369 @@
+# cybersecurity-core/configs/security.yaml
+version: 1
+updatedAt: "2025-09-02T00:00:00Z"
+
+env: prod   # prod | staging | dev
+
+transport:
+  httpsOnly: true
+  hsts:
+    enabled: true
+    maxAgeSeconds: 31536000
+    includeSubdomains: true
+    preload: true
+  tls:
+    minVersion: "TLS1.2"
+    preferServerCiphers: true
+    # Список должен соответствовать ingress/controller, оставить пустым для дефолта контроллера
+    cipherSuites:
+      - "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+      - "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+      - "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+      - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+  mtls:
+    enabled: false
+    clientCAFile: "/etc/security/mtls/client-ca.pem"
+    subjectDNAllowlist: []  # e.g. ["CN=internal-client,O=Aethernova,L=..."]
+  ocspStapling: true
+
+headers:
+  xFrameOptions: "DENY"
+  xContentTypeOptions: "nosniff"
+  referrerPolicy: "no-referrer"
+  permissionsPolicy: 'geolocation=(), microphone=(), camera=()'
+  xXssProtection: "1; mode=block"  # для совместимости, понимаем устаревание
+  contentSecurityPolicy:
+    enabled: true
+    # Настройте источники под фронтенд/апи
+    policy: >
+      default-src 'none';
+      base-uri 'none';
+      connect-src 'self';
+      img-src 'self' data:;
+      script-src 'self';
+      style-src 'self' 'unsafe-inline';
+      font-src 'self';
+      frame-ancestors 'none';
+      form-action 'self';
+
+cors:
+  enabled: true
+  allowCredentials: false
+  allowedOrigins: ["https://cybersecurity-core.example.com"]
+  allowedMethods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+  allowedHeaders: ["Content-Type","Authorization","X-Request-ID"]
+  maxAgeSeconds: 600
+
+csrf:
+  enabled: true
+  cookie:
+    name: "__Host-csrf"
+    sameSite: "Strict"
+    secure: true
+    httpOnly: true
+  headerName: "X-CSRF-Token"
+  trustedOrigins: ["https://cybersecurity-core.example.com"]
+
+auth:
+  modes: ["jwt"]   # ["jwt","session","mtls"]
+  jwt:
+    issuer: "https://auth.aethernova.example"
+    audiences: ["cybersecurity-core"]
+    jwks:
+      # Либо статичный путь, либо URL провайдера
+      url: "https://auth.aethernova.example/.well-known/jwks.json"
+      cacheTtlSeconds: 300
+    algorithmsAllowlist: ["RS256","ES256"]
+    requiredClaims:
+      - "sub"
+      - "exp"
+      - "iat"
+    clockSkewSeconds: 60
+    accessToken:
+      maxLifetimeSeconds: 900
+    refreshToken:
+      enabled: false
+  session:
+    enabled: false
+    cookie:
+      name: "__Host-session"
+      sameSite: "Lax"
+      secure: true
+      httpOnly: true
+      rotationMinutes: 15
+    idleTimeoutMinutes: 30
+    absoluteTimeoutHours: 8
+  totp:
+    enabled: true
+    issuer: "Aethernova"
+    skewSteps: 1
+    length: 6
+  webauthn:
+    enabled: true
+    rpId: "cybersecurity-core.example.com"
+    origin: "https://cybersecurity-core.example.com"
+  passwordPolicy:
+    enabled: true
+    minLength: 12
+    requireClasses:
+      upper: true
+      lower: true
+      digit: true
+      symbol: true
+    breachCheck:
+      enabled: true
+      kAnonymity: true
+
+authorization:
+  model: "rbac"  # rbac | abac
+  defaultRole: "user"
+  roles:
+    - name: admin
+      inherits: ["secops"]
+      permissions:
+        - "*"
+    - name: secops
+      permissions:
+        - "threat.read"
+        - "threat.write"
+        - "policy.read"
+        - "audit.read"
+    - name: service
+      permissions:
+        - "ingest.write"
+        - "health.read"
+    - name: user
+      permissions:
+        - "self.read"
+        - "self.write"
+  rules:
+    # Пример endpoint-политик (совместимо с любым веб-фреймворком)
+    - resource: "/api/v1/health"
+      methods: ["GET"]
+      allow: ["*"]
+    - resource: "/api/v1/policy/**"
+      methods: ["GET","POST","PUT","DELETE"]
+      allow: ["secops","admin"]
+    - resource: "/api/v1/audit/**"
+      methods: ["GET"]
+      allow: ["secops","admin"]
+
+rateLimit:
+  enabled: true
+  global:
+    windowSeconds: 60
+    maxRequests: 120
+    burst: 60
+    key: "ip"  # ip | user | token | composite
+  perRoute:
+    - route: "/api/v1/auth/login"
+      windowSeconds: 300
+      maxRequests: 20
+      burst: 10
+    - route: "/api/v1/auth/2fa/verify"
+      windowSeconds: 300
+      maxRequests: 30
+      burst: 15
+  ban:
+    enabled: true
+    threshold429: 20
+    banMinutes: 30
+
+ipFiltering:
+  enabled: false
+  allow: []
+  deny: []
+  geo:
+    enabled: false
+    allowCountries: []   # ISO 3166-1 alpha-2
+
+requests:
+  maxBodyBytes: 1048576   # 1 MiB
+  jsonMaxDepth: 64
+  stringMaxLength: 8192
+  fieldWhitelist: []      # если непустой, блокируем всё вне allow-листа
+
+uploads:
+  enabled: false
+  maxSizeBytes: 5242880  # 5 MiB
+  allowedContentTypes: ["image/png","image/jpeg","application/pdf"]
+  antivirus:
+    enabled: true
+    engine: "clamav"
+    socket: "tcp://clamav.clamav:3310"
+    timeoutSeconds: 15
+  quarantineDir: "/var/quarantine"
+  sanitizeFilenames: true
+
+secrets:
+  provider: "k8s"  # k8s | vault | aws-sm | gcp-sm | azure-kv | file
+  k8s:
+    secretName: "cybersecurity-core-secrets"
+    namespace: "security"
+  vault:
+    addr: "https://vault.internal:8200"
+    mount: "secret"
+    pathPrefix: "cybersecurity-core/keys"
+  cloud:
+    aws:
+      region: "eu-central-1"
+      secretIdPrefix: "cybersecurity-core/"
+    gcp:
+      project: "aethernova-prod"
+      secretNamePrefix: "cybersecurity-core-"
+    azure:
+      keyVaultName: "kv-cybersecurity-core-prod"
+      secretNamePrefix: "cybersecurity-core-"
+  keys:
+    jwtSigningKeyRef: "jwt_secret"     # ключ/поле в секрете провайдера
+    cookieSecretRef: "cookie_secret"
+    encryptionKeyRef: "data_at_rest_key"
+    mtlsKeyPairRef:
+      cert: "tls.crt"
+      key: "tls.key"
+  rotation:
+    enabled: true
+    minIntervalHours: 720   # 30 дней
+    gracePeriodHours: 24
+    webhook:
+      enabled: false
+      url: ""
+      authHeader: ""
+    restartConsumers:
+      enabled: true
+      selectors:
+        - kind: "deployment"
+          name: "cybersecurity-core"
+          namespace: "security"
+
+crypto:
+  # Политика криптографии уровня приложения (шифрование полей/токенов)
+  algorithm: "AES-256-GCM"
+  hkdf:
+    hash: "SHA-256"
+    info: "cybersecurity-core-v1"
+  pbkdf2:
+    iterations: 210000
+    saltBytes: 16
+
+validation:
+  sql:
+    forbidCommentsInUserQueries: true
+    allowListTables: []
+  nosql:
+    maxOperatorsDepth: 5
+    forbidWhereTrue: true
+  url:
+    allowedSchemes: ["https"]
+    forbidIpLiterals: true
+
+privacy:
+  piiRedaction:
+    enabled: true
+    fields:
+      - "password"
+      - "authorization"
+      - "set-cookie"
+      - "ssn"
+      - "email"
+      - "phone"
+  dataRetention:
+    usersDays: 365
+    auditDays: 1095
+    tokensDays: 30
+  subjectRequests:
+    enabled: true
+    contactEmail: "privacy@aethernova.example"
+
+audit:
+  enabled: true
+  level: "INFO"  # INFO|WARN|ERROR|DEBUG
+  redactSecrets: true
+  # События для аудита
+  events:
+    - "auth.login"
+    - "auth.logout"
+    - "auth.failed"
+    - "policy.changed"
+    - "secrets.rotated"
+    - "role.assigned"
+    - "export.sent"
+  sinks:
+    stdout: true
+    file:
+      enabled: true
+      path: "/var/log/cybersecurity-core/audit.jsonl"
+      rotate:
+        maxSizeMB: 100
+        maxBackups: 10
+        maxAgeDays: 30
+        compress: true
+    otel:
+      enabled: true
+      endpoint: "http://otel-collector.observability:4317"
+      protocol: "grpc"
+      resourceAttributes:
+        service.name: "cybersecurity-core"
+        service.version: "1.0.0"
+        environment: "prod"
+    siem:
+      enabled: false
+      httpEndpoint: ""
+      authHeader: ""
+  integrity:
+    # Подпись/аттестация логов для анти-тампера (можно хранить ключ в secrets.keys)
+    signing:
+      enabled: true
+      keyRef: "audit_sign_key"
+      algo: "ed25519"
+    hashing:
+      enabled: true
+      algo: "sha256"
+      chain: "hashchain"  # none|hashchain
+
+anomalyDetection:
+  enabled: true
+  rules:
+    - name: "auth-401-spike"
+      metric: "auth.failed.rate"
+      windowSeconds: 300
+      threshold: 50
+      action: "alert"   # alert|ban-ip|captcha
+    - name: "rl-429-spike"
+      metric: "http.429.rate"
+      windowSeconds: 300
+      threshold: 100
+      action: "alert"
+
+dependencies:
+  licensesAllowlist:
+    - "Apache-2.0"
+    - "MIT"
+    - "BSD-2-Clause"
+    - "BSD-3-Clause"
+    - "MPL-2.0"
+  blockedPackages: []
+
+featureFlags:
+  strictJsonParsing: true
+  blockUnindexedEndpoints: true
+  requireFreshTokenOnPrivilegeEscalation: true
+
+overrides:
+  # Переопределения по окружениям
+  dev:
+    cors:
+      allowedOrigins: ["http://localhost:3000","http://127.0.0.1:3000"]
+    auth:
+      totp:
+        enabled: false
+      webauthn:
+        enabled: false
+    rateLimit:
+      global:
+        maxRequests: 1000
+        burst: 500
+  staging:
+    cors:
+      allowedOrigins: ["https://staging.cybersecurity-core.example.com"]
+  prod: {}

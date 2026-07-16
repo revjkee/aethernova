@@ -1,0 +1,566 @@
+// security-core/schemas/proto/v1/security/kms.proto
+syntax = "proto3";
+
+package security.v1;
+
+option go_package = "github.com/aethernova/neurocity/security-core/gen/go/security/v1;securityv1";
+option java_multiple_files = true;
+option java_package = "ai.aethernova.neurocity.security.v1";
+option java_outer_classname = "KmsProto";
+option csharp_namespace = "Aethernova.NeuroCity.Security.V1";
+option php_namespace = "Aethernova\\NeuroCity\\Security\\V1";
+option objc_class_prefix = "ANV";
+
+// Core Google types
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+
+///////////////////////////////////////////////////////////////
+// Common types: request context, metadata, audit
+///////////////////////////////////////////////////////////////
+
+message RequestContext {
+  // Logical tenant/project identifiers. At least one should be set.
+  string org_id      = 1;
+  string project_id  = 2;
+  string tenant_id   = 3;
+
+  // End-user/service identity.
+  string actor       = 10; // e.g. "svc:billing" or "user:alice"
+  string actor_id    = 11; // stable id, if available
+
+  // Idempotency and correlation.
+  string request_id       = 20; // caller-supplied opaque id
+  string idempotency_key  = 21; // used by mutating RPCs
+  string trace_id         = 22; // distributed tracing id
+
+  // Free-form labels for policy/routing.
+  map<string, string> labels = 30;
+}
+
+message RequestMetadata {
+  RequestContext context = 1;
+  string client_ip       = 2;
+  string user_agent      = 3;
+  string origin_service  = 4; // caller service name
+  map<string, string> annotations = 10;
+}
+
+message AuditMetadata {
+  string operation_id  = 1;  // server-assigned operation id
+  string key_name      = 2;  // fully-qualified key or version name
+  string key_version   = 3;  // resolved version used, if any
+  string actor         = 4;
+  string tenant_id     = 5;
+  google.protobuf.Timestamp processed_at = 10;
+  map<string, string> labels = 20;
+}
+
+///////////////////////////////////////////////////////////////
+// Enumerations
+///////////////////////////////////////////////////////////////
+
+enum KeyPurpose {
+  KEY_PURPOSE_UNSPECIFIED = 0;
+  ENCRYPT_DECRYPT         = 1; // symmetric AEAD
+  ASYMMETRIC_SIGN         = 2; // RSA/ECC/EdDSA sign/verify
+  ASYMMETRIC_DECRYPT      = 3; // RSA OAEP
+  MAC                     = 4; // HMAC
+  DERIVE_KEY              = 5; // HKDF etc. (future use)
+  WRAP_UNWRAP             = 6; // key wrapping (KWP/RSA-OAEP)
+}
+
+enum ProtectionLevel {
+  PROTECTION_LEVEL_UNSPECIFIED = 0;
+  SOFTWARE                     = 1; // software-protected
+  HSM                          = 2; // hardware security module
+  EXTERNAL                     = 3; // external KMS/HSM
+  TEE                          = 4; // trusted execution environment
+}
+
+enum KeyState {
+  KEY_STATE_UNSPECIFIED    = 0;
+  ACTIVE                   = 1;
+  DISABLED                 = 2;
+  PENDING_ROTATION         = 3;
+  SCHEDULED_FOR_DESTRUCTION= 4;
+  DESTROYED                = 5;
+  COMPROMISED              = 6; // set by incident response
+}
+
+enum KeyVersionState {
+  KEY_VERSION_STATE_UNSPECIFIED = 0;
+  PENDING_GENERATION            = 1;
+  ENABLED                       = 2;
+  DISABLED                      = 3;
+  IMPORTED                      = 4;
+  SCHEDULED_FOR_DESTRUCTION     = 5;
+  DESTROYED                     = 6;
+  COMPROMISED                   = 7;
+}
+
+enum AttestationFormat {
+  ATTESTATION_FORMAT_UNSPECIFIED = 0;
+  TCG_TPM2_QUOTE                 = 1;
+  INTEL_SGX_QUOTE_V3             = 2;
+  HSM_VENDOR_STATEMENT           = 3; // vendor-signed evidence
+}
+
+enum Algorithm {
+  ALGORITHM_UNSPECIFIED = 0;
+
+  // Symmetric AEAD
+  AES_GCM_128           = 1;
+  AES_GCM_256           = 2;
+  AES_KWP_256           = 3;  // AES Key Wrap with Padding (RFC 5649)
+  CHACHA20_POLY1305     = 4;
+
+  // RSA Sign
+  RSA_SIGN_PKCS1_2048_SHA256 = 10;
+  RSA_SIGN_PKCS1_3072_SHA256 = 11;
+  RSA_SIGN_PKCS1_4096_SHA256 = 12;
+  RSA_SIGN_PSS_2048_SHA256   = 13;
+  RSA_SIGN_PSS_3072_SHA256   = 14;
+  RSA_SIGN_PSS_4096_SHA256   = 15;
+
+  // RSA Decrypt
+  RSA_DECRYPT_OAEP_2048_SHA256 = 20;
+  RSA_DECRYPT_OAEP_3072_SHA256 = 21;
+  RSA_DECRYPT_OAEP_4096_SHA256 = 22;
+
+  // EC Sign
+  EC_SIGN_P256_SHA256 = 30;
+  EC_SIGN_P384_SHA384 = 31;
+
+  // EdDSA
+  ED25519 = 40;
+
+  // MAC
+  HMAC_SHA256 = 50;
+  HMAC_SHA512 = 51;
+}
+
+enum DigestType {
+  DIGEST_TYPE_UNSPECIFIED = 0;
+  SHA256 = 1;
+  SHA384 = 2;
+  SHA512 = 3;
+}
+
+enum WrapAlgorithm {
+  WRAP_ALGORITHM_UNSPECIFIED = 0;
+  WRAP_RSA_OAEP_SHA256       = 1;
+  WRAP_RSA_OAEP_SHA384       = 2;
+  WRAP_RSA_OAEP_SHA512       = 3;
+  WRAP_AES_KWP_256           = 10; // RFC 5649
+}
+
+///////////////////////////////////////////////////////////////
+// Resources
+///////////////////////////////////////////////////////////////
+
+message KeyRing {
+  // Resource name: projects/{project}/locations/{location}/keyRings/{key_ring}
+  string name = 1;
+  map<string, string> labels = 2;
+  google.protobuf.Timestamp create_time = 3;
+
+  reserved 100 to 199; // future fields
+}
+
+message VersionTemplate {
+  Algorithm algorithm        = 1;
+  ProtectionLevel protection = 2;
+}
+
+message CryptoKey {
+  // Resource name: .../keyRings/{key_ring}/cryptoKeys/{crypto_key}
+  string name = 1;
+
+  KeyPurpose purpose                 = 2;
+  ProtectionLevel protection_level   = 3;
+
+  // Rotation policy
+  google.protobuf.Duration rotation_period     = 10;
+  google.protobuf.Timestamp next_rotation_time = 11;
+
+  // Default template for newly created versions.
+  VersionTemplate version_template = 20;
+
+  // Primary version used by default in operations.
+  string primary_version = 21; // .../cryptoKeyVersions/{version}
+
+  map<string, string> labels = 30;
+  KeyState state             = 31;
+
+  google.protobuf.Timestamp create_time = 40;
+  google.protobuf.Timestamp update_time = 41;
+
+  reserved 100 to 199; // future policy/constraints caps
+}
+
+message Attestation {
+  AttestationFormat format = 1;
+  bytes evidence           = 2; // raw attestation blob (DER/CBOR/etc.)
+  repeated string pem_certificate_chain = 3; // for verification
+}
+
+message CryptoKeyVersion {
+  // Resource name: .../cryptoKeys/{crypto_key}/cryptoKeyVersions/{version}
+  string name                 = 1;
+
+  Algorithm algorithm         = 2;
+  KeyVersionState state       = 3;
+  ProtectionLevel protection  = 4;
+
+  // External id if imported from another system.
+  string external_id          = 10;
+
+  // If rewrapped, indicates prior wrapping key version.
+  string rewrapped_from       = 11;
+
+  google.protobuf.Timestamp create_time   = 20;
+  google.protobuf.Timestamp generate_time = 21;
+  google.protobuf.Timestamp destroy_time  = 22;
+
+  Attestation attestation = 30;
+
+  reserved 100 to 199;
+}
+
+message PublicKey {
+  // PEM-encoded SubjectPublicKeyInfo or certificate leaf.
+  string pem = 1;
+  Algorithm algorithm = 2;
+  // If served from an HSM with cert chain, include chain.
+  repeated string pem_cert_chain = 3;
+  // Fully qualified version that owns this public key.
+  string key_version = 4;
+}
+
+///////////////////////////////////////////////////////////////
+// Import jobs and key import
+///////////////////////////////////////////////////////////////
+
+message ImportJob {
+  // Resource: .../keyRings/{key_ring}/importJobs/{import_job}
+  string name = 1;
+
+  WrapAlgorithm wrap_algorithm = 2;
+
+  // PEM-encoded public key used to wrap key material for import.
+  string public_key_pem = 3;
+
+  google.protobuf.Timestamp create_time = 10;
+  google.protobuf.Timestamp expire_time = 11;
+
+  reserved 100 to 199;
+}
+
+///////////////////////////////////////////////////////////////
+// Requests/Responses: Admin plane
+///////////////////////////////////////////////////////////////
+
+message CreateKeyRingRequest {
+  string parent     = 1; // projects/{project}/locations/{location}
+  string key_ring_id= 2;
+  KeyRing key_ring  = 3;
+
+  RequestMetadata metadata = 10;
+}
+
+message ListKeyRingsRequest {
+  string parent   = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  string filter   = 4;
+  string order_by = 5;
+
+  RequestMetadata metadata = 10;
+}
+
+message ListKeyRingsResponse {
+  repeated KeyRing key_rings = 1;
+  string next_page_token = 2;
+}
+
+message GetKeyRingRequest {
+  string name = 1;
+  RequestMetadata metadata = 10;
+}
+
+message CreateCryptoKeyRequest {
+  string parent          = 1; // .../keyRings/{key_ring}
+  string crypto_key_id   = 2;
+  CryptoKey crypto_key   = 3;
+
+  // If true, do not create an initial version automatically.
+  bool skip_initial_version_creation = 4;
+
+  RequestMetadata metadata = 10;
+}
+
+message UpdateCryptoKeyRequest {
+  CryptoKey crypto_key                 = 1;
+  google.protobuf.FieldMask update_mask= 2;
+  RequestMetadata metadata             = 10;
+}
+
+message GetCryptoKeyRequest {
+  string name = 1;
+  RequestMetadata metadata = 10;
+}
+
+message ListCryptoKeysRequest {
+  string parent   = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  string filter   = 4;
+  string order_by = 5;
+  RequestMetadata metadata = 10;
+}
+
+message ListCryptoKeysResponse {
+  repeated CryptoKey crypto_keys = 1;
+  string next_page_token = 2;
+}
+
+message CreateCryptoKeyVersionRequest {
+  string parent = 1; // cryptoKey resource name
+  // Optional: specify algorithm/protection if overriding template.
+  CryptoKeyVersion version = 2;
+
+  RequestMetadata metadata = 10;
+}
+
+message GetCryptoKeyVersionRequest {
+  string name = 1;
+  RequestMetadata metadata = 10;
+}
+
+message ListCryptoKeyVersionsRequest {
+  string parent = 1; // cryptoKey
+  int32 page_size = 2;
+  string page_token = 3;
+  string filter = 4;
+  string order_by = 5;
+
+  RequestMetadata metadata = 10;
+}
+
+message ListCryptoKeyVersionsResponse {
+  repeated CryptoKeyVersion versions = 1;
+  string next_page_token = 2;
+}
+
+message DestroyCryptoKeyVersionRequest {
+  string name = 1; // version
+  // Optional schedule in the future to allow recovery window.
+  google.protobuf.Timestamp schedule_time = 2;
+
+  RequestMetadata metadata = 10;
+}
+
+message RestoreCryptoKeyVersionRequest {
+  string name = 1;
+  RequestMetadata metadata = 10;
+}
+
+message CreateImportJobRequest {
+  string parent = 1; // keyRing
+  string import_job_id = 2;
+  ImportJob import_job = 3;
+  RequestMetadata metadata = 10;
+}
+
+message GetImportJobRequest {
+  string name = 1;
+  RequestMetadata metadata = 10;
+}
+
+message ImportCryptoKeyVersionRequest {
+  string parent = 1;          // cryptoKey
+  string import_job = 2;      // import job resource name
+  bytes wrapped_key_material = 3; // key material wrapped by import_job key
+  bytes aad = 4;              // optional AAD for wrap
+
+  // Set if caller maintains its own external reference.
+  string external_id = 5;
+
+  RequestMetadata metadata = 10;
+}
+
+///////////////////////////////////////////////////////////////
+// Requests/Responses: Data plane (crypto operations)
+///////////////////////////////////////////////////////////////
+
+message EncryptRequest {
+  string name      = 1;   // cryptoKey (or version)
+  bytes plaintext  = 2;
+  bytes aad        = 3;   // associated data (AEAD)
+  // Optional: use specific version, otherwise primary is used.
+  string key_version = 4;
+
+  RequestMetadata metadata = 10;
+}
+
+message EncryptResponse {
+  bytes ciphertext  = 1;
+  // Nonce/IV used by AEAD, if applicable.
+  bytes nonce       = 2;
+  string key_version= 3; // resolved version
+  AuditMetadata audit = 10;
+}
+
+message DecryptRequest {
+  string name      = 1; // cryptoKey (or version)
+  bytes ciphertext = 2;
+  bytes aad        = 3;
+  RequestMetadata metadata = 10;
+}
+
+message DecryptResponse {
+  bytes plaintext  = 1;
+  string key_version = 2;
+  AuditMetadata audit = 10;
+}
+
+message AsymmetricSignRequest {
+  string name = 1; // cryptoKeyVersion (must be version)
+  oneof payload {
+    bytes digest = 2; // precomputed digest
+    bytes data   = 3; // raw data to be hashed server-side
+  }
+  DigestType digest_type = 4; // required if digest or data present
+  RequestMetadata metadata = 10;
+}
+
+message AsymmetricSignResponse {
+  bytes signature = 1;
+  AuditMetadata audit = 10;
+}
+
+message AsymmetricVerifyRequest {
+  string name = 1; // version
+  bytes signature = 2;
+  oneof payload {
+    bytes digest = 3;
+    bytes data   = 4;
+  }
+  DigestType digest_type = 5;
+  RequestMetadata metadata = 10;
+}
+
+message AsymmetricVerifyResponse {
+  bool success = 1;
+  string error_message = 2;
+  AuditMetadata audit = 10;
+}
+
+message MacSignRequest {
+  string name = 1; // version for MAC
+  bytes data = 2;
+  RequestMetadata metadata = 10;
+}
+
+message MacSignResponse {
+  bytes mac = 1;
+  AuditMetadata audit = 10;
+}
+
+message MacVerifyRequest {
+  string name = 1; // version for MAC
+  bytes data = 2;
+  bytes mac  = 3;
+  RequestMetadata metadata = 10;
+}
+
+message MacVerifyResponse {
+  bool success = 1;
+  string error_message = 2;
+  AuditMetadata audit = 10;
+}
+
+message GenerateRandomBytesRequest {
+  int32 length_bytes = 1; // up to policy-capped max
+  bool hardware_source = 2; // prefer HSM/TRNG if true
+  RequestMetadata metadata = 10;
+}
+
+message GenerateRandomBytesResponse {
+  bytes data = 1;
+  AuditMetadata audit = 10;
+}
+
+message GenerateDataKeyRequest {
+  // Wrapping key (cryptoKey or version) that will wrap the data key.
+  string name = 1;
+
+  int32 key_length_bytes = 2; // e.g. 32 for AES-256
+  WrapAlgorithm wrap_algorithm = 3;
+
+  // Return plaintext only if policy allows. Default false.
+  bool return_plaintext = 4;
+
+  // Optional AAD to bind wrapping.
+  bytes aad = 5;
+
+  // If set, use a particular version for wrapping.
+  string key_version = 6;
+
+  RequestMetadata metadata = 10;
+}
+
+message GenerateDataKeyResponse {
+  // Present only if return_plaintext=true and policy permits.
+  bytes plaintext_data_key = 1;
+  // Always present: the wrapped (encrypted) data key.
+  bytes wrapped_data_key   = 2;
+
+  string wrapping_key_version = 3;
+  AuditMetadata audit = 10;
+}
+
+message RewrapKeyRequest {
+  // Target wrapping key (cryptoKey or version).
+  string name = 1;
+
+  // The currently wrapped key to be rewrapped.
+  bytes wrapped_key = 2;
+
+  // Algorithm used by the target wrapping key.
+  WrapAlgorithm wrap_algorithm = 3;
+
+  // Optional source key metadata if needed by the service.
+  string source_wrapping_key = 4;
+
+  bytes aad = 5;
+
+  RequestMetadata metadata = 10;
+}
+
+message RewrapKeyResponse {
+  bytes rewrapped_key = 1;
+  string target_wrapping_key_version = 2;
+  AuditMetadata audit = 10;
+}
+
+message GetPublicKeyRequest {
+  string name = 1; // cryptoKeyVersion
+  RequestMetadata metadata = 10;
+}
+
+///////////////////////////////////////////////////////////////
+// KMS Service
+///////////////////////////////////////////////////////////////
+
+service Kms {
+  // KeyRing management
+  rpc CreateKeyRing(CreateKeyRingRequest) returns (KeyRing);
+  rpc GetKeyRing(GetKeyRingRequest) returns (KeyRing);
+  rpc ListKeyRings(ListKeyRingsRequest) returns (ListKeyRingsResponse);
+
+  // CryptoKey management
+  rpc CreateCryptoKey(CreateCryptoKeyRequest) returns (CryptoKey);
+  rpc GetCryptoKey

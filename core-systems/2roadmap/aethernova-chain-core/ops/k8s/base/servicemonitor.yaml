@@ -1,0 +1,78 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aethernova-rpc-servicemonitor
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: aethernova-rpc
+    app.kubernetes.io/part-of: aethernova-chain-core
+    app.kubernetes.io/component: rpc
+    monitoring.aethernova.io/scope: core
+spec:
+  namespaceSelector:
+    matchNames:
+      # Namespace, где работает сервис RPC (укажите реальный namespace приложения)
+      - aethernova-core
+  selector:
+    matchLabels:
+      # Эти метки должны совпадать с метками Service, публикующего порт "metrics"
+      app.kubernetes.io/name: aethernova-rpc
+      app.kubernetes.io/component: rpc
+  targetLabels:
+    # Протянуть стабильные метки с Service к target'ам Prometheus
+    - app.kubernetes.io/name
+    - app.kubernetes.io/component
+    - app.kubernetes.io/instance
+    - chain.aethernova.io/id
+  podTargetLabels:
+    # Протянуть метки из Pod (если присутствуют и нужны для разрезов в дашбордах)
+    - workload-type
+    - zone
+    - revision
+  sampleLimit: 50000           # Глобальный лимит сэмплов на скрейп
+  endpoints:
+    - port: metrics            # Имя порта из Service (не номер). Service должен объявлять "ports[].name: metrics"
+      scheme: http             # Если TLS/ingress — измените на https и добавьте tlsConfig
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      honorLabels: true
+      honorTimestamps: true
+      relabelings:
+        # Стабилизируем метки и убираем лишние динамические значения
+        - action: labeldrop
+          regex: (pod|container|endpoint|instance)
+        - action: labelkeep
+          regex: (job|namespace|service|app\.kubernetes\.io/.*|chain\.aethernova\.io/.*|zone|revision|workload-type)
+      metricRelabelings:
+        # Отсечь сверхкардинальные метрики/лейблы (примерные правила — адаптируйте под свой экспортёр)
+        - action: drop
+          regex: "go_gc_duration_seconds_bucket|go_gc_duration_seconds_summary"
+          sourceLabels: [__name__]
+        - action: labeldrop
+          regex: (le|quantile)  # уменьшение кардинальности для гистограмм/квантилей, если они не нужны
+        - action: drop
+          sourceLabels: [__name__]
+          regex: "prometheus_target_sync_*"  # служебные метрики Prometheus о себе не нужны на каждом target
+        - action: keep
+          sourceLabels: [__name__]
+          regex: "(aethernova_.*|process_.*|go_.*|rpc_.*|node_.*)"
+        - action: labelkeep
+          regex: "(job|instance|service|namespace|app\\.kubernetes\\.io/.*|chain\\.aethernova\\.io/.*)"
+      # Пример TLS/мутаторов, если потребуется HTTPS и клиентская аутентификация:
+      # tlsConfig:
+      #   insecureSkipVerify: false
+      #   caFile: /etc/prom-certs/ca.crt
+      #   certFile: /etc/prom-certs/tls.crt
+      #   keyFile: /etc/prom-certs/tls.key
+      # bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+    # (Опционально) Отдельная конечная точка для внутреннего профайлера/диагностики
+    # - port: diag
+    #   path: /metrics
+    #   interval: 30s
+    #   scrapeTimeout: 10s
+    #   metricRelabelings:
+    #     - action: drop
+    #       sourceLabels: [__name__]
+    #       regex: ".*_debug_.*"

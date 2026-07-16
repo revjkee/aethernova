@@ -1,0 +1,218 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnimind-core
+  namespace: default
+  labels:
+    app.kubernetes.io/name: omnimind-core
+    app.kubernetes.io/instance: omnimind-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: omnimind
+    app.kubernetes.io/version: "0.0.0"     # патчится оверлеем
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    # Аннотация для принудительного переката при изменении конфигов (патчить хешем в оверлее)
+    omnimind.io/config-hash: "REPLACE_ME_BY_OVERLAY"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: omnimind-core
+      app.kubernetes.io/instance: omnimind-core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: omnimind-core
+        app.kubernetes.io/instance: omnimind-core
+        app.kubernetes.io/component: api
+      annotations:
+        # Скрапинг метрик Prometheus (если приложение отдаёт /metrics на 8080)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+        # Ускоряет сетевой стек на некоторых CNI
+        kubernetes.io/egress-bandwidth: "10M"
+        kubernetes.io/ingress-bandwidth: "10M"
+    spec:
+      serviceAccountName: omnimind-core
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      dnsPolicy: ClusterFirst
+      # Раскладка по зонам и анти-аффинити
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: omnimind-core
+              app.kubernetes.io/instance: omnimind-core
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: omnimind-core
+                    app.kubernetes.io/instance: omnimind-core
+                topologyKey: kubernetes.io/hostname
+      # Тяжёлые узлы не трогаем без нужды; тейнты/толерации добавляйте в оверлее
+      imagePullSecrets:
+        - name: regcred
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: omnimind-core
+          image: ghcr.io/your-org/omnimind-core:0.0.0@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Базовые переменные окружения
+            - name: APP_NAME
+              value: "omnimind-core"
+            - name: APP_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: omnimind-core-config
+                  key: APP_ENV
+                  optional: true
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: omnimind-core-config
+                  key: LOG_LEVEL
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Секреты приложения
+            - name: OMNIMIND_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: omnimind-core-secrets
+                  key: SECRET_KEY
+                  optional: true
+          envFrom:
+            - configMapRef:
+                name: omnimind-core-config
+                optional: true
+            - secretRef:
+                name: omnimind-core-secrets
+                optional: true
+          args:
+            - "--host=0.0.0.0"
+            - "--port=8080"
+            # при необходимости: "--workers=2"
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/omnimind
+            - name: runtime
+              mountPath: /var/run/omnimind
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+            timeoutSeconds: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "1000m"
+              memory: "1024Mi"
+              ephemeral-storage: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      initContainers:
+        # Пример ожидания доступности внешней БД/брокера; адаптируйте при необходимости
+        - name: wait-deps
+          image: ghcr.io/your-org/netutils:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - >
+              /usr/bin/wait-for "${DB_HOST:-db}:5432" --timeout=60 &&
+              /usr/bin/wait-for "${BROKER_HOST:-rabbitmq}:5672" --timeout=60
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: omnimind-core-config
+            optional: true
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+        - name: runtime
+          emptyDir: {}

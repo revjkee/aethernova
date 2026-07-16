@@ -1,0 +1,876 @@
+# file: neuroforge-core/schemas/openapi/openapi.yaml
+openapi: 3.1.0
+info:
+  title: Neuroforge Core API
+  version: 1.0.0
+  summary: Единый API для управления датасетами, моделями, задачами обучения, артефактами и событиями.
+  description: |
+    Промышленная спецификация OpenAPI 3.1.0 для Neuroforge Core.
+
+    Особенности:
+    - Безопасность: OAuth2 (authorizationCode), Bearer JWT, API Key.
+    - Ошибки: application/problem+json (RFC 7807).
+    - Пагинация: cursor-based с limit/sort.
+    - Идемпотентность: заголовок Idempotency-Key для POST/PUT.
+    - Нагрузочные заголовки: X-RateLimit-* и Retry-After.
+    - Версионирование: префикс /v1; обратная совместимость через расширения.
+    - События: SSE-стрим прогресса обучения и webhooks.
+
+  termsOfService: https://neuroforge.example.com/terms
+  contact:
+    name: Neuroforge Platform Team
+    email: platform@neuroforge.example.com
+  license:
+    name: UNLICENSED
+
+servers:
+  - url: https://api.neuroforge.example.com
+    description: Production
+  - url: https://staging-api.neuroforge.example.com
+    description: Staging
+  - url: http://localhost:8080
+    description: Local
+
+tags:
+  - name: health
+    description: Проверки живости/готовности и информация о сборке.
+  - name: datasets
+  - name: models
+  - name: jobs
+  - name: artifacts
+  - name: events
+  - name: admin
+
+security:
+  # OR-логика: достаточно выполнить один из требований ниже
+  - bearerAuth: []
+  - apiKeyAuth: []
+  - oauth2Auth:
+      - openid
+      - profile
+      - neuroforge.read
+      - neuroforge.write
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Проверка готовности (readiness)
+      responses:
+        "200":
+          description: Сервис готов
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /livez:
+    get:
+      tags: [health]
+      summary: Проверка живости (liveness)
+      responses:
+        "200":
+          description: Процесс жив
+  /v1/info:
+    get:
+      tags: [health]
+      summary: Версия и информация о сборке
+      responses:
+        "200":
+          description: Информация о версии/коммите/времени сборки
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildInfo"
+
+  /v1/datasets:
+    get:
+      tags: [datasets]
+      summary: Список датасетов
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/sort"
+        - $ref: "#/components/parameters/q"
+      responses:
+        "200":
+          description: Коллекция датасетов
+          headers:
+            X-Next-Cursor:
+              $ref: "#/components/headers/X-Next-Cursor"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasetList"
+    post:
+      tags: [datasets]
+      summary: Создать датасет (метаданные)
+      security:
+        - bearerAuth: []
+        - oauth2Auth: [neuroforge.write]
+      parameters:
+        - $ref: "#/components/parameters/Idempotency-Key"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatasetCreate"
+            examples:
+              basic:
+                value:
+                  name: qa_squad_dev
+                  title: "SQuAD dev subset"
+                  description: "Dev split for QA"
+                  source: "s3://nf-datasets/qa/squad/dev"
+                  tags: { domain: "qa", lang: "en" }
+      responses:
+        "201":
+          description: Датасет создан
+          headers:
+            Location:
+              description: URL созданного ресурса
+              schema: { type: string, format: uri }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dataset"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /v1/datasets/{datasetId}:
+    parameters:
+      - $ref: "#/components/parameters/datasetId"
+    get:
+      tags: [datasets]
+      summary: Получить датасет
+      responses:
+        "200":
+          description: Датасет
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dataset"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [datasets]
+      summary: Изменить датасет (метаданные)
+      security:
+        - bearerAuth: []
+        - oauth2Auth: [neuroforge.write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatasetPatch"
+      responses:
+        "200":
+          description: Обновлено
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dataset"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [datasets]
+      summary: Удалить датасет
+      security:
+        - bearerAuth: []
+        - oauth2Auth: [neuroforge.write]
+      responses:
+        "204":
+          description: Удалено
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/models:
+    get:
+      tags: [models]
+      summary: Список моделей
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/q"
+      responses:
+        "200":
+          description: Коллекция моделей
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+    post:
+      tags: [models]
+      summary: Зарегистрировать модель
+      security:
+        - bearerAuth: []
+        - oauth2Auth: [neuroforge.write]
+      parameters:
+        - $ref: "#/components/parameters/Idempotency-Key"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModelRegister"
+      responses:
+        "201":
+          description: Модель зарегистрирована
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Model"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v1/models/{modelId}:
+    parameters:
+      - $ref: "#/components/parameters/modelId"
+    get:
+      tags: [models]
+      summary: Получить модель
+      responses:
+        "200":
+          description: Модель
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Model"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/models/{modelId}/versions:
+    parameters:
+      - $ref: "#/components/parameters/modelId"
+    get:
+      tags: [models]
+      summary: Список версий модели
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: Версии модели
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelVersionList"
+    post:
+      tags: [models]
+      summary: Добавить версию модели
+      security:
+        - bearerAuth: []
+        - oauth2Auth: [neuroforge.write]
+      parameters:
+        - $ref: "#/components/parameters/Idempotency-Key"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModelVersionCreate"
+      responses:
+        "201":
+          description: Версия добавлена
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelVersion"
+
+  /v1/jobs/training:
+    get:
+      tags: [jobs]
+      summary: Список задач обучения
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+        - name: status
+          in: query
+          description: Фильтр по статусу
+          schema:
+            type: string
+            enum: [queued, running, succeeded, failed, canceled]
+      responses:
+        "200":
+          description: Список задач
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrainingJobList"
+    post:
+      tags: [jobs]
+      summary: Создать задачу обучения
+      security:
+        - bearerAuth: []
+        - oauth2Auth: [neuroforge.write]
+      parameters:
+        - $ref: "#/components/parameters/Idempotency-Key"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrainingJobCreate"
+            examples:
+              create:
+                value:
+                  datasetRef: "s3://nf-datasets/qa/squad/dev"
+                  model: { name: "qa-transformer", version: "base" }
+                  hyperparams: { lr: "3e-5", batch_size: "32", epochs: "3" }
+                  resources: { gpuType: "A100-80GB", gpuCount: 1 }
+                  webhooks:
+                    completed: "https://hooks.example.com/nf/train/completed"
+                    failed: "https://hooks.example.com/nf/train/failed"
+      responses:
+        "202":
+          description: Задача принята в обработку
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrainingJob"
+
+  /v1/jobs/training/{jobId}:
+    parameters:
+      - $ref: "#/components/parameters/jobId"
+    get:
+      tags: [jobs]
+      summary: Получить состояние задачи
+      responses:
+        "200":
+          description: Состояние задачи
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrainingJob"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/jobs/training/{jobId}:cancel:
+    post:
+      tags: [jobs]
+      summary: Отменить задачу обучения
+      security:
+        - bearerAuth: []
+        - oauth2Auth: [neuroforge.write]
+      parameters:
+        - $ref: "#/components/parameters/jobId"
+        - $ref: "#/components/parameters/Idempotency-Key"
+      responses:
+        "202":
+          description: Отмена запрошена
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v1/jobs/training/{jobId}/events:
+    get:
+      tags: [events]
+      summary: История событий обучения (страница)
+      parameters:
+        - $ref: "#/components/parameters/jobId"
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: События
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrainingEventList"
+
+  /v1/jobs/training/{jobId}/events:stream:
+    get:
+      tags: [events]
+      summary: SSE-стрим событий прогресса
+      parameters:
+        - $ref: "#/components/parameters/jobId"
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                sse:
+                  value: |
+                    event: progress
+                    data: {"step": 100, "epoch": 1, "metrics":{"loss":0.123}}
+
+  /v1/artifacts/presign:
+    post:
+      tags: [artifacts]
+      summary: Пресайн PUT/GET для загрузки/скачивания артефактов
+      security:
+        - bearerAuth: []
+        - oauth2Auth: [neuroforge.write]
+      parameters:
+        - $ref: "#/components/parameters/Idempotency-Key"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PresignRequest"
+      responses:
+        "200":
+          description: Пресайн ссылки
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PresignResponse"
+
+  /v1/events/training:
+    post:
+      tags: [events]
+      summary: Инжест событий обучения (JSON-представление Avro TrainingEvent)
+      security:
+        - bearerAuth: []
+        - oauth2Auth: [neuroforge.write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrainingEvent"
+      responses:
+        "202":
+          description: Принято
+
+webhooks:
+  training.completed:
+    post:
+      summary: Уведомление о завершении обучения
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrainingJob"
+      responses:
+        "204":
+          description: Принято
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    oauth2Auth:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.neuroforge.example.com/oauth2/authorize
+          tokenUrl: https://auth.neuroforge.example.com/oauth2/token
+          scopes:
+            openid: OpenID Connect scope
+            profile: Basic profile
+            neuroforge.read: Read access
+            neuroforge.write: Write access
+
+  headers:
+    X-Request-Id:
+      description: Идентификатор запроса для трассировки
+      schema: { type: string }
+    X-Next-Cursor:
+      description: Курсор для следующей страницы
+      schema: { type: string }
+    X-RateLimit-Limit:
+      description: Максимум запросов в окне
+      schema: { type: integer }
+    X-RateLimit-Remaining:
+      description: Остаток запросов в текущем окне
+      schema: { type: integer }
+    X-RateLimit-Reset:
+      description: Время (epoch seconds) до сброса окна
+      schema: { type: integer }
+
+  parameters:
+    cursor:
+      name: cursor
+      in: query
+      description: Курсор для постраничной навигации
+      schema: { type: string }
+    limit:
+      name: limit
+      in: query
+      description: Размер страницы (1..1000)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    sort:
+      name: sort
+      in: query
+      description: Поле сортировки с направлением, например: createdAt:desc
+      schema: { type: string }
+    q:
+      name: q
+      in: query
+      description: Поисковый запрос (ключ:значение, подстрока)
+      schema: { type: string }
+    Idempotency-Key:
+      name: Idempotency-Key
+      in: header
+      description: Ключ идемпотентности для повторяемых операций
+      required: false
+      schema: { type: string }
+    datasetId:
+      name: datasetId
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[a-z0-9][a-z0-9-_]{2,63}$" }
+    modelId:
+      name: modelId
+      in: path
+      required: true
+      schema: { type: string }
+    jobId:
+      name: jobId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Conflict:
+      description: Конфликт состояния
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    UnprocessableEntity:
+      description: Ошибка валидации
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 Problem Details
+      properties:
+        type:   { type: string, format: uri, default: "about:blank" }
+        title:  { type: string }
+        status: { type: integer, minimum: 100, maximum: 599 }
+        detail: { type: string }
+        instance: { type: string, format: uri }
+        traceId: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+      required: [title, status]
+      additionalProperties: true
+
+    HealthStatus:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              status: { type: string, enum: [ok, warn, fail] }
+              detail: { type: string }
+        now: { type: string, format: date-time }
+      required: [status, now]
+
+    BuildInfo:
+      type: object
+      properties:
+        service: { type: string, example: neuroforge-core }
+        version: { type: string }
+        buildTime: { type: string, format: date-time }
+        commit: { type: string }
+        env: { type: string, enum: [dev, staging, prod] }
+      required: [service, version, buildTime]
+
+    # ----- Datasets -----
+    DatasetCreate:
+      type: object
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-_]{2,63}$"
+        title: { type: string }
+        description: { type: string }
+        source: { type: string, format: uri }
+        tags:
+          type: object
+          additionalProperties: { type: string }
+        schemaRef:
+          type: string
+          description: "URI/ID схемы данных (Avro/JSON Schema/Parquet)"
+      required: [name, source]
+    DatasetPatch:
+      type: object
+      properties:
+        title: { type: string }
+        description: { type: string }
+        tags:
+          type: object
+          additionalProperties: { type: string }
+        schemaRef: { type: string }
+      additionalProperties: false
+    Dataset:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        title: { type: string }
+        description: { type: string }
+        source: { type: string, format: uri }
+        schemaRef: { type: string }
+        tags:
+          type: object
+          additionalProperties: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [id, name, source, createdAt, updatedAt]
+    DatasetList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Dataset" }
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+      required: [items, meta]
+
+    # ----- Models -----
+    ModelRegister:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        tags:
+          type: object
+          additionalProperties: { type: string }
+      required: [name]
+    Model:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        latestVersion: { type: string }
+        tags:
+          type: object
+          additionalProperties: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      required: [id, name, createdAt, updatedAt]
+    ModelList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Model" }
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+      required: [items, meta]
+
+    ModelVersionCreate:
+      type: object
+      properties:
+        version: { type: string }
+        modelUri: { type: string, format: uri }
+        metrics:
+          type: object
+          additionalProperties: { type: number }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+      required: [version, modelUri]
+    ModelVersion:
+      type: object
+      properties:
+        id: { type: string }
+        version: { type: string }
+        modelUri: { type: string, format: uri }
+        metrics:
+          type: object
+          additionalProperties: { type: number }
+        labels:
+          type: object
+          additionalProperties: { type: string }
+        createdAt: { type: string, format: date-time }
+      required: [id, version, modelUri, createdAt]
+    ModelVersionList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ModelVersion" }
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+      required: [items, meta]
+
+    # ----- Training Jobs & Events -----
+    TrainingJobCreate:
+      type: object
+      properties:
+        datasetRef: { type: string }
+        model:
+          type: object
+          properties:
+            name: { type: string }
+            version: { type: string }
+          required: [name]
+        hyperparams:
+          type: object
+          additionalProperties: { type: string }
+        resources:
+          type: object
+          properties:
+            gpuType: { type: string }
+            gpuCount: { type: integer, minimum: 0 }
+            cpuCores: { type: number, minimum: 0 }
+            memoryGb: { type: number, minimum: 0 }
+        webhooks:
+          type: object
+          properties:
+            completed: { type: string, format: uri }
+            failed: { type: string, format: uri }
+      required: [datasetRef, model]
+      additionalProperties: false
+    TrainingJob:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed, canceled]
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        datasetRef: { type: string }
+        model:
+          type: object
+          properties:
+            name: { type: string }
+            version: { type: string }
+        lastError: { type: string }
+        metrics:
+          type: object
+          additionalProperties: { type: number }
+      required: [id, status, createdAt, updatedAt, datasetRef, model]
+    TrainingJobList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/TrainingJob" }
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+      required: [items, meta]
+
+    TrainingEvent:
+      type: object
+      description: JSON-представление TrainingEvent (см. Avro схему)
+      properties:
+        schema_version: { type: string }
+        event_id: { type: string, format: uuid }
+        event_time: { type: string, format: date-time }
+        type:
+          type: string
+          enum: [TRAINING_STARTED, TRAINING_PROGRESS, CHECKPOINT_SAVED, TRAINING_COMPLETED, TRAINING_FAILED, MODEL_REGISTERED, DATA_VERSIONED]
+        environment: { type: string, enum: [dev, staging, prod] }
+        producer: { type: string }
+        source: { type: string }
+        correlation_id: { type: [ "string", "null" ] }
+        trace_id: { type: [ "string", "null" ] }
+        span_id: { type: [ "string", "null" ] }
+        tenant: { type: [ "string", "null" ] }
+        run:
+          type: object
+          properties:
+            run_id: { type: string, format: uuid }
+            project: { type: string }
+            experiment: { type: [ "string", "null" ] }
+            user: { type: [ "string", "null" ] }
+          required: [run_id, project]
+        context:
+          type: object
+          properties:
+            dataset_id: { type: [ "string", "null" ] }
+            dataset_version: { type: [ "string", "null" ] }
+            model_id: { type: [ "string", "null" ] }
+            model_version: { type: [ "string", "null" ] }
+        payload:
+          description: Полезная нагрузка согласно типу события
+          type: [ "object", "null" ]
+      required: [schema_version, event_id, event_time, type, producer, source, run]
+
+    # ----- Artifacts -----
+    PresignRequest:
+      type: object
+      properties:
+        path: { type: string, description: "Ключ/путь хранения, например: models/qa/ckpt.bin" }
+        contentType: { type: string }
+        size: { type: integer, minimum: 0 }
+        sha256: { type: string, pattern: "^[A-Fa-f0-9]{64}$" }
+        operation:
+          type: string
+          enum: [put, get]
+          default: put
+      required: [path, operation]
+    PresignResponse:
+      type: object
+      properties:
+        url: { type: string, format: uri }
+        method: { type: string, enum: [PUT, GET] }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+        expiresInSeconds: { type: integer }
+        etag: { type: string }
+      required: [url, method, expiresInSeconds]
+
+    # ----- Common -----
+    PageMeta:
+      type: object
+      properties:
+        limit: { type: integer }
+        nextCursor: { type: [ "string", "null" ] }
+        totalApprox: { type: [ "integer", "null" ], description: "При наличии, приблизительное количество элементов" }
+      required: [limit]
+
+x-idempotency:
+  header: Idempotency-Key
+  windowSeconds: 7200
+  responseCache: true

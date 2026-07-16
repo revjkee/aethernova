@@ -1,0 +1,231 @@
+{{- /*
+File: ops/helm/cybersecurity-core/templates/deployment.yaml
+Industrial-grade Deployment for cybersecurity-core
+*/ -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- $fullname := default (printf "%s-%s" .Release.Name $name) .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | default .Chart.Version | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: cybersecurity-core
+    app.kubernetes.io/component: app
+  {{- with .Values.deploymentAnnotations }}
+  annotations:
+{{ toYaml . | indent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount | default 2 }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit | default 10 }}
+  progressDeadlineSeconds: {{ .Values.progressDeadlineSeconds | default 600 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.strategy.maxUnavailable | default 0 }}
+      maxSurge: {{ .Values.strategy.maxSurge | default "25%" }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/part-of: cybersecurity-core
+        app.kubernetes.io/component: app
+      {{- with .Values.podLabels }}
+{{ toYaml . | indent 8 }}
+      {{- end }}
+      annotations:
+        {{- /* Optional external checksum to force rollout on config changes */}}
+        checksum/config: {{ .Values.configChecksum | default "" | quote }}
+        {{- with .Values.podAnnotations }}
+{{ toYaml . | indent 8 }}
+        {{- end }}
+    spec:
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+      {{- range .Values.imagePullSecrets }}
+        - name: {{ .name | quote }}
+      {{- end }}
+      {{- end }}
+      serviceAccountName: {{- if .Values.serviceAccount.create -}}{{ default (printf "%s-sa" $fullname) .Values.serviceAccount.name }}{{- else -}}{{ default "default" .Values.serviceAccount.name }}{{- end }}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken | default false }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.hostAliases }}
+      hostAliases:
+{{ toYaml . | indent 8 }}
+      {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+{{ toYaml . | indent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: {{ .Values.podSecurityContext.seccompProfile.type | default "RuntimeDefault" }}
+        fsGroup: {{ .Values.podSecurityContext.fsGroup | default 10001 }}
+        fsGroupChangePolicy: {{ .Values.podSecurityContext.fsGroupChangePolicy | default "OnRootMismatch" }}
+        runAsNonRoot: true
+        runAsUser: {{ .Values.podSecurityContext.runAsUser | default 10001 }}
+        runAsGroup: {{ .Values.podSecurityContext.runAsGroup | default 10001 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 30 }}
+      {{- with .Values.initContainers }}
+      initContainers:
+{{ toYaml . | indent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: "{{ .Values.image.repository | required "image.repository is required" }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort | default 8080 }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port | default 9090 }}
+              protocol: TCP
+            {{- end }}
+          {{- if .Values.command }}
+          command:
+{{ toYaml .Values.command | indent 12 }}
+          {{- end }}
+          {{- if .Values.args }}
+          args:
+{{ toYaml .Values.args | indent 12 }}
+          {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+          {{- with .Values.env }}
+{{ toYaml . | indent 12 }}
+          {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+{{ toYaml . | indent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: {{ .Values.containerSecurityContext.runAsUser | default 10001 }}
+            runAsGroup: {{ .Values.containerSecurityContext.runAsGroup | default 10001 }}
+            capabilities:
+              drop: [ "ALL" ]
+            seccompProfile:
+              type: {{ .Values.containerSecurityContext.seccompProfile.type | default "RuntimeDefault" }}
+          resources:
+{{ toYaml (.Values.resources | default (dict "limits" (dict "cpu" "500m" "memory" "512Mi") "requests" (dict "cpu" "100m" "memory" "128Mi"))) | indent 12 }}
+          {{- if .Values.startupProbe.enabled }}
+          startupProbe:
+{{ toYaml .Values.startupProbe.config | indent 12 }}
+          {{- else }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.paths.startup | default "/healthz" }}
+              port: http
+            failureThreshold: 30
+            periodSeconds: 3
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+{{ toYaml .Values.livenessProbe.config | indent 12 }}
+          {{- else }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.paths.liveness | default "/healthz" }}
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+{{ toYaml .Values.readinessProbe.config | indent 12 }}
+          {{- else }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.paths.readiness | default "/ready" }}
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /run
+            - name: var-run
+              mountPath: /var/run
+          {{- with .Values.volumeMounts }}
+{{ toYaml . | indent 12 }}
+          {{- end }}
+        {{- with .Values.extraContainers }}
+{{ toYaml . | indent 8 }}
+        {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: { medium: "", sizeLimit: {{ .Values.tmpfs.sizeLimit | default "64Mi" | quote }} }
+        - name: run
+          emptyDir: { medium: "", sizeLimit: {{ .Values.tmpfs.sizeLimit | default "32Mi" | quote }} }
+        - name: var-run
+          emptyDir: { medium: "", sizeLimit: {{ .Values.tmpfs.sizeLimit | default "32Mi" | quote }} }
+      {{- with .Values.volumes }}
+{{ toYaml . | indent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+{{ toYaml . | indent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: {{ $name }}
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+{{ toYaml . | indent 8 }}
+      {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $name }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+{{ toYaml . | indent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+{{ toYaml . | indent 8 }}
+      {{- end }}

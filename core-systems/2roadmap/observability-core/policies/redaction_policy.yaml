@@ -1,0 +1,104 @@
+apiVersion: teslaai.org/v1
+kind: RedactionPolicy
+metadata:
+  name: teslaai-global-redaction
+  namespace: observability
+  labels:
+    security-level: high
+    compliance: true
+    owner: teslaai-core
+    system: logging-tracing
+
+spec:
+  enabled: true
+  defaultBehavior:
+    redactUnknownFields: true
+    redactOnFailure: true
+    blockExportOnViolation: true
+    auditRedactedEvents: true
+
+  classificationLevels:
+    - name: pii
+      description: Personally identifiable information
+      actions:
+        - mask: "[REDACTED::PII]"
+        - hash: sha256
+    - name: secret
+      description: Secrets and tokens
+      actions:
+        - mask: "[REDACTED::SECRET]"
+        - remove
+    - name: credential
+      description: API keys, passwords, certificates
+      actions:
+        - mask: "[REDACTED::CRED]"
+        - truncate: 6
+    - name: financial
+      description: Payment-related or monetary fields
+      actions:
+        - mask: "[REDACTED::FIN]"
+        - round: 0
+    - name: prompt-content
+      description: Raw AI prompt contents
+      actions:
+        - hash: sha512
+        - redactContextWindow
+
+  matchRules:
+    - name: redact-headers
+      match:
+        source: http
+        fields:
+          - headers.authorization
+          - headers.cookie
+          - headers['x-api-key']
+      classification: credential
+
+    - name: redact-user-profile
+      match:
+        source: logs
+        fields:
+          - user.email
+          - user.phone
+          - user.full_name
+      classification: pii
+
+    - name: redact-ai-input
+      match:
+        source: ai-core
+        fields:
+          - prompt.input
+          - prompt.messages[*].content
+      classification: prompt-content
+
+    - name: redact-database-dump
+      match:
+        source: postgres-exporter
+        fields:
+          - row_data.card_number
+          - row_data.ssn
+          - row_data.account_balance
+      classification: financial
+
+    - name: redact-env-vars
+      match:
+        source: container.env
+        fields:
+          - env.JWT_SECRET
+          - env.SSH_PRIVATE_KEY
+      classification: secret
+
+  fallback:
+    ifUnclassified:
+      action: mask
+      value: "[REDACTED::UNKNOWN]"
+
+  audit:
+    logRedactedFields: true
+    destination: s3://teslaai-audit/redaction-log/
+    retentionDays: 30
+    format: json
+    alertOnViolation: true
+    metrics:
+      enabled: true
+      path: /metrics/redaction

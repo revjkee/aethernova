@@ -1,0 +1,605 @@
+syntax = "proto3";
+
+package veilmind.v1;
+
+option go_package = "github.com/veilmind/veilmind-core/gen/go/veilmind/v1;veilmindv1";
+option java_package = "org.veilmind.v1";
+option java_multiple_files = true;
+option csharp_namespace = "VeilMind.V1";
+option php_namespace = "VeilMind\\V1";
+option ruby_package = "VeilMind::V1";
+option objc_class_prefix = "VM";
+option cc_enable_arenas = true;
+option optimize_for = SPEED;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/rpc/status.proto";
+
+// -----------------------------------------------------------------------------
+// Общие утилиты (пагинация, маркеры, валидация)
+// -----------------------------------------------------------------------------
+
+message PageRequest {
+  // zero-based page size; server may enforce max
+  uint32 page_size = 1;
+  // opaque token from previous response; mutually exclusive with page_index
+  string page_token = 2;
+  // explicit page index (for simple UIs), optional
+  uint32 page_index = 3;
+}
+
+message PageResponse {
+  // number of items in this page
+  uint32 page_size = 1;
+  // next page token if more data available
+  string next_page_token = 2;
+  // 0-based index of the current page if known
+  uint32 page_index = 3;
+  // total count if cheap to compute; otherwise 0
+  uint64 total_count = 4;
+}
+
+message Label {
+  string key = 1;
+  string value = 2;
+}
+
+message ValidationError {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    REQUIRED = 1;
+    OUT_OF_RANGE = 2;
+    INVALID_REGEX = 3;
+    INVALID_DISTRIBUTION = 4;
+    CONFLICT = 5;
+    DUPLICATE = 6;
+    UNSUPPORTED = 7;
+    SECURITY = 8;
+  }
+  Code code = 1;
+  // JSONPath-подобный путь (например, "$.schema.fields[2].name")
+  string path = 2;
+  string message = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Типы и домены данных
+// -----------------------------------------------------------------------------
+
+enum DataType {
+  DATA_TYPE_UNSPECIFIED = 0;
+  STRING = 1;
+  INT64 = 2;
+  DOUBLE = 3;
+  BOOL = 4;
+  TIMESTAMP = 5;
+  BYTES = 6;
+  CATEGORY = 7;
+  JSON = 8;
+}
+
+enum FileFormat {
+  FILE_FORMAT_UNSPECIFIED = 0;
+  PARQUET = 1;
+  AVRO = 2;
+  CSV = 3;
+  JSONL = 4;
+}
+
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  NONE = 1;
+  GZIP = 2;
+  ZSTD = 3;
+  SNAPPY = 4;
+}
+
+enum DPMechanism {
+  DP_MECHANISM_UNSPECIFIED = 0;
+  LAPLACE = 1;
+  GAUSSIAN = 2;
+}
+
+enum AnomalyType {
+  ANOMALY_TYPE_UNSPECIFIED = 0;
+  OUTLIER = 1;
+  NULL_BURST = 2;
+  DUPLICATE = 3;
+  SCHEMA_SHIFT = 4;
+  DRIFT = 5;
+  SPIKE = 6;
+}
+
+enum DriftType {
+  DRIFT_TYPE_UNSPECIFIED = 0;
+  MEAN_SHIFT = 1;
+  VARIANCE_SHIFT = 2;
+  CATEGORY_PROB_SHIFT = 3;
+  SEASONALITY = 4;
+}
+
+message NumericDomain {
+  double min = 1;
+  double max = 2;
+  // Задание распределения для числовых полей
+  message Distribution {
+    message Uniform {}
+    message Normal { double mean = 1; double stddev = 2; }
+    message LogNormal { double log_mean = 1; double log_stddev = 2; }
+    message Exponential { double lambda = 1; }
+    message Poisson { double lambda = 1; }
+    message Zipf { double s = 1; }
+
+    oneof kind {
+      Uniform uniform = 10;
+      Normal normal = 11;
+      LogNormal log_normal = 12;
+      Exponential exponential = 13;
+      Poisson poisson = 14;
+      Zipf zipf = 15;
+    }
+  }
+  Distribution distribution = 3;
+  // Квантование результата (например, до целого)
+  double quantize_step = 4;
+}
+
+message StringDomain {
+  uint32 min_length = 1;
+  uint32 max_length = 2;
+  // Ограничение по алфавиту (если пусто — любой)
+  string alphabet = 3;
+  // Регулярное выражение для соответствия (ECMA/RE2 в зависимости от реализации)
+  string regex = 4;
+  // Шаблон строки (например, "user-${seq}" или "${first_name} ${last_name}")
+  string template = 5;
+}
+
+message Category {
+  string label = 1;
+  double probability = 2; // суммарно по домену ≈ 1.0
+}
+
+message CategoryDomain {
+  repeated Category categories = 1;
+  // Возможность добавлять редкие категории с хвостом
+  double other_tail_probability = 2;
+}
+
+message TimestampDomain {
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2;
+  // Плотность во времени (равномерная/суточная сезонность и т.п.)
+  message TimeDistribution {
+    message Uniform {}
+    message DailySeasonality {
+      // 24 значения-коэффициента на каждый час суток, нормализуем на стороне сервиса
+      repeated double hourly_weights = 1;
+    }
+    oneof kind {
+      Uniform uniform = 10;
+      DailySeasonality daily_seasonality = 11;
+    }
+  }
+  TimeDistribution distribution = 3;
+  // Формат сериализации при выводе в текстовые форматы (CSV/JSONL)
+  string format = 4; // например, RFC3339
+  string timezone = 5; // IANA TZ, например "UTC"
+}
+
+message JsonDomain {
+  // Шаблон JSON (Struct) с указанием вероятностей пустых/отсутствующих полей
+  google.protobuf.Struct template = 1;
+}
+
+// Значение по умолчанию, типобезопасно
+message DefaultValue {
+  oneof value {
+    string string_value = 1;
+    int64 int_value = 2;
+    double double_value = 3;
+    bool bool_value = 4;
+    google.protobuf.Timestamp timestamp_value = 5;
+    bytes bytes_value = 6;
+    google.protobuf.Struct json_value = 7;
+  }
+}
+
+// Ограничения и инварианты
+message Constraints {
+  bool required = 1;
+  bool unique = 2;
+  // Для числовых
+  double min_inclusive = 10;
+  double max_inclusive = 11;
+  // Для строк
+  string pattern = 20;
+  // Для категорий
+  repeated string allowed_values = 30;
+  // Вероятность пропусков (дополнительно к nullable)
+  double missing_rate = 40;
+}
+
+// Спецификация одного поля
+message FieldSpec {
+  string name = 1;
+  DataType type = 2;
+  bool nullable = 3;
+
+  oneof domain {
+    NumericDomain numeric = 10;
+    StringDomain string = 11;
+    CategoryDomain category = 12;
+    TimestampDomain timestamp = 13;
+    JsonDomain json = 14;
+  }
+
+  DefaultValue default_value = 20;
+  Constraints constraints = 21;
+
+  // Произвольные метки для управления пайплайном
+  repeated Label labels = 90;
+
+  reserved 4, 5, 6, 7, 8, 9, 22, 23, 24;
+}
+
+// Схема набора данных
+message DatasetSchema {
+  repeated FieldSpec fields = 1;
+  repeated string primary_key = 2; // имена полей, формирующих PK/уникальность
+  // Индексы для быстрого доступа в downstream-системах (метаданные)
+  repeated string indexes = 3;
+
+  reserved 10 to 19;
+}
+
+// Зависимости/отношения между полями
+message RelationshipSpec {
+  // Задание корреляций (Пирсон) между числовыми полями
+  message Correlation {
+    string field_x = 1;
+    string field_y = 2;
+    double pearson_r = 3; // [-1..1]
+  }
+  repeated Correlation correlations = 1;
+
+  // Вычислимые поля через выражение
+  message Expression {
+    enum Language {
+      LANGUAGE_UNSPECIFIED = 0;
+      CEL = 1;  // Common Expression Language
+      LUA = 2;
+      JS = 3;
+    }
+    string target_field = 1;
+    Language language = 2;
+    string source = 3; // код выражения/скрипта
+  }
+  repeated Expression computed = 2;
+
+  reserved 10 to 19;
+}
+
+// Дифференциальная приватность
+message PrivacySpec {
+  bool enabled = 1;
+  DPMechanism mechanism = 2;
+  double epsilon = 3; // >= 0
+  double delta = 4;   // [0..1], для гаусс.
+  // Чувствительность/масштаб шума
+  double sensitivity = 5;
+  // Доп. параметры для категорий (например, randomized response)
+  double category_flip_prob = 6;
+
+  reserved 10 to 19;
+}
+
+// Аномалии и дрейф
+message AnomalySpec {
+  // Суммарная доля записей с аномалиями
+  double anomaly_rate = 1;
+  repeated AnomalyType types = 2;
+
+  message Outlier {
+    string field = 1;
+    double stddev_factor = 2; // насколько далеко выбрасывать
+    double rate = 3;
+  }
+  repeated Outlier outliers = 10;
+
+  message Duplicate {
+    double ratio = 1;
+    // Сдвиг времени/полей при дублировании для реалистичности
+    google.protobuf.Duration timestamp_jitter = 2;
+  }
+  Duplicate duplicate = 11;
+
+  message NullBurst {
+    repeated string fields = 1;
+    double burst_rate = 2;
+    google.protobuf.Duration burst_window = 3;
+  }
+  NullBurst null_burst = 12;
+
+  message DriftPhase {
+    DriftType type = 1;
+    string field = 2;
+    // Сдвиг среднего/дисперсии/вероятностей
+    double magnitude = 3;
+    // Когда начинать относительно начала генерации
+    google.protobuf.Duration start_after = 4;
+    // За сколько применить
+    google.protobuf.Duration ramp_duration = 5;
+  }
+  repeated DriftPhase drift = 13;
+
+  reserved 20 to 29;
+}
+
+// Вывод/синки
+message LocalSink {
+  string base_path = 1; // корневая директория
+}
+
+message S3Sink {
+  string endpoint = 1;
+  string region = 2;
+  string bucket = 3;
+  string prefix = 4;
+  bool force_path_style = 5;
+  string kms_key_id = 6; // опционально
+}
+
+message GCSSink {
+  string bucket = 1;
+  string prefix = 2;
+  string kms_key = 3;
+}
+
+message AzureBlobSink {
+  string account = 1;
+  string container = 2;
+  string prefix = 3;
+  string kms_key = 4;
+}
+
+message KafkaSink {
+  repeated string brokers = 1;
+  string topic = 2;
+  // ключ сообщений (шаблон с подстановками, напр. "${user_id}")
+  string key_template = 3;
+  // Формат полезной нагрузки
+  FileFormat format = 4; // допустим JSONL для записей
+  bool tls_enabled = 5;
+  bool sasl_enabled = 6;
+  string sasl_username = 7;
+  string sasl_password = 8;
+  // Целевая интенсивность (записей в секунду)
+  uint32 target_rps = 9;
+}
+
+message Partitioning {
+  // Шаблон партиций: "date=YYYY/MM/DD/hour=HH" или "${YYYY}/${MM}/${DD}"
+  string template = 1;
+}
+
+message OutputSpec {
+  FileFormat format = 1;
+  Compression compression = 2;
+  uint64 target_file_size_bytes = 3; // желаемый размер чанка
+  Partitioning partitioning = 4;
+
+  oneof sink {
+    LocalSink local = 10;
+    S3Sink s3 = 11;
+    GCSSink gcs = 12;
+    AzureBlobSink azure = 13;
+    KafkaSink kafka = 14;
+  }
+
+  reserved 20 to 29;
+}
+
+// Потоковая генерация (если не используем файловый вывод)
+message StreamingSpec {
+  // Если указан KafkaSink в OutputSpec.sink, StreamingSpec может дополнять его параметрами
+  bool enabled = 1;
+  uint32 target_rps = 2;
+  // Имитация батчей/всплесков
+  uint32 burst_rps = 3;
+  google.protobuf.Duration burst_duration = 4;
+}
+
+// Зерно генерации/детерминизм
+message SeedSpec {
+  uint64 seed = 1;
+  bool deterministic = 2;
+}
+
+// Основная спецификация набора данных
+message SyntheticDatasetSpec {
+  string dataset_name = 1;
+  DatasetSchema schema = 2;
+  uint64 record_count = 3;
+
+  RelationshipSpec relationships = 10;
+  PrivacySpec privacy = 11;
+  AnomalySpec anomalies = 12;
+  SeedSpec seed = 13;
+
+  repeated Label labels = 90;
+
+  reserved 20 to 29;
+}
+
+// Планировщик (по желанию)
+message ScheduleSpec {
+  bool enabled = 1;
+  // cron в формате стандартного 5-поля (мин часы день месяц день_недели), UTC
+  string cron = 2;
+}
+
+// Метрики генерации
+message GenerationMetrics {
+  uint64 records_generated = 1;
+  uint64 files_written = 2;
+  uint64 bytes_written = 3;
+  double avg_records_per_sec = 4;
+  double avg_bytes_per_sec = 5;
+
+  // Счётчики аномалий по типам
+  map<string, uint64> anomaly_counts = 10;
+  // Ошибки по кодам/причинам
+  map<string, uint64> error_counts = 11;
+}
+
+// Состояния заданий
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  PENDING = 1;
+  RUNNING = 2;
+  SUCCEEDED = 3;
+  FAILED = 4;
+  CANCELED = 5;
+}
+
+// Представление задания
+message SyntheticJob {
+  string id = 1;
+  SyntheticDatasetSpec spec = 2;
+  OutputSpec output = 3;
+  StreamingSpec streaming = 4;
+  ScheduleSpec schedule = 5;
+
+  JobState state = 10;
+  double percent_complete = 11;
+  string sink_uri = 12; // итоговая базовая ссылка/префикс (если применимо)
+
+  GenerationMetrics metrics = 20;
+  google.rpc.Status last_error = 21;
+
+  google.protobuf.Timestamp created_at = 30;
+  google.protobuf.Timestamp updated_at = 31;
+  google.protobuf.Timestamp started_at = 32;
+  google.protobuf.Timestamp finished_at = 33;
+
+  reserved 40 to 49;
+}
+
+// Универсальная запись для стрим-предпросмотра и онлайн-выдачи
+message SyntheticRecord {
+  // Порядковый номер записи в рамках потока
+  uint64 seq_no = 1;
+  // Время события
+  google.protobuf.Timestamp event_time = 2;
+  // Полезная нагрузка с произвольной структурой согласно Schema
+  google.protobuf.Struct data = 3;
+  // Партиционный ключ (напр., user_id или шаблон)
+  string partition_key = 4;
+}
+
+// -----------------------------------------------------------------------------
+// Запросы/ответы сервиса
+// -----------------------------------------------------------------------------
+
+message GenerateDatasetRequest {
+  SyntheticDatasetSpec spec = 1;
+  OutputSpec output = 2;
+  StreamingSpec streaming = 3;
+  ScheduleSpec schedule = 4;
+  // Проверка без запуска
+  bool dry_run = 5;
+}
+
+message GenerateDatasetResponse {
+  SyntheticJob job = 1;
+}
+
+message GetJobRequest {
+  string id = 1;
+}
+
+message GetJobResponse {
+  SyntheticJob job = 1;
+}
+
+message CancelJobRequest {
+  string id = 1;
+}
+
+message CancelJobResponse {
+  SyntheticJob job = 1;
+}
+
+message ListJobsRequest {
+  PageRequest page = 1;
+  // Фильтры по state/dataset_name/label и т.п.
+  repeated JobState states = 2;
+  string dataset_name = 3;
+  repeated Label labels = 4;
+}
+
+message ListJobsResponse {
+  repeated SyntheticJob jobs = 1;
+  PageResponse page = 2;
+}
+
+message StreamRecordsRequest {
+  SyntheticDatasetSpec spec = 1;
+  // Если задано — генерировать не менее rps записей
+  uint32 min_rps = 2;
+  // Максимальная продолжительность
+  google.protobuf.Duration max_duration = 3;
+}
+
+message ValidateSpecRequest {
+  SyntheticDatasetSpec spec = 1;
+  OutputSpec output = 2;
+  StreamingSpec streaming = 3;
+}
+
+message ValidateSpecResponse {
+  bool valid = 1;
+  repeated ValidationError errors = 2;
+}
+
+message PreviewSchemaRequest {
+  DatasetSchema schema = 1;
+  // Количество примеров записей для предпросмотра
+  uint32 sample_records = 2;
+  SeedSpec seed = 3;
+}
+
+message PreviewSchemaResponse {
+  // Первые N записей как пример
+  repeated google.protobuf.Struct samples = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Сервис
+// -----------------------------------------------------------------------------
+
+service SyntheticService {
+  // Создать задание генерации (батч/стрим/расписание)
+  rpc CreateGenerationJob (GenerateDatasetRequest) returns (GenerateDatasetResponse);
+
+  // Получить состояние задания
+  rpc GetJob (GetJobRequest) returns (GetJobResponse);
+
+  // Отменить задание
+  rpc CancelJob (CancelJobRequest) returns (CancelJobResponse);
+
+  // Список заданий
+  rpc ListJobs (ListJobsRequest) returns (ListJobsResponse);
+
+  // Валидация спецификации без запуска
+  rpc ValidateSpec (ValidateSpecRequest) returns (ValidateSpecResponse);
+
+  // Предпросмотр (сэмплы по заданной схеме)
+  rpc PreviewSchema (PreviewSchemaRequest) returns (PreviewSchemaResponse);
+
+  // Онлайновая генерация записей (server-streaming)
+  rpc StreamRecords (StreamRecordsRequest) returns (stream SyntheticRecord);
+}

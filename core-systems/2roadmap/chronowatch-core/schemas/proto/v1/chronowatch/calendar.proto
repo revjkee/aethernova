@@ -1,0 +1,617 @@
+// chronowatch-core/schemas/proto/v1/chronowatch/calendar.proto
+syntax = "proto3";
+
+package chronowatch.v1;
+
+option go_package        = "github.com/aethernova/chronowatch-core/gen/proto/go/chronowatch/v1;chronowatchv1";
+option java_multiple_files = true;
+option java_package      = "com.aethernova.chronowatch.v1";
+option java_outer_classname = "CalendarProto";
+option csharp_namespace  = "Aethernova.Chronowatch.V1";
+option php_namespace     = "Aethernova\\Chronowatch\\V1";
+option ruby_package      = "Aethernova::Chronowatch::V1";
+option objc_class_prefix = "CWX";
+
+// ----------------------------------------------------------------------------
+// Imports
+// ----------------------------------------------------------------------------
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/field_mask.proto";
+import "google/type/date.proto";
+import "google/type/timeofday.proto";
+import "google/api/annotations.proto";
+import "google/api/resource.proto";
+
+// ----------------------------------------------------------------------------
+// Enums & constants
+// ----------------------------------------------------------------------------
+
+enum CalendarKind {
+  CALENDAR_KIND_UNSPECIFIED = 0;
+  CALENDAR_KIND_RUNTIME     = 1; // 24x7/рабочие окна исполнения
+  CALENDAR_KIND_BUSINESS    = 2; // бизнес-часы
+  CALENDAR_KIND_MAINTENANCE = 3; // окна обслуживания
+  CALENDAR_KIND_BLACKOUT    = 4; // блэкауты (запретные интервалы)
+  CALENDAR_KIND_HOLIDAY     = 5; // праздники (провайдеры/ручные даты)
+}
+
+enum CollisionStrategy {
+  COLLISION_STRATEGY_UNSPECIFIED = 0;
+  COLLISION_STRATEGY_MERGE            = 1;
+  COLLISION_STRATEGY_OVERRIDE_NEWER   = 2;
+  COLLISION_STRATEGY_OVERRIDE_PRIORITY= 3;
+}
+
+enum TzMode {
+  TZ_MODE_UNSPECIFIED = 0;
+  TZ_MODE_FLOATING    = 1; // rrule без TZ, применяем к TZ календаря
+  TZ_MODE_AWARE       = 2; // rrule с BYHOUR/минутами учитывает TZ
+}
+
+enum DstPolicy {
+  DST_POLICY_UNSPECIFIED = 0;
+  DST_POLICY_RESPECT     = 1; // соблюдать переходы DST
+  DST_POLICY_IGNORE      = 2; // игнорировать переходы
+}
+
+enum DayOfWeek {
+  DAY_OF_WEEK_UNSPECIFIED = 0;
+  MONDAY    = 1;
+  TUESDAY   = 2;
+  WEDNESDAY = 3;
+  THURSDAY  = 4;
+  FRIDAY    = 5;
+  SATURDAY  = 6;
+  SUNDAY    = 7;
+}
+
+// ----------------------------------------------------------------------------
+// Common messages
+// ----------------------------------------------------------------------------
+
+message TimeInterval {
+  google.protobuf.Timestamp start = 1; // включительно
+  google.protobuf.Timestamp end   = 2; // исключительно
+}
+
+message TimeSpan {
+  google.type.TimeOfDay start = 1; // локальное время в TZ календаря
+  google.type.TimeOfDay end   = 2; // start < end
+}
+
+message DailyRule {
+  DayOfWeek day = 1;
+  repeated TimeSpan spans = 2; // 0..N интервалов в день
+}
+
+message Labels {
+  map<string, string> values = 1;
+}
+
+message Annotations {
+  map<string, string> values = 1;
+}
+
+// RRULE окно: строка RRULE + обязательная длительность
+message RRuleWindow {
+  string rrule = 1;                      // пример: "FREQ=WEEKLY;BYDAY=SU;BYHOUR=1;BYMINUTE=0"
+  google.protobuf.Duration duration = 2; // пример: PT2H
+  string timezone = 3;                   // опциональное переопределение TZ
+  TzMode tz_mode = 4;                    // поведение TZ при вычислении
+  DstPolicy dst_policy = 5;              // политика DST
+}
+
+// Фиксированное окно реального времени
+message FixedWindow {
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end   = 2;
+}
+
+// Исключение может ссылаться на RRULE, фиксированное окно, другую сущность или дату
+message Exclusion {
+  oneof expr {
+    RRuleWindow rrule     = 1;
+    FixedWindow fixed     = 2;
+    string calendar_ref   = 3; // calendars/{id}
+    string provider_ref   = 4; // holidays/{id}
+    google.type.Date date = 5; // локальная дата в TZ календаря
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Calendar resources
+// ----------------------------------------------------------------------------
+
+message Calendar {
+  option (google.api.resource) = {
+    type: "chronowatch.googleapis.com/Calendar"
+    pattern: "calendars/{calendar}"
+  };
+
+  // Ресурсное имя: calendars/{id}
+  string name = 1;
+
+  // Человекочитаемое имя
+  string display_name = 2;
+
+  CalendarKind kind = 3;
+
+  // IANA TZ, напр. "Europe/Stockholm"
+  string timezone = 4;
+
+  // BCP-47 locale, напр. "se-SE"
+  string locale = 5;
+
+  Labels labels = 6;
+  Annotations annotations = 7;
+
+  google.protobuf.Timestamp create_time = 8;
+  google.protobuf.Timestamp update_time = 9;
+
+  // Оптимистичная блокировка
+  string etag = 10;
+
+  // Схема расписания (ровно одна)
+  oneof schedule {
+    RuntimeSchedule   runtime   = 20;
+    BusinessSchedule  business  = 21;
+    WindowSchedule    windows   = 22;
+    HolidaySchedule   holidays  = 23;
+  }
+
+  // Универсальные исключения поверх schedule
+  repeated Exclusion excludes = 30;
+
+  // Эволюционный запас нумерации
+  reserved 11, 12, 13, 14, 15, 16, 17, 18, 19;
+}
+
+// 24x7 / rule-based интервалы
+message RuntimeSchedule {
+  repeated RRuleWindow includes = 1; // например, DAILY;INTERVAL=1 с duration=PT24H
+}
+
+// Бизнес-часы по дням с исключениями
+message BusinessSchedule {
+  repeated DailyRule work_week = 1;     // понедельник-воскресенье
+  repeated Exclusion excludes   = 2;    // выходные, праздники и т.п.
+}
+
+// Набор окон (maintenance/blackout и т.д.)
+message WindowSchedule {
+  repeated RRuleWindow windows = 1;     // периодические окна по RRULE
+  repeated FixedWindow fixed   = 2;     // единичные окна
+}
+
+// Праздники
+message HolidaySchedule {
+  repeated string provider_refs = 1; // holidays/{id}
+  repeated google.type.Date dates = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Holiday providers & ICS subscriptions
+// ----------------------------------------------------------------------------
+
+message HolidayProvider {
+  // holidays/{id}
+  string name = 1;
+
+  // builtin | external
+  string type = 2;
+
+  // Например, "SE", "RU"
+  string country = 3;
+
+  bool observed = 4;
+  google.protobuf.Duration cache_ttl = 5;
+
+  Labels labels = 6;
+  Annotations annotations = 7;
+}
+
+// Подписка на внешние ICS
+message IcsSubscription {
+  // subscriptions/{id}
+  string name = 1;
+  string url = 2;
+  string timezone = 3;
+  google.protobuf.Duration refresh_interval = 4;
+  bool signature_required = 5;
+  bool allow_http = 6;
+
+  // Куда маппить события
+  string to_calendar = 7;        // calendars/{id}
+  CollisionStrategy collision = 8;
+
+  Labels labels = 9;
+  Annotations annotations = 10;
+}
+
+// ----------------------------------------------------------------------------
+// Composite calendars
+// ----------------------------------------------------------------------------
+
+message CompositeCalendar {
+  // composites/{id}
+  string name = 1;
+
+  string display_name = 2;
+
+  // include - subtract композиция
+  repeated string include_refs = 3; // calendars/{id}
+  repeated string subtract_refs = 4; // calendars/{id}
+
+  Labels labels = 5;
+  Annotations annotations = 6;
+
+  google.protobuf.Timestamp create_time = 7;
+  google.protobuf.Timestamp update_time = 8;
+  string etag = 9;
+}
+
+// ----------------------------------------------------------------------------
+// SLA profiles & service bindings
+// ----------------------------------------------------------------------------
+
+message SlaProfile {
+  // slas/{id}
+  string name = 1;
+  string display_name = 2;
+
+  google.protobuf.Duration response_time   = 3;
+  google.protobuf.Duration resolution_time = 4;
+
+  string calendar_ref = 5; // calendars/{id} или composites/{id}
+
+  Labels labels = 6;
+  Annotations annotations = 7;
+
+  google.protobuf.Timestamp create_time = 8;
+  google.protobuf.Timestamp update_time = 9;
+  string etag = 10;
+}
+
+message ServiceBinding {
+  // services/{service}/bindings/{id}
+  string name = 1;
+
+  string service = 2;        // логическое имя сервиса
+  string calendar_ref = 3;   // calendars/{id} или composites/{id}
+  string sla_profile_ref = 4;// slas/{id}
+
+  Labels labels = 5;
+  Annotations annotations = 6;
+
+  google.protobuf.Timestamp create_time = 7;
+  google.protobuf.Timestamp update_time = 8;
+  string etag = 9;
+}
+
+// ----------------------------------------------------------------------------
+// Requests & responses
+// ----------------------------------------------------------------------------
+
+message ListCalendarsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  string filter = 3;   // например: kind=BUSINESS AND labels.env=prod
+  string order_by = 4; // например: update_time desc
+}
+
+message ListCalendarsResponse {
+  repeated Calendar calendars = 1;
+  string next_page_token = 2;
+}
+
+message GetCalendarRequest {
+  string name = 1; // calendars/{id}
+}
+
+message CreateCalendarRequest {
+  Calendar calendar = 1;
+}
+
+message UpdateCalendarRequest {
+  Calendar calendar = 1;
+  google.protobuf.FieldMask update_mask = 2;
+  string etag = 3;
+}
+
+message DeleteCalendarRequest {
+  string name = 1; // calendars/{id}
+  string etag = 2;
+}
+
+message ListCompositeCalendarsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  string filter = 3;
+  string order_by = 4;
+}
+
+message ListCompositeCalendarsResponse {
+  repeated CompositeCalendar composites = 1;
+  string next_page_token = 2;
+}
+
+message GetCompositeCalendarRequest {
+  string name = 1; // composites/{id}
+}
+
+message CreateCompositeCalendarRequest {
+  CompositeCalendar composite = 1;
+}
+
+message UpdateCompositeCalendarRequest {
+  CompositeCalendar composite = 1;
+  google.protobuf.FieldMask update_mask = 2;
+  string etag = 3;
+}
+
+message DeleteCompositeCalendarRequest {
+  string name = 1; // composites/{id}
+  string etag = 2;
+}
+
+message ListSlaProfilesRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  string filter = 3;
+  string order_by = 4;
+}
+
+message ListSlaProfilesResponse {
+  repeated SlaProfile slas = 1;
+  string next_page_token = 2;
+}
+
+message GetSlaProfileRequest {
+  string name = 1; // slas/{id}
+}
+
+message CreateSlaProfileRequest {
+  SlaProfile profile = 1;
+}
+
+message UpdateSlaProfileRequest {
+  SlaProfile profile = 1;
+  google.protobuf.FieldMask update_mask = 2;
+  string etag = 3;
+}
+
+message DeleteSlaProfileRequest {
+  string name = 1; // slas/{id}
+  string etag = 2;
+}
+
+message ListServiceBindingsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  string filter = 3;   // service="api-gateway"
+  string order_by = 4;
+}
+
+message ListServiceBindingsResponse {
+  repeated ServiceBinding bindings = 1;
+  string next_page_token = 2;
+}
+
+message GetServiceBindingRequest {
+  string name = 1; // services/{service}/bindings/{id}
+}
+
+message CreateServiceBindingRequest {
+  ServiceBinding binding = 1;
+}
+
+message UpdateServiceBindingRequest {
+  ServiceBinding binding = 1;
+  google.protobuf.FieldMask update_mask = 2;
+  string etag = 3;
+}
+
+message DeleteServiceBindingRequest {
+  string name = 1; // services/{service}/bindings/{id}
+  string etag = 2;
+}
+
+// Вычисление доступности
+message ResolveAvailabilityRequest {
+  // Календарная композиция на лету (опционально).
+  repeated string calendar_refs = 1; // calendars/{id} или composites/{id}
+  TimeInterval interval = 2;         // окно запроса
+  bool return_busy = 3;              // вернуть занятые интервалы помимо доступных
+  string timezone = 4;               // переопределение TZ результата (если пусто — TZ первого календаря)
+}
+
+message ResolveAvailabilityResponse {
+  repeated TimeInterval available = 1;
+  repeated TimeInterval busy = 2;
+}
+
+// Расчёт SLA-времени в заданном интервале
+message ComputeSlaRequest {
+  string sla_profile_ref = 1; // slas/{id}
+  TimeInterval interval = 2;
+}
+
+message ComputeSlaResponse {
+  // Накопленные «рабочие» минуты/секунды внутри интервала согласно календарю SLA
+  google.protobuf.Duration effective = 1;
+  // Истёкшие до response_time/resolution_time
+  bool breached_response = 2;
+  bool breached_resolution = 3;
+}
+
+// Watch (события об изменениях)
+message WatchCalendarsRequest {
+  string filter = 1;
+  string etag = 2; // позиция с последней ревизии
+}
+
+message ResourceUpdate {
+  string name = 1;  // calendars/{id} | composites/{id} | slas/{id} | services/{service}/bindings/{id}
+  string type = 2;  // "calendar" | "composite" | "sla" | "binding"
+  string etag = 3;
+  google.protobuf.Timestamp update_time = 4;
+}
+
+// ----------------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------------
+
+service CalendarService {
+  // --- Calendars ---
+  rpc ListCalendars(ListCalendarsRequest) returns (ListCalendarsResponse) {
+    option (google.api.http) = {
+      get: "/v1/calendars"
+    };
+  }
+
+  rpc GetCalendar(GetCalendarRequest) returns (Calendar) {
+    option (google.api.http) = {
+      get: "/v1/{name=calendars/*}"
+    };
+  }
+
+  rpc CreateCalendar(CreateCalendarRequest) returns (Calendar) {
+    option (google.api.http) = {
+      post: "/v1/calendars"
+      body: "calendar"
+    };
+  }
+
+  rpc UpdateCalendar(UpdateCalendarRequest) returns (Calendar) {
+    option (google.api.http) = {
+      patch: "/v1/{calendar.name=calendars/*}"
+      body: "calendar"
+    };
+  }
+
+  rpc DeleteCalendar(DeleteCalendarRequest) returns (.google.protobuf.Timestamp) {
+    option (google.api.http) = {
+      delete: "/v1/{name=calendars/*}"
+    };
+  }
+
+  // --- Composites ---
+  rpc ListCompositeCalendars(ListCompositeCalendarsRequest) returns (ListCompositeCalendarsResponse) {
+    option (google.api.http) = {
+      get: "/v1/composites"
+    };
+  }
+
+  rpc GetCompositeCalendar(GetCompositeCalendarRequest) returns (CompositeCalendar) {
+    option (google.api.http) = {
+      get: "/v1/{name=composites/*}"
+    };
+  }
+
+  rpc CreateCompositeCalendar(CreateCompositeCalendarRequest) returns (CompositeCalendar) {
+    option (google.api.http) = {
+      post: "/v1/composites"
+      body: "composite"
+    };
+  }
+
+  rpc UpdateCompositeCalendar(UpdateCompositeCalendarRequest) returns (CompositeCalendar) {
+    option (google.api.http) = {
+      patch: "/v1/{composite.name=composites/*}"
+      body: "composite"
+    };
+  }
+
+  rpc DeleteCompositeCalendar(DeleteCompositeCalendarRequest) returns (.google.protobuf.Timestamp) {
+    option (google.api.http) = {
+      delete: "/v1/{name=composites/*}"
+    };
+  }
+
+  // --- SLA ---
+  rpc ListSlaProfiles(ListSlaProfilesRequest) returns (ListSlaProfilesResponse) {
+    option (google.api.http) = {
+      get: "/v1/slas"
+    };
+  }
+
+  rpc GetSlaProfile(GetSlaProfileRequest) returns (SlaProfile) {
+    option (google.api.http) = {
+      get: "/v1/{name=slas/*}"
+    };
+  }
+
+  rpc CreateSlaProfile(CreateSlaProfileRequest) returns (SlaProfile) {
+    option (google.api.http) = {
+      post: "/v1/slas"
+      body: "profile"
+    };
+  }
+
+  rpc UpdateSlaProfile(UpdateSlaProfileRequest) returns (SlaProfile) {
+    option (google.api.http) = {
+      patch: "/v1/{profile.name=slas/*}"
+      body: "profile"
+    };
+  }
+
+  rpc DeleteSlaProfile(DeleteSlaProfileRequest) returns (.google.protobuf.Timestamp) {
+    option (google.api.http) = {
+      delete: "/v1/{name=slas/*}"
+    };
+  }
+
+  // --- Service bindings ---
+  rpc ListServiceBindings(ListServiceBindingsRequest) returns (ListServiceBindingsResponse) {
+    option (google.api.http) = {
+      get: "/v1/serviceBindings"
+    };
+  }
+
+  rpc GetServiceBinding(GetServiceBindingRequest) returns (ServiceBinding) {
+    option (google.api.http) = {
+      get: "/v1/{name=services/*/bindings/*}"
+    };
+  }
+
+  rpc CreateServiceBinding(CreateServiceBindingRequest) returns (ServiceBinding) {
+    option (google.api.http) = {
+      post: "/v1/serviceBindings"
+      body: "binding"
+    };
+  }
+
+  rpc UpdateServiceBinding(UpdateServiceBindingRequest) returns (ServiceBinding) {
+    option (google.api.http) = {
+      patch: "/v1/{binding.name=services/*/bindings/*}"
+      body: "binding"
+    };
+  }
+
+  rpc DeleteServiceBinding(DeleteServiceBindingRequest) returns (.google.protobuf.Timestamp) {
+    option (google.api.http) = {
+      delete: "/v1/{name=services/*/bindings/*}"
+    };
+  }
+
+  // --- Compute & Watch ---
+  rpc ResolveAvailability(ResolveAvailabilityRequest) returns (ResolveAvailabilityResponse) {
+    option (google.api.http) = {
+      post: "/v1/availability:resolve"
+      body: "*"
+    };
+  }
+
+  rpc ComputeSla(ComputeSlaRequest) returns (ComputeSlaResponse) {
+    option (google.api.http) = {
+      post: "/v1/sla:compute"
+      body: "*"
+    };
+  }
+
+  rpc WatchCalendars(WatchCalendarsRequest) returns (stream ResourceUpdate) {
+    // HTTP-маппинг обычно через WebSocket/SSE на уровне шлюза; тут только gRPC стрим.
+  }
+}

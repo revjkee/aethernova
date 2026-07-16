@@ -1,0 +1,390 @@
+# human-sovereignty-core/config/veto_policy.yaml
+schema:
+  name: human-sovereignty.veto-policy
+  version: "1.0.0"
+  description: >
+    Policy that enforces human sovereignty by vetting and vetoing high-risk actions.
+    The policy is intended to be consumed by runtime validators and agent governors.
+  generated_at_utc: "2026-01-27T00:00:00Z"
+
+policy:
+  policy_id: "veto-policy.default"
+  mode: "enforce"                 # enforce | audit_only | disabled
+  precedence: "deny_over_allow"   # deny_over_allow | allow_over_deny
+  evaluation:
+    match_strategy: "first_match_by_priority"   # first_match_by_priority | all_matches
+    case_sensitivity: "insensitive"            # sensitive | insensitive
+    normalize:
+      trim: true
+      collapse_whitespace: true
+      unicode_nfkc: true
+
+risk_taxonomy:
+  levels:
+    - id: "low"
+      score_min: 0
+      score_max: 24
+    - id: "medium"
+      score_min: 25
+      score_max: 49
+    - id: "high"
+      score_min: 50
+      score_max: 79
+    - id: "critical"
+      score_min: 80
+      score_max: 100
+
+  domains:
+    - id: "identity_access"
+      description: "Authentication, authorization, accounts, tokens, credentials, MFA, sessions."
+    - id: "payments_finance"
+      description: "Payments, wallets, transfers, invoices, refunds, pricing, billing."
+    - id: "infra_devops"
+      description: "CI/CD, deployments, infrastructure changes, secrets, key vaults."
+    - id: "data_privacy"
+      description: "PII, personal data handling, export, sharing, retention."
+    - id: "security_offsec"
+      description: "Offensive security actions, exploitation, persistence, lateral movement."
+    - id: "legal_compliance"
+      description: "Contractual, policy, compliance and regulatory impacts."
+    - id: "user_safety"
+      description: "Actions that may affect safety or cause harm."
+    - id: "unknown"
+      description: "Unclassified or insufficiently described actions."
+
+defaults:
+  decision:
+    on_unknown_action: "require_human_approval"   # allow | require_human_approval | block
+    on_unknown_domain: "require_human_approval"
+    on_missing_metadata: "require_human_approval"
+  thresholds:
+    require_human_approval_risk_score_gte: 50
+    block_risk_score_gte: 80
+  timeouts:
+    approval_ttl_seconds: 900
+    escalation_ttl_seconds: 3600
+  limits:
+    max_action_payload_bytes: 128000
+    max_reason_length: 8192
+    max_evidence_items: 256
+    max_tags: 64
+
+human_presence:
+  required_for:
+    - "high"
+    - "critical"
+  approval:
+    methods:
+      - id: "explicit_confirm"
+        description: "Explicit human confirmation in UI or signed approval."
+      - id: "signed_token"
+        description: "Short-lived signed approval token."
+    token:
+      algorithm: "hmac-sha256"
+      required_claims:
+        - "sub"
+        - "iat"
+        - "exp"
+        - "policy_id"
+        - "action_id"
+      max_ttl_seconds: 900
+
+audit:
+  enabled: true
+  sink: "stdout_json"        # stdout_json | file_jsonl | http | kafka
+  file_jsonl:
+    path: "human-sovereignty-core/var/audit/veto_events.jsonl"
+  redact:
+    enabled: true
+    fields:
+      - "secrets"
+      - "password"
+      - "token"
+      - "authorization"
+      - "private_key"
+      - "seed"
+  include:
+    decision_packet_hash: true
+    canonical_action_hash: true
+    matched_rule_ids: true
+    risk_score: true
+
+escalation:
+  enabled: true
+  on:
+    - event: "require_human_approval"
+      level: "human"
+    - event: "block"
+      level: "human"
+  channels:
+    - id: "webui"
+      enabled: true
+    - id: "telegram"
+      enabled: false
+    - id: "email"
+      enabled: false
+
+actions_catalog:
+  # This catalog documents common action identifiers and their default domain/risk scoring.
+  # Runtime must not rely only on this catalog; rules below remain authoritative.
+  items:
+    - action_id: "iam.create_user"
+      domain: "identity_access"
+      base_risk_score: 45
+    - action_id: "iam.grant_role"
+      domain: "identity_access"
+      base_risk_score: 70
+    - action_id: "vault.read_secret"
+      domain: "infra_devops"
+      base_risk_score: 65
+    - action_id: "vault.rotate_key"
+      domain: "infra_devops"
+      base_risk_score: 85
+    - action_id: "payments.transfer"
+      domain: "payments_finance"
+      base_risk_score: 80
+    - action_id: "data.export"
+      domain: "data_privacy"
+      base_risk_score: 75
+    - action_id: "security.exploit"
+      domain: "security_offsec"
+      base_risk_score: 95
+
+rules:
+  # Highest priority wins if match_strategy is first_match_by_priority.
+  - rule_id: "deny.offensive.persistence"
+    priority: 1000
+    effect: "block"
+    rationale: "Disallow persistence and stealth operations without exception."
+    match:
+      any:
+        - field: "action.id"
+          op: "regex"
+          value: "(?i)\\b(persist|persistence|backdoor|rootkit|keylogger|credential_dump|lateral_move)\\b"
+        - field: "domain"
+          op: "eq"
+          value: "security_offsec"
+      and:
+        - field: "risk.score"
+          op: "gte"
+          value: 80
+    response:
+      code: "VETO_BLOCK"
+      message: "Action blocked by human sovereignty veto policy."
+      require_human_approval: false
+      log_level: "warning"
+
+  - rule_id: "deny.exploit.by_default"
+    priority: 950
+    effect: "block"
+    rationale: "Disallow exploitation actions by default."
+    match:
+      any:
+        - field: "action.id"
+          op: "regex"
+          value: "(?i)^security\\.(exploit|rce|privesc|payload)\\b"
+        - field: "action.tags"
+          op: "contains_any"
+          value:
+            - "exploit"
+            - "payload"
+            - "rce"
+    response:
+      code: "VETO_BLOCK"
+      message: "Exploitation actions are blocked by default."
+      require_human_approval: false
+      log_level: "warning"
+
+  - rule_id: "require.approval.privileged_role_change"
+    priority: 900
+    effect: "require_human_approval"
+    rationale: "Privileged role changes require explicit human approval."
+    match:
+      any:
+        - field: "action.id"
+          op: "eq"
+          value: "iam.grant_role"
+        - field: "action.id"
+          op: "regex"
+          value: "(?i)^iam\\.(grant|revoke)_(role|scope|permission)$"
+      and:
+        - field: "action.payload.role"
+          op: "contains_any"
+          value:
+            - "admin"
+            - "root"
+            - "owner"
+            - "superuser"
+            - "security_admin"
+    response:
+      code: "VETO_APPROVAL_REQUIRED"
+      message: "Privileged access changes require human approval."
+      require_human_approval: true
+      log_level: "info"
+
+  - rule_id: "require.approval.secret_access"
+    priority: 850
+    effect: "require_human_approval"
+    rationale: "Reading or exporting secrets requires explicit human approval."
+    match:
+      any:
+        - field: "action.id"
+          op: "regex"
+          value: "(?i)^vault\\.(read_secret|export|dump|backup)$"
+        - field: "action.payload"
+          op: "jsonpath_exists"
+          value: "$.secret_name"
+    response:
+      code: "VETO_APPROVAL_REQUIRED"
+      message: "Secret access requires human approval."
+      require_human_approval: true
+      log_level: "info"
+
+  - rule_id: "deny.key_rotation.critical_without_approval"
+    priority: 840
+    effect: "require_human_approval"
+    rationale: "Key rotation can cause outages; require approval."
+    match:
+      any:
+        - field: "action.id"
+          op: "eq"
+          value: "vault.rotate_key"
+        - field: "action.id"
+          op: "regex"
+          value: "(?i)^vault\\.(rotate|rekey|reseed)\\b"
+    response:
+      code: "VETO_APPROVAL_REQUIRED"
+      message: "Key rotation requires human approval."
+      require_human_approval: true
+      log_level: "info"
+
+  - rule_id: "deny.payments.transfer"
+    priority: 820
+    effect: "block"
+    rationale: "Direct transfers are blocked unless explicitly allowlisted in a separate policy."
+    match:
+      any:
+        - field: "action.id"
+          op: "eq"
+          value: "payments.transfer"
+        - field: "domain"
+          op: "eq"
+          value: "payments_finance"
+      and:
+        - field: "risk.score"
+          op: "gte"
+          value: 80
+    response:
+      code: "VETO_BLOCK"
+      message: "Payment transfers are blocked by default."
+      require_human_approval: false
+      log_level: "warning"
+
+  - rule_id: "require.approval.data_export"
+    priority: 800
+    effect: "require_human_approval"
+    rationale: "Data export can leak personal data; require approval."
+    match:
+      any:
+        - field: "action.id"
+          op: "regex"
+          value: "(?i)^data\\.(export|share|sync|dump|backup)$"
+        - field: "domain"
+          op: "eq"
+          value: "data_privacy"
+      and:
+        - field: "risk.score"
+          op: "gte"
+          value: 50
+    response:
+      code: "VETO_APPROVAL_REQUIRED"
+      message: "Data export requires human approval."
+      require_human_approval: true
+      log_level: "info"
+
+  - rule_id: "require.approval.infra.deploy_production"
+    priority: 780
+    effect: "require_human_approval"
+    rationale: "Production deployments require approval."
+    match:
+      any:
+        - field: "action.id"
+          op: "regex"
+          value: "(?i)^(ci|cd|deploy)\\.(apply|release|promote)$"
+        - field: "domain"
+          op: "eq"
+          value: "infra_devops"
+      and:
+        - field: "context.environment"
+          op: "eq"
+          value: "prod"
+    response:
+      code: "VETO_APPROVAL_REQUIRED"
+      message: "Production deployment requires human approval."
+      require_human_approval: true
+      log_level: "info"
+
+  - rule_id: "block.on_missing_required_fields"
+    priority: 700
+    effect: "block"
+    rationale: "If packet lacks minimal attribution, block."
+    match:
+      any:
+        - field: "actor.id"
+          op: "missing"
+          value: true
+        - field: "action.id"
+          op: "missing"
+          value: true
+        - field: "created_at"
+          op: "missing"
+          value: true
+    response:
+      code: "VETO_BLOCK"
+      message: "Missing required attribution fields."
+      require_human_approval: false
+      log_level: "warning"
+
+  - rule_id: "default.thresholds"
+    priority: 1
+    effect: "dynamic"
+    rationale: "Fallback to risk thresholds."
+    match:
+      any:
+        - field: "risk.score"
+          op: "gte"
+          value: 0
+    dynamic:
+      require_human_approval_if_risk_score_gte: 50
+      block_if_risk_score_gte: 80
+    response:
+      code: "VETO_THRESHOLD"
+      message: "Decision derived from risk thresholds."
+      log_level: "info"
+
+match_operators:
+  # Documented operator set expected by consumers.
+  # Consumers must implement these semantics; this section is a contract, not executable code.
+  supported:
+    - "eq"
+    - "neq"
+    - "gte"
+    - "lte"
+    - "regex"
+    - "missing"
+    - "contains_any"
+    - "jsonpath_exists"
+
+allowlist:
+  enabled: true
+  # Allowlist is intentionally empty by default; populate in environment-specific overlays.
+  rules: []
+
+telemetry:
+  enabled: true
+  metrics:
+    - "veto.decisions.total"
+    - "veto.decisions.blocked"
+    - "veto.decisions.approval_required"
+    - "veto.rules.matched"
+    - "veto.errors.total"

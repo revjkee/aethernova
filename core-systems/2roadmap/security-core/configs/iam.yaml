@@ -1,0 +1,405 @@
+apiVersion: security-core/v1
+kind: IAMConfig
+metadata:
+  name: security-core-iam
+  owner: security-core
+  partOf: core-systems
+  environment: prod
+  labels:
+    managed-by: security-core
+    compliance: iso27001
+  annotations:
+    description: "Единый источник прав для security-core (AWS‑ориентировано)."
+
+spec:
+  defaults:
+    session:
+      maxDurationSeconds: 3600
+      requireMFA: true
+      allowSessionTags: true
+    tags:
+      Component: security-core
+      PartOf: core-systems
+      ManagedBy: terraform
+      Environment: prod
+
+  providers:
+    aws:
+      partition: aws
+      regions: [ eu-central-1 ]
+      accounts:
+        - name: prod
+          id: "000000000000"        # заменить на реальный
+          alias: "security-core-prod"
+        - name: stage
+          id: "000000000001"        # заменить на реальный
+          alias: "security-core-stage"
+      oidcProviders:
+        github:
+          url: "token.actions.githubusercontent.com"
+          audience: "sts.amazonaws.com"
+
+  policyLibrary:
+    # Permission Boundary: «PowerUser без IAM/Organizations/Account», плюс запрет опасных сервисов через Deny.
+    boundaries:
+      - name: boundary.poweruser-no-iam
+        document:
+          Version: "2012-10-17"
+          Statement:
+            # Boundary должен содержать только Allow; для запретов используем SCP/inline Deny в ролях ниже.
+            - Sid: AllowMostButNotIAM
+              Effect: Allow
+              Action: "*"
+              Resource: "*"
+              Condition:
+                StringNotEquals:
+                  aws:CalledVia: [ "iam.amazonaws.com", "organizations.amazonaws.com", "account.amazonaws.com" ]
+        tags:
+          Purpose: "Boundary for engineers/CI"
+
+    # Библиотека inline‑политик (микроскоупы).
+    policies:
+      - name: policy.sts.tag-session
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: STSTagSession
+              Effect: Allow
+              Action:
+                - "sts:TagSession"
+                - "sts:AssumeRole"
+                - "sts:AssumeRoleWithWebIdentity"
+              Resource: "*"
+
+      - name: policy.kms.use
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: KMSUseWithContext
+              Effect: Allow
+              Action:
+                - "kms:Encrypt"
+                - "kms:Decrypt"
+                - "kms:ReEncrypt*"
+                - "kms:GenerateDataKey*"
+                - "kms:DescribeKey"
+              Resource: "arn:aws:kms:*:*:key/*"
+              Condition:
+                StringEquals:
+                  kms:EncryptionContext:App: "security-core"
+
+      - name: policy.s3.app-buckets-rw
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: S3RWAppBuckets
+              Effect: Allow
+              Action:
+                - "s3:PutObject"
+                - "s3:GetObject"
+                - "s3:DeleteObject"
+                - "s3:ListBucket"
+              Resource:
+                - "arn:aws:s3:::security-core-*"
+                - "arn:aws:s3:::security-core-*/*"
+              Condition:
+                StringEquals:
+                  s3:ResourceAccount: "${aws:PrincipalAccount}"
+            - Sid: EnforceKmsAndTags
+              Effect: Allow
+              Action: "s3:PutObject"
+              Resource: "arn:aws:s3:::security-core-*/*"
+              Condition:
+                StringEquals:
+                  s3:x-amz-server-side-encryption: "aws:kms"
+                ForAllValues:StringEquals:
+                  s3:RequestObjectTag/App: "security-core"
+
+      - name: policy.ecr.push-pull
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: ECRPullPush
+              Effect: Allow
+              Action:
+                - "ecr:GetAuthorizationToken"
+                - "ecr:BatchCheckLayerAvailability"
+                - "ecr:CompleteLayerUpload"
+                - "ecr:UploadLayerPart"
+                - "ecr:InitiateLayerUpload"
+                - "ecr:PutImage"
+                - "ecr:GetDownloadUrlForLayer"
+                - "ecr:BatchGetImage"
+              Resource: "*"
+
+      - name: policy.logs.write
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: CWLogsWrite
+              Effect: Allow
+              Action:
+                - "logs:CreateLogGroup"
+                - "logs:CreateLogStream"
+                - "logs:PutLogEvents"
+              Resource:
+                - "arn:aws:logs:*:*:log-group:/aws/security-core/*"
+                - "arn:aws:logs:*:*:log-group:/aws/security-core/*:log-stream:*"
+
+      - name: policy.parameters.read
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: SSMParamsRead
+              Effect: Allow
+              Action:
+                - "ssm:GetParameter"
+                - "ssm:GetParameters"
+                - "ssm:GetParametersByPath"
+              Resource: "arn:aws:ssm:*:*:parameter/security-core/*"
+
+      - name: policy.secrets.read
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: SecretsRead
+              Effect: Allow
+              Action:
+                - "secretsmanager:GetSecretValue"
+                - "secretsmanager:DescribeSecret"
+              Resource: "arn:aws:secretsmanager:*:*:secret:security-core/*"
+
+      - name: policy.guardduty.readonly
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: GuardDutyRO
+              Effect: Allow
+              Action:
+                - "guardduty:Get*"
+                - "guardduty:List*"
+                - "securityhub:Get*"
+                - "securityhub:Describe*"
+                - "securityhub:List*"
+              Resource: "*"
+
+      - name: policy.incident-response
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: IRReadTrails
+              Effect: Allow
+              Action:
+                - "cloudtrail:LookupEvents"
+                - "cloudtrail:DescribeTrails"
+              Resource: "*"
+            - Sid: IRForensicsS3
+              Effect: Allow
+              Action:
+                - "s3:GetObject"
+                - "s3:ListBucket"
+              Resource:
+                - "arn:aws:s3:::security-core-forensics-*"
+                - "arn:aws:s3:::security-core-forensics-*/*"
+
+    # Общие запрещающие (inline Deny) блоки для ролей.
+    denySnippets:
+      - name: deny.dangerous-services
+        document:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: DenyIAMAndOrg
+              Effect: Deny
+              Action:
+                - "iam:*"
+                - "organizations:*"
+                - "account:*"
+              Resource: "*"
+            - Sid: DenyWildcardPassRole
+              Effect: Deny
+              Action: "iam:PassRole"
+              Resource: "*"
+              Condition:
+                StringNotLike:
+                  iam:PassedToService:
+                    - "ecs-tasks.amazonaws.com"
+                    - "eks.amazonaws.com"
+                    - "ec2.amazonaws.com"
+
+  roles:
+    # Роль для GitHub Actions (OIDC), деплой образов/манифестов.
+    - name: role.ci.deploy
+      provider: aws
+      account: prod
+      description: "CI/CD deploy role (GitHub OIDC)."
+      permissionsBoundary: boundary.poweruser-no-iam
+      maxSessionDurationSeconds: 3600
+      trust:
+        type: oidc
+        providerRef: github
+        conditions:
+          StringEquals:
+            token.actions.githubusercontent.com:aud: "sts.amazonaws.com"
+          StringLike:
+            token.actions.githubusercontent.com:sub:
+              - "repo:ORG/REPO:ref:refs/heads/main"
+              - "repo:ORG/REPO:ref:refs/tags/*"
+      inlinePolicies:
+        attach:
+          - policy.sts.tag-session
+          - policy.ecr.push-pull
+          - policy.kms.use
+          - policy.s3.app-buckets-rw
+          - policy.logs.write
+          - policy.parameters.read
+      inlineDeny:
+        attach:
+          - deny.dangerous-services
+      managedPolicies:
+        attachArns:
+          - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+      session:
+        tagsRequired:
+          - App
+          - Owner
+        defaultTags:
+          App: security-core
+          Owner: "ci"
+        mfa: false
+
+    # Роль «человек‑инженер» с MFA, для аварийных операций в проде (без IAM).
+    - name: role.human.engineer
+      provider: aws
+      account: prod
+      description: "Human engineer with MFA, limited by boundary."
+      permissionsBoundary: boundary.poweruser-no-iam
+      maxSessionDurationSeconds: 3600
+      trust:
+        type: same-account
+        conditions:
+          Bool:
+            aws:MultiFactorAuthPresent: "true"
+      inlinePolicies:
+        attach:
+          - policy.sts.tag-session
+          - policy.kms.use
+          - policy.s3.app-buckets-rw
+          - policy.logs.write
+          - policy.parameters.read
+          - policy.secrets.read
+      inlineDeny:
+        attach:
+          - deny.dangerous-services
+      managedPolicies:
+        attachArns:
+          - "arn:aws:iam::aws:policy/PowerUserAccess"
+      session:
+        tagsRequired: [ App, Owner ]
+        defaultTags:
+          App: security-core
+          Owner: "human"
+        mfa: true
+
+    # ReadOnly для аудиторов/наблюдения.
+    - name: role.readonly
+      provider: aws
+      account: prod
+      description: "ReadOnly с MFA, доступ к SecurityHub/GuardDuty."
+      maxSessionDurationSeconds: 3600
+      trust:
+        type: same-account
+        conditions:
+          Bool:
+            aws:MultiFactorAuthPresent: "true"
+      inlinePolicies:
+        attach:
+          - policy.guardduty.readonly
+      managedPolicies:
+        attachArns:
+          - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+      session:
+        mfa: true
+
+    # Инцидент‑респондер (чтение трейлов и форензики).
+    - name: role.ir
+      provider: aws
+      account: prod
+      description: "Incident Response (CloudTrail, forensics S3)."
+      maxSessionDurationSeconds: 3600
+      trust:
+        type: same-account
+        conditions:
+          Bool:
+            aws:MultiFactorAuthPresent: "true"
+      inlinePolicies:
+        attach:
+          - policy.incident-response
+          - policy.guardduty.readonly
+      managedPolicies:
+        attachArns:
+          - "arn:aws:iam::aws:policy/AWSSecurityHubReadOnlyAccess"
+      session:
+        mfa: true
+
+  sso:
+    permissionSets:
+      - name: sso.poweruser-no-iam
+        description: "PowerUser без IAM/Org (через boundary)."
+        managedPolicies:
+          attachArns:
+            - "arn:aws:iam::aws:policy/PowerUserAccess"
+        customerManagedPolicies:
+          attach:
+            - policy.guardduty.readonly
+        sessionDuration: "PT1H"
+        relayState: "https://console.aws.amazon.com/"
+        tags:
+          Purpose: "Engineer SSO"
+        permissionsBoundary: boundary.poweruser-no-iam
+
+      - name: sso.readonly
+        description: "Только чтение + SecurityHub/GuardDuty."
+        managedPolicies:
+          attachArns:
+            - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+            - "arn:aws:iam::aws:policy/AWSSecurityHubReadOnlyAccess"
+        sessionDuration: "PT1H"
+        tags:
+          Purpose: "Audit SSO"
+
+    assignments:
+      - permissionSet: sso.poweruser-no-iam
+        principalType: group
+        principalName: "eng-sec-core"
+        accounts: [ prod, stage ]
+      - permissionSet: sso.readonly
+        principalType: group
+        principalName: "auditors"
+        accounts: [ prod ]
+
+  eks:
+    irsa:
+      # Пример: сервис‑аккаунт в EKS с узким доступом к Logs/Parameters.
+      - name: sa.security-core-api
+        clusterOIDCProviderArn: "arn:aws:iam::000000000000:oidc-provider/oidc.eks.eu-central-1.amazonaws.com/id/CLUSTER_ID"
+        namespace: "security-core"
+        serviceAccountName: "api"
+        policy:
+          attach:
+            - policy.logs.write
+            - policy.parameters.read
+        tags:
+          Purpose: "IRSA for API"
+
+  validation:
+    requireBoundaryFor:
+      roles:
+        - role.ci.deploy
+        - role.human.engineer
+    enforceMFARoles:
+      - role.human.engineer
+      - role.readonly
+      - role.ir
+    denyInlineOnRoles:
+      - name: role.ci.deploy
+        denySnippets: [ deny.dangerous-services ]

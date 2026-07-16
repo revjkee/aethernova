@@ -1,0 +1,245 @@
+# =============================================================================
+# Aethernova Chain Core — Telemetry (industrial-grade)
+# Назначение: единый конфиг для SDK/агентов и (опционально) локального OTel Collector.
+# Верификация и источники:
+# - OpenTelemetry Specification (env vars, SDK, data model):
+#   https://opentelemetry.io/docs/specs/otel/                        # Спецификация (обзор)
+#   https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/  # Переменные окружения
+# - OpenTelemetry Protocol (OTLP):
+#   https://github.com/open-telemetry/opentelemetry-proto            # Протокол/схемы
+# - OpenTelemetry Collector (pipelines, processors):
+#   https://opentelemetry.io/docs/collector/configuration/           # Формат конфигурации
+# - Resource Semantic Conventions:
+#   https://opentelemetry.io/docs/specs/semconv/                     # Семантические атрибуты
+# - Batch processor, memory_limiter, retry:
+#   https://opentelemetry.io/docs/collector/configuration/#processors
+# - Prometheus exposition (pull):
+#   https://prometheus.io/docs/instrumenting/exposition_formats/     # Экспозиция метрик
+# - Collector security & TLS/mTLS:
+#   https://opentelemetry.io/docs/collector/security/                # Рекомендации по безопасности
+# =============================================================================
+
+version: 1
+
+# -----------------------------------------------------------------------------
+# Секция SDK: параметры для приложений/агентов (язык-агностично).
+# Эти опции транслируются в ENV переменные SDK (см. ссылки выше).
+# -----------------------------------------------------------------------------
+sdk:
+  service:
+    name: "${OTEL_SERVICE_NAME:-aethernova-chain-core}"        # см. semconv
+    namespace: "${OTEL_SERVICE_NAMESPACE:-blockchain}"
+    instance_id: "${OTEL_RESOURCE_ATTRIBUTES_SERVICE_INSTANCE_ID:-${HOSTNAME:-local}}"
+    environment: "${DEPLOY_ENV:-dev}"                          # env tag
+
+  resource:
+    # Доп. атрибуты ресурса по семантическим соглашениям.
+    attributes:
+      service.version: "${SERVICE_VERSION:-0.1.0}"
+      deployment.environment: "${DEPLOY_ENV:-dev}"
+      cloud.region: "${CLOUD_REGION:-local}"
+      host.arch: "${HOST_ARCH:-x86_64}"
+      telemetry.distro: "aethernova-otel-profile"
+
+  tracing:
+    enabled: true
+    # Родительский + вероятностный семплинг (рекомендовано в прод):
+    # https://opentelemetry.io/docs/specs/otel/trace/sdk/#sampler
+    sampler:
+      type: parentbased_traceidratio
+      ratio: ${OTEL_TRACES_SAMPLER_ARG:-0.1}      # 10% по умолчанию
+    span_limits:
+      attribute_value_length_limit: 4096
+      attribute_count_limit: 128
+      event_count_limit: 256
+      link_count_limit: 128
+    # Экспорт трейсов через OTLP (gRPC с TLS/mTLS).
+    exporters:
+      otlp:
+        protocol: "${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}"        # grpc|http/protobuf
+        endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-https://otel-collector:4317}"
+        # Аутентификация: заголовок или bearer-токен.
+        headers:
+          authorization: "${OTEL_EXPORTER_OTLP_HEADERS_AUTHORIZATION:-}"
+        timeout: 10s
+        retry:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 10s
+          max_elapsed_time: 60s
+        tls:
+          insecure: false
+          # При mTLS задайте пути к файлам:
+          ca_file: "${OTEL_EXPORTER_OTLP_TLS_CA_FILE:-/etc/otel/ca.pem}"
+          cert_file: "${OTEL_EXPORTER_OTLP_TLS_CERT_FILE:-/etc/otel/tls.crt}"
+          key_file: "${OTEL_EXPORTER_OTLP_TLS_KEY_FILE:-/etc/otel/tls.key}"
+          insecure_skip_verify: false
+
+  metrics:
+    enabled: true
+    # Временная агрегированность и агрегации определяются SDK/читалками:
+    # https://opentelemetry.io/docs/specs/otel/metrics/
+    readers:
+      - type: otlp
+        protocol: "${OTEL_EXPORTER_OTLP_METRICS_PROTOCOL:-grpc}"
+        endpoint: "${OTEL_EXPORTER_OTLP_METRICS_ENDPOINT:-https://otel-collector:4317}"
+        timeout: 10s
+        retry:
+          enabled: true
+      - type: prometheus
+        # Локальная экспозиция для pull-скрейпа Prometheus:
+        endpoint: "${PROMETHEUS_EXPORTER_ENDPOINT:-0.0.0.0:9464}"
+        disable_target_info: false
+    views:
+      # Пример нормализации high-cardinality лейблов.
+      - name: "rpc_client_duration_bucketed"
+        instrument:
+          name: "rpc.client.duration"
+          type: histogram
+        aggregation:
+          explicit_bucket_boundaries: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+
+  logs:
+    enabled: true
+    level: "${OTEL_LOG_LEVEL:-info}"                # trace|debug|info|warn|error|fatal
+    # Экспорт логов через OTLP (далее коллектор может слать в Loki/ES и т.д.)
+    exporters:
+      otlp:
+        protocol: "${OTEL_EXPORTER_OTLP_LOGS_PROTOCOL:-grpc}"
+        endpoint: "${OTEL_EXPORTER_OTLP_LOGS_ENDPOINT:-https://otel-collector:4317}"
+        timeout: 10s
+        retry:
+          enabled: true
+        tls:
+          insecure: false
+          ca_file: "${OTEL_EXPORTER_OTLP_TLS_CA_FILE:-/etc/otel/ca.pem}"
+          cert_file: "${OTEL_EXPORTER_OTLP_TLS_CERT_FILE:-/etc/otel/tls.crt}"
+          key_file: "${OTEL_EXPORTER_OTLP_TLS_KEY_FILE:-/etc/otel/tls.key}"
+
+  processors:
+    # Батчинг согласно рекомендациям OTel Collector:
+    # https://opentelemetry.io/docs/collector/configuration/#batch
+    batch:
+      send_batch_size: 8192
+      timeout: 5s
+      send_batch_max_size: 16384
+      metadata_keys: []
+    # Лимитер памяти на стороне SDK-агента (если поддерживается):
+    memory_limiter:
+      check_interval: 1s
+      limit_mib: ${OTEL_MEMORY_LIMIT_MIB:-512}
+      spike_limit_mib: ${OTEL_MEMORY_SPIKE_LIMIT_MIB:-128}
+    # Редактирование/маскирование секретов (если поддерживается в выбранном агенте/языке).
+    attributes:
+      actions:
+        - key: "db.password"
+          action: "update"
+          value: "[REDACTED]"
+        - key: "http.request.header.authorization"
+          action: "delete"
+
+# -----------------------------------------------------------------------------
+# (Опционально) Встроенная конфигурация локального OpenTelemetry Collector.
+# Если вы используете внешний Collector — оставьте этот блок отключенным.
+# Формат ниже соответствует спецификации Collector (см. ссылки выше).
+# -----------------------------------------------------------------------------
+collector:
+  enabled: ${ENABLE_LOCAL_COLLECTOR:-false}
+
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"
+          tls:
+            cert_file: "/etc/otel/tls/server.crt"
+            key_file: "/etc/otel/tls/server.key"
+        http:
+          endpoint: "0.0.0.0:4318"
+          tls:
+            cert_file: "/etc/otel/tls/server.crt"
+            key_file: "/etc/otel/tls/server.key"
+    # Для pull-метрик Prometheus от нод/процессов:
+    prometheus:
+      config:
+        scrape_configs:
+          - job_name: "aethernova-chain-core"
+            scrape_interval: 10s
+            static_configs:
+              - targets: ["127.0.0.1:9464"]
+
+  processors:
+    memory_limiter:
+      check_interval: 1s
+      limit_mib: ${OTEL_COLLECTOR_MEMORY_LIMIT_MIB:-1024}
+      spike_limit_mib: ${OTEL_COLLECTOR_MEMORY_SPIKE_LIMIT_MIB:-256}
+    batch:
+      send_batch_size: 8192
+      timeout: 5s
+      send_batch_max_size: 16384
+    attributes/scrub:
+      actions:
+        - key: "db.password"
+          action: "update"
+          value: "[REDACTED]"
+        - key: "http.request.header.authorization"
+          action: "delete"
+    resourcedetection:
+      detectors: [env, system]
+      timeout: 5s
+      override: false
+
+  exporters:
+    # Основной канал — OTLP дальше в центральный Collector/Observability стек.
+    otlp:
+      endpoint: "${UPSTREAM_OTLP_ENDPOINT:-https://otel-gateway:4317}"
+      tls:
+        insecure: false
+        ca_file: "/etc/otel/ca/chain.pem"
+        cert_file: "/etc/otel/tls/client.crt"
+        key_file: "/etc/otel/tls/client.key"
+      headers:
+        authorization: "${UPSTREAM_OTLP_AUTHORIZATION:-}"
+      sending_queue:
+        enabled: true
+        num_consumers: 8
+        queue_size: 8192
+      retry_on_failure:
+        enabled: true
+        initial_interval: 1s
+        max_interval: 10s
+        max_elapsed_time: 60s
+
+    # Локальная экспозиция метрик для Prometheus (pull):
+    prometheus:
+      endpoint: "0.0.0.0:9465"     # отдельный порт коллектора
+      resource_to_telemetry_conversion:
+        enabled: true
+
+    # Диагностический экспорт в лог (отключен по умолчанию).
+    logging:
+      loglevel: "error"
+
+  extensions:
+    health_check:
+      endpoint: "0.0.0.0:13133"
+    pprof:
+      endpoint: "0.0.0.0:1777"
+    zpages:
+      endpoint: "0.0.0.0:55679"
+
+  service:
+    extensions: [health_check, pprof, zpages]
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [memory_limiter, attributes/scrub, batch]
+        exporters: [otlp]
+      metrics:
+        receivers: [otlp, prometheus]
+        processors: [memory_limiter, batch]
+        exporters: [otlp, prometheus]
+      logs:
+        receivers: [otlp]
+        processors: [memory_limiter, attributes/scrub, batch]
+        exporters: [otlp]

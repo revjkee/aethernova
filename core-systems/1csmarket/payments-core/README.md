@@ -1,0 +1,3 @@
+# payments-core
+
+Project Documentation

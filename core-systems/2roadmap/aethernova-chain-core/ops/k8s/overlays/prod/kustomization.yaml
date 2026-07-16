@@ -1,0 +1,149 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Прод-namespace и единые метки/аннотации
+namespace: aethernova-prod
+namePrefix: anc-
+commonLabels:
+  app.kubernetes.io/name: aethernova-chain-core
+  app.kubernetes.io/instance: chain-core-prod
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/part-of: aethernova
+  environment: prod
+commonAnnotations:
+  cluster.aethernova.io/tier: core
+  cluster.aethernova.io/owner: platform-ops
+
+# Базовые манифесты
+resources:
+  - ../../base
+
+generatorOptions:
+  disableNameSuffixHash: false   # включаем хеш для откатов/rollout по конфигам
+
+# Генерация prod-конфига из TOML (существующий файл)
+configMapGenerator:
+  - name: chain-core-config
+    behavior: replace
+    files:
+      - prod.toml=../../../../configs/env/prod.toml
+    options:
+      labels:
+        app.kubernetes.io/component: config
+      annotations:
+        reloader.stakater.com/match: "true"
+
+# Патчи для ужесточения безопасности, ресурсов и проб (нацелены на Deployment с именем aethernova-chain-core)
+patches:
+  # JSON6902 patch: ресурсы/лимиты/пробы/безопасность/реплики
+  - target:
+      version: v1
+      kind: Deployment
+      name: aethernova-chain-core
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          fsGroup: 10001
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: APP_ENV
+            value: production
+          - name: TZ
+            value: UTC
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: config
+          mountPath: /etc/aethernova
+          readOnly: true
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: config
+          configMap:
+            name: chain-core-config
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /livez
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 6
+      - op: add
+        path: /spec/template/spec/containers/0/startupProbe
+        value:
+          httpGet:
+            path: /healthz
+            port: 8080
+          failureThreshold: 30
+          periodSeconds: 2
+
+  # Добавляем аннотации для контроля rollout при смене конфигов
+  - target:
+      version: v1
+      kind: Deployment
+      name: aethernova-chain-core
+    patch: |
+      - op: add
+        path: /spec/template/metadata/annotations/checksum-config
+        value: dummy # будет автоматически перегенерирован kustomize за счет hash у ConfigMap
+
+  # Усиление PodDisruptionBudget (если PDB в базе — патчим его; иначе можно игнорировать)
+  - target:
+      version: policy/v1
+      kind: PodDisruptionBudget
+      name: aethernova-chain-core
+    patch: |
+      - op: replace
+        path: /spec/minAvailable
+        value: 1
+
+# Имиджи можно фиксировать через kustomize edit set image в CI/CD.
+# Если необходимо — раскомментируйте и задайте конкретный тег:
+# images:
+#   - name: ghcr.io/aethernova/chain-core
+#     newTag: v1.0.0
+
+# Замена namespace в уже описанных ресурсах базового слоя (если там он задан)
+namespaceSelector:
+  matchLabels:
+    environment: prod

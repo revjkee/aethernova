@@ -1,0 +1,3 @@
+# auction-core
+
+Project Documentation

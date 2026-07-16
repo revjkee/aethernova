@@ -1,0 +1,225 @@
+name: ci
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Минимально необходимые глобальные права; при необходимости усиливаются на уровне job
+permissions:
+  contents: read
+
+env:
+  PY_VERSIONS: '["3.11", "3.12"]'
+  WORKDIR: "."
+  COV_FAIL_UNDER: "85"
+  SBOM_FILE: "sbom.spdx.json"
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # для загрузки SARIF в Code Scanning
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install ruff
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.6.9
+
+      - name: Ruff format check
+        run: |
+          ruff format --check ${{ env.WORKDIR }}
+
+      - name: Ruff lint (SARIF)
+        run: |
+          ruff check --output-format sarif -o ruff.sarif ${{ env.WORKDIR }}
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ruff.sarif
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install mypy and plugins
+        run: |
+          python -m pip install --upgrade pip
+          pip install mypy==1.10.0 pydantic==2.* "sqlalchemy>=2" pydantic-settings "pydantic[mypy]" sqlalchemy2-stubs || true
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          if [ -f pyproject.toml ]; then pip install -e . || true; fi
+
+      - name: Run mypy
+        run: |
+          mypy --config-file mypy.ini
+
+  test:
+    name: Tests (pytest ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.11", "3.12" ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install -e .[dev,test] || pip install -e .
+          fi
+          pip install pytest pytest-cov
+
+      - name: Pytest with coverage
+        run: |
+          pytest -q --maxfail=1 --disable-warnings \
+            --cov=zero_trust_core --cov-report=xml --cov-report=term \
+            --cov-fail-under=${{ env.COV_FAIL_UNDER }}
+
+      - name: Upload coverage.xml
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  dep-audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit==2.7.3
+
+      - name: Run pip-audit (requirements*)
+        run: |
+          set -e
+          if ls requirements*.txt 1>/dev/null 2>&1; then
+            for f in requirements*.txt; do
+              echo "Auditing $f"
+              pip-audit -r "$f"
+            done
+          else
+            echo "No requirements*.txt found; auditing current environment (best-effort)"
+            pip-audit || true
+          fi
+
+  dep-review:
+    name: Dependency Review (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: true
+
+  build:
+    name: Build & Validate (sdist/wheel)
+    runs-on: ubuntu-latest
+    needs: [ lint, typecheck, test, dep-audit ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Build artifacts
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build --sdist --wheel --outdir dist
+          python -m twine check dist/*
+
+      - name: Upload dist/*
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  sbom:
+    name: SBOM (SPDX JSON)
+    runs-on: ubuntu-latest
+    needs: [ build ]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: ${{ env.SBOM_FILE }}
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: ${{ env.SBOM_FILE }}
+          retention-days: 7

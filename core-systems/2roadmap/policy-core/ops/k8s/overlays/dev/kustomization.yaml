@@ -1,0 +1,167 @@
+# path: policy-core/ops/k8s/overlays/dev/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# -------- Identity / Scoping --------
+namePrefix: dev-
+namespace: policy-core-dev
+
+commonLabels:
+  app.kubernetes.io/name: policy-core
+  app.kubernetes.io/instance: dev
+  app.kubernetes.io/part-of: policy-core
+  app.kubernetes.io/environment: dev
+  app.kubernetes.io/managed-by: kustomize
+
+commonAnnotations:
+  reloader.stakater.com/auto: "true"             # перезапуск при изменении CM/Secret
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8000"
+  prometheus.io/path: "/metrics"
+
+# -------- Base manifests --------
+resources:
+  - ../../base
+
+# -------- Image pinning for dev --------
+images:
+  - name: ghcr.io/aethernova/policy-core
+    newName: ghcr.io/aethernova/policy-core
+    newTag: dev-latest
+
+# -------- Configuration (dev overrides) --------
+generatorOptions:
+  disableNameSuffixHash: false
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    checksum/source: "overlays/dev"              # подсказка при отладке
+
+configMapGenerator:
+  - name: policy-core-config
+    behavior: merge
+    literals:
+      - APP_ENV=dev
+      - LOG_LEVEL=debug
+      - UVICORN_WORKERS=1
+      - FEATURE_FLAGS=dev,trace
+      - HTTP_PORT=8000
+      - HEALTH_PATH=/healthz
+      - READY_PATH=/readyz
+      - STARTUP_PATH=/startupz
+
+# Внимание: значения для dev — холдеры. Для production использовать внешние секреты/SealedSecret.
+secretGenerator:
+  - name: policy-core-secrets
+    behavior: merge
+    literals:
+      - JWT_SECRET=dev-change-me
+      - API_TOKEN=dev-token-placeholder
+
+# -------- Patches (JSON6902) --------
+patches:
+  # Patch Deployment: replicas, resources, probes, envFrom, securityContext, annotations
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: policy-core
+    patch: |
+      - op: add
+        path: /spec/replicas
+        value: 1
+      - op: add
+        path: /spec/template/metadata/annotations
+        value:
+          checksum/config: dev
+          scheduler.alpha.kubernetes.io/critical-pod: "false"
+      - op: add
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          seccompProfile:
+            type: RuntimeDefault
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+      - op: add
+        path: /spec/template/spec/containers/0/envFrom
+        value:
+          - configMapRef:
+              name: policy-core-config
+          - secretRef:
+              name: policy-core-secrets
+      - op: add
+        path: /spec/template/spec/containers/0/ports
+        value:
+          - name: http
+            containerPort: 8000
+            protocol: TCP
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+            ephemeral-storage: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+            ephemeral-storage: "1Gi"
+      - op: add
+        path: /spec/template/spec/containers/0/livenessProbe
+        value:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 6
+      - op: add
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 6
+          successThreshold: 1
+      - op: add
+        path: /spec/template/spec/containers/0/startupProbe
+        value:
+          httpGet:
+            path: /startupz
+            port: http
+          initialDelaySeconds: 1
+          periodSeconds: 2
+          failureThreshold: 30
+      - op: add
+        path: /spec/template/spec/terminationGracePeriodSeconds
+        value: 30
+
+  # Patch Service: явные порты, тип для dev
+  - target:
+      version: v1
+      kind: Service
+      name: policy-core
+    patch: |
+      - op: add
+        path: /spec/type
+        value: ClusterIP
+      - op: add
+        path: /spec/ports/0
+        value:
+          name: http
+          port: 8000
+          protocol: TCP
+          targetPort: http

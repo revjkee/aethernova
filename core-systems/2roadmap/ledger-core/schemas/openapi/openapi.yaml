@@ -1,0 +1,510 @@
+openapi: 3.1.0
+info:
+  title: Ledger Core Public API
+  summary: Надежный API для учета операций и экспорта отчетов
+  description: |
+    Стандартизированный REST API с идемпотентностью, четкой схемой ошибок, безопасной эволюцией и поддержкой вебхуков.
+    Все временные значения в ISO8601 UTC. Денежные суммы — десятичные строки с фиксированной точностью.
+  version: 1.0.0
+  termsOfService: https://example.com/terms
+  contact:
+    name: Data Platform Team
+    email: api-support@example.com
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  - url: https://api.example.com
+    description: Production
+  - url: https://staging-api.example.com
+    description: Staging
+
+tags:
+  - name: health
+    description: Готовность и живость сервиса
+  - name: transactions
+    description: CRUD операции с транзакциями
+  - name: exports
+    description: Экспорт отчетов и управление заданиями
+  - name: system
+    description: Служебные ресурсы и метаданные
+
+externalDocs:
+  url: https://docs.example.com/ledger-core
+  description: Полная документация и руководства
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Уникальный ключ клиента
+    OAuth2:
+      type: oauth2
+      description: OAuth2 Client Credentials
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.example.com/oauth/token
+          scopes:
+            ledger.read: Чтение транзакций
+            ledger.write: Создание и изменение транзакций
+            exports.manage: Управление экспортом
+  headers:
+    X-Request-Id:
+      description: Уникальный идентификатор запроса для трассировки
+      schema: { type: string, format: uuid }
+    X-RateLimit-Limit:
+      description: Лимит запросов в текущем окне
+      schema: { type: integer, minimum: 0 }
+    X-RateLimit-Remaining:
+      description: Оставшееся число запросов в окне
+      schema: { type: integer, minimum: 0 }
+    X-RateLimit-Reset:
+      description: Время в секундах до сброса окна лимитов
+      schema: { type: integer, minimum: 0 }
+    Retry-After:
+      description: Рекомендуемая пауза перед повтором запроса (секунды)
+      schema: { type: integer, minimum: 0 }
+  parameters:
+    TraceParent:
+      name: traceparent
+      in: header
+      description: W3C Trace Context
+      required: false
+      schema: { type: string }
+    Tenant:
+      name: X-Tenant-Id
+      in: header
+      description: Идентификатор тенанта
+      required: false
+      schema: { type: string, maxLength: 128 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Ключ идемпотентности для POST/PUT/PATCH
+      required: false
+      schema: { type: string, minLength: 1, maxLength: 255 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      description: Размер страницы
+    PageToken:
+      name: page_token
+      in: query
+      schema: { type: string }
+      description: Токен страницы (получен из next_page_token)
+    Sort:
+      name: sort
+      in: query
+      schema:
+        type: string
+        pattern: '^(created_at|amount|id):(asc|desc)$'
+        default: created_at:desc
+      description: Поле и порядок сортировки
+    FromTs:
+      name: from
+      in: query
+      schema: { type: string, format: date-time }
+      description: Начало интервала времени
+    ToTs:
+      name: to
+      in: query
+      schema: { type: string, format: date-time }
+      description: Конец интервала времени
+    IdParam:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[A-Za-z0-9_-]{8,64}$' }
+      description: Идентификатор ресурса
+  responses:
+    RateLimited:
+      description: Превышение лимитов
+      headers:
+        X-RateLimit-Limit: { $ref: '#/components/headers/X-RateLimit-Limit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/X-RateLimit-Remaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/X-RateLimit-Reset' }
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            rate_limited:
+              value:
+                code: RATE_LIMITED
+                message: Too many requests
+                status: 429
+    Unauthorized:
+      description: Требуется аутентификация
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Доступ запрещен
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Конфликт состояния (например, дубликат идемпотентного запроса с иным body)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [code, message, status]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        status: { type: integer, minimum: 100, maximum: 599 }
+        request_id: { type: string, format: uuid }
+        details:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    Money:
+      type: object
+      required: [currency, amount]
+      properties:
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        amount:
+          type: string
+          pattern: '^-?[0-9]+(\.[0-9]{1,6})?$'
+          description: Десятичная строка с точностью до 6 знаков
+    Transaction:
+      type: object
+      required: [id, kind, status, amount, created_at]
+      properties:
+        id: { type: string, pattern: '^[A-Za-z0-9_-]{8,64}$' }
+        external_id: { type: string, maxLength: 128 }
+        kind: { type: string, enum: [payment, refund, transfer, adjustment] }
+        status: { type: string, enum: [pending, posted, failed, canceled] }
+        amount: { $ref: '#/components/schemas/Money' }
+        description: { type: string, maxLength: 1024 }
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+            maxLength: 2048
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        value_date: { type: string, format: date }
+        counterparty:
+          type: object
+          properties:
+            name: { type: string, maxLength: 256 }
+            account: { type: string, maxLength: 64 }
+            iban: { type: string, maxLength: 34 }
+    TransactionCreateRequest:
+      type: object
+      required: [kind, amount]
+      properties:
+        kind: { type: string, enum: [payment, refund, transfer, adjustment] }
+        external_id: { type: string, maxLength: 128 }
+        amount: { $ref: '#/components/schemas/Money' }
+        description: { type: string, maxLength: 1024 }
+        metadata:
+          type: object
+          additionalProperties: { type: string, maxLength: 2048 }
+        value_date: { type: string, format: date }
+        counterparty:
+          type: object
+          properties:
+            name: { type: string, maxLength: 256 }
+            account: { type: string, maxLength: 64 }
+            iban: { type: string, maxLength: 34 }
+    TransactionPatchRequest:
+      type: object
+      description: JSON Merge Patch документ
+      additionalProperties: true
+      properties:
+        description: { type: string, maxLength: 1024 }
+        metadata:
+            type: object
+            additionalProperties: { type: string, maxLength: 2048 }
+        status: { type: string, enum: [posted, failed, canceled] }
+    PaginatedTransactions:
+      type: object
+      required: [items, next_page_token]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Transaction' }
+        next_page_token: { type: string, nullable: true }
+    ExportJob:
+      type: object
+      required: [id, kind, status, created_at]
+      properties:
+        id: { type: string, pattern: '^[A-Za-z0-9_-]{8,64}$' }
+        kind: { type: string, enum: [transactions_csv, transactions_json, gdpr_json] }
+        status: { type: string, enum: [queued, running, succeeded, failed, canceled] }
+        filters:
+          type: object
+          additionalProperties: true
+        location: { type: string, nullable: true, description: URL артефакта в хранилище }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        error: { $ref: '#/components/schemas/Error' }
+
+security:
+  - OAuth2: [ledger.read, ledger.write]
+  - ApiKeyAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Проверка готовности/живости
+      operationId: healthCheck
+      parameters:
+        - name: kind
+          in: query
+          schema: { type: string, enum: [liveness, readiness, startup], default: readiness }
+          description: Тип проверки
+        - $ref: '#/components/parameters/TraceParent'
+      responses:
+        '200':
+          description: Сервис здоров
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, degraded] }
+                  version: { type: string }
+                  uptime_seconds: { type: integer }
+        '503':
+          description: Сервис не готов
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/transactions:
+    get:
+      tags: [transactions]
+      summary: Список транзакций
+      operationId: listTransactions
+      security:
+        - OAuth2: [ledger.read]
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageToken'
+        - $ref: '#/components/parameters/Sort'
+        - $ref: '#/components/parameters/FromTs'
+        - $ref: '#/components/parameters/ToTs'
+        - in: query
+          name: kind
+          schema: { type: string }
+        - in: query
+          name: status
+          schema: { type: string }
+        - $ref: '#/components/parameters/Tenant'
+        - $ref: '#/components/parameters/TraceParent'
+      responses:
+        '200':
+          description: Успешно
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            X-RateLimit-Limit: { $ref: '#/components/headers/X-RateLimit-Limit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/X-RateLimit-Remaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/X-RateLimit-Reset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaginatedTransactions' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+    post:
+      tags: [transactions]
+      summary: Создать транзакцию (идемпотентно)
+      operationId: createTransaction
+      security:
+        - OAuth2: [ledger.write]
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/Tenant'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransactionCreateRequest' }
+            examples:
+              example:
+                value:
+                  kind: payment
+                  external_id: ext-123
+                  amount: { currency: USD, amount: "12.34" }
+                  description: Order #42
+                  metadata: { channel: web }
+      responses:
+        '201':
+          description: Создано
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+        '400':
+          description: Некорректный запрос
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/transactions/{id}:
+    get:
+      tags: [transactions]
+      summary: Получить транзакцию
+      operationId: getTransaction
+      security:
+        - OAuth2: [ledger.read]
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+        - $ref: '#/components/parameters/Tenant'
+        - $ref: '#/components/parameters/TraceParent'
+      responses:
+        '200':
+          description: Ок
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/Transaction' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+    patch:
+      tags: [transactions]
+      summary: Частичное обновление транзакции (JSON Merge Patch)
+      operationId: patchTransaction
+      security:
+        - OAuth2: [ledger.write]
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/Tenant'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/TransactionPatchRequest' }
+      responses:
+        '200':
+          description: Обновлено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+        '400':
+          description: Ошибка валидации
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+    delete:
+      tags: [transactions]
+      summary: Отмена/удаление транзакции
+      operationId: deleteTransaction
+      security:
+        - OAuth2: [ledger.write]
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+        - $ref: '#/components/parameters/Tenant'
+        - $ref: '#/components/parameters/TraceParent'
+      responses:
+        '204':
+          description: Удалено
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/exports:
+    post:
+      tags: [exports]
+      summary: Создать задание экспорта
+      operationId: createExport
+      security:
+        - OAuth2: [exports.manage]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [transactions_csv, transactions_json, gdpr_json] }
+                filters:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '202':
+          description: Принято в обработку
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportJob' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/exports/{id}:
+    get:
+      tags: [exports]
+      summary: Получить статус задания экспорта
+      operationId: getExport
+      security:
+        - OAuth2: [exports.manage, ledger.read]
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+        - $ref: '#/components/parameters/TraceParent'
+      responses:
+        '200':
+          description: Ок
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/ExportJob' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+webhooks:
+  export.completed:
+    post:
+      summary: Вебхук завершения экспорта
+      description: Отправляется при переходе задания в состояние succeeded или failed
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event, data]
+              properties:
+                event: { type: string, enum: [export.completed] }
+                sent_at: { type: string, format: date-time }
+                data: { $ref: '#/components/schemas/ExportJob' }
+      responses:
+        '200':
+          description: Принято
+
+x-idempotency:
+  storage: redis
+  ttlSeconds: 86400
+  onConflict: 409
+
+x-rate-limits:
+  policyRef: "ledger-core/ops/configs/policies/rate_limits.yaml"
+  headers: [X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After]

@@ -1,0 +1,375 @@
+name: reva-studio
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+    compress: "true"
+
+x-common-env: &common-env
+  TZ: ${TZ:-Europe/Riga}
+  APP_ENV: ${APP_ENV:-production}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+x-app-service: &app-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+    args:
+      APP_ENV: ${APP_ENV:-production}
+  env_file:
+    - .env
+  restart: unless-stopped
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  logging: *default-logging
+  networks:
+    - backend
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: reva-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Riga}
+      POSTGRES_DB: ${POSTGRES_DB:-reva}
+      POSTGRES_USER: ${POSTGRES_USER:-reva}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-200}
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-64MB}
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=${POSTGRES_WAL_BUFFERS:-16MB}
+      - -c
+      - default_statistics_target=100
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-reva} -d ${POSTGRES_DB:-reva} -h 127.0.0.1 -p 5432"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging: *default-logging
+    networks:
+      - backend
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+  redis:
+    image: redis:7-alpine
+    container_name: reva-redis
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - >
+        redis-server
+        --appendonly yes
+        --save 60 1000
+        --maxmemory ${REDIS_MAXMEMORY:-256mb}
+        --maxmemory-policy allkeys-lru
+        --requirepass "${REDIS_PASSWORD:-change_me}"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -a \"${REDIS_PASSWORD:-change_me}\" ping | grep PONG"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging: *default-logging
+    networks:
+      - backend
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+
+  minio:
+    image: minio/minio:latest
+    container_name: reva-minio
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Riga}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-revaadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change_me_strong}
+      MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_REDIRECT_URL:-http://localhost:9001}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O - http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 || exit 1"
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging: *default-logging
+    networks:
+      - backend
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: reva-minio-init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-revaadmin} ${MINIO_ROOT_PASSWORD:-change_me_strong};
+      mc mb --ignore-existing local/${MINIO_BUCKET_MEDIA:-reva-media};
+      mc mb --ignore-existing local/${MINIO_BUCKET_EXPORTS:-reva-exports};
+      mc anonymous set none local/${MINIO_BUCKET_MEDIA:-reva-media};
+      mc anonymous set none local/${MINIO_BUCKET_EXPORTS:-reva-exports};
+      exit 0;
+      "
+    networks:
+      - backend
+    profiles:
+      - bootstrap
+
+  migrate:
+    <<: *app-service
+    container_name: reva-migrate
+    command: >
+      sh -c "alembic upgrade head"
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-reva}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-reva}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-revaadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change_me_strong}
+      S3_BUCKET_MEDIA: ${MINIO_BUCKET_MEDIA:-reva-media}
+      S3_BUCKET_EXPORTS: ${MINIO_BUCKET_EXPORTS:-reva-exports}
+    restart: "no"
+    profiles:
+      - bootstrap
+
+  api:
+    <<: *app-service
+    container_name: reva-api
+    command: >
+      sh -c "
+      uvicorn src.main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers ${API_WORKERS:-2}
+      --proxy-headers
+      "
+    environment:
+      <<: *common-env
+      APP_ROLE: api
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-reva}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-reva}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/2
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-revaadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change_me_strong}
+      S3_BUCKET_MEDIA: ${MINIO_BUCKET_MEDIA:-reva-media}
+      S3_BUCKET_EXPORTS: ${MINIO_BUCKET_EXPORTS:-reva-exports}
+      UVICORN_PORT: "8000"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).read()\""
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  bot:
+    <<: *app-service
+    container_name: reva-bot
+    command: >
+      sh -c "python -m src.presentation.telegram.bot"
+    environment:
+      <<: *common-env
+      APP_ROLE: bot
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-reva}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-reva}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/2
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-revaadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change_me_strong}
+      S3_BUCKET_MEDIA: ${MINIO_BUCKET_MEDIA:-reva-media}
+      S3_BUCKET_EXPORTS: ${MINIO_BUCKET_EXPORTS:-reva-exports}
+
+  worker:
+    <<: *app-service
+    container_name: reva-worker
+    command: >
+      sh -c "
+      celery -A src.infrastructure.celery_app worker
+      --loglevel=${CELERY_LOG_LEVEL:-INFO}
+      --concurrency=${CELERY_CONCURRENCY:-2}
+      "
+    environment:
+      <<: *common-env
+      APP_ROLE: worker
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-reva}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-reva}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/2
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-revaadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change_me_strong}
+      S3_BUCKET_MEDIA: ${MINIO_BUCKET_MEDIA:-reva-media}
+      S3_BUCKET_EXPORTS: ${MINIO_BUCKET_EXPORTS:-reva-exports}
+
+  scheduler:
+    <<: *app-service
+    container_name: reva-scheduler
+    command: >
+      sh -c "
+      celery -A src.infrastructure.celery_app beat
+      --loglevel=${CELERY_LOG_LEVEL:-INFO}
+      "
+    environment:
+      <<: *common-env
+      APP_ROLE: scheduler
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-reva}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-reva}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/2
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-revaadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change_me_strong}
+      S3_BUCKET_MEDIA: ${MINIO_BUCKET_MEDIA:-reva-media}
+      S3_BUCKET_EXPORTS: ${MINIO_BUCKET_EXPORTS:-reva-exports}
+
+  flower:
+    image: mher/flower:2.0.1
+    container_name: reva-flower
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Riga}
+      FLOWER_PORT: 5555
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-change_me}@redis:6379/2
+      FLOWER_BASIC_AUTH: ${FLOWER_BASIC_AUTH:-admin:change_me}
+    command:
+      - celery
+      - --broker=redis://:${REDIS_PASSWORD:-change_me}@redis:6379/1
+      - flower
+      - --port=5555
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - backend
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    profiles:
+      - ops
+
+  pgadmin:
+    image: dpage/pgadmin4:9
+    container_name: reva-pgadmin
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@reva.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-change_me}
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
+      PGADMIN_CONFIG_CONSOLE_LOG_LEVEL: 20
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - backend
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    profiles:
+      - ops
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: reva-redisinsight
+    restart: unless-stopped
+    volumes:
+      - redisinsight_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - backend
+    ports:
+      - "${REDISINSIGHT_PORT:-5540}:5540"
+    profiles:
+      - ops
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: reva_postgres_data
+  redis_data:
+    name: reva_redis_data
+  minio_data:
+    name: reva_minio_data
+  pgadmin_data:
+    name: reva_pgadmin_data
+  redisinsight_data:
+    name: reva_redisinsight_data

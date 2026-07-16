@@ -1,0 +1,308 @@
+# ==============================================================================
+# OmniMind Core — Rate Limiting Policies (production-grade template)
+# Этот файл предназначен для шаблонизации Ansible ({{ ... }} приходят из group_vars).
+# Не содержит секретов. Поддерживает распределённое применение (Redis).
+# ==============================================================================
+
+version: 1
+
+globals:
+  enabled: true
+  # Часы: допускаем небольшую рассинхронизацию узлов
+  clock_skew_ms: 500
+  # Приоритеты политик: меньше — выше приоритет
+  priority_order: ["user", "api_key", "ip", "anonymous", "global"]
+
+  # Стратегии подсчёта: token_bucket | leaky_bucket | sliding_window
+  default_strategy: "token_bucket"
+
+  # RFC заголовки (IETF RateLimit Fields) — включены по умолчанию
+  emit_ratelimit_headers: true
+  # Формат: RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset
+  # Также X-RateLimit-* для обратной совместимости
+  emit_legacy_headers: true
+
+  # Ответ при ограничении
+  default_response:
+    http_status: 429
+    json_body:
+      code: "rate_limited"
+      message: "Too many requests"
+      retry_after_seconds: "{{ ratelimit_retry_after_default | default(1) }}"
+    headers:
+      Retry-After: "{{ ratelimit_retry_after_default | default(1) }}"
+
+  # Режим тени (не блокировать, только логировать и слать заголовки)
+  shadow_mode: "{{ ratelimit_shadow_mode | default(false) }}"
+
+# ------------------------------------------------------------------------------
+# Backends (state storage) — распределённое применение лимитов
+# ------------------------------------------------------------------------------
+backends:
+  # Основной стор для продакшна: Redis Cluster / Sentinel / Single
+  redis:
+    enabled: true
+    mode: "{{ ratelimit_redis.mode | default('single') }}"  # single|sentinel|cluster
+    endpoints: "{{ ratelimit_redis.endpoints | default(['127.0.0.1:6379']) }}"
+    username: "{{ ratelimit_redis.username | default('') }}"
+    password: "{{ vault_ratelimit_redis_password | default('') }}"
+    db: "{{ ratelimit_redis.db | default(0) }}"
+    tls:
+      enabled: "{{ ratelimit_redis.tls_enabled | default(false) }}"
+      insecure_skip_verify: "{{ ratelimit_redis.tls_insecure | default(false) }}"
+    timeouts:
+      connect_ms: 100
+      read_ms: 50
+      write_ms: 50
+    pool:
+      size: 200
+      max_conn_lifetime_s: 600
+      idle_timeout_s: 60
+  # Фолбэк (на случай недоступности Redis) — процессный стор
+  memory:
+    enabled: true
+    eviction_policy: "lru"
+    max_keys: 100000
+
+# ------------------------------------------------------------------------------
+# Key builders — как формируются ключи для лимитирования
+# ------------------------------------------------------------------------------
+keys:
+  ip:
+    sources: ["request.client_ip", "headers.x-forwarded-for:first"]
+    normalize_cidrs: ["/32", "/128"]
+  user:
+    sources: ["auth.user_id"]
+  api_key:
+    sources: ["headers.authorization:bearer_token", "headers.x-api-key"]
+    hash: "sha256"  # не храним ключи в открытом виде
+  anonymous:
+    sources: ["cookies.session_id", "request.client_ip"]
+    salt: "{{ ratelimit_anonymous_salt | default('change-me') }}"
+
+# ------------------------------------------------------------------------------
+# Matchers — правила сопоставления маршрутов/методов/хостов/тегов
+# ------------------------------------------------------------------------------
+matchers:
+  # Общий API v1
+  api_v1:
+    hosts: ["{{ public_host | default('api.example.com') }}"]
+    path_regex: "^/v1/.*$"
+    methods: ["GET","POST","PUT","DELETE","PATCH"]
+    tags: ["api","v1"]
+
+  # Публичные чтения (GET) — обычно допускают более высокий лимит
+  reads:
+    methods: ["GET"]
+    tags: ["read"]
+
+  # Записи и ресурсоемкие операции
+  writes:
+    methods: ["POST","PUT","DELETE","PATCH"]
+    tags: ["write"]
+
+  # Аутентификация/логин — уязвимо для брутфорса
+  auth:
+    path_regex: "^/(v1/)?auth/(login|token|refresh)$"
+    methods: ["POST"]
+    tags: ["auth"]
+
+  # Поисковые/LLM-запросы — потенциально тяжелые
+  heavy:
+    path_regex: "^/v1/(search|generate|plan)"
+    methods: ["POST","GET"]
+    tags: ["heavy"]
+
+# ------------------------------------------------------------------------------
+# Политики — конкретные лимиты по ключам и матчерам
+# При совпадении нескольких правил применяется наивысший приоритет из globals.priority_order
+# ------------------------------------------------------------------------------
+policies:
+
+  # --- Пользовательские лимиты (авторизованные пользователи) ---
+  - name: "user-default"
+    scope: "user"
+    match: ["api_v1"]
+    windows:
+      # burst: быстрое короткое окно (скользящее или токен-бакет)
+      - strategy: "token_bucket"
+        capacity: 60          # максимум токенов
+        refill_per_second: 30 # объем пополнения
+        window: "60s"         # справочный период
+      # sustained: устойчивый лимит
+      - strategy: "sliding_window"
+        limit: 300
+        window: "5m"
+    response:
+      headers:
+        RateLimit-Policy: "user; burst=30/60s; sustained=300/5m"
+
+  # Повышенные лимиты для тарифов Pro, Enterprise
+  - name: "user-pro"
+    scope: "user"
+    conditions:
+      user_tier: ["pro","enterprise"]
+    match: ["api_v1"]
+    windows:
+      - strategy: "token_bucket"
+        capacity: 120
+        refill_per_second: 60
+        window: "60s"
+      - strategy: "sliding_window"
+        limit: 3000
+        window: "5m"
+    response:
+      headers:
+        RateLimit-Policy: "user-pro; burst=60/60s; sustained=3000/5m"
+
+  # --- Лимиты по API ключу (машинные клиенты) ---
+  - name: "api-key-default"
+    scope: "api_key"
+    match: ["api_v1"]
+    windows:
+      - strategy: "token_bucket"
+        capacity: 120
+        refill_per_second: 60
+        window: "60s"
+      - strategy: "sliding_window"
+        limit: 6000
+        window: "10m"
+    response:
+      headers:
+        RateLimit-Policy: "api-key; burst=60/60s; sustained=6000/10m"
+
+  # Ужесточение для тяжелых маршрутов даже при api_key
+  - name: "api-key-heavy"
+    scope: "api_key"
+    match: ["api_v1","heavy"]
+    windows:
+      - strategy: "token_bucket"
+        capacity: 30
+        refill_per_second: 15
+        window: "60s"
+      - strategy: "sliding_window"
+        limit: 300
+        window: "10m"
+    response:
+      headers:
+        RateLimit-Policy: "api-key-heavy; burst=15/60s; sustained=300/10m"
+
+  # --- Per-IP для анонимного трафика (без auth/ключа) ---
+  - name: "ip-anonymous-default"
+    scope: "ip"
+    match: ["api_v1","reads"]
+    windows:
+      - strategy: "token_bucket"
+        capacity: 30
+        refill_per_second: 10
+        window: "60s"
+      - strategy: "sliding_window"
+        limit: 200
+        window: "10m"
+    response:
+      headers:
+        RateLimit-Policy: "ip-anon; burst=10/60s; sustained=200/10m"
+
+  - name: "ip-anonymous-writes"
+    scope: "ip"
+    match: ["api_v1","writes"]
+    windows:
+      - strategy: "token_bucket"
+        capacity: 10
+        refill_per_second: 5
+        window: "60s"
+      - strategy: "sliding_window"
+        limit: 60
+        window: "10m"
+    response:
+      headers:
+        RateLimit-Policy: "ip-anon-writes; burst=5/60s; sustained=60/10m"
+
+  # --- Анти-брутфорс для auth-маршрутов ---
+  - name: "auth-bruteforce-ip"
+    scope: "ip"
+    match: ["auth"]
+    windows:
+      - strategy: "sliding_window"
+        limit: 10
+        window: "5m"
+    ban:
+      enabled: true
+      threshold_failures: 20            # суммарные отказы/ошибки за период
+      lookback_window: "15m"
+      ban_duration: "30m"
+      track_status_classes: ["4xx","5xx"]
+    response:
+      http_status: 429
+      headers:
+        RateLimit-Policy: "auth-bruteforce; 10/5m"
+
+  # --- Глобальный предохранитель на слой шторма (защита кластера) ---
+  - name: "global-surge-guard"
+    scope: "global"
+    windows:
+      - strategy: "leaky_bucket"
+        capacity: 5000
+        drain_per_second: 4000
+        window: "1s"
+    response:
+      http_status: 503
+      json_body:
+        code: "overloaded"
+        message: "Service is temporarily overloaded"
+        retry_after_seconds: 1
+      headers:
+        Retry-After: "1"
+        RateLimit-Policy: "global-surge-guard"
+
+# ------------------------------------------------------------------------------
+# Исключения и белые списки
+# ------------------------------------------------------------------------------
+exemptions:
+  # Служебные подсети и хелсчеки
+  cidrs:
+    - "{{ monitoring_internal_cidrs | default([]) }}"
+  users:
+    # Системные сервисные учётки
+    - "{{ ratelimit_exempt_users | default([]) }}"
+  api_keys:
+    - "{{ ratelimit_exempt_api_keys | default([]) }}"
+
+# ------------------------------------------------------------------------------
+# Порядок применения и конфликтная логика
+# ------------------------------------------------------------------------------
+evaluation:
+  # Если совпало несколько политик — берём наиболее специфичную по scope приоритету,
+  # затем наиболее строгую по фактическому исчерпанию.
+  conflict_resolution: "by-scope-then-strictest"
+  # Кэш решений матчеров (мс)
+  matcher_cache_ms: 5000
+
+# ------------------------------------------------------------------------------
+# Телеметрия/логирование
+# ------------------------------------------------------------------------------
+telemetry:
+  enabled: true
+  # Метрики в Prometheus (экспорт через /metrics приложения)
+  metrics:
+    namespace: "omnimind_core_ratelimit"
+    labels:
+      env: "{{ app.env | default('production') }}"
+      service: "omnimind-core"
+  logs:
+    level: "{{ logging.level | default('info') }}"
+    redact_keys: ["api_key_hash", "user_id", "client_ip"]
+  tracing:
+    enabled: "{{ otlp.enabled | default(false) }}"
+    attributes:
+      component: "ratelimiter"
+
+# ------------------------------------------------------------------------------
+# Валидация (может использоваться стартовым скриптом)
+# ------------------------------------------------------------------------------
+validation:
+  require_backend: ["redis"]
+  ensure_policies_nonempty: true
+  ensure_windows_reasonable:
+    max_capacity: 100000
+    max_window: "1h"

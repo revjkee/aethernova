@@ -1,0 +1,508 @@
+name: security-core CI
+
+on:
+  push:
+    branches: [main, develop, release/**]
+    paths:
+      - "core-systems/security-core/**"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "core-systems/security-core/**"
+      - ".github/workflows/**"
+  schedule:
+    - cron: "0 4 * * *"   # Ежедневные security-сканы (04:00 UTC)
+  workflow_dispatch:
+
+# Глобальные минимальные разрешения (джобам повышаем точечно)
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  packages: read
+  id-token: none
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKDIR: core-systems/security-core
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  GO_VERSION: "1.22.x"
+  RUST_TOOLCHAIN: "stable"
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/security-core
+  TRIVY_SEVERITY: "CRITICAL,HIGH"
+  SEMGREP_RULES: "p/ci"
+  # Фиксация версий CLI-инструментов
+  STATICCHECK_VERSION: "2024.1.1"
+  GOSEC_VERSION: "2.20.1"
+  SEMGREP_ACTION_VERSION: "v1"
+  TRIVY_ACTION_VERSION: "0.25.0"
+
+jobs:
+  # Определяем, какие стеки затронуты изменениями
+  detect_changes:
+    name: Detect changed stacks
+    runs-on: ubuntu-24.04
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      node:   ${{ steps.filter.outputs.node }}
+      go:     ${{ steps.filter.outputs.go }}
+      rust:   ${{ steps.filter.outputs.rust }}
+      docker: ${{ steps.filter.outputs.docker }}
+      docs:   ${{ steps.filter.outputs.docs }}
+      any:    ${{ steps.filter.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          base: ${{ github.event_name == 'pull_request' && 'origin/' || '' }}${{ github.base_ref || 'main' }}
+          working-directory: .
+          filters: |
+            python:
+              - "${{ env.WORKDIR }}/**/*.py"
+              - "${{ env.WORKDIR }}/**/pyproject.toml"
+              - "${{ env.WORKDIR }}/**/requirements*.txt"
+            node:
+              - "${{ env.WORKDIR }}/**/package.json"
+              - "${{ env.WORKDIR }}/**/package-lock.json"
+              - "${{ env.WORKDIR }}/**/*.ts"
+              - "${{ env.WORKDIR }}/**/*.js"
+            go:
+              - "${{ env.WORKDIR }}/**/go.mod"
+              - "${{ env.WORKDIR }}/**/go.sum"
+              - "${{ env.WORKDIR }}/**/*.go"
+            rust:
+              - "${{ env.WORKDIR }}/**/Cargo.toml"
+              - "${{ env.WORKDIR }}/**/Cargo.lock"
+              - "${{ env.WORKDIR }}/**/*.rs"
+            docker:
+              - "${{ env.WORKDIR }}/**/Dockerfile"
+              - "${{ env.WORKDIR }}/docker/**"
+            docs:
+              - "${{ env.WORKDIR }}/**/*.md"
+              - "${{ env.WORKDIR }}/NOTICE"
+              - "${{ env.WORKDIR }}/THIRD_PARTY_NOTICES.md"
+            any:
+              - "${{ env.WORKDIR }}/**"
+
+  # ---------- Python ----------
+  python_lint_test:
+    name: Python • lint+type+audit+tests
+    needs: detect_changes
+    if: needs.detect_changes.outputs.python == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: |
+            ${{ env.WORKDIR }}/**/requirements*.txt
+            ${{ env.WORKDIR }}/**/pyproject.toml
+      - name: Install dev tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ruff==0.5.7" "mypy==1.10.0" "bandit==1.7.9" "pip-audit==2.7.3" "pytest==8.3.2" "pytest-cov==5.0.0"
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Ruff (lint)
+        run: ruff check .
+      - name: MyPy (types)
+        run: |
+          if [ -f mypy.ini ] || [ -f setup.cfg ] || [ -f pyproject.toml ]; then
+            mypy .
+          else
+            echo "No mypy config found; running with defaults"
+            mypy .
+          fi
+      - name: Bandit (SAST)
+        run: bandit -q -r . -x tests
+      - name: pip-audit (deps CVE)
+        run: pip-audit -r requirements.txt || pip-audit || true
+      - name: Tests
+        run: pytest -q --maxfail=1 --disable-warnings --cov --cov-report=xml
+      - name: Upload coverage xml
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-xml
+          path: ${{ env.WORKDIR }}/coverage.xml
+          if-no-files-found: ignore
+
+  # ---------- Node.js ----------
+  node_lint_test:
+    name: Node.js • lint+audit+tests
+    needs: detect_changes
+    if: needs.detect_changes.outputs.node == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: ${{ env.WORKDIR }}/**/package-lock.json
+      - name: npm ci (no scripts)
+        run: |
+          if [ -f package.json ]; then
+            npm ci --ignore-scripts
+          fi
+      - name: ESLint
+        run: |
+          if [ -f package.json ] && npx --yes eslint -v >/dev/null 2>&1; then
+            npx eslint .
+          else
+            echo "ESLint not configured; skipping"
+          fi
+      - name: npm audit
+        run: |
+          if [ -f package.json ]; then
+            npm audit --audit-level=high || true
+          fi
+      - name: Tests
+        run: |
+          if [ -f package.json ] && npm run | grep -q " test"; then
+            npm test --silent --if-present -- --ci || npm test --silent --if-present
+          else
+            echo "No tests script; skipping"
+          fi
+
+  # ---------- Go ----------
+  go_lint_test:
+    name: Go • vet+staticcheck+gosec+tests
+    needs: detect_changes
+    if: needs.detect_changes.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Go vet
+        run: go vet ./...
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@${{ env.STATICCHECK_VERSION }}
+          staticcheck ./...
+      - name: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v${{ env.GOSEC_VERSION }}
+          gosec ./...
+      - name: Go tests
+        run: go test ./... -race -count=1
+
+  # ---------- Rust ----------
+  rust_lint_test:
+    name: Rust • fmt+clippy+audit+tests
+    needs: detect_changes
+    if: needs.detect_changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - name: Cargo fmt
+        run: |
+          if [ -f Cargo.toml ]; then cargo fmt --all -- --check; fi
+      - name: Clippy
+        run: |
+          if [ -f Cargo.toml ]; then cargo clippy --all-targets -- -D warnings; fi
+      - name: cargo-audit
+        run: |
+          if [ -f Cargo.toml ]; then
+            cargo install cargo-audit --locked || true
+            cargo audit || true
+          fi
+      - name: Cargo tests
+        run: |
+          if [ -f Cargo.toml ]; then cargo test --all --quiet; fi
+
+  # ---------- CodeQL (multi-language SAST) ----------
+  codeql:
+    name: CodeQL • init+analyze
+    needs: detect_changes
+    if: needs.detect_changes.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: auto
+      - uses: github/codeql-action/analyze@v3
+
+  # ---------- Semgrep (rulepack p/ci) ----------
+  semgrep:
+    name: Semgrep • SAST
+    needs: detect_changes
+    if: needs.detect_changes.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: semgrep/semgrep-action@${{ env.SEMGREP_ACTION_VERSION }}
+        with:
+          config: ${{ env.SEMGREP_RULES }}
+          generateSarif: "1"
+          publishToken: ""
+          publishDeployment: ""
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+  # ---------- Gitleaks (secret scanning) ----------
+  gitleaks:
+    name: Gitleaks • secrets
+    needs: detect_changes
+    if: needs.detect_changes.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --source=. --no-banner --redact --report-format sarif --report-path gitleaks.sarif
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+
+  # ---------- SBOM (SPDX & CycloneDX) ----------
+  sbom:
+    name: SBOM • SPDX & CycloneDX
+    needs: detect_changes
+    if: needs.detect_changes.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SPDX
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ env.WORKDIR }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      - name: Generate CycloneDX
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ env.WORKDIR }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-artifacts
+          path: |
+            sbom.spdx.json
+            sbom.cdx.json
+
+  # ---------- FS vulnerability scan ----------
+  vuln_fs:
+    name: Trivy • FS scan
+    needs: detect_changes
+    if: needs.detect_changes.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy FS (SARIF)
+        uses: aquasecurity/trivy-action@${{ env.TRIVY_ACTION_VERSION }}
+        with:
+          scan-type: "fs"
+          scan-ref: ${{ env.WORKDIR }}
+          severity: ${{ env.TRIVY_SEVERITY }}
+          format: "sarif"
+          output: "trivy-fs.sarif"
+          vuln-type: "os,library"
+          hide-progress: true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+  # ---------- Build & scan container image ----------
+  build_container:
+    name: Container • build (+push on non-PR)
+    needs: [detect_changes, python_lint_test, node_lint_test, go_lint_test, rust_lint_test]
+    if: needs.detect_changes.outputs.docker == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=sha-${{ github.sha }}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKDIR }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+      - name: Export image digest
+        run: echo "IMAGE_DIGEST=${{ steps.build.outputs.digest }}" >> $GITHUB_ENV
+
+  scan_image:
+    name: Trivy • image scan
+    needs: build_container
+    if: needs.detect_changes.outputs.docker == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+    steps:
+      - name: Trivy image (SARIF)
+        uses: aquasecurity/trivy-action@${{ env.TRIVY_ACTION_VERSION }}
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}@${{ needs.build_container.outputs.image-digest || env.IMAGE_DIGEST }}"
+          format: "sarif"
+          output: "trivy-image.sarif"
+          severity: ${{ env.TRIVY_SEVERITY }}
+          hide-progress: true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+  # ---------- Cosign sign & provenance attest ----------
+  sign_and_attest:
+    name: Cosign • sign + attest provenance
+    needs: build_container
+    if: needs.detect_changes.outputs.docker == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write       # для keyless подписи
+      packages: write
+      contents: read
+    steps:
+      - name: Set IMAGE_REF
+        run: |
+          echo "IMAGE_REF=${{ env.IMAGE_NAME }}@${{ env.IMAGE_DIGEST }}" >> $GITHUB_ENV
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Cosign sign (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign --yes $IMAGE_REF
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          push-to-registry: true
+
+  # ---------- Consolidate & release artifacts ----------
+  release_artifacts:
+    name: Release • attach SBOM & notices
+    needs: [sbom, build_container]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom-artifacts
+          path: .
+      - uses: actions/checkout@v4
+      - name: Collect notices
+        run: |
+          cp ${{ env.WORKDIR }}/NOTICE ./NOTICE || true
+          cp ${{ env.WORKDIR }}/THIRD_PARTY_NOTICES.md ./THIRD_PARTY_NOTICES.md || true
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sbom.spdx.json
+            sbom.cdx.json
+            NOTICE
+            THIRD_PARTY_NOTICES.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------- Job summary ----------
+  summary:
+    name: Build Summary
+    needs:
+      - detect_changes
+      - python_lint_test
+      - node_lint_test
+      - go_lint_test
+      - rust_lint_test
+      - codeql
+      - semgrep
+      - gitleaks
+      - sbom
+      - vuln_fs
+      - build_container
+      - scan_image
+      - sign_and_attest
+      - release_artifacts
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Summarize
+        run: |
+          echo "## security-core CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Python: ${{ needs.detect_changes.outputs.python }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Node:   ${{ needs.detect_changes.outputs.node }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Go:     ${{ needs.detect_changes.outputs.go }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Rust:   ${{ needs.detect_changes.outputs.rust }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Docker: ${{ needs.detect_changes.outputs.docker }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Docs:   ${{ needs.detect_changes.outputs.docs }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Artifacts: SBOM (SPDX/CycloneDX), coverage.xml (если был Python), Trivy SARIFs." >> $GITHUB_STEP_SUMMARY

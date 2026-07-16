@@ -1,0 +1,329 @@
+---
+# Mythos Core — промышленный деплой через Ansible.
+# Режимы:
+#   deploy_mode: "docker" | "k8s"          (по умолчанию docker)
+# Ключевые переменные (см. defaults/main.yml):
+#   mythos_user, mythos_group, mythos_dirs, mythos_config, mythos_env, mythos_secrets
+#   image_repo, image_tag, image_digest (опц.), registry_auth
+#   systemd_unit_name, service_port, health_url
+#   k8s_namespace, k8s_manifest_src (шаблон/файл), k8s_wait_deployment
+#   selinux_enable, firewalld_enable
+#   logrotate_enable
+
+- name: "Preflight | Проверка платформы"
+  assert:
+    that:
+      - ansible_os_family in ['Debian','RedHat']
+    fail_msg: "Поддерживаются только семейства Debian/RedHat"
+    success_msg: "OS поддерживается"
+
+- name: "Preflight | Установить fact по режиму деплоя"
+  set_fact:
+    _deploy_mode: "{{ deploy_mode | default('docker') }}"
+
+- name: "Users | Создать группу"
+  become: true
+  group:
+    name: "{{ mythos_group | default('mythos') }}"
+    state: present
+
+- name: "Users | Создать пользователя без shell"
+  become: true
+  user:
+    name: "{{ mythos_user | default('mythos') }}"
+    group: "{{ mythos_group | default('mythos') }}"
+    shell: /usr/sbin/nologin
+    create_home: false
+    system: true
+    state: present
+
+- name: "FS | Создать каталоги"
+  become: true
+  file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ mythos_user | default('mythos') }}"
+    group: "{{ mythos_group | default('mythos') }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop: "{{ mythos_dirs | default([
+          {'path':'/opt/mythos-core','mode':'0750'},
+          {'path':'/etc/mythos-core','mode':'0750'},
+          {'path':'/var/lib/mythos-core','mode':'0750'},
+          {'path':'/var/log/mythos-core','mode':'0750'}
+        ]) }}"
+
+- name: "Config | Разместить основной конфиг (валидация через jq/ytt если доступно)"
+  become: true
+  copy:
+    dest: "/etc/mythos-core/app.yaml"
+    content: "{{ mythos_config | default('# empty config\n') }}"
+    owner: "{{ mythos_user | default('mythos') }}"
+    group: "{{ mythos_group | default('mythos') }}"
+    mode: "0640"
+  register: _cfg_main
+  notify: ["restart mythos-core"]
+
+- name: "Config | Переменные окружения (.env)"
+  become: true
+  copy:
+    dest: "/etc/mythos-core/app.env"
+    content: |
+      {% for k,v in (mythos_env | default({})).items() %}
+      {{ k }}={{ v }}
+      {% endfor %}
+    owner: "{{ mythos_user | default('mythos') }}"
+    group: "{{ mythos_group | default('mythos') }}"
+    mode: "0640"
+  when: (mythos_env | default({})) | length > 0
+  notify: ["restart mythos-core"]
+
+- name: "Secrets | Секреты в отдельном файле"
+  become: true
+  copy:
+    dest: "/etc/mythos-core/secret.env"
+    content: |
+      {% for k,v in (mythos_secrets | default({})).items() %}
+      {{ k }}={{ v }}
+      {% endfor %}
+    owner: "{{ mythos_user | default('mythos') }}"
+    group: "{{ mythos_group | default('mythos') }}"
+    mode: "0640"
+  when: (mythos_secrets | default({})) | length > 0
+  no_log: true
+  notify: ["restart mythos-core"]
+
+# --------------------------
+# Docker mode
+# --------------------------
+- block:
+    - name: "Docker | Установить Docker/Podman при необходимости"
+      become: true
+      package:
+        name: "{{ item }}"
+        state: present
+      loop: >-
+        {{ (docker_packages | default(
+            (ansible_os_family == 'Debian') | ternary(['docker.io'], ['podman'])
+          )) }}
+      when: docker_manage_install | default(true)
+
+    - name: "Docker | Логин в реестр (опционально)"
+      become: true
+      vars:
+        _reg: "{{ registry_auth | default({}) }}"
+      command: >
+        docker login {{ _reg.registry | default((image_repo | default('')).split('/')[0]) }}
+        -u {{ _reg.username }} -p {{ _reg.password }}
+      no_log: true
+      changed_when: false
+      when:
+        - (registry_auth | default({})) | length > 0
+        - _reg.username is defined
+        - _reg.password is defined
+        - (_deploy_mode == 'docker')
+
+    - name: "Docker | Вычислить тег/референс образа"
+      set_fact:
+        _image_ref: >-
+          {{ image_repo | default('registry.local/mythos/mythos-core') }}:{{ image_tag | default('latest') }}
+        _image_digest: "{{ image_digest | default('') }}"
+      when: _deploy_mode == 'docker'
+
+    - name: "Docker | Получить digest (если не задан) для пинования"
+      become: true
+      shell: "docker pull {{ _image_ref }} >/dev/null 2>&1 && docker inspect --format='{{'{{'}}index .RepoDigests 0{{'}}'}}' {{ _image_ref }} | awk -F@ '{print $2}'"
+      register: _digest_out
+      changed_when: false
+      when:
+        - _deploy_mode == 'docker'
+        - (_image_digest | length) == 0
+
+    - name: "Docker | Установить итоговый pinned reference"
+      set_fact:
+        _final_ref: >-
+          {{ (image_repo | default('registry.local/mythos/mythos-core')) }}@{{ (_image_digest | length > 0) | ternary(_image_digest, _digest_out.stdout | default('')) }}
+      when: _deploy_mode == 'docker'
+
+    - name: "Docker | Подтянуть pinned image"
+      become: true
+      command: "docker pull {{ _final_ref }}"
+      register: _pull
+      changed_when: "'Downloaded newer image' in _pull.stdout or 'Status: Downloaded' in _pull.stdout"
+      when: _deploy_mode == 'docker'
+
+    - name: "Systemd | Unit-файл для контейнера"
+      become: true
+      copy:
+        dest: "/etc/systemd/system/{{ systemd_unit_name | default('mythos-core.service') }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Mythos Core (containerized)
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=notify
+          Restart=always
+          RestartSec=5
+          User={{ mythos_user | default('mythos') }}
+          Group={{ mythos_group | default('mythos') }}
+          EnvironmentFile=-/etc/mythos-core/app.env
+          EnvironmentFile=-/etc/mythos-core/secret.env
+          ExecStartPre=-/usr/bin/docker rm -f mythos-core >/dev/null 2>&1
+          ExecStart=/usr/bin/docker run --name mythos-core \
+            --env-file /etc/mythos-core/app.env \
+            --env-file /etc/mythos-core/secret.env \
+            --read-only \
+            --pids-limit=4096 \
+            --memory={{ docker_memory | default('1g') }} \
+            --cpus={{ docker_cpus | default('1.0') }} \
+            --health-cmd="curl -sf {{ health_url | default('http://127.0.0.1:8081/readyz') }} || exit 1" \
+            --health-interval=10s \
+            --health-retries=3 \
+            --health-timeout=2s \
+            -p {{ service_port | default(8081) }}:8081 \
+            -v /etc/mythos-core:/config:ro \
+            -v /var/log/mythos-core:/var/log/mythos-core \
+            {{ _final_ref }}
+          ExecStop=/usr/bin/docker stop mythos-core
+
+          [Install]
+          WantedBy=multi-user.target
+      register: _unit
+      notify: ["daemon-reload","restart mythos-core"]
+      when: _deploy_mode == 'docker'
+
+    - name: "Systemd | Включить и запустить сервис"
+      become: true
+      systemd:
+        name: "{{ systemd_unit_name | default('mythos-core.service') }}"
+        enabled: true
+        state: started
+      when: _deploy_mode == 'docker'
+
+  when: _deploy_mode == 'docker'
+  rescue:
+    - name: "Docker | Откат: вернуть предыдущую версию unit при ошибке"
+      debug:
+        msg: "Ошибка в docker-блоке. Проверьте журнал. Откат unit-файла при необходимости выполните вручную."
+  always: []
+
+# --------------------------
+# Kubernetes mode
+# --------------------------
+- block:
+    - name: "K8s | Установить зависимости (python3-kubernetes) — опционально"
+      become: true
+      package:
+        name: "{{ (ansible_os_family == 'Debian') | ternary('python3-kubernetes','python3-kubernetes') }}"
+        state: present
+      when: k8s_manage_client | default(false)
+
+    - name: "K8s | Создать namespace"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ k8s_namespace | default('default') }}"
+      when: (k8s_namespace | default('default')) != 'default'
+
+    - name: "K8s | Рендер/Применить манифест"
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ k8s_namespace | default('default') }}"
+        src: "{{ k8s_manifest_src | default('files/mythos-core.yaml') }}"
+      register: _k8s_apply
+
+    - name: "K8s | Ожидать готовность Deployment"
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ k8s_namespace | default('default') }}"
+        name: "{{ k8s_wait_deployment | default('mythos-core') }}"
+      register: _dep_info
+      until: >
+        (_dep_info.resources | length) > 0 and
+        (_dep_info.resources[0].status.availableReplicas | default(0)) >=
+        (_dep_info.resources[0].spec.replicas | default(1))
+      retries: "{{ k8s_wait_retries | default(60) }}"
+      delay: "{{ k8s_wait_delay | default(5) }}"
+
+  when: _deploy_mode == 'k8s'
+  rescue:
+    - name: "K8s | Ошибка применения"
+      fail:
+        msg: "Применение манифеста провалилось. Проверьте корректность манифеста и доступ к кластеру."
+  always: []
+
+# --------------------------
+# SELinux / Firewall
+# --------------------------
+- name: "SELinux | Разрешить сетевые подключения контейнера (опционально)"
+  become: true
+  seboolean:
+    name: container_connect_network
+    state: true
+    persistent: true
+  when:
+    - selinux_enable | default(false)
+    - ansible_selinux is defined and ansible_selinux.status == "enabled"
+
+- name: "FirewallD | Разрешить порт сервиса (опционально)"
+  become: true
+  firewalld:
+    port: "{{ service_port | default(8081) }}/tcp"
+    permanent: true
+    state: enabled
+    immediate: true
+  when:
+    - firewalld_enable | default(false)
+    - ansible_facts.services['firewalld.service'] is defined or ansible_os_family == 'RedHat'
+
+# --------------------------
+# Logrotate
+# --------------------------
+- name: "Logrotate | Конфигурация (опционально)"
+  become: true
+  copy:
+    dest: "/etc/logrotate.d/mythos-core"
+    mode: "0644"
+    content: |
+      /var/log/mythos-core/*.log {
+        weekly
+        rotate 8
+        missingok
+        notifempty
+        compress
+        delaycompress
+        copytruncate
+      }
+  when: logrotate_enable | default(true)
+
+# --------------------------
+# Health-check
+# --------------------------
+- name: "Health | Проверка готовности сервиса (локально)"
+  uri:
+    url: "{{ health_url | default('http://127.0.0.1:8081/readyz') }}"
+    status_code: 200
+    return_content: false
+  register: _health
+  retries: 20
+  delay: 3
+  until: _health is succeeded
+  when: _deploy_mode == 'docker'
+
+- name: "Summary | Статус деплоя"
+  debug:
+    msg:
+      deploy_mode: "{{ _deploy_mode }}"
+      docker_image: "{{ _final_ref | default(omit) }}"
+      k8s_namespace: "{{ k8s_namespace | default(omit) }}"
+      service_port: "{{ service_port | default(8081) }}"
+      config_changed: "{{ _cfg_main is changed }}"
+      unit_changed: "{{ _unit is changed if _deploy_mode == 'docker' else omit }}"

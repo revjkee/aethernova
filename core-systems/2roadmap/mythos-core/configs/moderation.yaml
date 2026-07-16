@@ -1,0 +1,371 @@
+# mythos-core/configs/moderation.yaml
+metadata:
+  policy_id: "mythos-core-default"
+  version: "1.0.0"
+  environment: "${ENV:-prod}"
+  owners:
+    - security@yourorg.example
+    - platform@yourorg.example
+  updated_at: "2025-08-27"
+  description: "Единая политика модерации содержимого и PII-редакции для mythos-core."
+
+defaults:
+  locale_allowlist: ["ru", "en"]
+  max_input_chars: 20000
+  max_output_tokens: 2048
+  redact_pii_by_default: true
+  # fail_open=false: при ошибке провайдера блокируем или безопасно завершаем
+  fail_open: false
+  # аудит включен с семплированием; чувствительные payload’ы хэшируются
+  audit:
+    enabled: true
+    sample_rate: 0.05
+    sink: "s3://${AUDIT_BUCKET}/mythos-core/moderation/"
+    sse_kms_key_id: "${KMS_KEY_ID}"
+    hash_algo: "sha256"
+    hash_fields: ["text", "result.text"]
+    retention_days: 30
+
+providers:
+  # Внешний провайдер модерации/классификации (HTTP). Схема намеренно абстрактна.
+  external_moderation:
+    enabled: true
+    endpoint: "${MODERATION_API_URL}"
+    api_key_env: "MODERATION_API_KEY"
+    timeout_ms: 6000
+    # Ожидается вероятность по категориям [0..1]
+    categories:
+      - sexual_minors
+      - sexual_explicit
+      - self_harm
+      - violence_threat
+      - hate
+      - harassment
+      - extremist
+      - weapons_illicit
+      - drugs
+      - financial_fraud
+    thresholds:
+      block: 0.90
+      flag: 0.70
+      allow: 0.30
+
+  # Анти-вирус для файлов (локальный кластерный сервис, например, ClamAV через proxy)
+  antivirus:
+    enabled: true
+    endpoint: "${AV_PROXY_URL}"
+    timeout_ms: 15000
+
+  # NSFW/горячий фильтр изображений (любой доступный классификатор/эндпоинт)
+  nsfw:
+    enabled: true
+    endpoint: "${NSFW_API_URL}"
+    timeout_ms: 6000
+    threshold_block: 0.92
+    threshold_flag: 0.75
+
+  # OCR для изображений (для вторичной текстовой модерации)
+  ocr:
+    enabled: true
+    endpoint: "${OCR_API_URL}"
+    timeout_ms: 8000
+    languages: ["ru", "en"]
+
+pii_redaction:
+  strategy: "mask"        # mask|hash|drop
+  token: "[REDACTED:{type}]"
+  preserve_last4_for: ["credit_card"]
+  types:
+    email:
+      enabled: true
+      pattern: "(?i)\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b"
+    phone_e164:
+      enabled: true
+      pattern: "\\+\\d{6,15}"
+    credit_card:
+      enabled: true
+      pattern: "\\b(?:\\d[ -]*?){13,19}\\b"
+      luhn_check: true
+    iban:
+      enabled: true
+      pattern: "\\b[A-Z]{2}\\d{2}[A-Z0-9]{10,30}\\b"
+    swift_bic:
+      enabled: true
+      pattern: "\\b[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?\\b"
+    ssn_us:
+      enabled: true
+      pattern: "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+    passport_generic:
+      enabled: true
+      pattern: "\\b[A-Z0-9]{6,9}\\b"
+    ipv4:
+      enabled: true
+      pattern: "\\b(?:(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|1?\\d?\\d)\\b"
+    ipv6:
+      enabled: true
+      pattern: "\\b(?:[A-F0-9]{1,4}:){7}[A-F0-9]{1,4}\\b"
+    crypto_eth:
+      enabled: true
+      pattern: "\\b0x[a-fA-F0-9]{40}\\b"
+    location_query:
+      enabled: true
+      pattern: "(?i)\\b(адрес|address|дом|улица|street|квартира|apt|postcode|zip)\\b"
+
+rules:
+  dictionaries:
+    profanity:
+      ru:
+        - "бляд"
+        - "сука"
+        - "хер"
+        - "мразь"
+      en:
+        - "fuck"
+        - "shit"
+        - "bitch"
+        - "asshole"
+    self_harm_keywords:
+      - "хочу умереть"
+      - "как покончить"
+      - "commit suicide"
+      - "kill myself"
+    violent_threats:
+      - "убью тебя"
+      - "я тебя зарежу"
+      - "i will kill you"
+    jailbreak_markers:
+      - "(?i)ignore previous instructions"
+      - "(?i)developer mode"
+      - "(?i)bypass safety"
+      - "(?i)DAN"
+      - "(?i)unfiltered response"
+    blocked_url_tlds:
+      - ".onion"
+    blocked_url_hosts:
+      - "pastebin.com"
+      - "ghostbin.com"
+    url_shorteners:
+      - "bit.ly"
+      - "tinyurl.com"
+      - "t.co"
+
+  url_policies:
+    allow_ip_literals: false
+    allow_ftp: false
+
+actions:
+  matrix:
+    # Матрица решений по severity/категории
+    sexual_minors:      { block: true,  flag: true,  escalate: true }
+    sexual_explicit:    { block: true,  flag: true,  escalate: false }
+    self_harm:          { block: true,  flag: true,  escalate: true }
+    violence_threat:    { block: true,  flag: true,  escalate: true }
+    hate:               { block: true,  flag: true,  escalate: true }
+    harassment:         { block: false, flag: true,  escalate: false }
+    extremist:          { block: true,  flag: true,  escalate: true }
+    weapons_illicit:    { block: true,  flag: true,  escalate: false }
+    drugs:              { block: false, flag: true,  escalate: false }
+    financial_fraud:    { block: true,  flag: true,  escalate: true }
+    pii_detected:       { block: false, flag: true,  escalate: false, redact: true }
+    profanity:          { block: false, flag: true,  escalate: false }
+    jailbreak:          { block: false, flag: true,  escalate: false, safe_completion: true }
+    malware_file:       { block: true,  flag: true,  escalate: true }
+  safe_completion:
+    enabled: true
+    templates:
+      self_harm_ru: "Мне жаль, что вы так себя чувствуете. Я не могу помочь с вредом себе. Обратитесь к профессиональной помощи: {local_hotlines}."
+      self_harm_en: "I'm sorry you're feeling this way. I can’t assist with self-harm. Please consider contacting professional help: {local_hotlines}."
+      jailbreak_ru: "Я не могу игнорировать правила безопасности. Могу помочь в разрешенных рамках."
+      jailbreak_en: "I can't bypass safety. I can help within allowed guidelines."
+  escalation:
+    enabled: true
+    sample_rate: 0.10
+    queue: "moderation/human-review"
+    webhook: "${SECURITY_WEBHOOK_URL}"
+  rate_limit:
+    enabled: true
+    window_seconds: 60
+    max_requests_per_user: 120
+    action: "throttle"  # throttle|block
+  role_overrides:
+    # Пример: для роли "admin" разрешаем больше флагов, но не снимаем блокирующие категории
+    admin:
+      allow_flagged_through: true
+      still_block_categories:
+        - sexual_minors
+        - extremist
+        - self_harm
+        - violence_threat
+
+pipelines:
+  input_text:
+    enabled: true
+    atomic: true
+    steps:
+      - id: length_guard
+        type: guard.length
+        max_chars: ${INPUT_MAX_CHARS:-20000}
+        action_on_violation: "block"
+
+      - id: pii_detect
+        type: detect.pii
+        pii_types: ["email","phone_e164","credit_card","iban","swift_bic","ssn_us","passport_generic","ipv4","ipv6","crypto_eth","location_query"]
+        redact: true
+        action_on_detection: "flag"
+
+      - id: dictionary_checks
+        type: detect.dictionary
+        dictionaries: ["profanity","self_harm_keywords","violent_threats"]
+        action_on_match: "flag"
+
+      - id: jailbreak_heuristics
+        type: detect.regex
+        patterns_from: "rules.dictionaries.jailbreak_markers"
+        action_on_match: "safe_completion"
+
+      - id: url_policy
+        type: detect.url
+        allow_ip_literals: false
+        allow_ftp: false
+        blocked_tlds_from: "rules.dictionaries.blocked_url_tlds"
+        blocked_hosts_from: "rules.dictionaries.blocked_url_hosts"
+        shorteners_from: "rules.dictionaries.url_shorteners"
+        action_on_violation: "flag"
+
+      - id: external_mod
+        type: detect.external
+        provider: "external_moderation"
+        # map провайдера → локальные категории
+        category_map:
+          sexual/minors: "sexual_minors"
+          sexual/explicit: "sexual_explicit"
+          self-harm: "self_harm"
+          violence/threat: "violence_threat"
+          hate: "hate"
+          harassment: "harassment"
+          extremist: "extremist"
+          weapons: "weapons_illicit"
+          drugs: "drugs"
+          fraud: "financial_fraud"
+        thresholds_from: "providers.external_moderation.thresholds"
+        action_matrix_from: "actions.matrix"
+
+  output_text:
+    enabled: true
+    atomic: true
+    steps:
+      - id: pii_redact_out
+        type: redact.pii
+        apply_if_flag: true
+        strategy_from: "pii_redaction"
+
+      - id: profanity_out
+        type: detect.dictionary
+        dictionaries: ["profanity"]
+        action_on_match: "flag"
+
+      - id: jailbreak_out
+        type: detect.regex
+        patterns_from: "rules.dictionaries.jailbreak_markers"
+        action_on_match: "safe_completion"
+
+      - id: external_mod_out
+        type: detect.external
+        provider: "external_moderation"
+        thresholds_from: "providers.external_moderation.thresholds"
+        action_matrix_from: "actions.matrix"
+
+  image:
+    enabled: true
+    atomic: true
+    steps:
+      - id: nsfw
+        type: detect.nsfw
+        provider: "nsfw"
+        thresholds:
+          block: ${NSFW_BLOCK:-0.92}
+          flag: ${NSFW_FLAG:-0.75}
+      - id: ocr_extract
+        type: transform.ocr
+        provider: "ocr"
+        output_key: "ocr_text"
+      - id: ocr_moderate
+        type: detect.dictionary
+        field: "ocr_text"
+        dictionaries: ["profanity","self_harm_keywords","violent_threats"]
+        action_on_match: "flag"
+      - id: external_mod_ocr
+        type: detect.external
+        field: "ocr_text"
+        provider: "external_moderation"
+        thresholds_from: "providers.external_moderation.thresholds"
+        action_matrix_from: "actions.matrix"
+
+  file_uploads:
+    enabled: true
+    atomic: true
+    accept:
+      max_size_mb: 25
+      types_allowlist:
+        - "application/pdf"
+        - "text/plain"
+        - "image/png"
+        - "image/jpeg"
+        - "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    steps:
+      - id: antivirus
+        type: detect.antivirus
+        provider: "antivirus"
+        action_on_detection: "block"
+      - id: ocr_if_image
+        type: transform.ocr
+        provider: "ocr"
+        condition_mime_prefix: "image/"
+        output_key: "ocr_text"
+      - id: ocr_text_moderation
+        type: detect.external
+        field: "ocr_text"
+        provider: "external_moderation"
+        thresholds_from: "providers.external_moderation.thresholds"
+        action_matrix_from: "actions.matrix"
+
+streaming_guards:
+  # Во время потоковой генерации немедленно обрываем поток при trigger
+  enabled: true
+  hard_stop_categories:
+    - sexual_minors
+    - self_harm
+    - violence_threat
+    - extremist
+  soft_stop_categories:
+    - jailbreak
+    - sexual_explicit
+  token_window:
+    n_last_tokens: 128
+
+observability:
+  metrics:
+    prometheus_namespace: "mythos_core_moderation"
+    export_interval_sec: 15
+  logs:
+    level: "info"
+    json: true
+    sanitize_payloads: true
+
+overrides:
+  # Пример обязательной фильтрации для публичного чат-API
+  routes:
+    - match:
+        path: "/api/v1/chat"
+        methods: ["POST"]
+      enforce:
+        pipeline: "input_text"
+        output_pipeline: "output_text"
+        rate_limit:
+          window_seconds: 60
+          max_requests_per_user: 60
+  # Пример ослабления для внутреннего админ-инструмента (кроме блокирующих категорий)
+  roles:
+    - match: { role: "admin" }
+      allow_flagged_through: true
+      still_block_categories: ["sexual_minors","violence_threat","extremist","self_harm"]

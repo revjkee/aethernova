@@ -1,0 +1,307 @@
+# ------------------------------------------------------------------------------
+# ГЛОБАЛЬНЫЕ НАСТРОЙКИ
+# ------------------------------------------------------------------------------
+global:
+  nameOverride: ""
+  fullnameOverride: ""
+  # Метки, прокидываемые во все ресурсы
+  labels: {}
+  annotations: {}
+  imagePullSecrets: []  # пример: [{name: regcred}]
+  # Профиль: dev|prod — влияет на некоторые дефолты (ресурсы/логгинг)
+  profile: "prod"
+
+# ------------------------------------------------------------------------------
+# ОБРАЗ И ЗАПУСК
+# ------------------------------------------------------------------------------
+image:
+  repository: ghcr.io/your-org/veilmind-core
+  tag: "1.2.0"          # синхронизирован с veilmind-core/VERSION
+  pullPolicy: IfNotPresent
+
+replicaCount: 3
+
+command: []
+args: []
+
+env:
+  # Базовые переменные окружения согласованы с examples/quickstart/config.yaml
+  ACTIVE_PROFILE: "prod"
+  ENABLE_METRICS: "1"
+  PROM_PORT: "9109"
+  LOG_LEVEL: "INFO"
+  RISK_QUEUE_BACKEND: "redis"      # memory|redis|kafka|rabbit
+  REDIS_URL: "redis://redis:6379/0"
+  # OTLP
+  OTLP_ENDPOINT: "http://otel-collector:4317"
+
+envFrom: []
+extraEnv: []
+extraEnvFrom: []
+
+# Конфигурация приложения (монтируется как файл)
+config:
+  enabled: true
+  # Если пусто — будет использоваться встроенный конфиг по умолчанию контейнера.
+  # Для внешнего файла вставьте содержимое ниже или используйте existingConfigMap.
+  inline: |
+    apiVersion: zero-trust-core/v1
+    kind: QuickstartConfig
+    activeProfile: ${ACTIVE_PROFILE:-prod}
+    metrics:
+      enabled: true
+      prometheus:
+        bindAddress: 0.0.0.0
+        port: 9109
+        path: /metrics
+    tracing:
+      enabled: true
+      exporter: otlp
+      sampling: 0.1
+      otlp:
+        endpoint: ${OTLP_ENDPOINT:-http://otel-collector:4317}
+        insecure: true
+    featureFlags:
+      enableRiskWorker: true
+      enableIstioAdapter: true
+      enablePolicyEngine: true
+      denyByDefault: true
+  mountPath: /etc/veilmind/config.yaml
+  existingConfigMap: ""  # если задан, игнорирует inline
+
+secrets:
+  enabled: false
+  data: {}              # ключ: значение base64 или stringData если useStringData=true
+  useStringData: true
+  existingSecret: ""    # если задан, игнорирует data
+
+serviceAccount:
+  create: true
+  name: ""
+  automountServiceAccountToken: true
+  annotations: {}
+
+rbac:
+  create: true
+  # Дополнительные правила при необходимости
+  extraRules: []
+
+podAnnotations: {}
+podLabels: {}
+
+priorityClassName: ""  # пример: system-cluster-critical
+
+# ------------------------------------------------------------------------------
+# СЕТИ, СЕРВИС, INGRESS/ISTIO
+# ------------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+  labels: {}
+  extraPorts:
+    # Экспорт метрик Prometheus:
+    - name: metrics
+      port: 9109
+      targetPort: 9109
+      protocol: TCP
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: veilmind.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # Пример:
+  # tls:
+  # - secretName: veilmind-tls
+  #   hosts: [veilmind.example.com]
+
+istio:
+  # Если используется Istio, можно избегать Kubernetes Ingress и использовать Gateway/VirtualService.
+  enabled: true
+  # Добавить необходимые метки для инъекции сайдкара
+  podLabels:
+    sidecar.istio.io/inject: "true"
+  # Для сервисов, публикуемых наружу, используйте отдельный чарт/манифесты Gateway/VirtualService.
+
+networkPolicy:
+  enabled: true
+  createDefaultDeny: true          # np-default-deny-all
+  allowDNS: true                   # UDP/TCP 53 к kube-system/coredns
+  # Дополнительные гибкие правила (mergable массив объектов NetworkPolicy)
+  extra: []
+
+# ------------------------------------------------------------------------------
+# НАБЛЮДАЕМОСТЬ (Prometheus/ServiceMonitor, ЛОГИ, ТРЕЙСИНГ)
+# ------------------------------------------------------------------------------
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    namespace: ""        # по умолчанию тот же ns
+    interval: 30s
+    scrapeTimeout: 10s
+    # Селектор Prometheus Operator
+    selector: {}
+    labels: {}
+    scheme: http
+    path: /metrics
+    port: metrics        # должен совпадать с именем порта сервиса
+    relabelings: []
+    metricRelabelings: []
+
+logging:
+  json: true
+  level: INFO
+
+tracing:
+  enabled: true
+  otlp:
+    endpoint: "http://otel-collector:4317"
+    insecure: true
+    headers: {}
+
+# ------------------------------------------------------------------------------
+# РЕСУРСЫ, БЕЗОПАСНОСТЬ, ПРОБЫ
+# ------------------------------------------------------------------------------
+resources:
+  # Продакшн дефолты; переопределяйте под нагрузки
+  requests:
+    cpu: "200m"
+    memory: "256Mi"
+  limits:
+    cpu: "1"
+    memory: "1Gi"
+
+podSecurityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 6
+
+startupProbe:
+  enabled: true
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 30
+
+# ------------------------------------------------------------------------------
+# АВТОСКЕЙЛИНГ, СТРАТЕГИЯ ОБНОВЛЕНИЯ, PDB
+# ------------------------------------------------------------------------------
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  # targetMemoryUtilizationPercentage: 80
+  # Доп. метрики HPA v2 можно добавить через extraMetrics
+  extraMetrics: []
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 25%
+
+pdb:
+  enabled: true
+  minAvailable: 2
+  # или можно использовать percentage:
+  # minAvailable: "66%"
+
+# ------------------------------------------------------------------------------
+# ТОПОЛОГИЯ, НОДЫ, TOLERATIONS
+# ------------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+topologySpreadConstraints:
+  enabled: true
+  rules:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector: {}
+
+# ------------------------------------------------------------------------------
+# ХРАНИЛИЩА/ТОМЫ
+# ------------------------------------------------------------------------------
+persistence:
+  enabled: false
+  accessModes: ["ReadWriteOnce"]
+  size: 1Gi
+  storageClass: ""
+  mountPath: /var/lib/veilmind
+  annotations: {}
+  labels: {}
+
+extraVolumes: []
+extraVolumeMounts: []
+
+# ------------------------------------------------------------------------------
+# ДОПОЛНИТЕЛЬНЫЕ КОНТЕЙНЕРЫ, ИНИТ‑КОНТЕЙНЕРЫ
+# ------------------------------------------------------------------------------
+initContainers: []
+sidecars: []
+
+# ------------------------------------------------------------------------------
+# ХУКИ/ТЕСТЫ
+# ------------------------------------------------------------------------------
+tests:
+  enabled: true
+  image:
+    repository: curlimages/curl
+    tag: "8.10.1"
+    pullPolicy: IfNotPresent
+  command:
+    - sh
+    - -c
+    - >
+      code=$(curl -s -o /dev/null -w "%{http_code}" http://{{ include "veilmind-core.fullname" . }}:8080/healthz);
+      echo "HTTP:$code"; test "$code" = "200"
+
+# ------------------------------------------------------------------------------
+# КОНФИГУРИРУЕМЫЕ РЕСУРСЫ CHART’А (ConfigMap/Secret шаблоны)
+# ------------------------------------------------------------------------------
+templates:
+  config:
+    annotations: {}
+    labels: {}
+  secret:
+    annotations: {}
+    labels: {}

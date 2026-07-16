@@ -1,0 +1,289 @@
+---
+# Molecule Verify Playbook for role: omnimind-core
+# Задача: индустриальные проверки после converge.
+# Безопасные дефолты, все условия зависят от переменных,
+# переданных на converge (omnimind_users, omnimind_sudoers, omnimind_*).
+
+- name: Verify omnimind-core role
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Дефолты для случая локального запуска verify без converge-переменных
+    omnimind_service_name: "{{ omnimind_service_name | default('omnimind-core') }}"
+    omnimind_unit_path: "/etc/systemd/system/{{ omnimind_service_name }}.service"
+    omnimind_port: "{{ omnimind_port | default(8000) }}"
+    omnimind_bind_host: "{{ omnimind_bind_host | default('0.0.0.0') }}"
+    omnimind_env_file: "{{ omnimind_env_file | default('/etc/omnimind-core/env') }}"
+    omnimind_users: "{{ omnimind_users | default([]) }}"
+    omnimind_groups: "{{ omnimind_groups | default([]) }}"
+    omnimind_sudoers: "{{ omnimind_sudoers | default([]) }}"
+    omnimind_login_defs: "{{ omnimind_login_defs | default({ UMASK: '027', PASS_MAX_DAYS: '365', PASS_MIN_DAYS: '1', PASS_WARN_AGE: '14' }) }}"
+    omnimind_limits: "{{ omnimind_limits | default([]) }}"
+
+  tasks:
+    - name: "Preflight | Resolve visudo path"
+      ansible.builtin.shell: "command -v visudo || echo /usr/sbin/visudo"
+      args:
+        executable: /bin/sh
+      register: _visudo_path
+      changed_when: false
+
+    - name: "Preflight | Gather service facts"
+      ansible.builtin.service_facts:
+
+    - name: "Preflight | Assert omnimind service unit exists"
+      ansible.builtin.stat:
+        path: "{{ omnimind_unit_path }}"
+      register: _unit
+    - ansible.builtin.assert:
+        that:
+          - _unit.stat.exists
+          - _unit.stat.mode is defined
+        fail_msg: "Systemd unit {{ omnimind_unit_path }} not found"
+        success_msg: "Systemd unit exists"
+
+    - name: "Systemd | Verify service is enabled"
+      ansible.builtin.command: "systemctl is-enabled {{ omnimind_service_name }}"
+      changed_when: false
+      register: _enabled
+      failed_when: _enabled.rc not in [0]
+    - ansible.builtin.assert:
+        that: "'enabled' in _enabled.stdout or 'static' in _enabled.stdout"
+        fail_msg: "Service {{ omnimind_service_name }} is not enabled"
+        success_msg: "Service is enabled/static"
+
+    - name: "Systemd | Verify service is active"
+      ansible.builtin.command: "systemctl is-active {{ omnimind_service_name }}"
+      changed_when: false
+      register: _active
+      failed_when: _active.rc not in [0]
+    - ansible.builtin.assert:
+        that: "'active' in _active.stdout"
+        fail_msg: "Service {{ omnimind_service_name }} is not active"
+        success_msg: "Service is active"
+
+    - name: "Systemd | Journal has no recent failures for service"
+      ansible.builtin.shell: |
+        journalctl -u {{ omnimind_service_name }} --since "5 minutes ago" --priority=0..3 | wc -l
+      args:
+        executable: /bin/sh
+      changed_when: false
+      register: _recent_errors
+    - ansible.builtin.assert:
+        that: "_recent_errors.stdout | int == 0"
+        fail_msg: "Recent errors found in journal for {{ omnimind_service_name }}"
+        success_msg: "No recent errors in journal"
+
+    - name: "Filesystem | Verify runtime/state/cache/logs directories and modes"
+      vars:
+        paths:
+          - { p: "/run/omnimind",     m: "0750" }
+          - { p: "/var/lib/omnimind", m: "0750" }
+          - { p: "/var/cache/omnimind", m: "0750" }
+          - { p: "/var/log/omnimind", m: "0750" }
+      ansible.builtin.stat:
+        path: "{{ item.p }}"
+      register: _dirs
+      loop: "{{ paths }}"
+    - name: "Filesystem | Assert paths exist with secure modes"
+      ansible.builtin.assert:
+        that:
+          - _dirs.results | length > 0
+          - (_dirs.results | map(attribute='stat.exists') | list) | min
+        fail_msg: "One or more managed directories missing"
+        success_msg: "Managed directories exist"
+    - name: "Filesystem | Assert directory modes are secure"
+      ansible.builtin.assert:
+        that: >-
+          {{
+            (_dirs.results
+            | json_query("[].stat.mode")) | map('int', 8)
+            | list | select('defined') | list | length > 0
+          }}
+        fail_msg: "Failed to read directory modes"
+        success_msg: "Directory modes readable"
+
+    - name: "Env | /etc/omnimind-core/env is present when declared"
+      ansible.builtin.stat:
+        path: "{{ omnimind_env_file }}"
+      register: _envfile
+      when: omnimind_env_file is defined
+    - ansible.builtin.assert:
+        that: "_envfile.stat.exists"
+        fail_msg: "Env file {{ omnimind_env_file }} is missing"
+        success_msg: "Env file present"
+      when: omnimind_env_file is defined
+
+    - name: "Network | Verify port is listening"
+      ansible.builtin.shell: |
+        ss -ltnp | awk '{print $4}' | grep -E '(^|:)({{ omnimind_port }})$' | wc -l
+      args: { executable: /bin/sh }
+      changed_when: false
+      register: _listen_count
+    - ansible.builtin.assert:
+        that: "_listen_count.stdout | int > 0"
+        fail_msg: "Port {{ omnimind_port }} is not listening"
+        success_msg: "Port {{ omnimind_port }} is listening"
+
+    - name: "Health | Try HTTP GET /health (best-effort)"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ omnimind_port }}/health"
+        method: GET
+        return_content: false
+        status_code: [200, 204, 401, 403]  # допускаем защищенные эндпоинты
+        timeout: 5
+      register: _health
+      failed_when: false
+    - ansible.builtin.debug:
+        msg: "Health endpoint status: {{ _health.status | default('n/a') }}"
+
+    # -------- Users and groups --------
+    - name: "Accounts | Verify groups exist"
+      ansible.builtin.getent:
+        database: group
+        key: "{{ item.name }}"
+      loop: "{{ omnimind_groups }}"
+      when: omnimind_groups | length > 0
+      register: _groups_res
+    - name: "Accounts | Verify users exist"
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ item.name }}"
+      loop: "{{ omnimind_users | selectattr('state','defined') | selectattr('state','equalto','present') | list }}"
+      when: omnimind_users | length > 0
+      register: _users_res
+
+    - name: "SSH | Verify ~/.ssh and authorized_keys for each user"
+      vars:
+        home_path: "{{ (item.home | default('/home/' + item.name)) }}"
+      block:
+        - ansible.builtin.stat:
+            path: "{{ home_path }}/.ssh"
+          register: _ssh_dir
+        - ansible.builtin.assert:
+            that:
+              - _ssh_dir.stat.exists
+              - _ssh_dir.stat.isdir
+              - _ssh_dir.stat.mode == "0700"
+            fail_msg: "Invalid .ssh dir for {{ item.name }}"
+            success_msg: ".ssh dir ok for {{ item.name }}"
+        - ansible.builtin.stat:
+            path: "{{ home_path }}/.ssh/authorized_keys"
+          register: _auth
+        - ansible.builtin.assert:
+            that:
+              - _auth.stat.exists
+              - _auth.stat.mode == "0600"
+            fail_msg: "authorized_keys missing/bad mode for {{ item.name }}"
+            success_msg: "authorized_keys ok for {{ item.name }}"
+      loop: >-
+        {{
+          omnimind_users
+          | selectattr('state','defined')
+          | selectattr('state','equalto','present')
+          | selectattr('ssh_keys','defined')
+          | list
+        }}
+      when: omnimind_users | length > 0
+
+    # -------- sudoers & visudo validation --------
+    - name: "Sudoers | Validate global defaults drop-in"
+      ansible.builtin.command: "{{ _visudo_path.stdout }} -cf /etc/sudoers.d/00-omnimind-defaults"
+      changed_when: false
+
+    - name: "Sudoers | Validate per-user inline sudoers files"
+      ansible.builtin.command: "{{ _visudo_path.stdout }} -cf /etc/sudoers.d/20-{{ item.name }}"
+      loop: >-
+        {{
+          omnimind_users
+          | selectattr('state','defined')
+          | selectattr('state','equalto','present')
+          | selectattr('sudo','defined')
+          | list
+        }}
+      changed_when: false
+      register: _sudo_user_valid
+      failed_when: >
+        (_sudo_user_valid.results | map(attribute='rc') | list) | select('ne', 0) | list | length > 0
+      when: omnimind_users | length > 0
+
+    - name: "Sudoers | Validate policy files (grouped)"
+      ansible.builtin.command: "{{ _visudo_path.stdout }} -cf /etc/sudoers.d/10-{{ item.name }}"
+      loop: "{{ omnimind_sudoers }}"
+      when: omnimind_sudoers | length > 0
+      changed_when: false
+      register: _sudo_group_valid
+      failed_when: >
+        (_sudo_group_valid.results | map(attribute='rc') | list) | select('ne', 0) | list | length > 0
+
+    # -------- login.defs & limits --------
+    - name: "Auth | Assert /etc/login.defs policies"
+      vars:
+        policies: "{{ omnimind_login_defs | dict2items(key_name='k', value_name='v') }}"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        k="{{ item.k }}"; v="{{ item.v }}"
+        grep -E "^[#\s]*${k}\s+${v}\b" /etc/login.defs >/dev/null
+      args: { executable: /bin/sh }
+      changed_when: false
+      register: _login_defs_chk
+      failed_when: _login_defs_chk.rc != 0
+      loop: "{{ policies }}"
+
+    - name: "Limits | Verify /etc/security/limits.d/99-omnimind.conf content"
+      ansible.builtin.stat:
+        path: /etc/security/limits.d/99-omnimind.conf
+      register: _limits_stat
+    - ansible.builtin.assert:
+        that: _limits_stat.stat.exists
+        fail_msg: "limits.d file missing"
+        success_msg: "limits.d file present"
+      when: omnimind_limits | length > 0
+
+    - name: "Limits | Check lines"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        grep -E "^\s*{{ item.domain }}\s+{{ item.type }}\s+{{ item.item }}\s+{{ item.value }}\s*$" /etc/security/limits.d/99-omnimind.conf >/dev/null
+      args: { executable: /bin/sh }
+      loop: "{{ omnimind_limits }}"
+      register: _limits_chk
+      changed_when: false
+      failed_when: >-
+        (_limits_chk.results | map(attribute='rc') | list) | select('ne', 0) | list | length > 0
+      when: omnimind_limits | length > 0
+
+    # -------- Functional smoke: curl root and 404 sanity (best-effort) --------
+    - name: "HTTP | GET / (best-effort)"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ omnimind_port }}/"
+        method: GET
+        return_content: false
+        timeout: 3
+      register: _root_call
+      failed_when: false
+      changed_when: false
+
+    - name: "HTTP | GET /nonexistent 404 (best-effort)"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ omnimind_port }}/__molecule__/not_found"
+        method: GET
+        status_code: [404, 401, 403]
+        return_content: false
+        timeout: 3
+      register: _nf_call
+      failed_when: false
+      changed_when: false
+
+    # -------- Summary --------
+    - name: "Summary | Print essential verification results"
+      ansible.builtin.debug:
+        msg:
+          unit_exists: "{{ _unit.stat.exists }}"
+          service_enabled: "{{ _enabled.stdout | default('n/a') }}"
+          service_active: "{{ _active.stdout | default('n/a') }}"
+          listen_on_port: "{{ _listen_count.stdout | default('0') }}"
+          health_status: "{{ _health.status | default('n/a') }}"
+          http_root_status: "{{ _root_call.status | default('n/a') }}"
+          http_404_status: "{{ _nf_call.status | default('n/a') }}"

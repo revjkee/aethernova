@@ -1,0 +1,402 @@
+---
+# File: neuroforge-core/ops/ansible/roles/neuroforge-core/tasks/main.yml
+
+- name: "Preflight | Проверка версии Ansible и фактов"
+  ansible.builtin.assert:
+    that:
+      - ansible_version.full is version('2.13', '>=')
+      - ansible_os_family in ['Debian', 'RedHat']
+      - (ansible_user_uid | default(0)) == 0
+    fail_msg: "Нужны: Ansible>=2.13, root и поддерживаемое семейство ОС (Debian/RedHat)"
+  tags: [preflight]
+
+- name: "Preflight | Значения по умолчанию для переменных роли"
+  ansible.builtin.set_fact:
+    nf_user: "{{ neuroforge_user | default('neuroforge') }}"
+    nf_group: "{{ neuroforge_group | default('neuroforge') }}"
+    nf_home: "{{ neuroforge_home | default('/opt/neuroforge') }}"
+    nf_env_file: "{{ neuroforge_env_file | default(nf_home + '/.env') }}"
+    nf_compose_file: "{{ neuroforge_compose_file | default(nf_home + '/docker-compose.yaml') }}"
+    nf_state_dir: "{{ neuroforge_state_dir | default('/var/lib/neuroforge') }}"
+    nf_log_dir: "{{ neuroforge_log_dir | default('/var/log/neuroforge') }}"
+    nf_run_dir: "{{ neuroforge_run_dir | default('/var/run/neuroforge') }}"
+    nf_secrets_dir: "{{ neuroforge_secrets_dir | default(nf_home + '/secrets') }}"
+    nf_registry: "{{ neuroforge_registry | default(omit) }}"
+    nf_registry_user: "{{ neuroforge_registry_user | default(omit) }}"
+    nf_registry_password: "{{ neuroforge_registry_password | default(omit) }}"
+    nf_enable_systemd_unit: "{{ neuroforge_enable_systemd_unit | default(true) | bool }}"
+    nf_enable_registry_login: "{{ neuroforge_enable_registry_login | default(false) | bool }}"
+    nf_compose_project_name: "{{ neuroforge_project_name | default('neuroforge') }}"
+  tags: [preflight]
+
+- name: "Users | Создать системную группу"
+  ansible.builtin.group:
+    name: "{{ nf_group }}"
+    system: true
+    state: present
+  tags: [users]
+
+- name: "Users | Создать системного пользователя"
+  ansible.builtin.user:
+    name: "{{ nf_user }}"
+    group: "{{ nf_group }}"
+    comment: "neuroforge-core service user"
+    create_home: false
+    shell: /usr/sbin/nologin
+    system: true
+    state: present
+  tags: [users]
+
+- name: "OS | Установка Docker (Debian)"
+  when: ansible_os_family == 'Debian'
+  tags: [docker,install]
+  block:
+    - name: "Docker | Предустановки"
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        update_cache: true
+        state: present
+
+    - name: "Docker | Репозиторий и ключ"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+        echo \
+          "deb [arch={{ ansible_architecture }} signed-by=/etc/apt/keyrings/docker.gpg] \
+          https://download.docker.com/linux/{{ ansible_distribution | lower }} \
+          {{ ansible_distribution_release }} stable" \
+          > /etc/apt/sources.list.d/docker.list
+      args: { executable: /bin/bash }
+      changed_when: false
+
+    - name: "Docker | Пакеты"
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        update_cache: true
+        state: present
+
+- name: "OS | Установка Docker (RHEL/CentOS/Alma/Rocky)"
+  when: ansible_os_family == 'RedHat'
+  tags: [docker,install]
+  block:
+    - name: "Docker | Репозиторий"
+      ansible.builtin.yum_repository:
+        name: docker-ce-stable
+        description: Docker CE Stable - $basearch
+        baseurl: "https://download.docker.com/linux/centos/{{ ansible_distribution_major_version }}/$basearch/stable"
+        gpgcheck: true
+        gpgkey: https://download.docker.com/linux/centos/gpg
+        enabled: true
+    - name: "Docker | Пакеты"
+      ansible.builtin.yum:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+- name: "Docker | Включить и запустить сервис"
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+    daemon_reload: true
+  tags: [docker]
+
+- name: "FS | Создать каталоги"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ nf_user }}"
+    group: "{{ nf_group }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop:
+    - { path: "{{ nf_home }}", mode: "0755" }
+    - { path: "{{ nf_state_dir }}", mode: "0750" }
+    - { path: "{{ nf_log_dir }}", mode: "0750" }
+    - { path: "{{ nf_run_dir }}", mode: "0755" }
+    - { path: "{{ nf_secrets_dir }}", mode: "0700" }
+  tags: [fs]
+
+- name: "Secrets | Разложить секреты (если заданы)"
+  when: neuroforge_secrets is defined
+  ansible.builtin.copy:
+    dest: "{{ nf_secrets_dir }}/{{ item.key }}.txt"
+    content: "{{ item.value | string }}"
+    owner: "{{ nf_user }}"
+    group: "{{ nf_group }}"
+    mode: "0600"
+  loop: "{{ neuroforge_secrets | dict2items }}"
+  no_log: true
+  tags: [secrets]
+
+- name: "Config | Записать .env"
+  ansible.builtin.copy:
+    dest: "{{ nf_env_file }}"
+    owner: "{{ nf_user }}"
+    group: "{{ nf_group }}"
+    mode: "0640"
+    content: |-
+      # Generated by Ansible at {{ ansible_date_time.iso8601 }}
+      ENVIRONMENT={{ neuroforge_environment | default('production') }}
+      APP_NAME=neuroforge-core
+      APP_VERSION={{ neuroforge_app_version | default('0.1.0') }}
+      TZ={{ neuroforge_tz | default('UTC') }}
+
+      # DB
+      POSTGRES_DB={{ neuroforge_pg_db | default('neuroforge') }}
+      POSTGRES_USER={{ neuroforge_pg_user | default('neuroforge') }}
+      POSTGRES_PASSWORD={{ neuroforge_pg_password | default('change_me') }}
+      POSTGRES_DSN=postgresql://{{ neuroforge_pg_user | default('neuroforge') }}:{{ neuroforge_pg_password | default('change_me') }}@postgres:5432/{{ neuroforge_pg_db | default('neuroforge') }}?sslmode=disable
+
+      # Redis / Celery
+      REDIS_DSN=redis://redis:6379/1
+      CELERY_BROKER_URL=redis://redis:6379/3
+      CELERY_RESULT_BACKEND=redis://redis:6379/4
+
+      # S3 / MinIO
+      S3_ENABLED=true
+      S3_ENDPOINT=http://minio:9000
+      S3_REGION=us-east-1
+      S3_ACCESS_KEY_ID={{ neuroforge_s3_access_key | default('minioadmin') }}
+      S3_SECRET_ACCESS_KEY={{ neuroforge_s3_secret_key | default('minioadmin') }}
+      S3_BUCKET_MODELS={{ neuroforge_s3_bucket_models | default('neuroforge-models') }}
+      S3_BUCKET_ARTIFACTS={{ neuroforge_s3_bucket_artifacts | default('neuroforge-artifacts') }}
+
+      # HTTP
+      HTTP_PORT={{ neuroforge_http_port | default('8080') }}
+      LOG_LEVEL={{ neuroforge_log_level | default('INFO') }}
+
+      # Observability
+      OTEL_EXPORTER_OTLP_ENDPOINT={{ neuroforge_otel_endpoint | default('http://otel-collector:4318') }}
+      PROMETHEUS_ENABLED=true
+  tags: [config]
+
+- name: "Config | Записать docker-compose.yaml"
+  ansible.builtin.copy:
+    dest: "{{ nf_compose_file }}"
+    owner: "{{ nf_user }}"
+    group: "{{ nf_group }}"
+    mode: "0640"
+    content: |-
+      version: "3.9"
+      name: {{ nf_compose_project_name }}
+      services:
+        postgres:
+          image: postgres:16-alpine
+          environment:
+            POSTGRES_DB: ${POSTGRES_DB}
+            POSTGRES_USER: ${POSTGRES_USER}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+            TZ: ${TZ}
+          healthcheck:
+            test: ["CMD-SHELL","pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h localhost"]
+            interval: 10s
+            timeout: 5s
+            retries: 10
+            start_period: 20s
+          volumes:
+            - {{ nf_state_dir }}/pg_data:/var/lib/postgresql/data
+          networks: [ backend ]
+          restart: unless-stopped
+        redis:
+          image: redis:7-alpine
+          command: ["redis-server","--save","","--appendonly","no"]
+          healthcheck:
+            test: ["CMD","redis-cli","ping"]
+            interval: 5s
+            timeout: 3s
+            retries: 20
+            start_period: 10s
+          volumes:
+            - {{ nf_state_dir }}/redis:/data
+          networks: [ backend ]
+          restart: unless-stopped
+        minio:
+          image: quay.io/minio/minio:RELEASE.2025-02-20T00-00-00Z
+          command: ["server","/data","--console-address",":9001"]
+          environment:
+            MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID}
+            MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY}
+          healthcheck:
+            test: ["CMD-SHELL","curl -fsS http://localhost:9000/minio/health/ready || exit 1"]
+            interval: 10s
+            timeout: 5s
+            retries: 20
+            start_period: 20s
+          ports:
+            - "9000:9000"
+            - "9001:9001"
+          volumes:
+            - {{ nf_state_dir }}/minio_data:/data
+          networks: [ backend ]
+          restart: unless-stopped
+        app:
+          image: "{{ neuroforge_image | default('ghcr.io/your-org/neuroforge-core:latest') }}"
+          depends_on:
+            postgres: { condition: service_healthy }
+            redis:    { condition: service_healthy }
+            minio:    { condition: service_healthy }
+          env_file: ["{{ nf_env_file }}"]
+          healthcheck:
+            test: ["CMD-SHELL","wget -q -O- http://localhost:${HTTP_PORT}/healthz || exit 1"]
+            interval: 10s
+            timeout: 5s
+            retries: 12
+            start_period: 20s
+          ports:
+            - "${HTTP_PORT}:8080"
+          volumes:
+            - {{ nf_state_dir }}/app_var:/app/var
+            - {{ nf_log_dir }}:/app/log
+          networks: [ backend ]
+          restart: unless-stopped
+        worker:
+          image: "{{ neuroforge_image | default('ghcr.io/your-org/neuroforge-core:latest') }}"
+          command: ["python","-m","neuroforge.worker.celery","worker","-O","fair","--loglevel=${LOG_LEVEL}"]
+          depends_on:
+            redis:  { condition: service_healthy }
+            app:    { condition: service_started }
+          env_file: ["{{ nf_env_file }}"]
+          networks: [ backend ]
+          restart: unless-stopped
+      networks:
+        backend: { driver: bridge }
+  tags: [config]
+
+- name: "Docker | Логин в реестр (если включено)"
+  when: nf_enable_registry_login and nf_registry is defined and nf_registry_user is defined and nf_registry_password is defined
+  community.docker.docker_login:
+    registry_url: "{{ nf_registry }}"
+    username: "{{ nf_registry_user }}"
+    password: "{{ nf_registry_password }}"
+    reauthorize: true
+  no_log: true
+  tags: [docker,registry]
+
+- name: "Compose | Pull образов"
+  community.docker.docker_compose_v2:
+    project_src: "{{ nf_home }}"
+    files: [ "{{ nf_compose_file }}" ]
+    pull: always
+  register: compose_pull
+  failed_when: false
+  tags: [compose]
+
+- name: "Compose | Поднять стек через модуль"
+  community.docker.docker_compose_v2:
+    project_src: "{{ nf_home }}"
+    files: [ "{{ nf_compose_file }}" ]
+    state: present
+    remove_orphans: true
+    recreate: smart
+  register: compose_up
+  failed_when: false
+  tags: [compose]
+
+- name: "Compose | Fallback на CLI (если модуль недоступен)"
+  when: compose_up is failed
+  ansible.builtin.command:
+    cmd: "docker compose -f {{ nf_compose_file }} up -d --remove-orphans"
+    chdir: "{{ nf_home }}"
+  register: compose_cli_up
+  changed_when: "'Started' in compose_cli_up.stdout or 'Recreating' in compose_cli_up.stdout"
+  tags: [compose]
+
+- name: "systemd | Юнит для управления стеком (включается опционально)"
+  when: nf_enable_systemd_unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/neuroforge-compose.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |-
+      [Unit]
+      Description=Neuroforge Core via Docker Compose
+      Wants=docker.service
+      After=docker.service
+      StartLimitIntervalSec=500
+      StartLimitBurst=5
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory={{ nf_home }}
+      ExecStart=/usr/bin/docker compose -f {{ nf_compose_file }} up -d --remove-orphans
+      ExecStop=/usr/bin/docker compose -f {{ nf_compose_file }} down
+      ExecReload=/usr/bin/docker compose -f {{ nf_compose_file }} up -d
+      TimeoutStartSec=300
+      TimeoutStopSec=120
+      User=root
+      Group=root
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart neuroforge-compose
+  tags: [systemd]
+
+- name: "systemd | Включить сервис (если выбран)"
+  when: nf_enable_systemd_unit
+  ansible.builtin.systemd:
+    name: neuroforge-compose.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  tags: [systemd]
+
+- name: "Health | Ожидание готовности сервисов"
+  vars:
+    wait_targets:
+      - name: "postgres"
+        cmd: "docker inspect --format='{{\"{{\"}}.State.Health.Status{{\"}}\"}}' {{ nf_compose_project_name }}-postgres-1"
+        expect: "healthy"
+      - name: "redis"
+        cmd: "docker inspect --format='{{\"{{\"}}.State.Health.Status{{\"}}\"}}' {{ nf_compose_project_name }}-redis-1"
+        expect: "healthy"
+      - name: "minio"
+        cmd: "docker inspect --format='{{\"{{\"}}.State.Health.Status{{\"}}\"}}' {{ nf_compose_project_name }}-minio-1"
+        expect: "healthy"
+      - name: "app"
+        cmd: "docker inspect --format='{{\"{{\"}}.State.Health.Status{{\"}}\"}}' {{ nf_compose_project_name }}-app-1"
+        expect: "healthy"
+  ansible.builtin.shell: "{{ item.cmd }}"
+  register: hc
+  retries: 60
+  delay: 5
+  until: hc.stdout.strip() == item.expect
+  loop: "{{ wait_targets }}"
+  changed_when: false
+  failed_when: hc.stdout is not defined
+  tags: [health]
+
+- name: "Summary | Краткий отчёт"
+  ansible.builtin.debug:
+    msg:
+      - "neuroforge-core: развернуто в {{ nf_home }}, проект {{ nf_compose_project_name }}"
+      - "Сервисы: postgres, redis, minio, app, worker"
+      - "Логи: {{ nf_log_dir }}, состояние: {{ nf_state_dir }}"
+  tags: [summary]
+
+# ------------------------- Handlers внутри файла -----------------------------
+
+- name: "Restart neuroforge-compose"
+  ansible.builtin.systemd:
+    name: neuroforge-compose.service
+    state: restarted
+    daemon_reload: true
+  listen: "Restart neuroforge-compose"

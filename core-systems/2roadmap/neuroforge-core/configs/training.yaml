@@ -1,0 +1,395 @@
+# neuroforge-core training configuration (industrial-grade)
+# Schema: v1
+# All timestamps UTC; paths may use env expansion ${VAR:default}
+
+schema_version: "1"
+
+defaults: &defaults
+  project:
+    name: "neuroforge-core"
+    task: "training"
+    version: "1.0.0"
+    # security/process
+    umask: "077"
+    allow_core_dump: false
+
+  runtime:
+    device: "auto"            # auto|cpu|cuda|mps
+    num_workers: 8            # dataloader workers per process
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+    seed: 1337
+    deterministic: true       # cudnn.deterministic + algorithms.deterministic
+    benchmark: false
+    cudnn_enabled: true
+    matmul_precision: "high"  # default|high|highest (PyTorch 2.x)
+    mixed_precision:
+      enabled: true
+      dtype: "bf16"           # fp16|bf16
+      grad_scaler: true       # for fp16
+
+  distributed:
+    strategy: "ddp"           # ddp|fsdp|deepspeed|none
+    devices: "auto"           # count or "auto"
+    nodes: 1
+    find_unused_parameters: false
+    gradient_accumulation_steps: 1
+    grad_clip_norm: 1.0
+    gradient_checkpointing: false
+    fsdp:
+      policy: "auto_wrap"     # module wrapping policy name if used
+      cpu_offload: false
+    deepspeed:
+      enabled: false
+      stage: 2                # 1|2|3
+      zero_optimization: true
+      offload_optimizer: false
+      offload_parameters: false
+
+  logging:
+    level: "INFO"             # DEBUG|INFO|WARN|ERROR
+    json: true
+    console: true
+    file:
+      enabled: true
+      path: "${NF_OUT_DIR:./.out}/train.log"
+      rotate_max_bytes: 10485760
+      rotate_backups: 3
+    mlflow:
+      enabled: true
+      tracking_uri: "${MLFLOW_TRACKING_URI:http://127.0.0.1:5000}"
+      experiment: "neuroforge-core"
+      tags:
+        env: "dev"
+        component: "trainer"
+    wandb:
+      enabled: false
+      project: "neuroforge-core"
+      entity: ""
+      mode: "online"          # online|offline|disabled
+
+  checkpoints:
+    dir: "${NF_CKPT_DIR:./.out/checkpoints}"
+    save_top_k: 3
+    monitor: "val/metric_main"
+    mode: "max"               # max|min
+    save_last: true
+    every_n_epochs: 1
+    every_n_steps: 0
+    s3:
+      enabled: false
+      bucket: "${NF_S3_BUCKET:}"
+      prefix: "ckpt/${project.name}"
+      endpoint_url: "${S3_ENDPOINT_URL:}"
+      region: "${AWS_REGION:}"
+      profile: "${AWS_PROFILE:default}"
+    gcs:
+      enabled: false
+      bucket: "${NF_GCS_BUCKET:}"
+      prefix: "ckpt/${project.name}"
+
+  early_stopping:
+    enabled: true
+    monitor: "val/metric_main"
+    mode: "max"
+    patience: 10
+    min_delta: 0.0
+    strict: true
+
+  dataset:
+    name: "default-dataset"
+    root: "${NF_DATA_DIR:./data}"
+    train_manifest: "train.jsonl"
+    val_manifest: "val.jsonl"
+    test_manifest: "test.jsonl"
+    cache_dir: "${NF_CACHE_DIR:./.cache}"
+    num_classes: 1000
+    input:
+      image_size: [224, 224]
+      channels: 3
+      normalize:
+        mean: [0.485, 0.456, 0.406]
+        std:  [0.229, 0.224, 0.225]
+    augment:
+      enabled: true
+      randaugment:
+        n: 2
+        m: 9
+      mixup:
+        alpha: 0.2
+        prob: 0.3
+      cutmix:
+        alpha: 1.0
+        prob: 0.3
+      color_jitter: [0.1, 0.1, 0.1, 0.05]
+      random_erasing:
+        p: 0.25
+        scale: [0.02, 0.33]
+        ratio: [0.3, 3.3]
+
+  dataloader:
+    batch_size: 128           # per process
+    drop_last: true
+    shuffle: true
+    persistent: true
+
+  model:
+    arch: "resnet50"          # example; adapt to your registry
+    pretrained: false
+    init:
+      type: "kaiming"         # kaiming|xavier|truncnorm|none
+    norm:
+      type: "batchnorm"
+      eps: 1.0e-5
+      momentum: 0.1
+    dropout: 0.0
+    label_smoothing: 0.0
+    loss:
+      name: "cross_entropy"
+      params:
+        reduction: "mean"
+        weight: null
+
+  optimizer:
+    name: "adamw"
+    params:
+      lr: 2.0e-3
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      weight_decay: 5.0e-2
+      amsgrad: false
+    lookahead:
+      enabled: false
+      alpha: 0.5
+      k: 5
+
+  scheduler:
+    name: "cosine_warmup"     # cosine_warmup|step|plateau|none
+    params:
+      warmup_steps: 1000
+      min_lr: 1.0e-6
+      max_lr: null            # null => use optimizer lr
+      t_max: null             # null => auto by epochs*steps
+    step:
+      gamma: 0.1
+      step_size: 30
+    plateau:
+      factor: 0.1
+      patience: 5
+      threshold: 1.0e-3
+      min_lr: 1.0e-6
+      mode: "max"
+      monitor: "val/metric_main"
+
+  training:
+    max_epochs: 200
+    max_steps: -1
+    limit_train_batches: 1.0
+    limit_val_batches: 1.0
+    limit_test_batches: 1.0
+    accumulate_grad_batches: 1
+    check_val_every_n_epoch: 1
+    log_every_n_steps: 50
+    precision: "bf16-mixed"   # aligns with mixed_precision.dtype
+    stochastic_weight_averaging:
+      enabled: false
+      swa_lrs: 1.0e-4
+      swa_epoch_start: 0.8     # fraction of total epochs
+
+  evaluation:
+    metrics:
+      - name: "accuracy_top1"
+      - name: "accuracy_top5"
+      - name: "f1_macro"
+    export:
+      on_best: true
+      formats:
+        - "torchscript"
+        - "onnx"
+      onnx:
+        opset: 17
+        dynamic_axes: true
+
+  profiling:
+    enabled: false
+    schedule:
+      wait: 1
+      warmup: 1
+      active: 3
+      repeat: 2
+    activities:
+      cpu: true
+      cuda: true
+    trace_dir: "${NF_OUT_DIR:./.out}/traces"
+
+  compliance:
+    pii_guard:
+      enabled: false
+      redaction: "strict"
+
+# ---------- ENV PROFILES ----------
+profiles:
+  dev:
+    <<: *defaults
+    logging:
+      <<: *defaults.logging
+      level: "DEBUG"
+      mlflow:
+        <<: *defaults.logging.mlflow
+        tags:
+          env: "dev"
+          component: "trainer"
+      wandb:
+        <<: *defaults.logging.wandb
+        enabled: false
+    runtime:
+      <<: *defaults.runtime
+      num_workers: 4
+      deterministic: true
+      mixed_precision:
+        enabled: true
+        dtype: "bf16"
+    dataloader:
+      <<: *defaults.dataloader
+      batch_size: 32
+    training:
+      <<: *defaults.training
+      max_epochs: 10
+      log_every_n_steps: 10
+    checkpoints:
+      <<: *defaults.checkpoints
+      save_top_k: 1
+    dataset:
+      <<: *defaults.dataset
+      root: "${NF_DATA_DIR:./data}"
+      augment:
+        <<: *defaults.dataset.augment
+        mixup:
+          alpha: 0.1
+          prob: 0.15
+        cutmix:
+          alpha: 0.5
+          prob: 0.15
+
+  staging:
+    <<: *defaults
+    logging:
+      <<: *defaults.logging
+      mlflow:
+        <<: *defaults.logging.mlflow
+        tags:
+          env: "staging"
+          component: "trainer"
+      wandb:
+        <<: *defaults.logging.wandb
+        enabled: true
+        mode: "online"
+    distributed:
+      <<: *defaults.distributed
+      strategy: "ddp"
+      devices: "auto"
+      nodes: 1
+      gradient_accumulation_steps: 2
+    dataloader:
+      <<: *defaults.dataloader
+      batch_size: 64
+    training:
+      <<: *defaults.training
+      max_epochs: 50
+    checkpoints:
+      <<: *defaults.checkpoints
+      s3:
+        enabled: true
+        bucket: "${NF_S3_BUCKET:neuroforge-artifacts}"
+        prefix: "ckpt/${project.name}/staging"
+
+  prod:
+    <<: *defaults
+    logging:
+      <<: *defaults.logging
+      mlflow:
+        <<: *defaults.logging.mlflow
+        tags:
+          env: "prod"
+          component: "trainer"
+      wandb:
+        <<: *defaults.logging.wandb
+        enabled: true
+        mode: "online"
+    runtime:
+      <<: *defaults.runtime
+      benchmark: true
+      deterministic: false      # допускаем недетерминизм ради производительности
+      mixed_precision:
+        enabled: true
+        dtype: "bf16"
+    distributed:
+      <<: *defaults.distributed
+      strategy: "ddp"
+      devices: "auto"
+      nodes: 1
+      gradient_accumulation_steps: 4
+      grad_clip_norm: 1.0
+    dataloader:
+      <<: *defaults.dataloader
+      batch_size: 128
+    optimizer:
+      <<: *defaults.optimizer
+      params:
+        <<: *defaults.optimizer.params
+        lr: 1.2e-3
+        weight_decay: 4.0e-2
+    scheduler:
+      <<: *defaults.scheduler
+      params:
+        <<: *defaults.scheduler.params
+        warmup_steps: 2000
+        min_lr: 5.0e-6
+    training:
+      <<: *defaults.training
+      max_epochs: 120
+      check_val_every_n_epoch: 1
+      accumulate_grad_batches: 2
+    checkpoints:
+      <<: *defaults.checkpoints
+      save_top_k: 5
+      s3:
+        enabled: true
+        bucket: "${NF_S3_BUCKET:neuroforge-artifacts}"
+        prefix: "ckpt/${project.name}/prod"
+    early_stopping:
+      <<: *defaults.early_stopping
+      patience: 12
+      min_delta: 1.0e-4
+
+# ---------- PRESETS (for CLI or pipeline) ----------
+presets:
+  quick_dev:
+    profile: "dev"
+    overrides:
+      training.max_epochs: 3
+      dataloader.batch_size: 16
+      logging.level: "DEBUG"
+  high_throughput_prod:
+    profile: "prod"
+    overrides:
+      distributed.gradient_accumulation_steps: 8
+      dataloader.batch_size: 256
+      runtime.num_workers: 16
+      optimizer.params.lr: 1.6e-3
+
+# ---------- VALIDATION CONSTRAINTS (optional; for a validator) ----------
+constraints:
+  dataloader.batch_size:
+    min: 1
+    max: 2048
+  optimizer.params.lr:
+    min: 1.0e-6
+    max: 1.0e-1
+  scheduler.params.warmup_steps:
+    min: 0
+    max: 20000
+  training.max_epochs:
+    min: 1
+    max: 1000

@@ -1,0 +1,415 @@
+# chronowatch-core/ops/k8s/base/prometheus-rules.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: chronowatch-core-prometheus-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: chronowatch-core
+    app.kubernetes.io/part-of: chronowatch-core
+    app.kubernetes.io/component: observability
+    monitoring: "true"
+spec:
+  groups:
+
+  # ---------- Recording rules: агрегаты, SLI/SLO и производные метрики ----------
+  - name: recording.rules
+    interval: 1m
+    rules:
+      # CPU загрузка узла (0..1)
+      - record: node:cpu_utilisation:ratio
+        expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+      # Доля доступной памяти узла (0..1)
+      - record: node:memory_available:ratio
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+      # Заполненность ФС (0..1)
+      - record: node:fs_used:ratio
+        expr: 1 - (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"})
+      # 95-й перцентиль латентности HTTP по сервису
+      - record: workload:http_request_duration_seconds:p95
+        expr: histogram_quantile(0.95, sum by (service, le) (rate(http_request_duration_seconds_bucket[5m])))
+      # Ошибки HTTP 5xx / весь трафик (5m)
+      - record: workload:http_error_rate:ratio_5m
+        expr: sum by (service) (rate(http_requests_total{code=~"5.."}[5m]))
+              /
+              sum by (service) (rate(http_requests_total[5m]))
+      # Ошибки HTTP 5xx / весь трафик (1h)
+      - record: workload:http_error_rate:ratio_1h
+        expr: sum by (service) (rate(http_requests_total{code=~"5.."}[1h]))
+              /
+              sum by (service) (rate(http_requests_total[1h]))
+      # Скорость рестартов контейнеров (5m)
+      - record: k8s:pod_restart_rate:5m
+        expr: sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total[5m]))
+      # Доля троттлинга CPU по контейнеру (5m)
+      - record: container:cpu_throttle:ratio
+        expr: sum by (namespace, pod, container) (rate(container_cpu_cfs_throttled_periods_total[5m]))
+              /
+              sum by (namespace, pod, container) (rate(container_cpu_cfs_periods_total[5m]))
+      # SLO-целевой уровень доступности (константа для бюджет-бурна)
+      - record: slo:availability:target
+        expr: 0.999
+
+  # ---------- Общая доступность и метрики Prometheus ----------
+  - name: general.availability
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Экземпляр недоступен ({{ $labels.job }} / {{ $labels.instance }})
+          description: Target up==0 более 5 минут. Экземпляр недоступен или не скрапится.
+          runbook: docs/runbooks/instance-down.md
+
+      - alert: ManyTargetsDownByJob
+        expr: sum by (job) (up == 0) > 2
+        for: 10m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Массовая деградация таргетов в job {{ $labels.job }}
+          description: Больше двух таргетов up==0 в течение 10 минут.
+          runbook: docs/runbooks/prometheus-many-targets-down.md
+
+      - alert: PrometheusScrapeErrors
+        expr: rate(prometheus_target_scrapes_exceeded_sample_limit_total[5m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Превышен лимит выборки при скрапинге
+          description: Prometheus отбрасывает выборки из-за лимита. Проверьте sample_limit и «шумные» таргеты.
+          runbook: docs/runbooks/prometheus-scrape-errors.md
+
+  # ---------- Kubernetes control plane и объекты ----------
+  - name: kubernetes.control-plane
+    rules:
+      - alert: KubeAPIDown
+        expr: up{job=~"apiserver|kube-apiserver"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Kubernetes API недоступен
+          description: Метрики kube-apiserver недоступны более 5 минут.
+          runbook: docs/runbooks/kube-apiserver-down.md
+
+      - alert: APIServerHighErrorRate
+        expr: |
+          sum(rate(apiserver_request_total{code=~"5.."}[5m]))
+          /
+          sum(rate(apiserver_request_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Высокая доля 5xx от kube-apiserver
+          description: Ошибки 5xx превышают 5% за 10 минут.
+          runbook: docs/runbooks/kube-apiserver-5xx.md
+
+      - alert: APIServerLatencyP99High
+        expr: histogram_quantile(0.99, sum by (le, verb) (rate(apiserver_request_duration_seconds_bucket{verb!~"WATCH|WATCHLIST"}[5m]))) > 1
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Высокая латентность kube-apiserver P99
+          description: P99 длительности запросов > 1s.
+          runbook: docs/runbooks/kube-apiserver-latency.md
+
+      - alert: EtcdMemberDown
+        expr: up{job=~"etcd"} == 0 or max(etcd_server_has_leader) == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Проблема с etcd (нет лидера или инстанс down)
+          description: Проверьте кластер etcd и сетевую связность.
+          runbook: docs/runbooks/etcd-down.md
+
+  - name: kubernetes.workloads
+    rules:
+      - alert: NodeNotReady
+        expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Узел NotReady ({{ $labels.node }})
+          description: Нода в состоянии NotReady более 5 минут.
+          runbook: docs/runbooks/node-notready.md
+
+      - alert: PodsPendingTooLong
+        expr: sum by (namespace) (kube_pod_status_phase{phase="Pending"}) > 5
+        for: 20m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Много Pod в Pending
+          description: Более 5 Pod в статусе Pending > 20 минут. Возможны проблемы с планированием/ресурсами.
+          runbook: docs/runbooks/pods-pending.md
+
+      - alert: PodCrashLooping
+        expr: increase(kube_pod_container_status_restarts_total[10m]) > 5
+        for: 10m
+        labels:
+          severity: critical
+          team: app
+        annotations:
+          summary: Частые рестарты контейнеров
+          description: Больше 5 рестартов за 10 минут ({{ $labels.namespace }}/{{ $labels.pod }}).
+          runbook: docs/runbooks/pod-crashloop.md
+
+      - alert: PodNotReady
+        expr: kube_pod_status_ready{condition="true"} == 0
+        for: 15m
+        labels:
+          severity: warning
+          team: app
+        annotations:
+          summary: Pod не готов (NotReady)
+          description: Pod {{ $labels.namespace }}/{{ $labels.pod }} остаётся NotReady более 15 минут.
+          runbook: docs/runbooks/pod-notready.md
+
+      - alert: DeploymentReplicasMismatch
+        expr: kube_deployment_status_replicas_unavailable > 0
+        for: 15m
+        labels:
+          severity: warning
+          team: app
+        annotations:
+          summary: Недоступные реплики в Deployment
+          description: У Deployment есть недоступные реплики более 15 минут.
+          runbook: docs/runbooks/deployment-replicas-mismatch.md
+
+      - alert: DaemonSetMissScheduled
+        expr: kube_daemonset_status_number_misscheduled > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: DaemonSet запланирован не на те узлы
+          description: Есть misscheduled поды у DaemonSet.
+          runbook: docs/runbooks/daemonset-misscheduled.md
+
+  # ---------- Узлы и ОС ----------
+  - name: nodes.health
+    rules:
+      - alert: HostHighCPU
+        expr: node:cpu_utilisation:ratio > 0.9
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Высокая загрузка CPU узла
+          description: Средняя загрузка CPU > 90% более 15 минут ({{ $labels.instance }}).
+          runbook: docs/runbooks/node-high-cpu.md
+
+      - alert: HostHighMemoryPressure
+        expr: node:memory_available:ratio < 0.1
+        for: 15m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Низкая доступная память на узле
+          description: Доступно <10% памяти более 15 минут ({{ $labels.instance }}).
+          runbook: docs/runbooks/node-memory-pressure.md
+
+      - alert: HostHighSwapUsage
+        expr: (node_memory_SwapTotal_bytes > 0) and (node_memory_SwapUsed_bytes / node_memory_SwapTotal_bytes > 0.8)
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Высокое использование swap на узле
+          description: Использование swap превышает 80% на {{ $labels.instance }}.
+          runbook: docs/runbooks/node-swap-usage.md
+
+      - alert: FilesystemAlmostFull
+        expr: node:fs_used:ratio > 0.9
+        for: 10m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Файловая система почти заполнена
+          description: Заполненность ФС > 90% ({{ $labels.instance }} {{ $labels.mountpoint }}).
+          runbook: docs/runbooks/filesystem-full.md
+
+      - alert: FilesystemFillingUp
+        expr: predict_linear(node_filesystem_free_bytes{fstype!~"tmpfs|overlay"}[6h], 24*3600) < 0
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Диск заполнится менее чем за 24 часа
+          description: Прогноз по тренду свободного места указывает на исчерпание < 24h.
+          runbook: docs/runbooks/filesystem-filling-up.md
+
+      - alert: InodesAlmostFull
+        expr: (node_filesystem_files_free{fstype!~"tmpfs|overlay"} / node_filesystem_files{fstype!~"tmpfs|overlay"}) < 0.1
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Почти закончились inode
+          description: Свободных inode < 10% ({{ $labels.instance }} {{ $labels.mountpoint }}).
+          runbook: docs/runbooks/inodes-low.md
+
+      - alert: ClockSkewDetected
+        expr: (node_timex_sync_status == 0) or (abs(node_timex_offset_seconds) > 0.5)
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Обнаружен рассинхрон времени
+          description: Узел не синхронизирован с NTP или |offset| > 0.5s.
+          runbook: docs/runbooks/clock-skew.md
+
+  # ---------- Сеть ----------
+  - name: network.health
+    rules:
+      - alert: NodeNetworkErrors
+        expr: rate(node_network_receive_errs_total[5m]) > 0 or rate(node_network_transmit_errs_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Ошибки сетевого интерфейса на узле
+          description: Обнаружены ошибки RX/TX на {{ $labels.instance }} интерфейс {{ $labels.device }}.
+          runbook: docs/runbooks/network-errors.md
+
+      - alert: NodeNetworkDrops
+        expr: rate(node_network_receive_drop_total[5m]) > 0 or rate(node_network_transmit_drop_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Дропы сетевых пакетов на узле
+          description: Обнаружены drop-пакеты на {{ $labels.instance }} интерфейс {{ $labels.device }}.
+          runbook: docs/runbooks/network-drops.md
+
+  # ---------- Хранилище Kubernetes ----------
+  - name: kubernetes.storage
+    rules:
+      - alert: PersistentVolumeFullSoon
+        expr: (kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes) < 0.1
+        for: 20m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: PV почти заполнен
+          description: Свободное место в томе < 10% ({{ $labels.persistentvolumeclaim }} / {{ $labels.namespace }}).
+          runbook: docs/runbooks/pv-low-space.md
+
+      - alert: PersistentVolumeInodesLow
+        expr: (kubelet_volume_stats_inodes_free / kubelet_volume_stats_inodes) < 0.1
+        for: 20m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Мало inode в PV
+          description: Свободных inode < 10% ({{ $labels.persistentvolumeclaim }} / {{ $labels.namespace }}).
+          runbook: docs/runbooks/pv-inodes-low.md
+
+  # ---------- Приложения и SLO ----------
+  - name: apps.health
+    rules:
+      - alert: AppHighErrorRate
+        expr: workload:http_error_rate:ratio_5m > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          team: app
+        annotations:
+          summary: Высокая доля 5xx в сервисе {{ $labels.service }}
+          description: Ошибки 5xx > 5% за последние 10 минут.
+          runbook: docs/runbooks/app-high-error-rate.md
+
+      - alert: AppLatencyP95High
+        expr: workload:http_request_duration_seconds:p95 > 0.5
+        for: 15m
+        labels:
+          severity: warning
+          team: app
+        annotations:
+          summary: Высокая P95 латентность {{ $labels.service }}
+          description: 95-й перцентиль длительности запросов > 500ms.
+          runbook: docs/runbooks/app-latency.md
+
+      - alert: CPUBudgetThrottlingHigh
+        expr: container:cpu_throttle:ratio > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          team: app
+        annotations:
+          summary: Высокий троттлинг CPU ({{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }})
+          description: Более 20% периодов были затроттлены за 10 минут. Проверьте CPU limits/requests.
+          runbook: docs/runbooks/cpu-throttling.md
+
+      - alert: ErrorBudgetBurnHigh
+        expr: |
+          (
+            workload:http_error_rate:ratio_5m / (1 - slo:availability:target)
+          ) > 14
+          and
+          (
+            workload:http_error_rate:ratio_1h / (1 - slo:availability:target)
+          ) > 7
+        for: 5m
+        labels:
+          severity: critical
+          team: app
+          slo: "availability"
+        annotations:
+          summary: Высокий расход error-бюджета ({{ $labels.service }})
+          description: Многократно превышен бюджет-берн по двум окнам (5m/1h). Требуется немедленная реакция.
+          runbook: docs/runbooks/error-budget-burn.md
+
+  # ---------- Отсутствие метрик (sanity checks) ----------
+  - name: telemetry.absence
+    rules:
+      - alert: NodeExporterAbsent
+        expr: absent(node_uname_info)
+        for: 10m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Отсутствуют метрики node_exporter
+          description: Серия node_uname_info отсутствует. Вероятно, не работает node_exporter на части узлов.
+          runbook: docs/runbooks/node-exporter-absent.md
+
+      - alert: KubeStateMetricsAbsent
+        expr: absent(up{job=~"kube-state-metrics"})
+        for: 10m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Отсутствуют метрики kube-state-metrics
+          description: Экспортер kube-state-metrics отсутствует или не скрапится.
+          runbook: docs/runbooks/kube-state-metrics-absent.md

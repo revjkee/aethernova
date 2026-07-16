@@ -1,0 +1,401 @@
+# OblivionVault Core — Industrial configuration (prod-ready)
+# Все параметры имеют безопасные значения по умолчанию и могут быть
+# переопределены переменными окружения вида ${ENV_VAR:-default}.
+
+version: "1.0"
+
+server:
+  bind_addr: ${OV_BIND_ADDR:-0.0.0.0}
+  port: ${OV_PORT:-9443}
+  # Только HTTPS. Для debug можно выключить, но по умолчанию — строго.
+  http_enabled: false
+  https_enabled: true
+  request_timeout: ${OV_REQUEST_TIMEOUT_SECONDS:-30}         # сек
+  read_header_timeout: ${OV_READ_HEADER_TIMEOUT_SECONDS:-10}
+  idle_timeout: ${OV_IDLE_TIMEOUT_SECONDS:-60}
+  max_request_body_mb: ${OV_MAX_BODY_MB:-25}
+  # Заголовки безопасности (OWASP ASVS)
+  security_headers:
+    strict_transport_security: "max-age=63072000; includeSubDomains; preload"
+    x_content_type_options: "nosniff"
+    x_frame_options: "DENY"
+    referrer_policy: "no-referrer"
+    content_security_policy: "default-src 'none'; frame-ancestors 'none'; base-uri 'none';"
+    permissions_policy: "geolocation=(), microphone=(), camera=()"
+  cors:
+    enabled: ${OV_CORS_ENABLED:-false}
+    allow_origins: ${OV_CORS_ALLOW_ORIGINS:-[]}     # пример: '["https://example.com"]'
+    allow_methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"]
+    allow_headers: ["Authorization","Content-Type","X-Request-Id"]
+    allow_credentials: false
+    max_age_seconds: 600
+  grpc:
+    enabled: ${OV_GRPC_ENABLED:-false}
+    port: ${OV_GRPC_PORT:-9444}
+    max_message_mb: ${OV_GRPC_MAX_MB:-16}
+  unix_socket:
+    enabled: ${OV_UNIX_SOCK_ENABLED:-false}
+    path: ${OV_UNIX_SOCK_PATH:-/run/oblivionvault/ov.sock}
+    mode: "0660"
+
+tls:
+  mode: ${OV_TLS_MODE:-required}      # required|optional|disabled
+  min_version: "TLS1.2"
+  prefer_server_ciphers: true
+  cipher_suites:
+    - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+    - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+  certificate_file: ${OV_TLS_CERT_FILE:-/etc/oblivionvault/tls/server.crt}
+  private_key_file: ${OV_TLS_KEY_FILE:-/etc/oblivionvault/tls/server.key}
+  client_ca_file: ${OV_TLS_CLIENT_CA_FILE:-}        # для mTLS
+  ocsp:
+    stapling_enabled: ${OV_OCSP_STAPLING:-true}
+  session_tickets:
+    enabled: false
+  hsts_preload: true
+
+mtls:
+  enabled: ${OV_MTLS_ENABLED:-false}
+  require_san_match: true
+  san_allowed_dns: ${OV_MTLS_SAN_DNS:-[]}
+  san_allowed_ips: ${OV_MTLS_SAN_IPS:-[]}
+
+api:
+  base_path: "/api"
+  pagination:
+    default_limit: ${OV_API_DEF_LIMIT:-50}
+    max_limit: ${OV_API_MAX_LIMIT:-500}
+  idempotency:
+    enabled: true
+    header: "Idempotency-Key"
+    ttl_seconds: 600
+
+authn:
+  # Множественная аутентификация: OIDC, JWT, mTLS, static (для break-glass)
+  order: ["mtls","oidc","jwt","static"]
+  oidc:
+    enabled: ${OV_OIDC_ENABLED:-false}
+    issuer: ${OV_OIDC_ISSUER:-}
+    client_id: ${OV_OIDC_CLIENT_ID:-}
+    client_secret: ${OV_OIDC_CLIENT_SECRET:-}
+    jwks_url: ${OV_OIDC_JWKS_URL:-}
+    scopes: ["openid","profile","email","groups"]
+    username_claim: "preferred_username"
+    groups_claim: "groups"
+    cache_ttl_seconds: 300
+  jwt:
+    enabled: ${OV_JWT_ENABLED:-false}
+    issuers:
+      - issuer: ${OV_JWT_ISSUER:-}
+        audience: ${OV_JWT_AUDIENCE:-oblivionvault}
+        jwks_url: ${OV_JWT_JWKS_URL:-}
+        required_claims:
+          - "sub"
+          - "exp"
+        leeway_seconds: 60
+  static:
+    enabled: ${OV_STATIC_AUTH_ENABLED:-false}
+    users:
+      - username: ${OV_ADMIN_USER:-admin}
+        password_hash: ${OV_ADMIN_PASS_HASH:-}   # bcrypt/argon2
+        roles: ["admin"]
+
+authz:
+  # RBAC с преднастроенными ролями и минимальными привилегиями
+  model: "rbac"
+  roles:
+    - name: "admin"
+      description: "Full administrative access"
+      privileges: ["*"]
+    - name: "ops"
+      description: "Operational access without destructive admin"
+      privileges:
+        - "secrets:read"
+        - "secrets:list"
+        - "status:read"
+        - "backup:read"
+        - "metrics:read"
+    - name: "writer"
+      description: "Create/update secrets and metadata"
+      privileges:
+        - "secrets:create"
+        - "secrets:update"
+        - "secrets:read"
+        - "secrets:list"
+    - name: "reader"
+      description: "Read-only access"
+      privileges:
+        - "secrets:read"
+        - "secrets:list"
+  default_role: "reader"
+  policy_overrides_file: ${OV_RBAC_OVERRIDES:-}  # путь к кастомным политикам (YAML)
+
+tenancy:
+  mode: ${OV_TENANCY_MODE:-single}   # single|multi
+  header_tenant_key: "X-Tenant-Id"
+  enforce_isolation: ${OV_TENANCY_ISOLATION:-true}
+
+storage:
+  # Движок по умолчанию — файл (надёжный для single-node). Для HA используйте etcd/pgsql.
+  engine: ${OV_STORAGE_ENGINE:-file}   # file|etcd|postgres|s3
+  file:
+    path: ${OV_DATA_DIR:-/var/lib/oblivionvault/data}
+    fsync_on_write: true
+  etcd:
+    endpoints: ${OV_ETCD_ENDPOINTS:-["https://127.0.0.1:2379"]}
+    username: ${OV_ETCD_USER:-}
+    password: ${OV_ETCD_PASS:-}
+    tls:
+      enabled: true
+      ca_file: ${OV_ETCD_CA:-/etc/ssl/certs/ca-certificates.crt}
+      cert_file: ${OV_ETCD_CERT:-}
+      key_file: ${OV_ETCD_KEY:-}
+    dial_timeout_seconds: 5
+    request_timeout_seconds: 10
+  postgres:
+    dsn: ${OV_PG_DSN:-postgresql://ov:ov@127.0.0.1:5432/ov}
+    max_open_conns: ${OV_PG_MAX_OPEN:-50}
+    max_idle_conns: ${OV_PG_MAX_IDLE:-10}
+    conn_max_lifetime_minutes: 30
+    sslmode: ${OV_PG_SSLMODE:-require}
+    sslrootcert: ${OV_PG_SSLROOTCERT:-}
+    sslcert: ${OV_PG_SSLCERT:-}
+    sslkey: ${OV_PG_SSLKEY:-}
+  s3:
+    bucket: ${OV_S3_BUCKET:-}
+    region: ${OV_S3_REGION:-}
+    endpoint: ${OV_S3_ENDPOINT:-}
+    force_path_style: ${OV_S3_PATH_STYLE:-false}
+    kms_key_id: ${OV_S3_KMS_KEY_ID:-}
+    server_side_encryption: ${OV_S3_SSE:-aws:kms}
+    credentials_source: ${OV_S3_CRED_SRC:-iam}  # iam|env|static
+    access_key_id: ${OV_S3_ACCESS_KEY_ID:-}
+    secret_access_key: ${OV_S3_SECRET_ACCESS_KEY:-}
+
+encryption:
+  # Сквозное шифрование секрета на уровне приложения.
+  master_key_source: ${OV_MASTER_KEY_SRC:-kms}      # env|file|kms|hsm
+  env:
+    key_b64: ${OV_MASTER_KEY_B64:-}                 # 32/64 байта
+  file:
+    path: ${OV_MASTER_KEY_FILE:-/etc/oblivionvault/keys/master.key}
+  kms:
+    provider: ${OV_KMS_PROVIDER:-awskms}            # awskms|gcpkms|azurekv|hashicorp
+    awskms:
+      key_arn: ${OV_AWS_KMS_ARN:-}
+      region: ${OV_AWS_REGION:-}
+    gcpkms:
+      key_name: ${OV_GCP_KMS_KEY:-}
+    azurekv:
+      key_id: ${OV_AZURE_KV_KEY_ID:-}
+    hashicorp:
+      addr: ${OV_VAULT_ADDR:-https://127.0.0.1:8200}
+      token: ${OV_VAULT_TOKEN:-}
+      transit_key: ${OV_VAULT_TRANSIT_KEY:-ov-master}
+      tls_skip_verify: ${OV_VAULT_INSECURE:-false}
+  key_rotation:
+    enabled: true
+    interval_days: ${OV_KEY_ROTATE_DAYS:-90}
+    window_days: 30
+    reencrypt_batch_size: 200
+
+secrets:
+  # Политики для секретов и метаданных
+  max_secret_size_kb: ${OV_MAX_SECRET_KB:-64}
+  max_metadata_size_kb: ${OV_MAX_META_KB:-8}
+  default_ttl_hours: ${OV_SECRET_TTL_HRS:-0}   # 0 = без TTL
+  max_versions: ${OV_MAX_VERSIONS:-10}
+  delete_protection: ${OV_DELETE_PROTECT:-true}
+  soft_delete_retention_days: ${OV_SOFT_DEL_DAYS:-30}
+  access_policy:
+    require_reason: ${OV_REQUIRE_REASON:-false}
+    record_reason_in_audit: true
+  namespaces:
+    reserved: ["system","internal"]
+
+audit:
+  enabled: true
+  mode: "append-only"
+  redact_fields: ["data.value","credentials","token","password","secret"]
+  sinks:
+    - type: "file"
+      path: ${OV_AUDIT_LOG_PATH:-/var/log/oblivionvault/audit.log}
+      rotate:
+        max_size_mb: 128
+        max_backups: 14
+        max_age_days: 30
+        compress: true
+    - type: "syslog"
+      severity: "info"
+      facility: "auth"
+      endpoint: ${OV_SYSLOG_ENDPOINT:-}
+    # Пример отправки в SIEM (Loki/HTTP)
+    - type: "http"
+      endpoint: ${OV_AUDIT_HTTP_ENDPOINT:-}
+      method: "POST"
+      headers:
+        Authorization: ${OV_AUDIT_HTTP_AUTH:-}
+      tls_verify: true
+      timeout_seconds: 5
+  events:
+    include: ["authn.*","authz.*","secrets.*","backup.*","system.policy.*"]
+    exclude: []
+
+logging:
+  level: ${OV_LOG_LEVEL:-info}  # debug|info|warn|error
+  format: ${OV_LOG_FORMAT:-json}
+  file: ${OV_LOG_FILE:-/var/log/oblivionvault/oblivionvault.log}
+  rotate:
+    max_size_mb: 256
+    max_backups: 10
+    max_age_days: 14
+    compress: true
+  sampling:
+    enabled: true
+    initial: 100
+    thereafter: 1000
+
+telemetry:
+  prometheus:
+    enabled: ${OV_PROM_ENABLED:-true}
+    bind_addr: "127.0.0.1"
+    port: ${OV_PROM_PORT:-9464}
+    path: "/metrics"
+  tracing:
+    enabled: ${OV_TRACE_ENABLED:-false}
+    exporter: ${OV_TRACE_EXPORTER:-otlp}     # otlp|jaeger
+    otlp:
+      endpoint: ${OV_OTLP_ENDPOINT:-http://127.0.0.1:4318}
+      protocol: "http/protobuf"
+      timeout_seconds: 5
+    sampling_ratio: ${OV_TRACE_SAMPLING:-0.05}
+  health:
+    liveness_path: "/healthz"
+    readiness_path: "/readyz"
+
+ratelimit:
+  enabled: ${OV_RL_ENABLED:-true}
+  global_rps: ${OV_RL_GLOBAL_RPS:-1000}
+  per_ip_rps: ${OV_RL_IP_RPS:-50}
+  burst: ${OV_RL_BURST:-100}
+  key_strategies: ["ip","user","tenant"]
+  penalty_box_seconds: 60
+
+quotas:
+  enabled: ${OV_QUOTAS_ENABLED:-true}
+  tenants:
+    default:
+      secrets_per_day: ${OV_QUOTA_SECRETS_DAY:-5000}
+      read_ops_per_min: ${OV_QUOTA_READ_OPM:-2000}
+      write_ops_per_min: ${OV_QUOTA_WRITE_OPM:-200}
+    overrides: {}   # {tenant-id: {secrets_per_day: N, ...}}
+
+waf:
+  enabled: ${OV_WAF_ENABLED:-true}
+  blocklist_ips: ${OV_WAF_BLOCK_IPS:-[]}
+  allowlist_ips: ${OV_WAF_ALLOW_IPS:-[]}
+  max_uri_length: 2048
+  max_header_count: 64
+  deny_request_patterns:
+    - "(?i)(union\\s+select|information_schema)"
+    - "(?i)<script[^>]*>"
+
+cluster:
+  enabled: ${OV_CLUSTER_ENABLED:-false}
+  node_id: ${OV_NODE_ID:-}
+  advertise_addr: ${OV_ADVERTISE_ADDR:-}
+  peers: ${OV_CLUSTER_PEERS:-[]}
+  election_timeout_ms: 1500
+  heartbeat_ms: 200
+  shard_count: ${OV_SHARDS:-16}
+  consistency: "quorum"   # one|quorum|all
+
+maintenance:
+  auto_compaction_hours: 24
+  auto_vacuum: true
+  defrag_percent: 5
+  orphan_sweeper:
+    enabled: true
+    interval_minutes: 30
+
+backups:
+  enabled: ${OV_BACKUP_ENABLED:-true}
+  schedule_cron: ${OV_BACKUP_CRON:-"0 3 * * *"}
+  retention_days: ${OV_BACKUP_RETENTION_DAYS:-30}
+  target:
+    type: ${OV_BACKUP_TARGET_TYPE:-s3}    # file|s3
+    file:
+      path: ${OV_BACKUP_FILE_PATH:-/var/backups/oblivionvault}
+    s3:
+      bucket: ${OV_BACKUP_S3_BUCKET:-}
+      prefix: ${OV_BACKUP_S3_PREFIX:-ov/backup}
+      region: ${OV_BACKUP_S3_REGION:-}
+      kms_key_id: ${OV_BACKUP_S3_KMS_KEY_ID:-}
+      sse: ${OV_BACKUP_S3_SSE:-aws:kms}
+  verify:
+    enabled: true
+    strategy: "checksum"
+  throttle_mb_per_s: ${OV_BACKUP_THROTTLE_MBPS:-20}
+
+plugins:
+  allowed: ${OV_PLUGINS_ALLOWED:-[]}
+  dir: ${OV_PLUGINS_DIR:-/var/lib/oblivionvault/plugins}
+  sandbox:
+    enabled: true
+    allow_network: false
+    max_cpu_percent: 25
+    memory_limit_mb: 256
+
+migrations:
+  auto_apply: true
+  wait_ready_seconds: 30
+
+features:
+  soft_delete: true
+  secret_sharing: ${OV_FEATURE_SECRET_SHARING:-false}
+  sealed_secrets: ${OV_FEATURE_SEALED:-true}
+  ttl_enforce: true
+  api_keys:
+    enabled: ${OV_FEATURE_API_KEYS:-true}
+    prefix: "ovk_"
+    length: 40
+
+compliance:
+  cis_level: 1
+  gdpr:
+    data_minimization: true
+    export_enabled: true
+    delete_on_request: true
+  logging_pii:
+    allowed_fields: []
+    drop_unknown: true
+
+observability:
+  request_id_header: "X-Request-Id"
+  correlation:
+    propagate_headers: ["X-Request-Id","X-Correlation-Id","traceparent"]
+  redaction:
+    patterns:
+      - "(?i)authorization: Bearer .*"
+      - "(?i)password=[^&\\s]+"
+      - "(?i)secret=[^&\\s]+"
+
+# Преднастроенные «охраняемые» эндпойнты и минимальные права
+endpoints:
+  - path: "/api/v1/secrets"
+    methods: ["GET","POST","PUT","DELETE"]
+    required_privileges:
+      GET: ["secrets:read"]
+      POST: ["secrets:create"]
+      PUT: ["secrets:update"]
+      DELETE: ["secrets:delete"]
+  - path: "/api/v1/secrets/:id/versions"
+    methods: ["GET"]
+    required_privileges:
+      GET: ["secrets:read"]
+  - path: "/api/v1/status"
+    methods: ["GET"]
+    required_privileges:
+      GET: ["status:read"]

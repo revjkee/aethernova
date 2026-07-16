@@ -1,0 +1,473 @@
+version: "1.0"
+
+meta:
+  name: "agent_mash_e2e_suite"
+  owner: "qa"
+  description: "Industrial E2E scenarios for agent_mash platform"
+  created_utc: "2026-02-02T00:00:00Z"
+  spec:
+    compatibility:
+      - "agent_mash_e2e_runner>=1.0"
+    guarantees:
+      - "strict_schema"
+      - "deterministic_steps"
+      - "repeatable_runs"
+
+schema:
+  scenario:
+    required:
+      - id
+      - title
+      - steps
+    fields:
+      id: { type: string, pattern: "^[a-z0-9][a-z0-9_\\-\\.]{2,63}$" }
+      title: { type: string, min_length: 4, max_length: 160 }
+      description: { type: string, max_length: 2000 }
+      tags: { type: list, items: { type: string, max_length: 48 } }
+      severity: { type: string, enum: ["blocker", "critical", "major", "minor", "trivial"] }
+      enabled: { type: boolean }
+      matrix: { type: object }
+      preconditions: { type: list }
+      steps: { type: list, min_items: 1 }
+      cleanup: { type: list }
+      expect_global: { type: object }
+      sla: { type: object }
+      timeouts: { type: object }
+      retries: { type: object }
+
+defaults:
+  enabled: true
+  severity: "major"
+  tags: ["e2e"]
+  timeouts:
+    suite_seconds: 1800
+    scenario_seconds: 300
+    step_seconds: 30
+    connect_seconds: 5
+    read_seconds: 20
+  retries:
+    step:
+      max_attempts: 2
+      backoff_seconds: [1, 3]
+      retry_on:
+        - "timeout"
+        - "http_502"
+        - "http_503"
+        - "http_504"
+    scenario:
+      max_attempts: 1
+  stability:
+    flake_guard:
+      enabled: true
+      min_consecutive_passes: 1
+      quarantine:
+        enabled: true
+        on_failure_tag: "quarantine"
+  assertions:
+    strict_json: true
+    forbid_unknown_fields: true
+    require_status: true
+  reporting:
+    include_request_bodies: false
+    include_response_bodies_on_fail: true
+    redact:
+      headers: ["authorization", "x-api-key", "cookie", "set-cookie"]
+      json_paths:
+        - "$.token"
+        - "$.access_token"
+        - "$.refresh_token"
+        - "$.secret"
+        - "$.private_key"
+        - "$.password"
+        - "$.credentials"
+
+environments:
+  local:
+    base_url: "http://127.0.0.1:8080"
+    health_path: "/health"
+    api_prefix: "/api"
+    auth:
+      mode: "password"
+      login_path: "/api/auth/login"
+      logout_path: "/api/auth/logout"
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    vars:
+      tenant: "default"
+      test_user_login: "e2e_user"
+      test_user_password: "e2e_password"
+      admin_login: "e2e_admin"
+      admin_password: "e2e_admin_password"
+
+  staging:
+    base_url: "https://staging.example.invalid"
+    health_path: "/health"
+    api_prefix: "/api"
+    auth:
+      mode: "password"
+      login_path: "/api/auth/login"
+      logout_path: "/api/auth/logout"
+    headers:
+      accept: "application/json"
+      content-type: "application/json"
+    vars:
+      tenant: "staging"
+      test_user_login: "e2e_user"
+      test_user_password: "e2e_password"
+      admin_login: "e2e_admin"
+      admin_password: "e2e_admin_password"
+
+scenarios:
+  - id: "health_basic"
+    title: "Health endpoint returns ok"
+    description: "Checks service liveness and basic metadata"
+    severity: "blocker"
+    tags: ["e2e", "health", "smoke"]
+    steps:
+      - name: "GET health"
+        request:
+          method: "GET"
+          path: "{{env.health_path}}"
+        expect:
+          status: 200
+          json:
+            must_have:
+              - path: "$.status"
+                equals: "ok"
+            allow_additional_fields: true
+
+  - id: "auth_login_logout"
+    title: "User can login and logout"
+    severity: "critical"
+    tags: ["e2e", "auth", "smoke"]
+    steps:
+      - name: "POST login"
+        request:
+          method: "POST"
+          path: "{{env.auth.login_path}}"
+          json:
+            login: "{{env.vars.test_user_login}}"
+            password: "{{env.vars.test_user_password}}"
+        capture:
+          - name: "access_token"
+            from_json_path: "$.access_token"
+        expect:
+          status: 200
+          json:
+            must_have:
+              - path: "$.access_token"
+                type: "string"
+                min_length: 16
+      - name: "GET whoami"
+        request:
+          method: "GET"
+          path: "{{env.api_prefix}}/auth/whoami"
+          headers:
+            authorization: "Bearer {{capture.access_token}}"
+        expect:
+          status: 200
+          json:
+            must_have:
+              - path: "$.login"
+                equals: "{{env.vars.test_user_login}}"
+      - name: "POST logout"
+        request:
+          method: "POST"
+          path: "{{env.auth.logout_path}}"
+          headers:
+            authorization: "Bearer {{capture.access_token}}"
+        expect:
+          status: 204
+
+  - id: "rbac_forbidden_admin_route"
+    title: "Non-admin forbidden on admin route"
+    severity: "critical"
+    tags: ["e2e", "rbac", "security"]
+    steps:
+      - name: "Login as user"
+        request:
+          method: "POST"
+          path: "{{env.auth.login_path}}"
+          json:
+            login: "{{env.vars.test_user_login}}"
+            password: "{{env.vars.test_user_password}}"
+        capture:
+          - name: "user_token"
+            from_json_path: "$.access_token"
+        expect:
+          status: 200
+      - name: "Attempt admin endpoint"
+        request:
+          method: "GET"
+          path: "{{env.api_prefix}}/admin/metrics"
+          headers:
+            authorization: "Bearer {{capture.user_token}}"
+        expect:
+          status_one_of: [401, 403]
+      - name: "Logout user"
+        request:
+          method: "POST"
+          path: "{{env.auth.logout_path}}"
+          headers:
+            authorization: "Bearer {{capture.user_token}}"
+        expect:
+          status_one_of: [204, 401]
+
+  - id: "admin_access_admin_route"
+    title: "Admin can access admin route"
+    severity: "critical"
+    tags: ["e2e", "rbac", "security"]
+    steps:
+      - name: "Login as admin"
+        request:
+          method: "POST"
+          path: "{{env.auth.login_path}}"
+          json:
+            login: "{{env.vars.admin_login}}"
+            password: "{{env.vars.admin_password}}"
+        capture:
+          - name: "admin_token"
+            from_json_path: "$.access_token"
+        expect:
+          status: 200
+      - name: "GET admin metrics"
+        request:
+          method: "GET"
+          path: "{{env.api_prefix}}/admin/metrics"
+          headers:
+            authorization: "Bearer {{capture.admin_token}}"
+        expect:
+          status: 200
+          json:
+            allow_additional_fields: true
+      - name: "Logout admin"
+        request:
+          method: "POST"
+          path: "{{env.auth.logout_path}}"
+          headers:
+            authorization: "Bearer {{capture.admin_token}}"
+        expect:
+          status: 204
+
+  - id: "jobs_create_process_result"
+    title: "Create job, wait processing, fetch result"
+    severity: "major"
+    tags: ["e2e", "jobs", "queue"]
+    timeouts:
+      scenario_seconds: 420
+      step_seconds: 45
+    steps:
+      - name: "Login as user"
+        request:
+          method: "POST"
+          path: "{{env.auth.login_path}}"
+          json:
+            login: "{{env.vars.test_user_login}}"
+            password: "{{env.vars.test_user_password}}"
+        capture:
+          - name: "token"
+            from_json_path: "$.access_token"
+        expect:
+          status: 200
+      - name: "POST create job"
+        request:
+          method: "POST"
+          path: "{{env.api_prefix}}/jobs"
+          headers:
+            authorization: "Bearer {{capture.token}}"
+          json:
+            kind: "noop"
+            payload:
+              correlation_id: "{{uuid}}"
+              tenant: "{{env.vars.tenant}}"
+        capture:
+          - name: "job_id"
+            from_json_path: "$.id"
+        expect:
+          status: 201
+          json:
+            must_have:
+              - path: "$.id"
+                type: "string"
+                min_length: 8
+              - path: "$.status"
+                one_of: ["queued", "created"]
+      - name: "WAIT job becomes done"
+        wait:
+          strategy: "poll"
+          max_seconds: 240
+          interval_seconds: 2
+          request:
+            method: "GET"
+            path: "{{env.api_prefix}}/jobs/{{capture.job_id}}"
+            headers:
+              authorization: "Bearer {{capture.token}}"
+          until:
+            json_path: "$.status"
+            one_of: ["done", "failed"]
+        expect:
+          status: 200
+      - name: "GET job result"
+        request:
+          method: "GET"
+          path: "{{env.api_prefix}}/jobs/{{capture.job_id}}/result"
+          headers:
+            authorization: "Bearer {{capture.token}}"
+        expect:
+          status_one_of: [200, 204]
+          json:
+            allow_additional_fields: true
+      - name: "Logout user"
+        request:
+          method: "POST"
+          path: "{{env.auth.logout_path}}"
+          headers:
+            authorization: "Bearer {{capture.token}}"
+        expect:
+          status_one_of: [204, 401]
+
+  - id: "idempotency_create_job_same_key"
+    title: "Idempotency on job creation with same key"
+    severity: "major"
+    tags: ["e2e", "idempotency", "api"]
+    steps:
+      - name: "Login as user"
+        request:
+          method: "POST"
+          path: "{{env.auth.login_path}}"
+          json:
+            login: "{{env.vars.test_user_login}}"
+            password: "{{env.vars.test_user_password}}"
+        capture:
+          - name: "token"
+            from_json_path: "$.access_token"
+        expect:
+          status: 200
+      - name: "POST create job with idempotency key"
+        request:
+          method: "POST"
+          path: "{{env.api_prefix}}/jobs"
+          headers:
+            authorization: "Bearer {{capture.token}}"
+            idempotency-key: "{{uuid}}"
+          json:
+            kind: "noop"
+            payload:
+              correlation_id: "idem-{{uuid}}"
+        capture:
+          - name: "job_id_1"
+            from_json_path: "$.id"
+          - name: "idem_key"
+            from_header: "idempotency-key"
+            optional: true
+        expect:
+          status_one_of: [201, 202]
+      - name: "POST same request same key"
+        request:
+          method: "POST"
+          path: "{{env.api_prefix}}/jobs"
+          headers:
+            authorization: "Bearer {{capture.token}}"
+            idempotency-key: "{{last_request.headers.idempotency-key}}"
+          json:
+            kind: "noop"
+            payload:
+              correlation_id: "idem-{{uuid}}"
+        capture:
+          - name: "job_id_2"
+            from_json_path: "$.id"
+        expect:
+          status_one_of: [200, 201, 202]
+          rules:
+            - assert: "equals"
+              left: "{{capture.job_id_2}}"
+              right: "{{capture.job_id_1}}"
+      - name: "Logout user"
+        request:
+          method: "POST"
+          path: "{{env.auth.logout_path}}"
+          headers:
+            authorization: "Bearer {{capture.token}}"
+        expect:
+          status_one_of: [204, 401]
+
+  - id: "rate_limit_basic"
+    title: "Basic rate-limit is enforced on burst"
+    severity: "minor"
+    tags: ["e2e", "ratelimit", "security"]
+    steps:
+      - name: "Burst GET health"
+        request:
+          method: "GET"
+          path: "{{env.health_path}}"
+          repeat:
+            times: 40
+            concurrency: 8
+        expect:
+          status_mixed_allowed: true
+          status_distribution:
+            allow:
+              - 200
+              - 429
+
+  - id: "audit_event_on_login"
+    title: "Audit event emitted on login"
+    severity: "major"
+    tags: ["e2e", "audit", "security"]
+    steps:
+      - name: "Login as user"
+        request:
+          method: "POST"
+          path: "{{env.auth.login_path}}"
+          json:
+            login: "{{env.vars.test_user_login}}"
+            password: "{{env.vars.test_user_password}}"
+        capture:
+          - name: "token"
+            from_json_path: "$.access_token"
+        expect:
+          status: 200
+      - name: "GET audit events (recent)"
+        request:
+          method: "GET"
+          path: "{{env.api_prefix}}/audit/events?limit=20"
+          headers:
+            authorization: "Bearer {{capture.token}}"
+        expect:
+          status_one_of: [200, 403]
+          json:
+            allow_additional_fields: true
+      - name: "Logout user"
+        request:
+          method: "POST"
+          path: "{{env.auth.logout_path}}"
+          headers:
+            authorization: "Bearer {{capture.token}}"
+        expect:
+          status_one_of: [204, 401]
+
+  - id: "dependency_degradation_db_down"
+    title: "Graceful degradation when DB is unavailable"
+    severity: "critical"
+    tags: ["e2e", "resilience", "degradation"]
+    enabled: false
+    description: "Disabled by default because requires chaos control in environment"
+    preconditions:
+      - name: "DB outage injected"
+        note: "Runner must support env-level chaos hooks"
+    steps:
+      - name: "GET health during outage"
+        request:
+          method: "GET"
+          path: "{{env.health_path}}"
+        expect:
+          status_one_of: [200, 503]
+          json:
+            allow_additional_fields: true
+
+cleanup:
+  policies:
+    best_effort: true
+    ignore_errors: true
+    max_seconds: 60

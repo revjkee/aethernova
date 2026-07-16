@@ -1,0 +1,289 @@
+# File: ops/terraform/modules/k8s-observability/prometheus-stack/values/prod.yaml
+
+# Общие метаданные
+fullnameOverride: kube-prometheus-stack
+nameOverride: kube-prometheus-stack
+namespaceOverride: monitoring
+
+# Включить все дефолтные правила и алерты
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: true
+    general: true
+    k8s: true
+    kubeApiserver: true
+    kubeApiserverError: true
+    kubeApiserverSlos: true
+    kubePrometheusGeneral: true
+    kubePrometheusNodeRecording: true
+    kubeScheduler: true
+    kubeStateMetrics: true
+    kubelet: true
+    kubeProxy: true
+    network: true
+    node: true
+    nodeExporterAlerting: true
+    nodeExporterRecording: true
+    prometheus: true
+    prometheusOperator: true
+    time: true
+  appNamespacesTarget: ".*"
+
+# Prometheus Operator (контроллер CRD)
+prometheusOperator:
+  enabled: true
+  admissionWebhooks:
+    enabled: true
+    patch:
+      enabled: true
+  tls:
+    enabled: true
+  resources:
+    requests:
+      cpu: 200m
+      memory: 300Mi
+    limits:
+      cpu: 1
+      memory: 1Gi
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+
+# Alertmanager (HA + PVC)
+alertmanager:
+  enabled: true
+  config:
+    global: {}
+    route:
+      receiver: "null"
+    receivers:
+      - name: "null"
+  ingress:
+    enabled: false
+  service:
+    type: ClusterIP
+  alertmanagerSpec:
+    replicas: 3
+    retention: 120h
+    listenLocal: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 400Mi
+      limits:
+        cpu: 1
+        memory: 1Gi
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+          # storageClassName: <set-your-sc>
+
+# Prometheus (HA + PVC, строгие селекторы, доп. настройки)
+prometheus:
+  enabled: true
+  ingress:
+    enabled: false
+  service:
+    type: ClusterIP
+  prometheusSpec:
+    replicas: 2
+    logLevel: info
+    retention: 30d
+    retentionSize: 150GiB
+    walCompression: true
+    enableAdminAPI: false
+
+    # Метки экземпляра (для федераций/сквозной трассировки)
+    externalLabels:
+      cluster: prod
+      environment: prod
+
+    # Разрешить выбор объектов из всех неймспейсов через CRD-селекторы
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+    serviceMonitorNamespaceSelector: {}
+    podMonitorNamespaceSelector: {}
+    probeNamespaceSelector: {}
+    ruleNamespaceSelector: {}
+    scrapeConfigNamespaceSelector: {}
+
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+
+    # Хранилище Prometheus
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 300Gi
+          # storageClassName: <set-your-sc>
+
+    resources:
+      requests:
+        cpu: 1
+        memory: 4Gi
+      limits:
+        cpu: 4
+        memory: 12Gi
+
+    # Разрешить Pod/Service/Probe/Rule, созданные вне чарта, по меткам селектора
+    ruleSelector: {}
+    serviceMonitorSelector: {}
+    podMonitorSelector: {}
+    probeSelector: {}
+    scrapeConfigSelector: {}
+
+    # Доп. scrape-конфиги через Secret (создайте заранее и раскомментируйте)
+    # additionalScrapeConfigsSecret:
+    #   name: prometheus-additional-scrape
+    #   key: additional-scrape-configs.yaml
+
+    # Интеграция с Thanos sidecar (раскомментируйте и укажите секрет)
+    # thanos:
+    #   version: v0.36.0
+    #   objectStorageConfig:
+    #     name: thanos-objstore
+    #     key: objstore.yml
+    #   resources:
+    #     requests:
+    #       cpu: 100m
+    #       memory: 256Mi
+    #     limits:
+    #       cpu: 1
+    #       memory: 1Gi
+
+# Grafana (персистентность, секреты, датасорс Prometheus)
+grafana:
+  enabled: true
+  defaultDashboardsEnabled: true
+  # Доступ ограничен: логин/пароль из секрета
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  persistence:
+    enabled: true
+    type: pvc
+    accessModes: ["ReadWriteOnce"]
+    size: 20Gi
+    # storageClassName: <set-your-sc>
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 200Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  grafana.ini:
+    server:
+      root_url: "%(protocol)s://%(domain)s/"
+      serve_from_sub_path: true
+    security:
+      allow_embedding: false
+      cookie_secure: true
+      disable_gravatar: true
+      strict_transport_security: true
+    users:
+      allow_sign_up: false
+      viewers_can_edit: false
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      folder: /tmp/dashboards
+      provider:
+        allowUiUpdates: false
+    datasources:
+      enabled: true
+      label: grafana_datasource
+  additionalDataSources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      isDefault: true
+      url: http://kube-prometheus-stack-prometheus:9090
+
+# kube-state-metrics (ресурсы и селекторы)
+kube-state-metrics:
+  enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 200Mi
+    limits:
+      cpu: 500m
+      memory: 600Mi
+
+# Node Exporter (толерации на control-plane/master)
+prometheus-node-exporter:
+  enabled: true
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
+
+# Kubelet ServiceMonitors (использовать защищённые эндпоинты kubelet)
+kubelet:
+  enabled: true
+  serviceMonitor:
+    https: true
+    cAdvisor: true
+    probes: true
+    resource:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+
+# Включить сбор метрик для ключевых компонентов
+kubeScheduler:
+  enabled: true
+kubeControllerManager:
+  enabled: true
+kubeProxy:
+  enabled: true
+coreDns:
+  enabled: true
+kubeApiServer:
+  enabled: true
+kubeEtcd:
+  enabled: true
+
+# Общие аннотации/метки для всех подов стека
+commonLabels:
+  app.kubernetes.io/managed-by: terraform
+  app.kubernetes.io/part-of: observability
+commonAnnotations: {}
+
+# NetworkPolicy (если в кластере включены политики — оставьте включённым)
+networkPolicy:
+  enabled: true

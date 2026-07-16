@@ -1,0 +1,599 @@
+name: reva-studio-observability
+
+x-common-service: &common-service
+  restart: unless-stopped
+  networks:
+    - observability
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  observability-config-init:
+    <<: *common-service
+    image: alpine:3.20
+    container_name: reva-observability-config-init
+    restart: "no"
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command: |
+      APP_METRICS_TARGET="${APP_METRICS_TARGET:-app:8000}"
+      APP_HEALTHCHECK_TARGET="${APP_HEALTHCHECK_TARGET:-http://app:8000/healthz}"
+      PROMETHEUS_RETENTION="${PROMETHEUS_RETENTION:-15d}"
+
+      mkdir -p /seed/prometheus/rules
+      mkdir -p /seed/alertmanager
+      mkdir -p /seed/grafana/datasources
+      mkdir -p /seed/grafana/dashboards
+      mkdir -p /seed/loki
+      mkdir -p /seed/tempo
+      mkdir -p /seed/alloy
+      mkdir -p /seed/blackbox
+      mkdir -p /seed/tempo-data
+      mkdir -p /seed/grafana-data
+      mkdir -p /seed/prometheus-data
+      mkdir -p /seed/loki-data
+      mkdir -p /seed/alloy-data
+
+      cat > /seed/prometheus/prometheus.yml <<EOF
+      global:
+        scrape_interval: 15s
+        scrape_timeout: 10s
+        evaluation_interval: 15s
+        external_labels:
+          stack: reva-studio
+          env: ${APP_ENV:-local}
+
+      rule_files:
+        - /etc/prometheus/rules/*.yml
+
+      alerting:
+        alertmanagers:
+          - static_configs:
+              - targets:
+                  - alertmanager:9093
+
+      scrape_configs:
+        - job_name: prometheus
+          static_configs:
+            - targets:
+                - prometheus:9090
+
+        - job_name: alertmanager
+          static_configs:
+            - targets:
+                - alertmanager:9093
+
+        - job_name: grafana
+          metrics_path: /metrics
+          static_configs:
+            - targets:
+                - grafana:3000
+
+        - job_name: alloy
+          static_configs:
+            - targets:
+                - alloy:12345
+
+        - job_name: node-exporter
+          static_configs:
+            - targets:
+                - node-exporter:9100
+
+        - job_name: postgres-exporter
+          static_configs:
+            - targets:
+                - postgres-exporter:9187
+
+        - job_name: redis-exporter
+          static_configs:
+            - targets:
+                - redis-exporter:9121
+
+        - job_name: blackbox-exporter
+          static_configs:
+            - targets:
+                - blackbox-exporter:9115
+
+        - job_name: app-metrics
+          metrics_path: /metrics
+          static_configs:
+            - targets:
+                - ${APP_METRICS_TARGET}
+
+        - job_name: blackbox-http
+          metrics_path: /probe
+          params:
+            module: [http_2xx]
+          static_configs:
+            - targets:
+                - ${APP_HEALTHCHECK_TARGET}
+                - http://grafana:3000/api/health
+                - http://prometheus:9090/-/healthy
+                - http://alertmanager:9093/-/healthy
+                - http://loki:3100/ready
+                - http://tempo:3200/ready
+          relabel_configs:
+            - source_labels: [__address__]
+              target_label: __param_target
+            - source_labels: [__param_target]
+              target_label: instance
+            - target_label: __address__
+              replacement: blackbox-exporter:9115
+      EOF
+
+      cat > /seed/prometheus/rules/core-alerts.yml <<'EOF'
+      groups:
+        - name: core-observability
+          rules:
+            - alert: TargetDown
+              expr: up == 0
+              for: 2m
+              labels:
+                severity: critical
+              annotations:
+                summary: "Target down: {{ $labels.job }}"
+                description: "Endpoint {{ $labels.instance }} for job {{ $labels.job }} is unreachable."
+
+            - alert: BlackboxProbeFailed
+              expr: probe_success == 0
+              for: 2m
+              labels:
+                severity: critical
+              annotations:
+                summary: "Blackbox probe failed: {{ $labels.instance }}"
+                description: "HTTP probe failed for {{ $labels.instance }}."
+
+            - alert: HostHighMemoryUsage
+              expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.90
+              for: 10m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High host memory usage"
+                description: "Host memory usage is above 90 percent."
+
+            - alert: HostFilesystemAlmostFull
+              expr: (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) < 0.10
+              for: 10m
+              labels:
+                severity: warning
+              annotations:
+                summary: "Filesystem almost full"
+                description: "Less than 10 percent disk space is available on {{ $labels.mountpoint }}."
+      EOF
+
+      cat > /seed/alertmanager/alertmanager.yml <<'EOF'
+      global:
+        resolve_timeout: 5m
+
+      route:
+        receiver: default
+        group_by: ['alertname', 'job', 'instance']
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+
+      receivers:
+        - name: default
+      EOF
+
+      cat > /seed/grafana/datasources/datasources.yml <<'EOF'
+      apiVersion: 1
+
+      deleteDatasources:
+        - name: Prometheus
+          orgId: 1
+        - name: Loki
+          orgId: 1
+        - name: Tempo
+          orgId: 1
+
+      datasources:
+        - name: Prometheus
+          uid: prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+          editable: true
+          jsonData:
+            httpMethod: POST
+
+        - name: Loki
+          uid: loki
+          type: loki
+          access: proxy
+          url: http://loki:3100
+          editable: true
+
+        - name: Tempo
+          uid: tempo
+          type: tempo
+          access: proxy
+          url: http://tempo:3200
+          editable: true
+          jsonData:
+            serviceMap:
+              datasourceUid: prometheus
+            nodeGraph:
+              enabled: true
+            tracesToLogsV2:
+              datasourceUid: loki
+              spanStartTimeShift: "-5m"
+              spanEndTimeShift: "5m"
+              filterByTraceID: true
+              filterBySpanID: true
+      EOF
+
+      cat > /seed/grafana/dashboards/dashboards.yml <<'EOF'
+      apiVersion: 1
+
+      providers:
+        - name: default
+          orgId: 1
+          folder: Reva Studio
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards
+      EOF
+
+      cat > /seed/loki/local-config.yaml <<'EOF'
+      auth_enabled: false
+
+      server:
+        http_listen_port: 3100
+
+      common:
+        instance_addr: 127.0.0.1
+        path_prefix: /loki
+        replication_factor: 1
+        ring:
+          kvstore:
+            store: inmemory
+        storage:
+          filesystem:
+            chunks_directory: /loki/chunks
+            rules_directory: /loki/rules
+
+      schema_config:
+        configs:
+          - from: 2024-01-01
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+
+      ruler:
+        alertmanager_url: http://alertmanager:9093
+
+      pattern_ingester:
+        enabled: true
+
+      analytics:
+        reporting_enabled: false
+      EOF
+
+      cat > /seed/tempo/tempo.yml <<'EOF'
+      server:
+        http_listen_port: 3200
+        grpc_listen_port: 9095
+
+      distributor:
+        receivers:
+          otlp:
+            protocols:
+              grpc:
+                endpoint: 0.0.0.0:4317
+              http:
+                endpoint: 0.0.0.0:4318
+
+      ingester:
+        max_block_duration: 5m
+
+      compactor:
+        compaction:
+          block_retention: 48h
+
+      storage:
+        trace:
+          backend: local
+          wal:
+            path: /var/tempo/wal
+          local:
+            path: /var/tempo/blocks
+
+      overrides:
+        defaults:
+          ingestion:
+            max_bytes_per_trace: 5000000
+      EOF
+
+      cat > /seed/alloy/config.alloy <<'EOF'
+      livedebugging {
+        enabled = true
+      }
+
+      discovery.docker "linux" {
+        host = "unix:///var/run/docker.sock"
+      }
+
+      discovery.relabel "logs_integrations_docker" {
+        targets = []
+
+        rule {
+          source_labels = ["__meta_docker_container_name"]
+          regex         = "/(.*)"
+          target_label  = "service_name"
+        }
+      }
+
+      loki.process "docker" {
+        stage.docker {}
+        stage.static_labels {
+          values = {
+            job   = "docker"
+            stack = "reva-studio"
+          }
+        }
+
+        forward_to = [loki.write.local.receiver]
+      }
+
+      loki.source.docker "default" {
+        host          = "unix:///var/run/docker.sock"
+        targets       = discovery.docker.linux.targets
+        labels        = {"platform" = "docker"}
+        relabel_rules = discovery.relabel.logs_integrations_docker.rules
+        forward_to    = [loki.process.docker.receiver]
+      }
+
+      loki.write "local" {
+        endpoint {
+          url = "http://loki:3100/loki/api/v1/push"
+        }
+      }
+      EOF
+
+      cat > /seed/blackbox/blackbox.yml <<'EOF'
+      modules:
+        http_2xx:
+          prober: http
+          timeout: 5s
+          http:
+            method: GET
+            preferred_ip_protocol: ip4
+            valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      EOF
+
+      chmod -R 755 /seed/prometheus /seed/alertmanager /seed/grafana /seed/loki /seed/tempo /seed/alloy /seed/blackbox
+      chmod -R 777 /seed/tempo-data /seed/grafana-data /seed/prometheus-data /seed/loki-data /seed/alloy-data
+    volumes:
+      - prometheus_config:/seed/prometheus
+      - alertmanager_config:/seed/alertmanager
+      - grafana_provisioning:/seed/grafana
+      - loki_config:/seed/loki
+      - tempo_config:/seed/tempo
+      - alloy_config:/seed/alloy
+      - blackbox_config:/seed/blackbox
+      - tempo_data:/seed/tempo-data
+      - grafana_data:/seed/grafana-data
+      - prometheus_data:/seed/prometheus-data
+      - loki_data:/seed/loki-data
+      - alloy_data:/seed/alloy-data
+
+  prometheus:
+    <<: *common-service
+    image: prom/prometheus:v3.10.0
+    container_name: reva-prometheus
+    depends_on:
+      observability-config-init:
+        condition: service_completed_successfully
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+      - --web.enable-lifecycle
+      - --web.enable-remote-write-receiver
+      - --web.external-url=${PROMETHEUS_EXTERNAL_URL:-http://localhost:9090}
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - prometheus_config:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+
+  alertmanager:
+    <<: *common-service
+    image: prom/alertmanager:v0.31.1
+    container_name: reva-alertmanager
+    depends_on:
+      observability-config-init:
+        condition: service_completed_successfully
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "${ALERTMANAGER_PORT:-9093}:9093"
+    volumes:
+      - alertmanager_config:/etc/alertmanager:ro
+      - alertmanager_data:/alertmanager
+
+  grafana:
+    <<: *common-service
+    image: grafana/grafana:12.4.1
+    container_name: reva-grafana
+    depends_on:
+      observability-config-init:
+        condition: service_completed_successfully
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+      GF_INSTALL_PLUGINS: ""
+      GF_LOG_MODE: console
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - grafana_provisioning:/etc/grafana/provisioning:ro
+
+  loki:
+    <<: *common-service
+    image: grafana/loki:3.6.7
+    container_name: reva-loki
+    depends_on:
+      observability-config-init:
+        condition: service_completed_successfully
+    command:
+      - -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    volumes:
+      - loki_config:/etc/loki:ro
+      - loki_data:/loki
+
+  tempo:
+    <<: *common-service
+    image: grafana/tempo:2.10.3
+    container_name: reva-tempo
+    depends_on:
+      observability-config-init:
+        condition: service_completed_successfully
+    command:
+      - -config.file=/etc/tempo/tempo.yml
+    ports:
+      - "${TEMPO_HTTP_PORT:-3200}:3200"
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+    volumes:
+      - tempo_config:/etc/tempo:ro
+      - tempo_data:/var/tempo
+
+  alloy:
+    <<: *common-service
+    image: grafana/alloy:v1.14.0
+    container_name: reva-alloy
+    depends_on:
+      observability-config-init:
+        condition: service_completed_successfully
+      loki:
+        condition: service_started
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "${ALLOY_PORT:-12345}:12345"
+    volumes:
+      - alloy_config:/etc/alloy:ro
+      - alloy_data:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  node-exporter:
+    <<: *common-service
+    image: prom/node-exporter:v1.9.1
+    container_name: reva-node-exporter
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|run/docker/netns)($|/)
+    pid: host
+    ports:
+      - "${NODE_EXPORTER_PORT:-9100}:9100"
+    volumes:
+      - /:/host:ro,rslave
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+
+  blackbox-exporter:
+    <<: *common-service
+    image: prom/blackbox-exporter:v0.28.0
+    container_name: reva-blackbox-exporter
+    depends_on:
+      observability-config-init:
+        condition: service_completed_successfully
+    command:
+      - --config.file=/config/blackbox.yml
+    ports:
+      - "${BLACKBOX_EXPORTER_PORT:-9115}:9115"
+    volumes:
+      - blackbox_config:/config:ro
+
+  postgres-exporter:
+    <<: *common-service
+    image: prometheuscommunity/postgres-exporter:v0.18.0
+    container_name: reva-postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: ${POSTGRES_EXPORTER_DATA_SOURCE_NAME:-postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-reva_studio}?sslmode=disable}
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "true"
+    ports:
+      - "${POSTGRES_EXPORTER_PORT:-9187}:9187"
+
+  redis-exporter:
+    <<: *common-service
+    image: oliver006/redis_exporter:v1.82.0
+    container_name: reva-redis-exporter
+    environment:
+      REDIS_ADDR: ${REDIS_EXPORTER_ADDR:-redis://redis:6379}
+      REDIS_EXPORTER_CHECK_KEYS: ${REDIS_EXPORTER_CHECK_KEYS:-booking:*,cache:*}
+      REDIS_EXPORTER_INCL_SYSTEM_METRICS: "true"
+    ports:
+      - "${REDIS_EXPORTER_PORT:-9121}:9121"
+
+networks:
+  observability:
+    name: reva-observability
+    driver: bridge
+
+volumes:
+  prometheus_config:
+    name: reva-prometheus-config
+  prometheus_data:
+    name: reva-prometheus-data
+
+  alertmanager_config:
+    name: reva-alertmanager-config
+  alertmanager_data:
+    name: reva-alertmanager-data
+
+  grafana_provisioning:
+    name: reva-grafana-provisioning
+  grafana_data:
+    name: reva-grafana-data
+
+  loki_config:
+    name: reva-loki-config
+  loki_data:
+    name: reva-loki-data
+
+  tempo_config:
+    name: reva-tempo-config
+  tempo_data:
+    name: reva-tempo-data
+
+  alloy_config:
+    name: reva-alloy-config
+  alloy_data:
+    name: reva-alloy-data
+
+  blackbox_config:
+    name: reva-blackbox-config

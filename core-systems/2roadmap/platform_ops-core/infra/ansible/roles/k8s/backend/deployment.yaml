@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teslaai-backend
+  namespace: backend
+  labels:
+    app.kubernetes.io/name: teslaai-backend
+    app.kubernetes.io/component: core-api
+    app.kubernetes.io/part-of: teslaai
+    version: v20x-industrial
+    zero-trust: enforced
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: teslaai-backend
+  template:
+    metadata:
+      labels:
+        app: teslaai-backend
+        service: api-core
+        telemetry.teslaai.io/enabled: "true"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+      annotations:
+        checksum/config: {{ .Values.backendChecksum | default "REPLACE_WITH_HASH" }}
+        container.apparmor.security.beta.kubernetes.io/teslaai-backend: runtime/default
+    spec:
+      serviceAccountName: backend-sa
+      priorityClassName: high-priority
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1010
+        fsGroup: 1010
+        seccompProfile:
+          type: RuntimeDefault
+      nodeSelector:
+        gpu.teslaai.io/enabled: "true"
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - amd64
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: teslaai-backend
+              topologyKey: "kubernetes.io/hostname"
+      tolerations:
+        - key: "ai-core"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: api-core
+          image: registry.teslaai.io/backend/core-api:1.8.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - secretRef:
+                name: backend-secret
+          resources:
+            limits:
+              cpu: "1"
+              memory: "1024Mi"
+              nvidia.com/gpu: 1
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config/
+              readOnly: true
+      volumes:
+        - name: config-volume
+          configMap:
+            name: backend-config

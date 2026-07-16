@@ -1,0 +1,301 @@
+# =====================================================================
+# cybersecurity-core / configs / ids.yaml
+# Профиль: Suricata 7.x (NIDS/NIPS). Проверено для Linux/af-packet.
+# Примечание:
+#  - Файл можно использовать как основной suricata.yaml (симлинк/копия).
+#  - Логи EVE пишутся в /var/log/suricata/eve.json, далее OTEL Collector
+#    забирает их (filelog) и шипит в Loki/OTLP по вашему collector-config.yaml.
+#  - Ротацию eve.json выполняет logrotate/systemd (вне Suricata).
+# =====================================================================
+
+# -------------------------------
+# Глобальные переменные и правила
+# -------------------------------
+vars:
+  address-groups:
+    HOME_NET: "[192.168.0.0/16,10.0.0.0/8,172.16.0.0/12]"
+    EXTERNAL_NET: "!$HOME_NET"
+    DNS_SERVERS: "[8.8.8.8,8.8.4.4]"
+    HTTP_SERVERS: "$HOME_NET"
+    SMTP_SERVERS: "$HOME_NET"
+    SQL_SERVERS: "$HOME_NET"
+    FILE_DATA_PORTS: "[$HTTP_PORTS,110,143]"
+    SSH_SERVERS: "$HOME_NET"
+
+  port-groups:
+    HTTP_PORTS: "[80,8080,8000,8443,443]"
+    SHELLCODE_PORTS: "!$HTTP_PORTS"
+    ORACLE_PORTS: 1521
+    SSH_PORTS: 22
+    SMTP_PORTS: "[25,465,587]"
+    DNS_PORTS: 53
+
+default-rule-path: /etc/suricata/rules
+rule-files:
+  - suricata.rules
+  - local.rules
+
+classification-file: /etc/suricata/classification.config
+reference-config: /etc/suricata/reference.config
+# Доп. пороги/подавления правил — отдельный файл:
+threshold-file: /etc/suricata/threshold.config
+
+# -------------------------------
+# Логирование и уровень детализации
+# -------------------------------
+logging:
+  default-log-level: info
+  # Файл основного лога движка Suricata (не EVE)
+  outputs:
+    - file:
+        enabled: yes
+        filename: /var/log/suricata/suricata.log
+        level: info
+
+# -------------------------------
+# Производительность и память
+# -------------------------------
+defrag:
+  memcap: 64mb
+  hash-size: 65536
+  trackers: 65535
+
+flow:
+  memcap: 256mb
+  hash-size: 65536
+  prealloc: 10000
+  emergency-recovery: 30
+  # community-id добавляется в EVE (см. eve-log)
+  # Тюнинг timeouts под дефолтный дата-центр
+  timeouts:
+    new: 30
+    established: 300
+    closed: 0
+    emergency-new: 10
+    emergency-established: 100
+    emergency-closed: 0
+
+stream:
+  memcap: 512mb
+  reassembly:
+    memcap: 1024mb
+    depth: 0            # 0 = без ограничений (покрытие для IDS)
+    toserver-chunk-size: 2560
+    toclient-chunk-size: 2560
+
+host-os-policy:
+  windows: []
+  bsd: []
+  bsd-right: []
+  old-linux: []
+  linux: ["$HOME_NET"]
+  old-solaris: []
+  hpux10: []
+  hpux11: []
+  irix: []
+  macos: []
+  vista: []
+  windows2k3: []
+  windows2k3s: []
+
+# -------------------------------
+# Детектор/движок
+# -------------------------------
+engine-analysis:
+  rules-fast-pattern: yes
+
+detection:
+  profile: high        # high/balanced/low
+  custom-values:
+    toclient-groups: 3
+    toserver-groups: 3
+  sgh-mpm-context: auto
+  mpm-algo: auto       # auto/hs/ac
+  prefilter: yes
+
+# -------------------------------
+# Захват трафика (Linux af-packet)
+# -------------------------------
+af-packet:
+  - interface: ${SURICATA_IFACE:-eth0}
+    threads: auto
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+    # Используем tpacketv3 + mmap для высокой пропускной
+    use-mmap: yes
+    tpacketv3: yes
+    # Рекомендуемые размеры блоков/таймаут (значения зависят от NIC/нагрузки)
+    block-size: 1048576      # 1 MiB
+    block-timeout: 10        # ms
+    ring-size: 2048
+    buffer-size: 64535
+    # Проверка чек-сумм (auto — учитывать offload драйверов)
+    checksum-checks: auto
+    # Промискуитет включен для полного охвата
+    disable-promisc: no
+
+# Опционально: pcap-захват (fallback)
+pcap:
+  - interface: ${SURICATA_IFACE:-eth0}
+    checksum-checks: auto
+
+# CPU аффинити (рекомендуется включить на серверах с большим числом ядер)
+# Пример: 0-1 для менеджера/реассемблера, 2-7 для воркеров
+# Уточните под вашу топологию NUMA/IRQ.
+# set-cpu-affinity: yes
+# cpu-affinity:
+#   - management-cpu-set:
+#       cpu: [0,1]
+#   - worker-cpu-set:
+#       cpu: [2,3,4,5,6,7]
+#       mode: "balanced"
+
+# -------------------------------
+# App-layer протоколы и логирование
+# -------------------------------
+app-layer:
+  protocols:
+    http:
+      enabled: yes
+      libhtp:
+        default-config:
+          personality: IDS
+          request-body-limit: 10485760     # 10 MiB
+          response-body-limit: 10485760
+          request-body-inspection: yes
+          response-body-inspection: yes
+    tls:
+      enabled: yes
+      detection-ports:
+        dp: "[443,8443,9443]"
+      # JA3/JA3S сигнатуры
+      ja3-fingerprints: yes
+      ja3s-fingerprints: yes
+    dns:
+      enabled: yes
+      # Логировать ответы/запросы
+      # (подробности в eve-log types:dns)
+    ssh:
+      enabled: yes
+    smtp:
+      enabled: yes
+    ftp:
+      enabled: yes
+    smb:
+      enabled: yes
+    nfs:
+      enabled: yes
+    dhcp:
+      enabled: yes
+    rdp:
+      enabled: yes
+    dcerpc:
+      enabled: yes
+    modbus:
+      enabled: yes
+    enip:
+      enabled: yes
+
+# Извлечение файлов для последующего sandbox/AV (по сигнатурам или политикам)
+# В проде включайте выборочно по типам/доменам/сетям.
+file-store:
+  enabled: no
+  log-dir: /var/log/suricata/files
+  force-magic: yes
+  store: [ "MALWARE", "HTTP", "SMTP" ]
+
+# -------------------------------
+# Вывод событий (EVE JSON)
+# -------------------------------
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: /var/log/suricata/eve.json
+      rotate-interval: 0        # 0 = без встроенной ротации (исп. logrotate)
+      community-id: yes
+      community-id-seed: 0
+      # Поля по умолчанию
+      includepayload: no
+      # Включите только при необходимости:
+      # includetruncated: yes
+      # Независимые "типы" событий для вывода:
+      types:
+        - alert:
+            payload: no
+            metadata: yes
+            tagged-packets: yes
+        - flow
+        - stats:
+            totals: yes
+            threads: yes
+        - dns:
+            query: yes
+            answer: yes
+        - http:
+            extended: yes
+        - tls:
+            extended: yes
+            session-resumption: yes
+            ja3: yes
+            ja3s: yes
+        - ssh
+        - smtp
+        - smb
+        - nfs
+        - dhcp
+        - anomaly:
+            # Логирование аномалий протоколов
+            enabled: yes
+        - files:
+            force-magic: yes
+            force-hash: [sha1,sha256]
+        - netflow:
+            enabled: yes
+            # Преобразует flow в netflow-подобные записи
+        - drop:
+            alerts-only: no
+
+  # Дополнительные форматы (fast.log/syslog) — при необходимости:
+  - fast:
+      enabled: no
+      filename: /var/log/suricata/fast.log
+  - syslog:
+      enabled: no
+      facility: local5
+
+  # Статистика движка (удобно для Prometheus node_exporter textfile или otel)
+  - stats:
+      enabled: yes
+      interval: 60
+
+# -------------------------------
+# IPS/инлайн (если используется NFQ/IPS)
+# -------------------------------
+ips:
+  # В режиме IDS оставить no; для NFQUEUE меняйте на yes
+  enabled: no
+
+# -------------------------------
+# Безопасность и устойчивость
+# -------------------------------
+coredump:
+  max-dump: unlimited
+
+run-as:
+  user: suricata
+  group: suricata
+
+# -------------------------------
+# Верификация и тест
+# -------------------------------
+# suricata -T -c /path/to/ids.yaml -v
+
+# -------------------------------
+# Памятка по интеграции с observability
+# -------------------------------
+# 1) OTEL Collector читает /var/log/suricata/eve.json (filelog) и шипит:
+#    - logs/security -> Loki (и/или OTLP) согласно collector-config.yaml
+# 2) Prometheus собирает метрики хоста/коллектора; правила алертов — в Helm.
+# 3) threshold.config: rate_filter/suppress для "шумных" сигнатур (ET/Open).

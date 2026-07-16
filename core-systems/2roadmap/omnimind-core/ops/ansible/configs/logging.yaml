@@ -1,0 +1,259 @@
+# ==============================================================================
+# OmniMind Core — Logging configuration (production-grade)
+# Назначение: единая конфигурация логирования приложения.
+# Совместимость: stdout/journald/file/OTLP, Promtail/Fluent Bit, OpenTelemetry.
+# Примечание: значения {{ ... }} предполагают шаблонизацию Ansible (group_vars).
+# ==============================================================================
+
+version: 1
+
+global:
+  service_name: "omnimind-core"
+  environment: "{{ app.env | default('production') }}"
+  # Уровень по умолчанию для всего приложения (может быть переопределен на логгерах)
+  level: "{{ config.log_level | default('info') }}"
+  # Лимит очереди логов в памяти (защита от OOM при backpressure)
+  ring_buffer:
+    max_records: 50000
+    drop_policy: "newest"  # newest|oldest
+
+# ------------------------------------------------------------------------------
+# Форматирование и обогащение
+# ------------------------------------------------------------------------------
+format:
+  type: json
+  # Поля в JSON (минимально необходимые для поиска и трассировок)
+  fields:
+    timestamp: "@timestamp"            # ISO-8601 UTC
+    level: "level"
+    logger: "logger"
+    message: "message"
+    service: "service"
+    env: "env"
+    pid: "pid"
+    thread: "thread"
+    trace_id: "trace_id"
+    span_id: "span_id"
+    http_request_id: "request_id"
+    subsystem: "subsystem"
+    kv: "attrs"                        # произвольные пары ключ/значение
+
+  # Строгий ISO-8601 с миллисекундами и Z
+  timestamp_format: "iso8601_millis_z"
+
+# ------------------------------------------------------------------------------
+# Процессоры (редактирование, семплинг, корреляция)
+# ------------------------------------------------------------------------------
+processors:
+  correlation:
+    # Корреляция с OpenTelemetry (если включен OTEL-инструмент)
+    read_from_otel_context: true
+    # Альтернативные заголовки корелляции в HTTP
+    http_headers:
+      request_id: ["x-request-id", "x-correlation-id"]
+      trace_parent: ["traceparent"]
+
+  redaction:
+    # Маскирование секретов по ключам и шаблонам
+    enabled: true
+    replacement: "[REDACTED]"
+    key_patterns:
+      - "(?i)password"
+      - "(?i)passphrase"
+      - "(?i)secret"
+      - "(?i)token"
+      - "(?i)apikey"
+      - "(?i)authorization"
+    value_patterns:
+      # JWT, AWS Access Key, Bearer-токены и т.п.
+      - "eyJ[a-zA-Z0-9_-]{10,}\\.[a-zA-Z0-9_-]{10,}\\.[a-zA-Z0-9_-]{10,}"
+      - "AKIA[0-9A-Z]{16}"
+      - "(?i)Bearer\\s+[A-Za-z0-9._-]+"
+
+  sampling:
+    # Семплинг инфо-логов, чтобы не раздувать объем
+    enabled: true
+    rules:
+      - level: "info"
+        rate_per_second: 200
+      - level: "debug"
+        rate_per_second: 50
+    # Никогда не семплировать предупреждения/ошибки/аудит
+    never_sample:
+      - "warn"
+      - "error"
+      - "fatal"
+      - "audit"
+
+  shaping:
+    # Усечение больших сообщений
+    truncate:
+      enabled: true
+      max_bytes: 65536
+      strategy: "tail"   # head|middle|tail
+
+# ------------------------------------------------------------------------------
+# Sinks (куда писать логи)
+# ------------------------------------------------------------------------------
+sinks:
+  stdout:
+    enabled: "{{ (logging.driver | default('journald')) == 'stdout' or (logging.driver | default('journald')) == 'files' or (logging.driver | default('journald')) == 'journald' }}"
+    stream: "stdout"
+
+  journald:
+    enabled: "{{ logging.driver | default('journald') == 'journald' }}"
+    # При journald приложение пишет в stdout/stderr; забором занимается systemd-journald.
+    # Здесь оставляем для явной декларации.
+
+  file:
+    enabled: "{{ logging.driver | default('journald') == 'files' }}"
+    path: "{{ paths.log_dir }}/app.log"
+    rotation:
+      size: "50MB"
+      keep: 7
+      compress: true
+      # Синхронизировано с logrotate/journald, чтобы избежать двойной ротации
+
+  access_file:
+    enabled: "{{ logging.driver | default('journald') == 'files' }}"
+    path: "{{ paths.log_dir }}/access.log"
+    rotation:
+      size: "100MB"
+      keep: 7
+      compress: true
+
+  audit_file:
+    enabled: "{{ logging.driver | default('journald') == 'files' }}"
+    path: "{{ paths.log_dir }}/audit.log"
+    rotation:
+      size: "100MB"
+      keep: 14
+      compress: true
+
+  otlp:
+    enabled: "{{ (monitoring.prometheus.enabled | default(true)) and (env.OTLP_ENDPOINT is defined or otlp.endpoint is defined) | default(false) }}"
+    endpoint: "{{ otlp.endpoint | default(env.OTLP_ENDPOINT | default('')) }}"
+    protocol: "grpc"     # grpc|http
+    insecure: "{{ otlp.insecure | default(false) }}"
+    timeout: "5s"
+    headers: "{{ otlp.headers | default({}) }}"
+    # OTEL ресурсные атрибуты
+    resource:
+      service.name: "omnimind-core"
+      service.namespace: "default"
+      service.version: "{{ release.version | default('unknown') }}"
+      deployment.environment: "{{ app.env | default('production') }}"
+
+# ------------------------------------------------------------------------------
+# Pipelines (очередность: обогащение → редактирование → семплинг → вывод)
+# ------------------------------------------------------------------------------
+pipelines:
+  app:
+    include_loggers: ["app.*", "core.*"]
+    level: "{{ config.log_level | default('info') }}"
+    processors: ["correlation", "redaction", "sampling", "shaping"]
+    sinks:
+      - "stdout"
+      - "file"
+      - "journald"
+      - "otlp"
+
+  access:
+    include_loggers: ["http.access"]
+    level: "info"
+    processors: ["correlation", "shaping"]
+    sinks:
+      - "stdout"
+      - "access_file"
+      - "journald"
+      - "otlp"
+
+  audit:
+    include_loggers: ["audit.*"]
+    level: "info"
+    processors: ["correlation", "redaction", "shaping"]
+    sinks:
+      - "stdout"
+      - "audit_file"
+      - "journald"
+      - "otlp"
+
+  errors:
+    include_levels: ["warn", "error", "fatal"]
+    processors: ["correlation", "redaction", "shaping"]
+    sinks:
+      - "stdout"
+      - "file"
+      - "journald"
+      - "otlp"
+
+# ------------------------------------------------------------------------------
+# Логгеры и уровни (детальная настройка подподсистем)
+# ------------------------------------------------------------------------------
+loggers:
+  "app.startup":
+    level: "info"
+  "app.shutdown":
+    level: "info"
+  "core.scheduler":
+    level: "info"
+  "core.memory":
+    level: "info"
+  "core.security":
+    level: "warn"
+  "http.server":
+    level: "info"
+  "http.access":
+    level: "info"
+  "db":
+    level: "warn"
+  "cache":
+    level: "info"
+  "messaging":
+    level: "info"
+  "otel":
+    level: "warn"
+
+# ------------------------------------------------------------------------------
+# Политики деградации (при недоступности sink'ов)
+# ------------------------------------------------------------------------------
+backpressure:
+  # Если OTLP недоступен — не блокировать приложение, логировать локально
+  otlp:
+    on_error: "fallback"   # fail|fallback|drop
+    fallback_sinks: ["file", "journald", "stdout"]
+  file:
+    on_error: "fallback"
+    fallback_sinks: ["journald", "stdout"]
+
+# ------------------------------------------------------------------------------
+# Метаданные для агентов сбора (Promtail/Fluent Bit hints)
+# ------------------------------------------------------------------------------
+scrape_hints:
+  promtail:
+    enabled: true
+    labels:
+      job: "omnimind-core"
+      env: "{{ app.env | default('production') }}"
+      service: "omnimind-core"
+    # Пути подсказок для file-синков (если включены)
+    files:
+      - "{{ paths.log_dir }}/app.log"
+      - "{{ paths.log_dir }}/access.log"
+      - "{{ paths.log_dir }}/audit.log"
+
+# ------------------------------------------------------------------------------
+# Проверки консистентности (могут использоваться запуском приложения/entrypoint)
+# ------------------------------------------------------------------------------
+health:
+  require_sinks:
+    - "stdout"
+  warn_if_disabled:
+    - "otlp"     # без OTLP наблюдаемость ограничена, но не критично
+
+# ------------------------------------------------------------------------------
+# Конечные замечания:
+# - Для journald режимов убедитесь, что drop-in /etc/systemd/journald.conf.d/ активен.
+# - Для file режимов синхронизируйте политики с logrotate (см. роль Ansible).
+# - Для OTLP укажите endpoint и учтите сетевые ACL/NAT.
+# ------------------------------------------------------------------------------

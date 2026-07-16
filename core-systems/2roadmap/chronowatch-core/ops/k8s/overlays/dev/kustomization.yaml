@@ -1,0 +1,210 @@
+# chronowatch-core/ops/k8s/overlays/dev/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 1) Базовый стек
+resources:
+  - ../../base
+
+# 2) Изоляция dev-окружения
+namespace: chronowatch-dev
+namePrefix: dev-
+
+commonLabels:
+  app.kubernetes.io/name: chronowatch-core
+  app.kubernetes.io/part-of: chronowatch-core
+  app.kubernetes.io/instance: dev
+  app.kubernetes.io/environment: dev
+  app.kubernetes.io/managed-by: kustomize
+
+commonAnnotations:
+  reloader.stakater.com/auto: "true"
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+# 3) Генераторы конфигов и секретов (dev-значения)
+generatorOptions:
+  disableNameSuffixHash: false   # хэш сохраняем, чтобы обновления конфигов катили rollout
+
+configMapGenerator:
+  - name: app-config
+    behavior: merge
+    literals:
+      - ENVIRONMENT=dev
+      - LOG_LEVEL=debug
+      - FEATURE_FLAGS=DEV_MODE,EXPERIMENTAL_API
+      - REQUEST_TIMEOUT_MS=8000
+
+secretGenerator:
+  - name: app-secrets
+    behavior: merge
+    type: Opaque
+    literals:
+      - DATABASE_URL=postgresql://chronowatch:password@postgres.dev:5432/chronowatch
+      - JWT_SECRET=dev-secret-not-for-prod
+      - SENTRY_DSN=
+      - REDIS_URL=redis://redis.dev:6379/0
+
+# 4) Переопределение образа (совмещается с CI релизами)
+images:
+  - name: chronowatch-core
+    newName: ghcr.io/chronowatch/chronowatch-core
+    newTag: dev-latest
+
+# 5) Точечные патчи (inline) через strategic-merge по селекторам
+patches:
+  # 5.1 Deployment: реплики, ресурсы, пробы, env из ConfigMap/Secret, pullPolicy
+  - target:
+      kind: Deployment
+      apiVersion: apps/v1
+      labelSelector: app.kubernetes.io/name=chronowatch-core
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        labels:
+          app.kubernetes.io/name: chronowatch-core
+      spec:
+        replicas: 1
+        revisionHistoryLimit: 3
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 0
+            maxSurge: 1
+        template:
+          metadata:
+            annotations:
+              checksum/config: "{{- .ConfigMap.app-config.data | toJson | sha256sum -}}"
+              checksum/secret: "{{- .Secret.app-secrets.data | toJson | sha256sum -}}"
+          spec:
+            automountServiceAccountToken: true
+            terminationGracePeriodSeconds: 30
+            containers:
+              - name: chronowatch-core
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: ENVIRONMENT
+                    valueFrom:
+                      configMapKeyRef:
+                        name: app-config
+                        key: ENVIRONMENT
+                  - name: LOG_LEVEL
+                    valueFrom:
+                      configMapKeyRef:
+                        name: app-config
+                        key: LOG_LEVEL
+                  - name: FEATURE_FLAGS
+                    valueFrom:
+                      configMapKeyRef:
+                        name: app-config
+                        key: FEATURE_FLAGS
+                  - name: REQUEST_TIMEOUT_MS
+                    valueFrom:
+                      configMapKeyRef:
+                        name: app-config
+                        key: REQUEST_TIMEOUT_MS
+                  - name: DATABASE_URL
+                    valueFrom:
+                      secretKeyRef:
+                        name: app-secrets
+                        key: DATABASE_URL
+                  - name: JWT_SECRET
+                    valueFrom:
+                      secretKeyRef:
+                        name: app-secrets
+                        key: JWT_SECRET
+                  - name: REDIS_URL
+                    valueFrom:
+                      secretKeyRef:
+                        name: app-secrets
+                        key: REDIS_URL
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 128Mi
+                  limits:
+                    cpu: 200m
+                    memory: 256Mi
+                ports:
+                  - name: http
+                    containerPort: 8080
+                    protocol: TCP
+                readinessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: http
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  timeoutSeconds: 2
+                  successThreshold: 1
+                  failureThreshold: 6
+                livenessProbe:
+                  httpGet:
+                    path: /livez
+                    port: http
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                  timeoutSeconds: 2
+                  failureThreshold: 3
+                startupProbe:
+                  httpGet:
+                    path: /startup
+                    port: http
+                  initialDelaySeconds: 0
+                  periodSeconds: 5
+                  failureThreshold: 12
+            # Для dev допускаем планировщик по умолчанию; nodeSelector/tolerations опускаем
+
+  # 5.2 Ingress: dev-хост и staging-issuer
+  - target:
+      kind: Ingress
+      apiVersion: networking.k8s.io/v1
+      labelSelector: app.kubernetes.io/name=chronowatch-core
+    patch: |
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        annotations:
+          kubernetes.io/ingress.class: "nginx"
+          cert-manager.io/cluster-issuer: "letsencrypt-staging"
+      spec:
+        tls:
+          - hosts:
+              - dev.chronowatch.local
+            secretName: chronowatch-dev-tls
+        rules:
+          - host: dev.chronowatch.local
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: chronowatch-core
+                      port:
+                        number: 80
+
+  # 5.3 HPA: минимальные границы для DEV (если HPA есть в base)
+  - target:
+      kind: HorizontalPodAutoscaler
+      apiVersion: autoscaling/v2
+      labelSelector: app.kubernetes.io/name=chronowatch-core
+    patch: |
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      spec:
+        minReplicas: 1
+        maxReplicas: 2
+        behavior:
+          scaleDown:
+            stabilizationWindowSeconds: 60
+          scaleUp:
+            stabilizationWindowSeconds: 0
+            policies:
+              - type: Pods
+                value: 1
+                periodSeconds: 60
+
+# 6) Безопасные преобразования имён/полей (опционально можно добавить transformers при необходимости)

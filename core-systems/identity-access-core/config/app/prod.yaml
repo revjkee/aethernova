@@ -1,0 +1,239 @@
+# core-systems/identity-access-core/config/app/prod.yaml
+# Внимание: не могу подтвердить это. Схема ключей зависит от вашего приложения.
+
+app:
+  name: identity-access-core
+  env: prod
+  region: ${APP_REGION:-eu-central-1}
+  instance_id: ${INSTANCE_ID:-unknown}
+  build:
+    version: ${APP_VERSION:-0.0.0}
+    commit: ${GIT_COMMIT_SHA:-unknown}
+    built_at: ${BUILD_TIME_UTC:-unknown}
+
+server:
+  host: ${APP_HOST:-0.0.0.0}
+  port: ${APP_PORT:-8080}
+  public_base_url: ${PUBLIC_BASE_URL:-https://identity.example.com}
+  trusted_proxy:
+    enabled: true
+    # Для прод окружения обязательно ограничить список доверенных прокси.
+    # Пример: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    cidrs: ${TRUSTED_PROXY_CIDRS:-}
+  timeouts:
+    read_seconds: 15
+    write_seconds: 15
+    idle_seconds: 60
+  headers:
+    security:
+      enabled: true
+      hsts:
+        enabled: true
+        max_age_seconds: 31536000
+        include_subdomains: true
+        preload: false
+      x_content_type_options: true
+      x_frame_options: DENY
+      referrer_policy: no-referrer
+      content_security_policy: ${CSP_HEADER_VALUE:-}
+  cors:
+    enabled: true
+    allow_credentials: true
+    allowed_origins: ${CORS_ALLOWED_ORIGINS:-https://app.example.com}
+    allowed_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+    allowed_headers: "Authorization,Content-Type,X-Request-Id,X-CSRF-Token"
+    exposed_headers: "X-Request-Id"
+    max_age_seconds: 600
+
+observability:
+  request_id:
+    enabled: true
+    header: X-Request-Id
+    generate_if_missing: true
+  logging:
+    level: ${LOG_LEVEL:-INFO}
+    format: ${LOG_FORMAT:-json}
+    redact:
+      enabled: true
+      fields:
+        - authorization
+        - cookie
+        - set-cookie
+        - x-api-key
+        - password
+        - token
+        - refresh_token
+        - client_secret
+    sampling:
+      enabled: false
+      # Если включите, используйте в high-traffic средах.
+      rate: 0.1
+  metrics:
+    enabled: true
+    prometheus:
+      enabled: true
+      path: /metrics
+  tracing:
+    enabled: ${OTEL_TRACING_ENABLED:-true}
+    otel:
+      exporter: ${OTEL_EXPORTER:-otlp}
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      protocol: ${OTEL_EXPORTER_OTLP_PROTOCOL:-grpc}
+      service_name: identity-access-core
+      resource_attributes: ${OTEL_RESOURCE_ATTRIBUTES:-}
+
+database:
+  # Все секреты только через env.
+  url: ${DATABASE_URL:-}
+  pool:
+    min_size: 5
+    max_size: 20
+    max_overflow: 10
+    pool_timeout_seconds: 30
+    pool_recycle_seconds: 1800
+    pre_ping: true
+  migrations:
+    enabled: true
+    # В проде обычно включают строгий режим.
+    strict: true
+
+redis:
+  enabled: true
+  url: ${REDIS_URL:-redis://redis:6379/0}
+  timeouts:
+    connect_seconds: 3
+    read_seconds: 2
+    write_seconds: 2
+  tls:
+    enabled: ${REDIS_TLS_ENABLED:-false}
+
+security:
+  secrets:
+    # Ключи должны быть не короче 32 байт, храниться вне репозитория.
+    app_secret_key: ${APP_SECRET_KEY:-}
+    jwt_signing_key: ${JWT_SIGNING_KEY:-}
+    jwt_encryption_key: ${JWT_ENCRYPTION_KEY:-}
+  password_hashing:
+    algorithm: argon2id
+    # Параметры под нагрузку, тестировать в прод окружении.
+    argon2:
+      time_cost: 3
+      memory_kib: 65536
+      parallelism: 2
+      hash_len: 32
+      salt_len: 16
+  jwt:
+    issuer: ${JWT_ISSUER:-identity-access-core}
+    audience: ${JWT_AUDIENCE:-identity}
+    access_ttl_seconds: 900
+    refresh_ttl_seconds: 2592000
+    clock_skew_seconds: 30
+    rotate_refresh_tokens: true
+    denylist:
+      enabled: true
+      storage: redis
+      key_prefix: jwt:denylist:
+  csrf:
+    enabled: true
+    header: X-CSRF-Token
+    cookie_name: csrf_token
+    same_site: Strict
+    secure: true
+  rate_limit:
+    enabled: true
+    strategy: sliding_window
+    storage: redis
+    rules:
+      - name: auth_login
+        key: ip
+        window_seconds: 60
+        limit: 20
+      - name: auth_refresh
+        key: subject
+        window_seconds: 60
+        limit: 30
+      - name: global
+        key: ip
+        window_seconds: 60
+        limit: 300
+
+auth:
+  providers:
+    local:
+      enabled: true
+      # В проде рекомендуется включать сложность.
+      password_policy:
+        min_length: 12
+        require_upper: true
+        require_lower: true
+        require_digit: true
+        require_symbol: true
+        max_password_age_days: 180
+        history_count: 10
+    oidc:
+      enabled: ${OIDC_ENABLED:-false}
+      discovery_url: ${OIDC_DISCOVERY_URL:-}
+      client_id: ${OIDC_CLIENT_ID:-}
+      client_secret: ${OIDC_CLIENT_SECRET:-}
+      scopes: "openid profile email"
+      pkce: true
+      prompt: login
+      # Ограничение допустимых доменов email, если нужно.
+      allowed_email_domains: ${OIDC_ALLOWED_EMAIL_DOMAINS:-}
+  session:
+    enabled: true
+    cookie:
+      name: iac_session
+      http_only: true
+      secure: true
+      same_site: Strict
+      domain: ${SESSION_COOKIE_DOMAIN:-}
+      path: /
+      ttl_seconds: 86400
+
+rbac:
+  enabled: true
+  # Источник политик: файл или сервис. В проде лучше хранить версионируемо и подписано.
+  policy_source:
+    type: file
+    path: ${RBAC_POLICY_PATH:-/app/policies/rbac.yaml}
+  cache:
+    enabled: true
+    ttl_seconds: 60
+
+audit:
+  enabled: true
+  sink:
+    type: stdout
+    # В проде обычно отправляют в Kafka/OTEL/Loki/SIEM.
+  fields:
+    include:
+      - request_id
+      - actor_id
+      - actor_type
+      - action
+      - resource
+      - result
+      - ip
+      - user_agent
+  pii:
+    # Никогда не логировать PII в открытом виде.
+    redact: true
+
+feature_flags:
+  enabled: true
+  provider: env
+  flags:
+    strict_transport_security: true
+    enforce_mfa_for_admins: ${ENFORCE_MFA_FOR_ADMINS:-true}
+
+maintenance:
+  read_only_mode: ${READ_ONLY_MODE:-false}
+  banner: ${MAINTENANCE_BANNER:-}
+
+integrations:
+  # Заглушка под внешние интеграции.
+  webhooks:
+    enabled: ${WEBHOOKS_ENABLED:-false}
+    signing_secret: ${WEBHOOK_SIGNING_SECRET:-}
+    timeout_seconds: 5

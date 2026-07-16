@@ -1,0 +1,285 @@
+# zero-trust-core/configs/templates/posture_rule.example.yaml
+apiVersion: zerotrust.ae/v1
+kind: PostureRule
+metadata:
+  name: example-device-posture
+  labels:
+    environment: prod
+    owner: security
+    platform: any
+  annotations:
+    description: "Шаблон правила постуры устройства для Zero Trust"
+    changeControl: "Все изменения через Pull Request с 2 апруверами"
+spec:
+  version: 1
+  defaults:
+    decision: deny              # строгий default
+    staleSignalPolicy: fail     # fail|warn|ignore при просроченных сигналах
+    signalFreshnessMax: "5m"    # если у источника не задано иное
+    evidenceRetention: "30d"
+
+  scope:
+    platforms: ["macos","windows","linux","ios","android"]  # можно ограничить
+    ownership: ["COBO","COPE","BYOD"]                       # тип владения
+    tenants: ["*"]                                          # мульти‑арендность
+    includeSelectors:
+      - anyOf:
+          - { key: device.tags, op: containsAny, values: ["workforce","oncall"] }
+          - { key: device.enrollment.state, op: equals, value: "enrolled" }
+    excludeSelectors:
+      - allOf:
+          - { key: device.tags, op: containsAny, values: ["lab","sandbox"] }
+          - { key: context.env, op: equals, value: "dev" }
+
+  signals:
+    # Источники сигналов, доступные правилу
+    # Каждый источник должен быть объявлен в центральной конфигурации сборщиков; здесь задаются ожидания и свежесть
+    - id: mdm.device
+      required: true
+      maxAge: "10m"
+      requiredKeys: ["os.name","os.version","encryption.enabled","secure_boot","serial"]
+    - id: edr.status
+      required: true
+      maxAge: "2m"
+      requiredKeys: ["agent.healthy","threat.level"]
+    - id: cert.attestation
+      required: true
+      maxAge: "24h"
+      requiredKeys: ["mtls.verified","cert.issuer","cert.san.device_id"]
+    - id: geo.last_login
+      required: false
+      maxAge: "15m"
+
+  evaluation:
+    # Логика проверки постуры через декларативные условия
+    # Поддерживаемая логика: allOf/anyOf/not, а также выражение expression (при необходимости)
+    rules:
+      - id: disk_encryption_required
+        severity: high
+        allOf:
+          - { key: mdm.device.encryption.enabled, op: equals, value: true }
+          - { key: mdm.device.encryption.algorithm, op: in, values: ["filevault2","bitlocker","luks2"] }
+      - id: secure_boot_required
+        severity: high
+        anyOf:
+          - { key: mdm.device.secure_boot, op: equals, value: true }
+          - { key: mdm.device.tpm_present, op: equals, value: true }     # для Windows
+      - id: edr_agent_healthy
+        severity: critical
+        allOf:
+          - { key: edr.status.agent.healthy, op: equals, value: true }
+          - { key: edr.status.threat.level, op: "<=", value: 1 }
+      - id: mtls_device_attested
+        severity: critical
+        allOf:
+          - { key: cert.attestation.mtls.verified, op: equals, value: true }
+          - { key: cert.attestation.cert.issuer, op: in, values: ["ORG-ROOT-CA","ORG-INT-DEVICE-CA"] }
+          - { key: cert.attestation.cert.not_after_s, op: ">", value: "now()+86400" }  # не менее суток до экспирации
+      - id: os_min_versions
+        severity: medium
+        anyOf:
+          - { key: mdm.device.os.name, op: equals, value: "macos"    }
+          - { key: mdm.device.os.name, op: equals, value: "windows"  }
+          - { key: mdm.device.os.name, op: equals, value: "linux"    }
+        constraints:
+          # Версионные ограничения по платформам
+          - when: { key: mdm.device.os.name, op: equals, value: "macos"   }
+            require: { key: mdm.device.os.version, op: "semver>=", value: "13.6.0" }
+          - when: { key: mdm.device.os.name, op: equals, value: "windows" }
+            require: { key: mdm.device.os.version, op: "build>=",  value: "10.0.19045" }
+          - when: { key: mdm.device.os.name, op: equals, value: "linux"   }
+            require: { key: mdm.device.kernel.version, op: "semver>=", value: "5.15.0" }
+      - id: jailbreak_root_detect
+        severity: high
+        not:
+          anyOf:
+            - { key: mdm.device.jailbreak, op: equals, value: true }
+            - { key: mdm.device.rooted,    op: equals, value: true }
+
+    aggregation:
+      # Как агрегировать результаты правил в итоговый verdict
+      strategy: weighted          # firstFail|majority|weighted
+      weights:
+        critical: 5
+        high: 3
+        medium: 2
+        low: 1
+      thresholds:
+        passMaxScore: 0           # сумма штрафов для PASS
+        warnMaxScore: 2           # до включительно -> WARN
+        failMinScore: 3           # от -> FAIL
+      missingSignalsPenalty:
+        warn: 1
+        fail: 2
+
+    trustMapping:
+      # Соответствие итогового решения уровню доверия устройства
+      onPass:    high
+      onWarn:    medium
+      onFail:    quarantine
+
+    decisionMap:
+      # Дополнительные условия, влияющие на решение
+      - when:
+          allOf:
+            - { key: edr.status.threat.level, op: ">=", value: 3 }
+            - { key: edr.status.last_detection_s, op: ">=", value: "now()-3600" }
+        forceDecision: fail
+      - when:
+          anyOf:
+            - { key: geo.last_login.impossible_travel, op: equals, value: true }
+        forceDecision: warn
+
+  enforcement:
+    # Действия принудительного исполнения по итоговому решению
+    onPass:
+      - action: allow
+      - action: session.extend
+        params: { idle: "30m", absolute: "8h" }
+    onWarn:
+      - action: step_up_mfa
+        params: { reason: "device posture warn", ttl: "1h" }
+      - action: session.shorten
+        params: { idle: "10m", absolute: "2h" }
+      - action: restrict.resources
+        params:
+          sensitivityMax: "medium"
+    onFail:
+      - action: quarantine
+        params:
+          network: ["dns","mdm","idp","updates"]   # что оставляем доступным
+      - action: block.resource
+        params:
+          resources: ["service:*","audit:*"]
+      - action: notify
+        params:
+          channels: ["slack://sec-incident","pagerduty://sec-oncall"]
+          severity: "high"
+      - action: open_ticket
+        params:
+          system: jira
+          project: SEC
+          template: "ZT-POSTURE-FAIL"
+      - action: mdm.remediate
+        params:
+          playbook: "enable_encryption_and_secure_boot"
+
+  remediation:
+    # Подсказки и автоматические плейбуки на стороне MDM/EDR
+    guidance:
+      user:
+        ru: "Включите полное шифрование диска и перезагрузите устройство для активации Secure Boot."
+        en: "Enable full disk encryption and reboot to activate Secure Boot."
+      it:
+        mdmPlaybookRef: "enable_encryption_and_secure_boot"
+        edrPlaybookRef: "reinstall_agent"
+    gracePeriods:
+      # Временные окна на исправление для BYOD/не критичных платформ
+      - when:
+          allOf:
+            - { key: device.ownership, op: equals, value: "BYOD" }
+            - { key: mdm.device.encryption.enabled, op: equals, value: false }
+        allow: "24h"
+        decisionDuringGrace: warn
+
+  exceptions:
+    approvalsRequired: 2
+    entries:
+      - id: ex-macos-lab-nvme
+        scope:
+          selectors:
+            - { key: device.tags, op: containsAny, values: ["lab"] }
+            - { key: mdm.device.storage.type, op: equals, value: "NVMe" }
+        expiresAt: "2025-12-31T23:59:59Z"
+        justification: "Лабораторные стенды, контролируемая среда"
+        owners: ["team-platform","sec-device"]
+        decisionOverride: warn
+
+  rollout:
+    strategy: canary
+    stages:
+      - id: canary-5
+        samplePercent: 5
+        successCriteria:
+          maxFailPercent: 1
+          minCoveragePercent: 95
+          duration: "30m"
+      - id: prod-25
+        samplePercent: 25
+        successCriteria:
+          maxFailPercent: 1
+          minCoveragePercent: 97
+          duration: "1h"
+      - id: prod-100
+        samplePercent: 100
+        successCriteria:
+          maxFailPercent: 0.5
+          minCoveragePercent: 98
+          duration: "2h"
+    rollback:
+      on:
+        - condition: "stage.failPercent > maxFailPercent"
+          action: revert_to_previous
+
+  observability:
+    audit:
+      enabled: true
+      category: "POSTURE"
+      redact:
+        - "authorization"
+        - "cookie"
+        - "password"
+    metrics:
+      prometheus:
+        enabled: true
+        labels:
+          rule: example-device-posture
+        exports:
+          - name: posture_rule_decisions_total
+            help: "Счетчик решений по правилу"
+          - name: posture_rule_coverage_percent
+            help: "Процент устройств с валидной постурой"
+    traces:
+      otlp:
+        endpoint: "http://otel-collector:4317"
+        sampling: 0.1
+
+  complianceMapping:
+    soc2: ["CC6.1","CC7.2"]
+    iso27001: ["A.9.2","A.12.6"]
+
+  tests:
+    # Синтетические профили для локальной валидации логики
+    fixtures:
+      - id: macos_compliant
+        signals:
+          mdm.device:
+            os: { name: "macos", version: "13.6.1" }
+            encryption: { enabled: true, algorithm: "filevault2" }
+            secure_boot: true
+          edr.status: { agent: { healthy: true }, threat: { level: 0 } }
+          cert.attestation: { mtls: { verified: true }, cert: { issuer: "ORG-ROOT-CA", not_after_s: "now()+604800" } }
+        expect:
+          decision: pass
+          trust: high
+      - id: win_missing_secure_boot
+        signals:
+          mdm.device:
+            os: { name: "windows", version: "10.0.19041" }
+            encryption: { enabled: true, algorithm: "bitlocker" }
+            secure_boot: false
+          edr.status: { agent: { healthy: true }, threat: { level: 1 } }
+          cert.attestation: { mtls: { verified: true }, cert: { issuer: "ORG-INT-DEVICE-CA", not_after_s: "now()+259200" } }
+        expect:
+          decision: warn
+          trust: medium
+      - id: linux_no_encryption
+        signals:
+          mdm.device:
+            os: { name: "linux", kernel: { version: "5.4.0" } }
+            encryption: { enabled: false }
+            secure_boot: true
+          edr.status: { agent: { healthy: true }, threat: { level: 0 } }
+        expect:
+          decision: fail
+          trust: quarantine

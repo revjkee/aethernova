@@ -1,0 +1,137 @@
+name: SBOM
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "core-systems/identity-access-core/**"
+      - ".github/workflows/sbom.yml"
+  push:
+    branches: ["main"]
+    tags: ["v*.*.*"]
+    paths:
+      - "core-systems/identity-access-core/**"
+      - ".github/workflows/sbom.yml"
+  schedule:
+    - cron: "17 3 * * 1" # Weekly (Mon) 03:17 UTC
+
+concurrency:
+  group: sbom-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  generate:
+    name: Generate SBOM (SPDX + CycloneDX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      WORKDIR: core-systems/identity-access-core
+      OUTDIR: sbom-out
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare output directory
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUTDIR}"
+
+      - name: Generate SPDX SBOM (Syft via Anchore action)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ env.WORKDIR }}
+          format: spdx-json
+          output-file: ${{ env.OUTDIR }}/identity-access-core.spdx.json
+          upload-artifact: false
+
+      - name: Install CycloneDX CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/CycloneDX/cyclonedx-cli/master/install.sh | bash -s -- -d /usr/local/bin
+
+      - name: Convert SPDX -> CycloneDX
+        run: |
+          set -euo pipefail
+          cyclonedx convert \
+            --input-file "${OUTDIR}/identity-access-core.spdx.json" \
+            --output-file "${OUTDIR}/identity-access-core.cdx.json" \
+            --output-format json
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          (cd "${OUTDIR}" && sha256sum *.json | tee SHA256SUMS.txt)
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: identity-access-core-sbom
+          path: |
+            ${{ env.OUTDIR }}/identity-access-core.spdx.json
+            ${{ env.OUTDIR }}/identity-access-core.cdx.json
+            ${{ env.OUTDIR }}/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  release-attach:
+    name: Attach SBOM to Release (tags only)
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+
+    env:
+      WORKDIR: core-systems/identity-access-core
+      OUTDIR: sbom-out
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare output directory
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUTDIR}"
+
+      - name: Generate SPDX SBOM and upload to Release asset
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ env.WORKDIR }}
+          format: spdx-json
+          output-file: ${{ env.OUTDIR }}/identity-access-core.spdx.json
+          upload-artifact: false
+          upload-release-assets: true
+
+      - name: Install CycloneDX CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/CycloneDX/cyclonedx-cli/master/install.sh | bash -s -- -d /usr/local/bin
+
+      - name: Convert SPDX -> CycloneDX
+        run: |
+          set -euo pipefail
+          cyclonedx convert \
+            --input-file "${OUTDIR}/identity-access-core.spdx.json" \
+            --output-file "${OUTDIR}/identity-access-core.cdx.json" \
+            --output-format json
+
+      - name: Upload CycloneDX as Release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.OUTDIR }}/identity-access-core.cdx.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

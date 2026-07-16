@@ -1,0 +1,295 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: oblivionvault-core-rules
+  labels:
+    app.kubernetes.io/name: oblivionvault-core
+    app.kubernetes.io/part-of: observability
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+
+  # ============================
+  # HTTP/RED Recording Rules
+  # ============================
+  - name: ov-http-recordings
+    interval: 30s
+    rules:
+      # Унифицированные buckets (5m), поддержка разных названий лейбла пути: route|uri|path|handler
+      - record: ov:http:req:bucket:rate5m
+        expr: |
+          sum by (namespace, job, method, route, le) (
+            label_replace(
+              label_replace(
+                label_replace(
+                  rate(http_request_duration_seconds_bucket{job=~"oblivionvault-.*"}[5m]),
+                  "route","$1","path","(.*)"
+                ),
+                "route","$1","uri","(.*)"
+              ),
+              "route","$1","handler","(.*)"
+            )
+          )
+          or
+          sum by (namespace, job, method, route, le) (
+            label_replace(
+              label_replace(
+                label_replace(
+                  rate(http_server_requests_seconds_bucket{job=~"oblivionvault-.*"}[5m]),
+                  "route","$1","path","(.*)"
+                ),
+                "route","$1","uri","(.*)"
+              ),
+              "route","$1","handler","(.*)"
+            )
+          )
+
+      # Общее число запросов (5m), разные счётчики
+      - record: ov:http:req:rate5m
+        expr: |
+          sum by (namespace, job) (rate(http_requests_total{job=~"oblivionvault-.*"}[5m]))
+          or
+          sum by (namespace, job) (rate(http_server_requests_seconds_count{job=~"oblivionvault-.*"}[5m]))
+
+      # Ошибки 5xx (5m), разные счётчики и лейблы статуса: code|status
+      - record: ov:http:req:errors:rate5m
+        expr: |
+          sum by (namespace, job) (rate(http_requests_total{job=~"oblivionvault-.*", code=~"5.."}[5m]))
+          or
+          sum by (namespace, job) (rate(http_server_requests_seconds_count{job=~"oblivionvault-.*", status=~"5.."}[5m]))
+
+      - record: ov:http:req:error_ratio5m
+        expr: |
+          ov:http:req:errors:rate5m
+          /
+          clamp_min(ov:http:req:rate5m, 1e-10)
+
+      # Те же метрики на окнах 30m/1h/6h для SLO burn
+      - record: ov:http:req:rate30m
+        expr: |
+          sum by (namespace, job) (rate(http_requests_total{job=~"oblivionvault-.*"}[30m]))
+          or
+          sum by (namespace, job) (rate(http_server_requests_seconds_count{job=~"oblivionvault-.*"}[30m]))
+      - record: ov:http:req:errors:rate30m
+        expr: |
+          sum by (namespace, job) (rate(http_requests_total{job=~"oblivionvault-.*", code=~"5.."}[30m]))
+          or
+          sum by (namespace, job) (rate(http_server_requests_seconds_count{job=~"oblivionvault-.*", status=~"5.."}[30m]))
+      - record: ov:http:req:error_ratio30m
+        expr: ov:http:req:errors:rate30m / clamp_min(ov:http:req:rate30m, 1e-10)
+
+      - record: ov:http:req:rate1h
+        expr: |
+          sum by (namespace, job) (rate(http_requests_total{job=~"oblivionvault-.*"}[1h]))
+          or
+          sum by (namespace, job) (rate(http_server_requests_seconds_count{job=~"oblivionvault-.*"}[1h]))
+      - record: ov:http:req:errors:rate1h
+        expr: |
+          sum by (namespace, job) (rate(http_requests_total{job=~"oblivionvault-.*", code=~"5.."}[1h]))
+          or
+          sum by (namespace, job) (rate(http_server_requests_seconds_count{job=~"oblivionvault-.*", status=~"5.."}[1h]))
+      - record: ov:http:req:error_ratio1h
+        expr: ov:http:req:errors:rate1h / clamp_min(ov:http:req:rate1h, 1e-10)
+
+      - record: ov:http:req:rate6h
+        expr: |
+          sum by (namespace, job) (rate(http_requests_total{job=~"oblivionvault-.*"}[6h]))
+          or
+          sum by (namespace, job) (rate(http_server_requests_seconds_count{job=~"oblivionvault-.*"}[6h]))
+      - record: ov:http:req:errors:rate6h
+        expr: |
+          sum by (namespace, job) (rate(http_requests_total{job=~"oblivionvault-.*", code=~"5.."}[6h]))
+          or
+          sum by (namespace, job) (rate(http_server_requests_seconds_count{job=~"oblivionvault-.*", status=~"5.."}[6h]))
+      - record: ov:http:req:error_ratio6h
+        expr: ov:http:req:errors:rate6h / clamp_min(ov:http:req:rate6h, 1e-10)
+
+      # Латентность p95/p99 (5m)
+      - record: ov:http:req:latency:p95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (namespace, job, method, route, le) (ov:http:req:bucket:rate5m)
+          )
+      - record: ov:http:req:latency:p99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (namespace, job, method, route, le) (ov:http:req:bucket:rate5m)
+          )
+
+  # ============================
+  # SLO Error Budget Burn Alerts (99.5% availability)
+  # ============================
+  - name: ov-http-slo-alerts
+    interval: 30s
+    rules:
+      # Быстрый расход бюджета: 5m и 1h оба выше 14.4× бюджета (Google SRE multiwindow)
+      - alert: OVHttpSLOErrorBudgetBurnFast
+        expr: |
+          (ov:http:req:error_ratio5m   / 0.005 > 14.4)
+          and
+          (ov:http:req:error_ratio1h   / 0.005 > 14.4)
+          and
+          (ov:http:req:rate5m > 0)
+        for: 5m
+        labels:
+          severity: critical
+          slo: availability-99.5
+          team: core
+        annotations:
+          summary: Быстрый расход SLO-бюджета ошибок (99.5%)
+          description: |
+            Сервис {{ $labels.job }} в namespace {{ $labels.namespace }} превышает порог расхода SLO-бюджета (5xx).
+            5m/1h burn-rate > 14.4 от бюджета (0.5%). Это может исчерпать дневной бюджет за ~1 час.
+          runbook_url: https://runbooks.example.com/oblivionvault/slo#error-budget-burn
+
+      # Медленный расход: 30m и 6h оба выше 6× бюджета
+      - alert: OVHttpSLOErrorBudgetBurnSlow
+        expr: |
+          (ov:http:req:error_ratio30m / 0.005 > 6)
+          and
+          (ov:http:req:error_ratio6h  / 0.005 > 6)
+          and
+          (ov:http:req:rate30m > 0)
+        for: 30m
+        labels:
+          severity: warning
+          slo: availability-99.5
+          team: core
+        annotations:
+          summary: Медленный расход SLO-бюджета ошибок (99.5%)
+          description: |
+            Сервис {{ $labels.job }} стабильно расходует SLO-бюджет (5xx).
+            30m/6h burn-rate > 6×. Риск исчерпания недельного бюджета.
+          runbook_url: https://runbooks.example.com/oblivionvault/slo#error-budget-burn
+
+      # Высокая латентность p95 при наличии трафика
+      - alert: OVHttpHighLatencyP95
+        expr: |
+          ov:http:req:latency:p95 > 0.3
+          and on (namespace, job)
+          ov:http:req:rate5m > 0
+        for: 10m
+        labels:
+          severity: warning
+          slo: latency-p95-300ms
+          team: core
+        annotations:
+          summary: Высокая p95 латентность HTTP
+          description: |
+            p95(latency) > 300ms у {{ $labels.job }} (route={{ $labels.route }}, method={{ $labels.method }}).
+          runbook_url: https://runbooks.example.com/oblivionvault/perf#latency
+
+      # Нет трафика (информационный сигнал)
+      - alert: OVHttpNoTraffic
+        expr: ov:http:req:rate5m == 0
+        for: 15m
+        labels:
+          severity: info
+          team: core
+        annotations:
+          summary: Нет входящего HTTP-трафика
+          description: Сервис {{ $labels.job }} не получает запросы в течение 15m. Проверьте маршрутизацию и readiness.
+          runbook_url: https://runbooks.example.com/oblivionvault/ops#no-traffic
+
+  # ============================
+  # Kubernetes Runtime Alerts
+  # ============================
+  - name: ov-kubernetes-runtime
+    interval: 30s
+    rules:
+      # Частые рестарты контейнеров
+      - alert: OVKubeContainerHighRestarts
+        expr: |
+          sum by (namespace, pod) (
+            increase(kube_pod_container_status_restarts_total{namespace=~"oblivionvault.*"}[5m])
+          ) > 3
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Высокая частота рестартов контейнеров
+          description: Pod {{ $labels.pod }} в {{ $labels.namespace }} перезапускается > 3 раз за 5m.
+          runbook_url: https://runbooks.example.com/kubernetes/pods#restarts
+
+      # CrashLoopBackOff
+      - alert: OVKubeCrashLoopBackOff
+        expr: |
+          max by (namespace, pod, container) (
+            kube_pod_container_status_waiting_reason{
+              reason="CrashLoopBackOff",
+              namespace=~"oblivionvault.*"
+            }
+          ) > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: CrashLoopBackOff контейнера
+          description: Контейнер {{ $labels.container }} в pod {{ $labels.pod }} находится в CrashLoopBackOff.
+          runbook_url: https://runbooks.example.com/kubernetes/pods#crashloop
+
+      # OOM Kill
+      - alert: OVKubeContainerOOMKill
+        expr: |
+          increase(container_oom_events_total{namespace=~"oblivionvault.*"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: Зафиксирован OOMKill
+          description: Контейнеры в {{ $labels.namespace }} были завершены OOM за последние 10m.
+          runbook_url: https://runbooks.example.com/kubernetes/resources#oom
+
+      # Высокий CPU throttle
+      - alert: OVKubeCPUThrottlingHigh
+        expr: |
+          (
+            sum by (namespace, pod, container) (
+              rate(container_cpu_cfs_throttled_periods_total{image!=""}[5m])
+            )
+            /
+            clamp_min(
+              sum by (namespace, pod, container) (
+                rate(container_cpu_cfs_periods_total{image!=""}[5m])
+              ), 1
+            )
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Высокая доля CPU throttling
+          description: Контейнер {{ $labels.container }} в pod {{ $labels.pod }} throttled > 20% за 10m.
+          runbook_url: https://runbooks.example.com/kubernetes/resources#cpu-throttle
+
+      # Давление по памяти: использование > 90% лимита (или > 90% реквеста при отсутствии лимита)
+      - alert: OVKubeMemoryPressureHigh
+        expr: |
+          (
+            sum by (namespace, pod, container) (
+              container_memory_working_set_bytes{image!=""}
+            )
+            /
+            sum by (namespace, pod, container) (
+              # Берём лимит памяти, если он задан, иначе — request
+              max(
+                kube_pod_container_resource_limits{resource="memory"} > 0,
+                kube_pod_container_resource_requests{resource="memory"}
+              )
+            )
+          ) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: Высокое использование памяти контейнером
+          description: Контейнер {{ $labels.container }} в pod {{ $labels.pod }} использует > 90% выделенной памяти.
+          runbook_url: https://runbooks.example.com/kubernetes/resources#memory

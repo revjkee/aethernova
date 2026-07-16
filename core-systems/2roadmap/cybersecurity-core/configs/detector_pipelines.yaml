@@ -1,0 +1,460 @@
+# cybersecurity-core/configs/detector_pipelines.yaml
+# Schema: cybersecurity.aethernova/v1 DetectorPipelines
+# Назначение: единая декларация пайплайнов детектирования и маршрутизации инцидентов.
+
+apiVersion: cybersecurity.aethernova/v1
+kind: DetectorPipelines
+metadata:
+  name: cybersecurity-core-detectors
+  environment: ${ENVIRONMENT:-production}
+  owner: secops
+  labels:
+    app.kubernetes.io/name: cybersecurity-core
+    app.kubernetes.io/component: detection
+
+spec:
+  schemaVersion: "1.1"
+
+  globals:
+    timezone: "UTC"
+    maxInFlightAlerts: 500
+    defaultAlertFor: 10m
+    defaultEvalWindow: 5m
+    sampling:
+      enabled: true
+      rate: 1.0
+      exceptions:
+        - match: { source: "falco" }
+          rate: 1.0
+    pii_redaction:
+      enabled: true
+      strategies:
+        - type: regex
+          name: redact-emails
+          pattern: '(?i)([a-z0-9._%+-]+)@([a-z0-9.-]+\.[a-z]{2,})'
+          replacement: '***@***'
+        - type: regex
+          name: redact-phones
+          pattern: '(?:(?:\+?\d{1,3})?[\s-]?)?(?:\(?\d{3}\)?[\s-]?)?\d{3}[\s-]?\d{2,4}'
+          replacement: '***'
+        - type: ip-hash
+          name: hash-ipv4
+          saltEnv: REDACTION_SALT
+    deduplication:
+      window: 10m
+      keyTemplate: '{{ source }}:{{ rule_id }}:{{ labels.namespace }}:{{ labels.pod }}:{{ labels.node }}'
+    suppression:
+      rules:
+        - id: maintenance-window
+          match:
+            labels:
+              maintenance: "true"
+          window: 2h
+          action: drop
+    severityMap:
+      default: medium
+      overrides:
+        critical: [ "priv_esc", "cloudtrail_root_usage", "egress_exfiltration", "ransomware" ]
+        high:     [ "k8s_apiserver_5xx_spike", "s3_policy_change", "iam_key_leak" ]
+        medium:   [ "pod_crashloop_spike", "ingress_5xx_spike", "audit_401_403_spike" ]
+        low:      [ "node_fs_low", "node_cpu_throttle" ]
+
+  inputs:
+    - name: prometheus
+      type: prometheus
+      selector: 'job=~".*"'
+      remoteReadUrl: ${PROM_REMOTE_READ_URL:-""}
+      remoteWriteUrl: ${PROM_REMOTE_WRITE_URL:-""}
+    - name: loki
+      type: loki
+      url: ${LOKI_URL:-"http://loki.monitoring:3100"}
+      tenant: ${LOKI_TENANT:-"default"}
+    - name: falco
+      type: falco
+      grpc: ${FALCO_GRPC_ADDR:-"falco.falco:5060"}
+    - name: k8s_audit
+      type: filebeat
+      topic: k8s-audit
+    - name: apiserver
+      type: prometheus
+      selector: 'job=~"kube-apiserver"'
+    - name: ingress
+      type: prometheus
+      selector: 'job=~"nginx-ingress.*"|job=~"haproxy.*"'
+    - name: node
+      type: prometheus
+      selector: 'job=~"node-exporter"'
+    - name: cloudtrail
+      type: s3
+      bucket: ${CT_BUCKET:-""}
+      prefix: ${CT_PREFIX:-"AWSLogs/"}
+      region: ${AWS_REGION:-"eu-north-1"}
+
+  normalization:
+    # ECS-подобная нормализация для унификации
+    ecs:
+      enable: true
+      mappings:
+        - when: { source: "falco" }
+          fields:
+            "@timestamp": "evt.time"
+            "host.name": "host.hostname"
+            "kubernetes.pod.name": "k8s.pod.name"
+            "kubernetes.namespace": "k8s.ns.name"
+            "event.action": "rule"
+            "event.category": "process"
+            "event.type": "info"
+        - when: { source: "ingress" }
+          fields:
+            "http.response.status_code": "status"
+            "url.path": "path"
+            "client.ip": "remote_ip"
+        - when: { source: "cloudtrail" }
+          fields:
+            "event.action": "eventName"
+            "cloud.account.id": "recipientAccountId"
+            "user.name": "userIdentity.userName"
+            "source.ip": "sourceIPAddress"
+
+  enrichment:
+    - name: geoip
+      type: geoip
+      provider: ${GEOIP_PROVIDER:-"maxmind"}
+      dbPath: ${GEOIP_DB:-"/var/lib/geoip/GeoLite2-City.mmdb"}
+      applyTo: [ "client.ip", "source.ip" ]
+    - name: threatintel
+      type: ti-aggregate
+      providers:
+        - name: misp
+          url: ${MISP_URL:-""}
+          apiKeyEnv: MISP_API_KEY
+          enabled: ${MISP_ENABLED:-false}
+        - name: otx
+          url: "https://otx.alienvault.com/api/v1/"
+          apiKeyEnv: OTX_API_KEY
+          enabled: ${OTX_ENABLED:-false}
+      cacheTtl: 15m
+      applyTo: [ "client.ip", "source.ip", "url.domain", "file.hash.sha256" ]
+    - name: kube
+      type: kubernetes
+      enricher:
+        serviceAccount: true
+        labels: true
+        nodeRole: true
+    - name: aws
+      type: aws-lookup
+      accountAlias: true
+      vpc: true
+      iamUserTags: true
+
+  detectors:
+    # ---------- Timeseries / Prometheus ----------
+    - id: k8s_apiserver_5xx_spike
+      type: timeseries
+      source: apiserver
+      query: |
+        (
+          sum(rate(apiserver_request_total{code=~"5.."}[5m]))
+          /
+          sum(rate(apiserver_request_total[5m]))
+        ) > 0.05
+      evalWindow: 10m
+      for: 10m
+      labels:
+        domain: control-plane
+      annotations:
+        summary: "Высокая доля 5xx у kube-apiserver"
+        runbook: "ops/runbooks/apiserver_5xx.md"
+
+    - id: audit_401_403_spike
+      type: timeseries
+      source: apiserver
+      query: |
+        (
+          sum(rate(apiserver_request_total{code=~"401|403"}[5m]))
+          /
+          sum(rate(apiserver_request_total[5m]))
+        ) > 0.05
+      for: 10m
+      labels:
+        domain: security
+      annotations:
+        summary: "Рост 401/403 на kube-apiserver"
+        runbook: "ops/runbooks/api_auth_spike.md"
+
+    - id: ingress_5xx_spike
+      type: timeseries
+      source: ingress
+      query: |
+        (
+          sum(rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))
+          /
+          sum(rate(nginx_ingress_controller_requests[5m]))
+        ) > 0.05
+      for: 10m
+      labels:
+        domain: edge
+      annotations:
+        summary: "Высокая доля 5xx на Ingress"
+        runbook: "ops/runbooks/ingress_5xx.md"
+
+    - id: pod_crashloop_spike
+      type: timeseries
+      source: prometheus
+      query: |
+        max_over_time(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}[5m]) > 0
+      for: 10m
+      labels:
+        domain: workload
+      annotations:
+        summary: "CrashLoopBackOff в подах"
+        runbook: "ops/runbooks/pod_crashloop.md"
+
+    - id: node_fs_low
+      type: timeseries
+      source: node
+      query: |
+        (node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|aufs"}
+         / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs|overlay|aufs"}) < 0.10
+      for: 15m
+      labels:
+        domain: node
+      annotations:
+        summary: "Мало места на файловой системе"
+        runbook: "ops/runbooks/fs_space_low.md"
+
+    - id: egress_exfiltration
+      type: anomaly
+      source: prometheus
+      method: robust_zscore
+      signal: 'sum by (namespace,pod) (rate(container_network_transmit_bytes_total{pod!=""}[5m]))'
+      threshold: 3.5
+      minValue: 10485760        # 10 MiB/s
+      for: 10m
+      labels:
+        domain: security
+      annotations:
+        summary: "Аномально высокий egress-трафик"
+        runbook: "ops/runbooks/egress_spike.md"
+
+    # ---------- Falco / Runtime ----------
+    - id: priv_esc
+      type: rule
+      source: falco
+      match:
+        anyOf:
+          - evt.rule =~ "Privilege Escalation.*"
+          - evt.rule =~ "Launch Privileged Container"
+      for: 1m
+      labels:
+        domain: runtime
+      annotations:
+        summary: "Попытка повышения привилегий (Falco)"
+        runbook: "ops/runbooks/falco_critical.md"
+
+    # ---------- CloudTrail ----------
+    - id: cloudtrail_root_usage
+      type: rule
+      source: cloudtrail
+      match:
+        allOf:
+          - eventName != "GetCallerIdentity"
+          - userIdentity.type == "Root"
+      for: 0m
+      labels:
+        domain: aws
+      annotations:
+        summary: "Использование Root в AWS"
+        runbook: "ops/runbooks/cloudtrail_root_usage.md"
+
+    - id: s3_policy_change
+      type: rule
+      source: cloudtrail
+      match:
+        anyOf:
+          - eventName in [ "PutBucketPolicy", "DeleteBucketPolicy", "PutBucketPublicAccessBlock" ]
+      for: 0m
+      labels:
+        domain: aws
+      annotations:
+        summary: "Изменение политики S3"
+        runbook: "ops/runbooks/s3_policy_change.md"
+
+    # ---------- SCM / Secrets (пример интеграции) ----------
+    - id: iam_key_leak
+      type: rule
+      source: loki
+      match:
+        anyOf:
+          - log.message =~ "(?i)AKIA[0-9A-Z]{16}"
+          - log.message =~ "(?i)aws_secret_access_key"
+      for: 0m
+      labels:
+        domain: ci
+      annotations:
+        summary: "Потенциальная утечка AWS ключей в логах"
+        runbook: "ops/runbooks/secret_leak.md"
+
+  correlators:
+    - id: exfiltration_after_priv_esc
+      window: 30m
+      requires:
+        - detector: priv_esc
+        - detector: egress_exfiltration
+      join:
+        keys: [ "kubernetes.namespace", "kubernetes.pod.name" ]
+      emit:
+        severity: critical
+        rule_id: "priv_esc_exfil_combo"
+        title: "Комбинация: PrivEsc → Egress Exfiltration"
+        enrich:
+          ti.recheck: true
+
+    - id: 5xx_and_crashloop
+      window: 20m
+      requires:
+        - detector: ingress_5xx_spike
+        - detector: pod_crashloop_spike
+      join:
+        keys: [ "kubernetes.namespace" ]
+      emit:
+        severity: high
+        rule_id: "edge_app_failure_combo"
+        title: "Комбинация: рост 5xx на Ingress и CrashLoop в namespace"
+
+  scoring:
+    base:
+      critical: 90
+      high: 70
+      medium: 50
+      low: 30
+    assetCriticalityBoost:
+      map:
+        "tier1": 20
+        "tier2": 10
+        "default": 0
+    tiReputationBoost:
+      malicious: 25
+      suspicious: 10
+      clean: 0
+    decay:
+      halfLife: 72h
+
+  routing:
+    # Правила маршрутизации алертов по уровням
+    - match:
+        severity: critical
+      actions:
+        - type: alertmanager
+          url: ${ALERTMANAGER_URL:-"http://alertmanager.monitoring:9093"}
+          route: critical
+        - type: pagerduty
+          routingKeyEnv: PAGERDUTY_ROUTING_KEY
+        - type: slack
+          webhookEnv: SLACK_WEBHOOK_URL
+          channel: ${SLACK_CHANNEL_CRIT:-"#sec-incidents"}
+        - type: siem
+          system: opensearch
+          url: ${SIEM_URL:-"https://opensearch.siem:9200"}
+          index: "sec-events-critical-%{+YYYY.MM.dd}"
+        - type: webhook
+          url: ${WEBHOOK_CRIT_URL:-""}
+    - match:
+        severity: high
+      actions:
+        - type: alertmanager
+          url: ${ALERTMANAGER_URL:-"http://alertmanager.monitoring:9093"}
+          route: high
+        - type: slack
+          webhookEnv: SLACK_WEBHOOK_URL
+          channel: ${SLACK_CHANNEL_HIGH:-"#sec-high"}
+        - type: siem
+          system: opensearch
+          url: ${SIEM_URL:-"https://opensearch.siem:9200"}
+          index: "sec-events-high-%{+YYYY.MM.dd}"
+    - match:
+        severity: medium
+      actions:
+        - type: alertmanager
+          url: ${ALERTMANAGER_URL:-"http://alertmanager.monitoring:9093"}
+          route: medium
+        - type: siem
+          system: opensearch
+          url: ${SIEM_URL:-"https://opensearch.siem:9200"}
+          index: "sec-events-%{+YYYY.MM.dd}"
+    - match:
+        severity: low
+      actions:
+        - type: siem
+          system: opensearch
+          url: ${SIEM_URL:-"https://opensearch.siem:9200"}
+          index: "sec-events-%{+YYYY.MM.dd}"
+        - type: archive
+          s3Bucket: ${ARCHIVE_BUCKET:-""}
+          prefix: "alerts/low/"
+
+  pipelines:
+    # Пайплайн для аутентификации/авторизации API
+    - name: api-authz
+      description: "Аномалии API: 401/403, 5xx, латентность"
+      sources: [ "apiserver", "ingress" ]
+      stages:
+        - normalize: ecs
+        - enrich: [ geoip, threatintel, kube ]
+        - detect: [ audit_401_403_spike, k8s_apiserver_5xx_spike, ingress_5xx_spike ]
+        - correlate: [ 5xx_and_crashloop ]
+        - route:
+            severityFrom: detector
+            fallbackSeverity: medium
+
+    # Пайплайн для рантайм-аномалий
+    - name: runtime-security
+      description: "Falco, эксфильтрация, CrashLoop, OOM и т.п."
+      sources: [ "falco", "prometheus" ]
+      stages:
+        - normalize: ecs
+        - enrich: [ kube, threatintel ]
+        - detect: [ priv_esc, egress_exfiltration, pod_crashloop_spike, node_fs_low ]
+        - correlate: [ exfiltration_after_priv_esc ]
+        - route:
+            severityFrom: detector
+            fallbackSeverity: high
+
+    # Пайплайн для облачной плоскости управления
+    - name: cloud-control-plane
+      description: "CloudTrail: root usage, S3 policy changes"
+      sources: [ "cloudtrail" ]
+      stages:
+        - normalize: ecs
+        - enrich: [ aws, threatintel ]
+        - detect: [ cloudtrail_root_usage, s3_policy_change ]
+        - route:
+            severityFrom: detector
+            fallbackSeverity: high
+
+    # Пайплайн для секретов/SCM/логов
+    - name: secrets-and-logs
+      description: "Утечки секретов и чувствительных данных в логах"
+      sources: [ "loki" ]
+      stages:
+        - normalize: ecs
+        - pii_redact: true
+        - detect: [ iam_key_leak ]
+        - route:
+            severityFrom: detector
+            fallbackSeverity: high
+
+  healthChecks:
+    - name: ti-freshness
+      type: datasource
+      target: threatintel
+      maxAge: 30m
+    - name: geoip-db
+      type: file
+      path: ${GEOIP_DB:-"/var/lib/geoip/GeoLite2-City.mmdb"}
+
+  audit:
+    enableConfigChangeLog: true
+    sink:
+      type: file
+      path: "/var/log/cybersecurity-core/config-audit.log"

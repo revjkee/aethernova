@@ -1,0 +1,288 @@
+# path: omnimind-core/ops/ansible/configs/templates/agent_profile.example.yaml
+# Industrial agent profile template for omnimind-core
+# Все значения — примеры. Переопределяйте их инвентарём/групповыми варсами.
+schema_version: 1
+
+meta:
+  project: "omnimind-core"
+  environment: "prod"           # prod|stage|dev
+  owner: "platform@company.local"
+  created_by: "ansible"
+  last_review: "2025-08-01"
+  annotations:
+    purpose: "autonomous task worker for document processing"
+    ticket_ref: "OPS-1234"
+
+identity:
+  name: "doc-worker"
+  instance_id: "{{ inventory_hostname }}"
+  version: "1.4.0"
+  runtime:
+    language: "python"
+    min_python: "3.12"
+    entrypoint: "omnimind_core.agents.doc_worker:main"
+  labels:
+    tier: "backend"
+    component: "agent"
+    team: "ml-platform"
+  tags: ["documents", "ocr", "nlp"]
+
+security:
+  rbac:
+    allow:
+      # Разрешённые действия на внутреннем контроллере задач
+      - "task:claim"
+      - "task:ack"
+      - "task:fail"
+      - "queue:recv:documents"
+      - "queue:send:deadletter"
+    deny: []
+  secrets:
+    # Секреты не хранятся в явном виде. Указываются ссылки на провайдеров.
+    providers:
+      - name: "vault"                 # пример: HashiCorp Vault
+        type: "vault"
+        base_path: "kv/omnimind/prod/agents/doc-worker"
+      - name: "aws-ssm"               # пример: AWS SSM Parameter Store
+        type: "aws-ssm"
+        base_path: "/omnimind/prod/doc-worker"
+    refs:
+      # Логические имена -> ссылка на источник
+      api_token: "vault:kv/omnimind/prod/agents/doc-worker#api_token"
+      s3_access_key: "aws-ssm:/omnimind/prod/doc-worker/s3_access_key"
+      s3_secret_key: "aws-ssm:/omnimind/prod/doc-worker/s3_secret_key"
+  sandbox:
+    filesystem:
+      allowed_paths:
+        - "/var/lib/omnimind/work"
+        - "/tmp"
+      readonly_paths:
+        - "/etc"
+        - "/usr"
+    process:
+      no_new_privs: true
+      seccomp_profile: "default"
+      rlimits:
+        nofile: 1048576
+        nproc: 65535
+    network:
+      egress_allowlist:
+        - "s3.eu-north-1.amazonaws.com:443"
+        - "api.company.local:443"
+      dns_policy: "system"
+
+resources:
+  cpu:
+    request: "250m"
+    limit: "1000m"
+  memory:
+    request: "256Mi"
+    limit: "1Gi"
+  storage:
+    work_dir: "/var/lib/omnimind/work"
+    max_workdir_size_mb: 2048
+    tmpfs:
+      enabled: true
+      size_mb: 256
+  concurrency:
+    # Максимум параллельных задач
+    max_parallel_tasks: 4
+    queue_prefetch: 8
+
+resilience:
+  timeouts:
+    connect_ms: 2000
+    read_ms: 10000
+    write_ms: 5000
+    task_soft_timeout_s: 120
+    task_hard_timeout_s: 300
+  retry:
+    strategy: "exponential_backoff"
+    base_ms: 200
+    factor: 2.0
+    max_delay_ms: 10000
+    max_attempts: 5
+    jitter: "full"   # none|full
+    retriable_errors:
+      - "ECONNRESET"
+      - "ETIMEDOUT"
+      - "HTTP_5xx"
+  circuit_breaker:
+    window_seconds: 60
+    request_volume_threshold: 50
+    error_rate_threshold_pct: 50
+    sleep_window_seconds: 30
+  idempotency:
+    # Включить ключи идемпотентности на уровне задач
+    enabled: true
+    key_ttl_seconds: 86400
+  deduplication:
+    enabled: true
+    window_seconds: 300
+
+scheduling:
+  mode: "hybrid"           # pull|push|hybrid
+  cron:
+    # Периодические задачи (UTC). Для pull-агента можно оставить пустым.
+    - name: "rebuild-ocr-cache"
+      spec: "0 */6 * * *"
+      jitter_seconds: 300
+      timeout_seconds: 600
+  startup_delay_seconds: 0
+  drain_mode:
+    enabled: false
+    deadline_seconds: 600
+
+queues:
+  input:
+    name: "documents"
+    type: "sqs"
+    fifo: false
+    url: "https://sqs.eu-north-1.amazonaws.com/1234567890/omnimind-documents"
+    visibility_timeout_s: 60
+    wait_time_s: 10
+    dlq:
+      name: "documents-dlq"
+      max_receive_count: 5
+  output:
+    - name: "events"
+      type: "sns"
+      topic_arn: "arn:aws:sns:eu-north-1:1234567890:omnimind-events"
+    - name: "deadletter"
+      type: "sqs"
+      url: "https://sqs.eu-north-1.amazonaws.com/1234567890/omnimind-documents-dlq"
+
+integrations:
+  http_services:
+    - name: "ocr"
+      base_url: "https://ocr.api.company.local"
+      auth: "bearer:{{ secret.ref.api_token }}"
+      headers:
+        X-Client: "omnimind-core"
+      limits:
+        rps: 10
+        burst: 20
+    - name: "nlp"
+      base_url: "https://nlp.api.company.local"
+      auth: "none"
+  object_storage:
+    provider: "s3"
+    region: "eu-north-1"
+    bucket: "omnimind-docs"
+    path_style: false
+    credentials:
+      access_key_id: "{{ secret.ref.s3_access_key }}"
+      secret_access_key: "{{ secret.ref.s3_secret_key }}"
+  database:
+    enabled: false
+    dsn: ""
+
+observability:
+  logging:
+    level: "INFO"      # DEBUG|INFO|WARN|ERROR
+    format: "json"     # json|text
+    sink:
+      type: "stdout"   # stdout|file|http|syslog
+      file_path: "/var/log/omnimind/agent.log"
+    redact_keys: ["authorization", "api_key", "password"]
+    rotate:
+      enabled: true
+      max_size_mb: 20
+      max_files: 5
+  metrics:
+    exporter: "prometheus"
+    bind: "0.0.0.0:9101"
+    labels:
+      agent: "{{ meta.project }}-{{ identity.name }}"
+  tracing:
+    enabled: true
+    provider: "otlp"
+    endpoint: "http://otel-collector.monitoring.svc:4317"
+    sample_ratio: 0.05
+    baggage:
+      - "env={{ meta.environment }}"
+      - "service={{ identity.name }}"
+  audit:
+    enabled: true
+    sink: "kafka://kafka.monitoring.svc:9092/audit.omnimind"
+    redact_pii: true
+
+health:
+  endpoints:
+    liveness:  "/healthz"
+    readiness: "/readyz"
+    metrics:   "/metrics"
+  startup_grace_period_s: 30
+  failure_threshold: 3
+  success_threshold: 1
+  period_seconds: 10
+  timeout_seconds: 2
+
+policies:
+  sla:
+    # Целевые значения для продакшен-эксплуатации
+    availability_pct: 99.9
+    p50_latency_ms: 150
+    p95_latency_ms: 500
+    max_backlog: 1000
+  autoscaling_hints:
+    enabled: true
+    cpu_target_pct: 70
+    memory_target_pct: 75
+    queue_backlog_target: 500
+  updates:
+    strategy: "rolling"
+    max_unavailable: 1
+    max_surge: 1
+    rollback_on_failure: true
+  escalation:
+    pagerduty_service: "omnimind-core"
+    severity_threshold: "critical"  # info|warning|critical
+    notify:
+      email: ["oncall@company.local"]
+      slack_webhook: "https://hooks.slack.com/services/T000/B000/XXX"
+
+feature_flags:
+  enable_ocr_v2: false
+  enable_async_pipeline: true
+  strict_schema_validation: true
+
+# Параметры запуска/деплоя; удобно шаблонизировать через Ansible/Jinja
+deployment:
+  user: "omni"
+  group: "omni"
+  workdir: "/var/lib/omnimind/work"
+  env:
+    TZ: "UTC"
+    PYTHONUNBUFFERED: "1"
+    UV_THREADPOOL_SIZE: "64"
+  files:
+    create_dirs:
+      - "/var/lib/omnimind/work"
+      - "/var/log/omnimind"
+    permissions:
+      - path: "/var/lib/omnimind"
+        mode: "0750"
+        owner: "omni"
+        group: "omni"
+      - path: "/var/log/omnimind"
+        mode: "0750"
+        owner: "omni"
+        group: "omni"
+
+# Валидационные хычки (self-check) — агент может валидировать профиль на старте
+self_validation:
+  required:
+    - "identity.entrypoint"
+    - "queues.input.url"
+    - "observability.logging.level"
+  forbidden_when:
+    - condition: "security.secrets.refs.api_token is undefined"
+      message: "api_token must be provided via external secret provider"
+  numeric_ranges:
+    - key: "resources.concurrency.max_parallel_tasks"
+      min: 1
+      max: 64
+    - key: "resilience.retry.max_attempts"
+      min: 0
+      max: 20

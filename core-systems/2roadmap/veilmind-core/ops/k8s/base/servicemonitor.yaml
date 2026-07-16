@@ -1,0 +1,90 @@
+# veilmind-core/ops/k8s/base/servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: veilmind-core
+  namespace: veilmind
+  labels:
+    app.kubernetes.io/name: veilmind-core
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: veilmind
+spec:
+  jobLabel: app.kubernetes.io/name
+
+  # Выбираем ТОЛЬКО нужные Service'ы (не поды), помеченные ожидаемыми метками.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: veilmind-core
+      app.kubernetes.io/component: api
+
+  # Namespace с целевыми Service; добавьте другие при необходимости.
+  namespaceSelector:
+    matchNames:
+      - veilmind
+
+  # Скрапим два эндпоинта: основные метрики приложения и, опционально, отдельный путь для runtime.
+  endpoints:
+    - port: https-metrics            # имя порта в Service (например, 8443), ДОЛЖЕН существовать
+      scheme: https
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorTimestamps: true
+      followRedirects: false
+
+      # mTLS: секреты должны лежать в namespace Prometheus (обычно monitoring) и быть доступны через Operator.
+      # Используем безопасные ссылки на Secret/ConfigMap вместо файловых путей.
+      tlsConfig:
+        serverName: veilmind-core.veilmind.svc
+        insecureSkipVerify: false
+        ca:
+          secret:
+            name: veilmind-mtls
+            key: ca.crt
+        cert:
+          secret:
+            name: veilmind-mtls
+            key: client.crt
+        keySecret:
+            name: veilmind-mtls
+            key: client.key
+
+      # Ограничим высокую кардинальность и мусорные метрики на таргете.
+      metricRelabelings:
+        # Отбросить метрики с экстремальной кардинальностью по label "le" у гистограмм, если они не нужны
+        - action: drop
+          sourceLabels: ["__name__"]
+          regex: ".*_bucket$"
+        # Удалить шумовые лейблы (пример; оставьте только нужные вашему бэкенду)
+        - action: labeldrop
+          regex: "pod|container|endpoint|instance|job"
+
+    - port: https-metrics
+      scheme: https
+      path: /metrics/runtime
+      interval: 1m
+      scrapeTimeout: 10s
+      honorTimestamps: true
+      followRedirects: false
+      tlsConfig:
+        serverName: veilmind-core.veilmind.svc
+        insecureSkipVerify: false
+        ca:
+          secret:
+            name: veilmind-mtls
+            key: ca.crt
+        cert:
+          secret:
+            name: veilmind-mtls
+            key: client.crt
+        keySecret:
+            name: veilmind-mtls
+            key: client.key
+      metricRelabelings:
+        - action: labeldrop
+          regex: "pod|container|endpoint|instance|job"
+
+  # Пробрасываем полезные метки из Service к таргетам (минимально необходимый набор).
+  targetLabels:
+    - app.kubernetes.io/name
+    - app.kubernetes.io/component

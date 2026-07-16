@@ -1,0 +1,223 @@
+# chronowatch-core/examples/samples/calendars.yaml
+# Промышленный пример конфигурации календарей для Chronowatch Core.
+# Нотация: ISO 8601 даты; время в "HH:MM"; tz — IANA time zone.
+# Поддерживаются окна по дням недели, RRULE (RFC 5545), одиночные даты, диапазоны и исключения.
+
+schema_version: "1.2.0"
+
+metadata:
+  id: "chronowatch-calendars-sample"
+  description: "Эталонный набор календарей: 24x7, бизнес-часы (EU/US), blackout/maintenance, release freeze, исключения, SLA."
+  owner: "SRE Platform Team"
+  contacts:
+    - type: email
+      value: "sre-oncall@example.org"
+    - type: slack
+      value: "#chronowatch"
+  generated_at: "2025-08-29T07:00:00Z"
+  source_repository: "git@repo.example.org:neurocity/chronowatch-core.git"
+
+defaults:
+  timezone: "Europe/Stockholm"   # Базовая TZ, если не указана в объекте
+  locale: "ru-RU"
+  week_start: "monday"
+  # Поведение резолвинга при пересечениях
+  precedence:
+    calendars: 100         # Базовый приоритет календарей
+    blackouts: 200         # Blackout перекрывает бизнес-часы
+    freezes: 300           # Release freeze сильнее blackout
+    exceptions: 400        # Исключения имеют наивысший приоритет (точечные)
+  validation:
+    enabled: true
+    on_load_fail_policy: "fail"  # fail|warn
+    rules:
+      no_overlaps: true          # запрещать пересечения включающих окон внутри одного календаря
+      max_window_span_hours: 24  # жесткая граница длительности одного окна
+      time_bounds: ["00:00", "24:00"]
+      allow_cross_midnight: true
+
+providers:
+  holidays:
+    # Примеры внешних источников праздников (замените URL на реальные в вашем окружении).
+    - id: "holidays-eu"
+      region: "SE"  # Швеция (пример для Europe/Stockholm)
+      type: "ics"
+      url: "https://example.org/calendars/public-holidays/SE.ics"
+      cache_ttl: "168h"              # 7 дней
+      checksum: "sha256:REPLACE_ME"  # при наличии
+    - id: "holidays-us-ny"
+      region: "US-NY"
+      type: "ics"
+      url: "https://example.org/calendars/public-holidays/US-NY.ics"
+      cache_ttl: "168h"
+
+# Переиспользуемые фрагменты через якоря YAML
+x_anchors:
+  tz_stockholm: &tz_stockholm "Europe/Stockholm"
+  tz_newyork: &tz_newyork "America/New_York"
+
+  # Типовое окно бизнес-часов 09:00–18:00 по будням
+  bh_9_18: &bh_9_18
+    mode: "include"
+    windows:
+      - days: [mon, tue, wed, thu, fri]
+        at:
+          start: "09:00"
+          end: "18:00"
+
+  # Еженедельные maintenance blackout окна (суббота 22:00–24:00, воскресенье 00:00–02:00)
+  blackout_weekly: &blackout_weekly
+    windows:
+      - rrule: "FREQ=WEEKLY;BYDAY=SA"
+        at:
+          start: "22:00"
+          end: "24:00"
+      - rrule: "FREQ=WEEKLY;BYDAY=SU"
+        at:
+          start: "00:00"
+          end: "02:00"
+
+blackouts:
+  - id: "blackout-weekly"
+    name: "Weekly maintenance blackout"
+    description: "Регулярные окна техобслуживания."
+    timezone: *tz_stockholm
+    <<: *blackout_weekly
+
+freezes:
+  - id: "freeze-eoy"
+    name: "End-of-year release freeze"
+    description: "Годовой релизный freeze с 20 по 31 декабря включительно."
+    timezone: "UTC"
+    windows:
+      - rrule: "FREQ=YEARLY;BYMONTH=12;BYMONTHDAY=20,21,22,23,24,25,26,27,28,29,30,31"
+        at:
+          start: "00:00"
+          end: "24:00"
+
+calendars:
+  # 24x7 без ограничений
+  - id: "cal-24x7"
+    name: "24x7"
+    description: "Календарь круглосуточной доступности."
+    precedence: 10
+    timezone: "UTC"
+    schedule:
+      mode: "include"
+      windows:
+        - rrule: "FREQ=DAILY;INTERVAL=1"
+          at:
+            start: "00:00"
+            end: "24:00"
+    exclude_refs: []   # нет исключений
+
+  # EU Business Hours (Stockholm) с учетом праздников, blackout и freeze
+  - id: "cal-eu-bh"
+    name: "EU Business Hours (Stockholm)"
+    description: "Операционные часы для EU зоны: будни 09:00–18:00."
+    precedence: 20
+    timezone: *tz_stockholm
+    schedule:
+      <<: *bh_9_18
+    exclude_refs:
+      - "holidays-eu"     # провайдер праздников
+      - "blackout-weekly" # регулярный blackout
+      - "freeze-eoy"      # релизный freeze
+    exceptions:
+      # Точечные изменения графика
+      - date: "2025-12-31"
+        at:
+          start: "09:00"
+          end: "12:00"
+        reason: "Сокращенный предпраздничный день"
+      - daterange:
+          start: "2025-06-21"
+          end: "2025-06-21"
+        at:
+          start: "10:00"
+          end: "16:00"
+        reason: "Midsummer (специальный режим)"
+
+  # US Business Hours (New York)
+  - id: "cal-us-ny-bh"
+    name: "US Business Hours (NY)"
+    description: "Операционные часы для US East: будни 09:00–18:00 по America/New_York."
+    precedence: 20
+    timezone: *tz_newyork
+    schedule:
+      <<: *bh_9_18
+    exclude_refs:
+      - "holidays-us-ny"
+      - "blackout-weekly"
+      - "freeze-eoy"
+    exceptions:
+      - date: "2025-11-26"
+        at:
+          start: "09:00"
+          end: "15:00"
+        reason: "Thanksgiving Eve early close"
+
+slas:
+  # Пример SLA, привязанный к календарю 24x7
+  - id: "sla-p1-24x7"
+    name: "P1 Incidents — 24x7"
+    calendar_ref: "cal-24x7"
+    objectives:
+      - target: "ack"      # подтверждение
+        within: "10m"
+      - target: "restore"  # восстановление
+        within: "2h"
+
+  # Пример SLA для P2 в бизнес-часы EU
+  - id: "sla-p2-eu-bh"
+    name: "P2 Incidents — EU Business Hours"
+    calendar_ref: "cal-eu-bh"
+    objectives:
+      - target: "ack"
+        within: "30m"
+      - target: "restore"
+        within: "8h"
+
+overlays:
+  # Пример оверлея для окружения production: усиливаем ограничения в праздничные периоды
+  - name: "prod-holiday-tightening"
+    when:
+      env: ["prod"]
+    apply:
+      calendars:
+        - id: "cal-eu-bh"
+          exceptions:
+            - daterange:
+                start: "2025-12-24"
+                end: "2025-12-26"
+              at:
+                start: "10:00"
+                end: "16:00"
+              reason: "Рождественский период — укороченные часы"
+        - id: "cal-us-ny-bh"
+          exceptions:
+            - date: "2025-12-24"
+              at:
+                start: "09:00"
+                end: "14:00"
+              reason: "Christmas Eve — early close"
+
+rbac:
+  read:
+    - role: "viewer"
+    - group: "oncall-engineers"
+  write:
+    - role: "config-admins"
+  approve:
+    - role: "change-manager"
+
+integrity:
+  signed: false
+  signature: null
+  policy:
+    require_signed_in_prod: true
+
+notes:
+  - "Замените example.org на реальные источники ICS."
+  - "Если ваш рантайм не поддерживает RRULE, используйте явные days/date/daterange."
+  - "Исключения (exceptions) всегда имеют наивысший приоритет."

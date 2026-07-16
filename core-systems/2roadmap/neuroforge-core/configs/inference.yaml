@@ -1,0 +1,461 @@
+# neuroforge-core/configs/inference.yaml
+# СХЕМА
+schemaVersion: 1
+
+# --------------------------- СЕРВИС ---------------------------
+service:
+  name: neuroforge-inference
+  http:
+    enabled: true
+    host: 0.0.0.0
+    port: ${NF_HTTP_PORT:-8080}
+    # Максимальные размеры и таймауты на уровень HTTP
+    maxRequestBytes: 10485760         # 10 MiB
+    readHeaderTimeoutMs: 5000
+    readTimeoutMs: 60000
+    writeTimeoutMs: 60000
+    idleTimeoutMs: 60000
+    keepAlive: true
+    cors:
+      enabled: true
+      allowedOrigins:
+        - ${NF_CORS_ORIGINS:-"*"}
+      allowedMethods: [GET, POST, OPTIONS]
+      allowedHeaders: [Authorization, Content-Type, X-Request-Id]
+      allowCredentials: false
+      maxAgeSeconds: 600
+    rateLimit:
+      enabled: true
+      algorithm: token-bucket
+      capacityPerIpPerMinute: ${NF_RL_CAPACITY_PER_MINUTE:-120}
+      burst: ${NF_RL_BURST:-60}
+  grpc:
+    enabled: true
+    host: 0.0.0.0
+    port: ${NF_GRPC_PORT:-9090}
+    maxMessageMb: 64
+    keepalive:
+      timeMs: 60000
+      timeoutMs: 20000
+      permitWithoutCalls: false
+  admin:
+    enabled: true
+    host: 127.0.0.1
+    port: ${NF_ADMIN_PORT:-9099}
+    endpoints: [healthz, readyz, metrics, config]
+
+# --------------------------- БЕЗОПАСНОСТЬ ---------------------------
+security:
+  tls:
+    enabled: ${NF_TLS_ENABLED:-false}
+    # Если используются файлы:
+    certFile: ${NF_TLS_CERT_FILE:-""}
+    keyFile: ${NF_TLS_KEY_FILE:-""}
+    # Или секрет из K8s/окружения (приоритетнее файлов):
+    secretName: ${NF_TLS_SECRET_NAME:-""}
+    minVersion: TLS1.2
+    cipherSuites: [TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384]
+    clientAuth:
+      mode: none            # none/request/require
+      caFile: ""
+  auth:
+    # Один из режимов: none | apiKey | jwt
+    mode: ${NF_AUTH_MODE:-none}
+    apiKey:
+      header: X-API-Key
+      value: ${NF_API_KEY:-""}          # используйте секреты/ENV
+    jwt:
+      # Верификация через JWKS
+      jwksUrl: ${NF_JWKS_URL:-""}
+      audience: ${NF_JWT_AUD:-""}
+      issuer: ${NF_JWT_ISS:-""}
+      header: Authorization
+      prefix: "Bearer "
+  network:
+    allowListCidrs:
+      - ${NF_ALLOW_CIDR_1:-0.0.0.0/0}   # сократите в prod
+    denyListCidrs: []
+  requestValidation:
+    maxJsonDepth: 64
+    maxArrayLength: 100000
+    rejectUnknownFields: false
+
+# --------------------------- НАБЛЮДАЕМОСТЬ ---------------------------
+observability:
+  logging: &logging
+    level: ${NF_LOG_LEVEL:-INFO}            # TRACE/DEBUG/INFO/WARN/ERROR
+    format: json                            # json|text
+    sampling:
+      enabled: true
+      ratePerSecond: ${NF_LOG_SAMPLING_RPS:-50}
+  metrics:
+    prometheus:
+      enabled: true
+      path: /metrics
+      histogramBucketsMs: [10, 25, 50, 100, 250, 500, 1000, 2500]
+      includeProcessMetrics: true
+  tracing: &otel
+    enabled: ${NF_OTEL_ENABLED:-false}
+    exporter: otlp                          # otlp|jaeger|zipkin
+    otlp:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-"http://otel-collector:4317"}
+      protocol: grpc                        # grpc|http
+      headers: {}
+    sampling:
+      ratio: ${NF_OTEL_SAMPLING_RATIO:-0.1}
+    resourceAttributes:
+      service.name: neuroforge-inference
+      service.version: ${NF_VERSION:-"dev"}
+      deployment.environment: ${ENVIRONMENT:-"dev"}
+
+# --------------------------- РАНТАЙМЫ/ДЕВАЙСЫ ---------------------------
+runtime:
+  # Общие настройки вычислительных потоков
+  cpu:
+    threads: ${NF_CPU_THREADS:-0}           # 0 => auto
+    ompNumThreads: ${OMP_NUM_THREADS:-0}
+    mklNumThreads: ${MKL_NUM_THREADS:-0}
+    interOpThreads: ${NF_INTEROP_THREADS:-0}
+    pinMemory: true
+  gpu:
+    enabled: ${NF_GPU_ENABLED:-false}
+    backend: cuda                           # cuda|rocm|metal
+    visibleDevices: ${CUDA_VISIBLE_DEVICES:-"all"}  # "0,1"|"all"
+    memoryFraction: ${NF_CUDA_MEMORY_FRAC:-0.95}
+    cudnnBenchmark: true
+    cudaGraphs: false
+    tensorFloat32Matmul: true               # TF32 на Ampere+
+  mps:
+    enabled: ${NF_MPS_ENABLED:-false}       # Apple MPS
+  torch:
+    dtype: ${NF_TORCH_DTYPE:-bf16}          # fp32|fp16|bf16
+    compile:
+      enabled: ${NF_TORCH_COMPILE:-false}
+      mode: reduce-overhead                 # default|reduce-overhead|max-autotune
+  onnxruntime:
+    enabled: ${NF_ORT_ENABLED:-false}
+    intraOpThreads: ${NF_ORT_INTRA:-0}
+    interOpThreads: ${NF_ORT_INTER:-0}
+    executionProviders:
+      - ${NF_ORT_EP_1:-CUDAExecutionProvider}
+      - ${NF_ORT_EP_2:-CPUExecutionProvider}
+  tensorrt:
+    enabled: ${NF_TRT_ENABLED:-false}
+    precision: ${NF_TRT_PRECISION:-fp16}    # fp32|fp16|int8
+    workspaceSizeMb: ${NF_TRT_WS_MB:-4096}
+    useRefit: false
+    build:
+      maxBatch: ${NF_TRT_MAX_BATCH:-32}
+      enableSparsity: true
+
+# --------------------------- ПАКЕТИРОВАНИЕ/ЛИМИТЫ ---------------------------
+batching: &batching
+  enabled: true
+  strategy: dynamic                         # static|dynamic
+  maxBatchSize: ${NF_MAX_BATCH:-16}
+  maxBatchTokensTotal: ${NF_MAX_BATCH_TOKENS:-16384}
+  maxQueueDelayMs: ${NF_MAX_QUEUE_DELAY_MS:-10}
+  padToMultiple: 8
+  preferSameShape: true
+
+limits: &limits
+  requestTimeoutMs: ${NF_REQ_TIMEOUT_MS:-60000}
+  maxInputTokens: ${NF_MAX_INPUT_TOKENS:-4096}
+  maxNewTokens: ${NF_MAX_NEW_TOKENS:-1024}
+  maxTotalTokens: ${NF_MAX_TOTAL_TOKENS:-8192}
+  maxPromptBytes: ${NF_MAX_PROMPT_BYTES:-2097152}  # 2 MiB
+  maxParallelRequests: ${NF_MAX_PARALLEL:-256}
+
+# --------------------------- КЭШИ ---------------------------
+cache:
+  kv:
+    enabled: true
+    capacityTokens: ${NF_KV_CAP_TOKENS:-2000000}
+    segments: 8
+    eviction: two-queue                    # two-queue|lru|arc
+    pinHot: true
+  embeddings:
+    enabled: true
+    size: ${NF_EMB_CACHE_ITEMS:-500000}
+    policy: lru
+    persist:
+      enabled: false
+      dir: ${NF_EMB_CACHE_DIR:-"/var/cache/neuroforge/emb"}
+  disk:
+    enabled: false
+    dir: ${NF_DISK_CACHE_DIR:-"/var/cache/neuroforge/disk"}
+    maxSizeGb: 50
+
+# --------------------------- РЕЕСТРЫ И ИСТОЧНИКИ ---------------------------
+registries:
+  &hf_registry
+  huggingface:
+    enabled: true
+    token: ${HF_TOKEN:-""}
+    # По умолчанию скачивание через hf-hub/hf-cli, с локальным кешем
+    cacheDir: ${HF_HOME:-"/.cache/huggingface"}
+    timeoutSec: 600
+  &s3_registry
+  s3:
+    enabled: ${NF_S3_ENABLED:-false}
+    endpoint: ${S3_ENDPOINT_URL:-""}
+    region: ${AWS_REGION:-""}
+    bucket: ${NF_S3_BUCKET:-""}
+    accessKeyId: ${AWS_ACCESS_KEY_ID:-""}
+    secretAccessKey: ${AWS_SECRET_ACCESS_KEY:-""}
+    sessionToken: ${AWS_SESSION_TOKEN:-""}
+    pathStyle: ${S3_PATH_STYLE:-false}
+
+# --------------------------- МОДЕЛИ ---------------------------
+models:
+  # ----------- Основная LLM -----------
+  - id: llm-main
+    task: text-generation
+    backend: torch
+    routing:
+      endpoint: /v1/chat/completions
+      trafficWeight: 0.9                      # 90% трафика
+      canary: false
+      circuitBreaker:
+        failureRateThreshold: 20              # %
+        slowCallRateThreshold: 30             # %
+        slidingWindowSize: 50                 # запросов
+        openStateDurationSec: 30
+        halfOpenMaxCalls: 10
+      retry:
+        maxAttempts: 2
+        backoffMs: 50
+    source:
+      registry: *hf_registry
+      repoId: ${NF_LLM_REPO_ID:-"meta-llama/Llama-3.1-8B-Instruct"}
+      revision: ${NF_LLM_REV:-"main"}
+      files:
+        - "*.safetensors"
+        - "config.json"
+        - "tokenizer.*"
+      trustRemoteCode: ${NF_LLM_TRUST_RC:-false}
+    tokenizer:
+      modelMaxLength: ${NF_LLM_CTX:-8192}
+      addBos: false
+      addEos: false
+      truncation: longest-first
+    generation:
+      defaults:
+        temperature: ${NF_TEMP:-0.7}
+        top_p: 0.9
+        top_k: 50
+        repetition_penalty: 1.05
+        max_new_tokens: ${NF_MAX_NEW_TOKENS:-1024}
+        stop: []
+      enforceLimits: *limits
+      eosTokenId: null
+      padTokenId: null
+      speculativeDecoding:
+        enabled: ${NF_SPEC_DEC_ENABLED:-false}
+        draftModelRef: llm-draft
+        maxDraftTokens: 64
+        acceptThreshold: 0.7
+    quantization:
+      loadIn4bit: ${NF_LLM_4BIT:-false}
+      loadIn8bit: ${NF_LLM_8BIT:-false}
+      nf4: true
+      doubleQuant: true
+    parallelism:
+      tensorParallelSize: ${NF_TP_SIZE:-1}
+      pipelineParallelSize: 1
+    batching: *batching
+    runtimeOverrides:
+      torch:
+        dtype: ${NF_TORCH_DTYPE:-bf16}
+        compile:
+          enabled: ${NF_TORCH_COMPILE:-false}
+    health:
+      startupProbe:
+        timeoutSec: 60
+        failureThreshold: 10
+      livenessProbe:
+        intervalSec: 10
+        timeoutSec: 2
+        failureThreshold: 3
+
+  # ----------- Черновая/спекулятивная модель -----------
+  - id: llm-draft
+    task: text-generation
+    backend: torch
+    routing:
+      endpoint: /internal/draft
+      trafficWeight: 0.0
+      canary: false
+    source:
+      registry: *hf_registry
+      repoId: ${NF_DRAFT_REPO_ID:-"meta-llama/Llama-3.1-8B"}
+      revision: ${NF_DRAFT_REV:-"main"}
+      files: ["*.safetensors", "config.json", "tokenizer.*"]
+      trustRemoteCode: false
+    tokenizer:
+      modelMaxLength: 4096
+    generation:
+      defaults:
+        temperature: 0.8
+        top_p: 0.95
+        max_new_tokens: 512
+      enforceLimits: *limits
+    batching:
+      <<: *batching
+      maxBatchSize: 32
+      maxBatchTokensTotal: 24576
+
+  # ----------- Эмбеддинги -----------
+  - id: text-emb
+    task: embeddings
+    backend: torch
+    routing:
+      endpoint: /v1/embeddings
+      trafficWeight: 1.0
+      canary: false
+    source:
+      registry: *hf_registry
+      repoId: ${NF_EMB_REPO_ID:-"intfloat/e5-large-v2"}
+      revision: ${NF_EMB_REV:-"main"}
+      files: ["*.bin", "config.json", "tokenizer.*"]
+    embeddings:
+      normalize: true
+      pooling: mean
+      outputDim: ${NF_EMB_DIM:-1024}
+    batching:
+      <<: *batching
+      maxBatchSize: 128
+      maxBatchTokensTotal: 65536
+
+  # ----------- Визуальная (пример CLIP) -----------
+  - id: clip
+    task: vision-text
+    backend: onnxruntime
+    routing:
+      endpoint: /v1/clip
+      trafficWeight: 1.0
+      canary: false
+    source:
+      registry: *s3_registry
+      path: ${NF_CLIP_S3_PATH:-"models/clip/ViT-B-32.onnx"}
+      sha256: ${NF_CLIP_SHA256:-""}   # при наличии верифицировать
+    preprocessing:
+      image:
+        size: [224, 224]
+        centerCrop: true
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+        interpolation: bilinear
+    batching:
+      <<: *batching
+      maxBatchSize: 64
+      maxBatchTokensTotal: 0          # для vision не используется
+
+# --------------------------- МАРШРУТИЗАЦИЯ ---------------------------
+router:
+  # Описание публичных маршрутов. Вес — первичный, canary — доля canaryRoute
+  routes:
+    - name: chat-completions
+      path: /v1/chat/completions
+      methods: [POST]
+      primaryModel: llm-main
+      canaryRoute:
+        enabled: ${NF_CANARY_ENABLED:-false}
+        model: llm-main
+        # Напр., другой revision/weights подключаются через переменные окружения
+        weight: ${NF_CANARY_WEIGHT:-0.05}    # 5%
+      fallback:
+        order: [llm-main, llm-draft]
+        on:
+          - timeout
+          - overloaded
+          - internal-error
+      timeoutsMs:
+        queue: 200
+        inference: ${NF_REQ_TIMEOUT_MS:-60000}
+      concurrency:
+        maxConcurrent: 128
+        perIpLimit: 16
+    - name: embeddings
+      path: /v1/embeddings
+      methods: [POST]
+      primaryModel: text-emb
+      fallback:
+        order: [text-emb]
+        on: [timeout, overloaded]
+      concurrency:
+        maxConcurrent: 256
+        perIpLimit: 64
+    - name: clip
+      path: /v1/clip
+      methods: [POST]
+      primaryModel: clip
+      concurrency:
+        maxConcurrent: 128
+        perIpLimit: 32
+
+# --------------------------- РЕСУРСЫ/ЛИМИТЫ ---------------------------
+resources:
+  # Глобальные лимиты пула рабочих
+  workerPool:
+    minWorkers: ${NF_MIN_WORKERS:-1}
+    maxWorkers: ${NF_MAX_WORKERS:-8}
+    queueCapacity: 1024
+  # Пер-модельные лимиты (перекрывают глобальные)
+  perModel:
+    llm-main:
+      maxMemoryGb: ${NF_LLM_MAIN_MEM_GB:-20}
+      maxGpuMemoryGb: ${NF_LLM_MAIN_GPU_GB:-18}
+      maxConcurrency: 32
+    llm-draft:
+      maxMemoryGb: 18
+      maxGpuMemoryGb: 16
+      maxConcurrency: 32
+    text-emb:
+      maxMemoryGb: 12
+      maxGpuMemoryGb: 8
+      maxConcurrency: 128
+    clip:
+      maxMemoryGb: 8
+      maxGpuMemoryGb: 6
+      maxConcurrency: 64
+
+# --------------------------- СКЕЙЛИНГ/ЦЕЛИ ---------------------------
+scaling:
+  targets:
+    rps:
+      chat-completions: ${NF_SLO_CHAT_RPS:-50}
+      embeddings: ${NF_SLO_EMB_RPS:-200}
+    latencySloMs:
+      p95:
+        chat-completions: ${NF_SLO_CHAT_P95_MS:-3000}
+        embeddings: ${NF_SLO_EMB_P95_MS:-200}
+  hpa:
+    enabled: ${NF_HPA_ENABLED:-false}
+    # Метрики должны соответствовать экспортируемым Prometheus-метрикам сервера
+    metrics:
+      - type: Pods
+        name: nf_requests_inflight
+        targetAverageValue: "100"
+      - type: Pods
+        name: nf_request_latency_ms_p95
+        targetAverageValue: "2500"
+
+# --------------------------- ОШИБКИ/ОТВЕТЫ ---------------------------
+responses:
+  redactInternalErrors: true
+  errorMappings:
+    TIMEOUT: 504
+    OVERLOADED: 429
+    INVALID_ARGUMENT: 400
+    UNAUTHORIZED: 401
+    FORBIDDEN: 403
+    NOT_FOUND: 404
+    INTERNAL: 500
+
+# --------------------------- НАСТРОЙКИ ПО УМОЛЧАНИЮ ---------------------------
+defaults:
+  logging: *logging
+  tracing: *otel
+  batching: *batching
+  limits: *limits

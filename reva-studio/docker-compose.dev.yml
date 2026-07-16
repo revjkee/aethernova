@@ -1,0 +1,386 @@
+name: reva-studio-dev
+
+x-app-env: &app-env
+  APP_ENV: development
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  TZ: ${TZ:-Europe/Riga}
+
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB:-reva_studio}
+  POSTGRES_USER: ${POSTGRES_USER:-reva}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reva_dev_password}
+
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_dev_password}
+
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-reva}:${POSTGRES_PASSWORD:-reva_dev_password}@postgres:5432/${POSTGRES_DB:-reva_studio}
+  CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_dev_password}@redis:6379/0
+  CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_dev_password}@redis:6379/1
+
+x-app-common: &app-common
+  env_file:
+    - .env
+  environment:
+    <<: *app-env
+  networks:
+    - reva-studio
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+x-python-build: &python-build
+  context: .
+  dockerfile: deploy/docker/backend/Dockerfile.dev
+
+x-api-healthcheck: &api-healthcheck
+  test:
+    [
+      "CMD-SHELL",
+      "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\""
+    ]
+  interval: 15s
+  timeout: 5s
+  retries: 10
+  start_period: 20s
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: reva-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-reva_studio}
+      POSTGRES_USER: ${POSTGRES_USER:-reva}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reva_dev_password}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: ${TZ:-Europe/Riga}
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - log_min_duration_statement=300ms
+    ports:
+      - "${POSTGRES_PORT_FORWARD:-5432}:5432"
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-reva} -d ${POSTGRES_DB:-reva_studio}"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - reva-studio
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: reva-redis-dev
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--requirepass",
+        "${REDIS_PASSWORD:-redis_dev_password}",
+        "--save",
+        "60",
+        "1000"
+      ]
+    ports:
+      - "${REDIS_PORT_FORWARD:-6379}:6379"
+    volumes:
+      - redis_data_dev:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -a ${REDIS_PASSWORD:-redis_dev_password} ping | grep PONG"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - reva-studio
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  api:
+    <<: *app-common
+    build: *python-build
+    container_name: reva-api-dev
+    working_dir: /app
+    command: >
+      sh -c "
+      python -m alembic upgrade head &&
+      uvicorn src.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-dir /app/src
+      "
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - .:/app
+      - api_venv_dev:/app/.venv
+      - api_pycache_dev:/app/.cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck: *api-healthcheck
+    develop:
+      watch:
+        - action: sync
+          path: ./src
+          target: /app/src
+          ignore:
+            - __pycache__/
+            - .pytest_cache/
+            - .mypy_cache/
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./uv.lock
+        - action: rebuild
+          path: ./alembic.ini
+        - action: sync
+          path: ./alembic
+          target: /app/alembic
+
+  bot:
+    <<: *app-common
+    build: *python-build
+    container_name: reva-bot-dev
+    working_dir: /app
+    command: >
+      sh -c "
+      python -m src.entrypoints.run_bot
+      "
+    volumes:
+      - .:/app
+      - bot_venv_dev:/app/.venv
+      - bot_pycache_dev:/app/.cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    develop:
+      watch:
+        - action: sync
+          path: ./src
+          target: /app/src
+          ignore:
+            - __pycache__/
+            - .pytest_cache/
+            - .mypy_cache/
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./uv.lock
+
+  worker:
+    <<: *app-common
+    build: *python-build
+    container_name: reva-worker-dev
+    working_dir: /app
+    command: >
+      sh -c "
+      celery -A src.celery_app worker
+      --loglevel=INFO
+      --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
+      "
+    volumes:
+      - .:/app
+      - worker_venv_dev:/app/.venv
+      - worker_pycache_dev:/app/.cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "celery -A src.celery_app inspect ping -d celery@$$HOSTNAME | grep -q pong || exit 1"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    develop:
+      watch:
+        - action: sync
+          path: ./src
+          target: /app/src
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./uv.lock
+
+  beat:
+    <<: *app-common
+    build: *python-build
+    container_name: reva-beat-dev
+    working_dir: /app
+    command: >
+      sh -c "
+      celery -A src.celery_app beat
+      --loglevel=INFO
+      "
+    volumes:
+      - .:/app
+      - beat_venv_dev:/app/.venv
+      - beat_pycache_dev:/app/.cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    develop:
+      watch:
+        - action: sync
+          path: ./src
+          target: /app/src
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./uv.lock
+
+  flower:
+    <<: *app-common
+    build: *python-build
+    container_name: reva-flower-dev
+    working_dir: /app
+    command: >
+      sh -c "
+      celery -A src.celery_app flower
+      --port=5555
+      "
+    environment:
+      <<: *app-env
+      FLOWER_UNAUTHENTICATED_API: "true"
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    volumes:
+      - .:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    profiles:
+      - tooling
+
+  pgadmin:
+    image: dpage/pgadmin4:9
+    container_name: reva-pgadmin-dev
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@reva.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin_dev_password}
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "True"
+      PGADMIN_CONFIG_LOGIN_BANNER: "'Reva Studio DEV environment'"
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - pgadmin_data_dev:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - reva-studio
+    profiles:
+      - tooling
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  mailpit:
+    image: axllent/mailpit:v1.24
+    container_name: reva-mailpit-dev
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    networks:
+      - reva-studio
+    profiles:
+      - tooling
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  reva-studio:
+    name: reva-studio-dev-network
+    driver: bridge
+
+volumes:
+  postgres_data_dev:
+    name: reva-postgres-data-dev
+  redis_data_dev:
+    name: reva-redis-data-dev
+  pgadmin_data_dev:
+    name: reva-pgadmin-data-dev
+  api_venv_dev:
+    name: reva-api-venv-dev
+  api_pycache_dev:
+    name: reva-api-pycache-dev
+  bot_venv_dev:
+    name: reva-bot-venv-dev
+  bot_pycache_dev:
+    name: reva-bot-pycache-dev
+  worker_venv_dev:
+    name: reva-worker-venv-dev
+  worker_pycache_dev:
+    name: reva-worker-pycache-dev
+  beat_venv_dev:
+    name: reva-beat-venv-dev
+  beat_pycache_dev:
+    name: reva-beat-pycache-dev

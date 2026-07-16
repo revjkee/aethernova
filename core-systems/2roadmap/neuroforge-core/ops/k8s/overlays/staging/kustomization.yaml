@@ -1,0 +1,197 @@
+# file: neuroforge-core/ops/k8s/overlays/staging/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Наследуем дефолтные манифесты
+resources:
+  - ../../base
+
+# Пространство имён и единый префикс имён для staging
+namespace: neuroforge-staging
+namePrefix: stg-
+
+# Единые метки/аннотации для трассировки и поиска
+commonLabels:
+  app.kubernetes.io/environment: staging
+  app.kubernetes.io/part-of: neuroforge
+commonAnnotations:
+  backstage.io/kubernetes-id: neuroforge-api
+  kubernetes.io/change-cause: "staging overlay"
+
+# Переопределение контейнерных образов (пример)
+# Заменит имя/тег во всех манифестах, где встречается указанный image name.
+images:
+  - name: ghcr.io/neuroforge/api
+    newName: ghcr.io/neuroforge/api
+    newTag: "staging-2025-08-26"  # замените на фактический тег CI
+  - name: ghcr.io/neuroforge/worker
+    newName: ghcr.io/neuroforge/worker
+    newTag: "staging-2025-08-26"
+
+# Генераторы конфигов и секретов для staging
+# файлы должны существовать рядом с этим kustomization:
+#   ./config/app.env, ./config/logging.yaml, ./secrets/app.env
+configMapGenerator:
+  - name: neuroforge-app-config
+    envs:
+      - config/app.env
+    files:
+      - config/logging.yaml
+    options:
+      labels:
+        app.kubernetes.io/name: neuroforge-api
+        app.kubernetes.io/environment: staging
+secretGenerator:
+  - name: neuroforge-app-secrets
+    envs:
+      - secrets/app.env
+    type: Opaque
+    options:
+      labels:
+        app.kubernetes.io/name: neuroforge-api
+        app.kubernetes.io/environment: staging
+
+# Патчи (strategic merge / JSON6902) для окружения staging
+patches:
+  # Deployment: ресурсы, env, пробы, pullPolicy и подключение сгенерированных конфигов/секретов
+  - target:
+      version: v1
+      kind: Deployment
+      group: apps
+      name: neuroforge-api
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: neuroforge-api
+      spec:
+        replicas: 3
+        template:
+          metadata:
+            annotations:
+              checksum/config: $(NEUROFORGE_APP_CONFIG_HASH)
+              checksum/secrets: $(NEUROFORGE_APP_SECRETS_HASH)
+          spec:
+            # Пример: используем serviceAccount, если он определён в base
+            serviceAccountName: neuroforge-api
+            containers:
+              - name: app
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: APP_ENV
+                    value: "staging"
+                  - name: LOG_LEVEL
+                    value: "info"
+                envFrom:
+                  - configMapRef:
+                      name: neuroforge-app-config
+                  - secretRef:
+                      name: neuroforge-app-secrets
+                resources:
+                  requests:
+                    cpu: "200m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "1000m"
+                    memory: "1Gi"
+                readinessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: http
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  failureThreshold: 6
+                livenessProbe:
+                  httpGet:
+                    path: /livez
+                    port: http
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                  failureThreshold: 3
+
+  # HPA: более скромные пределы для staging
+  - target:
+      version: v2
+      kind: HorizontalPodAutoscaler
+      group: autoscaling
+      name: neuroforge-api-hpa
+    patch: |
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: neuroforge-api-hpa
+      spec:
+        minReplicas: 2
+        maxReplicas: 10
+        behavior:
+          scaleUp:
+            stabilizationWindowSeconds: 0
+            selectPolicy: Max
+            policies:
+              - type: Percent
+                value: 100
+                periodSeconds: 60
+              - type: Pods
+                value: 2
+                periodSeconds: 60
+          scaleDown:
+            stabilizationWindowSeconds: 300
+            selectPolicy: Min
+            policies:
+              - type: Percent
+                value: 10
+                periodSeconds: 60
+              - type: Pods
+                value: 1
+                periodSeconds: 60
+
+  # Service: для staging можно использовать ClusterIP (если в base иной тип)
+  - target:
+      version: v1
+      kind: Service
+      name: neuroforge-api
+    patch: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: neuroforge-api
+      spec:
+        type: ClusterIP
+
+  # Ingress/HTTPRoute: настройка хоста для стейджинга (если используется Ingress)
+  - target:
+      kind: Ingress
+      name: neuroforge-api
+    patch: |
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: neuroforge-api
+        annotations:
+          nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+          nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+      spec:
+        rules:
+          - host: "staging.neuroforge.example.com"  # замените на реальный домен
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: stg-neuroforge-api
+                      port:
+                        number: 80
+
+# Опции генераторов: хэши имён оставляем включёнными (роллаута по изменению данных),
+# но добавляем метки/аннотации на все генерируемые ресурсы.
+generatorOptions:
+  labels:
+    managed-by: kustomize
+  annotations:
+    kubernetes.io/change-cause: "config/secret updated for staging"
+
+# Примечание:
+# Переменные $(NEUROFORGE_APP_CONFIG_HASH) и $(NEUROFORGE_APP_SECRETS_HASH) могут быть
+# внедрены через kustomize replacements или предварительно подстановкой в CI/CD,
+# чтобы форсировать rollout при изменении данных. Если не нужны — удалите эти аннотации.

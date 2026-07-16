@@ -1,0 +1,3 @@
+# treasury-core
+
+Project Documentation

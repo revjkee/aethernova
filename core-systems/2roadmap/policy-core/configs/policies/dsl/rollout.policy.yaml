@@ -1,0 +1,408 @@
+# policy-core/configs/policies/dsl/rollout.policy.yaml
+apiVersion: policy.aethernova.io/v1alpha1
+kind: RolloutPolicyBundle
+
+metadata:
+  name: policy-core-rollout
+  version: "1.0.0"
+  revision: "2025-08-28"
+  owner: "platform-security-core"
+  labels:
+    app.kubernetes.io/name: policy-core
+    app.kubernetes.io/component: engine
+    app.kubernetes.io/part-of: policy-core
+    risk.tier: "high"
+
+spec:
+  schemaVersion: "1.0"
+
+  # ---------- Глобальные параметры и анкоры ----------
+  defaults:
+    retry: &retry_backoff
+      maxAttempts: 4
+      initialDelayMs: 250
+      maxDelayMs: 4000
+      jitter: true
+      strategy: exponential
+      backoffMultiplier: 2.0
+    timeoutMs: 5000
+    errorBudget:
+      window: "6h"
+      burnRateCritical: 2.0
+      burnRateWarning: 1.0
+    gatesBehavior:
+      mode: "fail-fast"      # fail-fast | soft-warn
+      pauseOnWarning: true
+    mesh:
+      provider: "istio"      # istio|nginx|traefik|none
+      trafficPolicy: "http"
+    rollout:
+      maxParallelRegions: 1
+      pauseBetweenStagesSec: 60
+      bakeTimeFullMinutes: 30
+    approvals:
+      required: true
+      minApprovers: 2
+      approverGroups:
+        - "team/platform"
+        - "team/security"
+    freeze:
+      respectGlobalFreeze: true
+    security:
+      requireCosign: true
+      cosignKeyRef: "policy-core/cosign.pub"   # секрет/конфиг в кластере/vaulте
+      requireSbom: true
+      maxVulnSev: "high"                       # none|low|medium|high|critical
+    compliance:
+      enforceOpa: true
+      opaBundleRef: "oci://ghcr.io/org/policy-core/policy-bundle:{{ .release }}"
+    notifications:
+      defaultChannel: "slack-sec"
+      emailFrom: "noreply@security.local"
+
+  # ---------- Источники данных ----------
+  sources:
+    prometheus:
+      name: "prom"
+      endpoint: "http://prometheus.monitoring.svc:9090"
+      retry: *retry_backoff
+      timeoutMs: 4000
+    otlp:
+      name: "otel"
+      endpoint: "otel-collector.monitoring.svc:4317"
+      protocol: "grpc"
+    loki:
+      name: "loki"
+      endpoint: "http://loki.logging.svc:3100"
+      retry: *retry_backoff
+    kubernetes:
+      name: "k8s"
+      context: ""   # текущий
+    artifactRegistry:
+      name: "oci"
+      endpoint: "ghcr.io"
+
+  # ---------- Артефакты релиза (верификация подписи/хеша/SBOM) ----------
+  artifacts:
+    containerImage:
+      repository: "ghcr.io/org/policy-core"
+      tag: "{{ .release }}"                     # подставляется CI/CD
+      expectedDigest: "{{ .digest }}"           # sha256:...
+      cosign:
+        enabled: true
+        keyRef: "{{ defaults.security.cosignKeyRef }}"
+    sbom:
+      ref: "oci://ghcr.io/org/policy-core/sbom:{{ .release }}"
+      required: true
+      policy:
+        maxSeverity: "{{ defaults.security.maxVulnSev }}"
+        blockUnknown: true
+
+  # ---------- Шаблоны запросов к метрикам/логам ----------
+  queryTemplates:
+    # Ошибки 5xx сервиса
+    http_5xx_rate: |
+      sum(rate(nginx_ingress_controller_requests{exported_service="{{ $svc }}",status=~"5.."}[5m]))
+      /
+      sum(rate(nginx_ingress_controller_requests{exported_service="{{ $svc }}"}[5m]))
+    # Латентность p95
+    http_p95_latency_ms: |
+      histogram_quantile(0.95,
+        sum(rate(http_server_request_duration_seconds_bucket{job="{{ $job }}",route="{{ $route }}"}[5m])) by (le)
+      ) * 1000
+    # Перезапуски Pod'ов
+    pod_restarts: |
+      sum(increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}", container="{{ $container }}"}[10m]))
+    # Ошибки в логах
+    log_error_ratio: |
+      sum(count_over_time({namespace="{{ $ns }}", app="{{ $app }}"} |= "ERROR" [5m]))
+      /
+      sum(count_over_time({namespace="{{ $ns }}", app="{{ $app }}"} [5m]))
+
+  # ---------- Окна изменений/фризы ----------
+  changeWindows:
+    allow:
+      - cron: "Mon-Fri 08:00-18:00 Europe/Stockholm"
+        envs: ["staging","prod"]
+    freeze:
+      - cron: "Sat-Sun * * Europe/Stockholm"
+        reason: "Выходные — ограниченная поддержка"
+      - dates:
+          from: "2025-12-24T00:00:00+01:00"
+          to:   "2025-12-26T23:59:59+01:00"
+        reason: "Праздничный фриз"
+
+  # ---------- Региональные/зональные волны ----------
+  regions:
+    waves:
+      - name: "eu-north"
+        clusters: ["prod-eu-north-1a","prod-eu-north-1b"]
+      - name: "eu-central"
+        clusters: ["prod-eu-central-1a","prod-eu-central-1b"]
+
+  # ---------- Кнопка остановки/ручные оверрайды ----------
+  controls:
+    killSwitch:
+      configRef: "policy-core/rollout-killswitch"  # ConfigMap/Secret ключ enabled=true/false
+      behavior: "immediate-rollback"                # immediate-rollback | pause
+    manualOverride:
+      enabled: true
+      allowSkipStages: ["postchecks"]
+      approverGroups: ["team/platform-leads"]
+
+  # ---------- Пре- и пост-гейты (общие) ----------
+  pregates:
+    - id: "gate.freeze-window"
+      type: "change-freeze"
+      action: "deny"
+      params:
+        respectGlobalFreeze: "{{ defaults.freeze.respectGlobalFreeze }}"
+    - id: "gate.artifact-signature"
+      type: "cosign-verify"
+      action: "deny"
+      params:
+        image: "{{ artifacts.containerImage.repository }}:{{ artifacts.containerImage.tag }}"
+        expectedDigest: "{{ artifacts.containerImage.expectedDigest }}"
+        keyRef: "{{ artifacts.containerImage.cosign.keyRef }}"
+    - id: "gate.sbom"
+      type: "sbom-verify"
+      action: "deny"
+      params:
+        ref: "{{ artifacts.sbom.ref }}"
+        maxSeverity: "{{ defaults.security.maxVulnSev }}"
+        blockUnknown: true
+    - id: "gate.opa-compliance"
+      type: "opa-bundle-check"
+      action: "deny"
+      params:
+        bundleRef: "{{ defaults.compliance.opaBundleRef }}"
+
+  postgates:
+    - id: "post.audit"
+      type: "notify"
+      action: "allow"
+      params:
+        channel: "{{ defaults.notifications.defaultChannel }}"
+        template: "Rollout {{ .release }} finished with status {{ .status }}"
+
+  # ---------- Ступени прогрессивного деплоя ----------
+  stages:
+
+    - name: "preflight"
+      description: "Синтаксис/политики/окна/подписи до начала выпуска"
+      kind: "checks-only"
+      checks:
+        - id: "pre.freeze"
+          uses: "gate.freeze-window"
+        - id: "pre.signature"
+          uses: "gate.artifact-signature"
+        - id: "pre.sbom"
+          uses: "gate.sbom"
+        - id: "pre.opa"
+          uses: "gate.opa-compliance"
+        - id: "pre.approvals"
+          type: "manual-approval"
+          params:
+            required: "{{ defaults.approvals.required }}"
+            minApprovers: "{{ defaults.approvals.minApprovers }}"
+            groups: "{{ defaults.approvals.approverGroups }}"
+
+    - name: "canary-10"
+      description: "Канареечный выпуск 10% трафика/1 реплика"
+      kind: "progressive"
+      traffic:
+        target: "service/{{ .svc }}"
+        strategy: "weighted"
+        weightPercent: 10
+      replicas:
+        min: 1
+      duration: "10m"
+      pauseOn:
+        warning: true
+        failure: true
+      checks:
+        - id: "m.http5xx"
+          type: "prometheus"
+          queryRef: "http_5xx_rate"
+          vars: { svc: "{{ .svc }}" }
+          assert:
+            lte: 0.02        # <= 2% 5xx
+        - id: "m.latency_p95"
+          type: "prometheus"
+          queryRef: "http_p95_latency_ms"
+          vars: { job: "{{ .job }}", route: "/" }
+          assert:
+            lte: 300
+        - id: "m.pod_restarts"
+          type: "prometheus"
+          queryRef: "pod_restarts"
+          vars: { ns: "{{ .ns }}", container: "{{ .container }}" }
+          assert:
+            lte: 1
+        - id: "l.error_ratio"
+          type: "loki"
+          queryRef: "log_error_ratio"
+          vars: { ns: "{{ .ns }}", app: "{{ .app }}" }
+          assert:
+            lte: 0.01
+        - id: "slo.errorBudgetBurn"
+          type: "slo-burn"
+          params:
+            window: "{{ defaults.errorBudget.window }}"
+            critical: "{{ defaults.errorBudget.burnRateCritical }}"
+            warning:  "{{ defaults.errorBudget.burnRateWarning }}"
+
+    - name: "ramp-30"
+      description: "Расширение до 30% при стабильных метриках"
+      kind: "progressive"
+      traffic:
+        target: "service/{{ .svc }}"
+        strategy: "weighted"
+        weightPercent: 30
+      replicas:
+        min: 2
+      duration: "15m"
+      checks:
+        - like: "canary-10.m.http5xx"
+        - like: "canary-10.m.latency_p95"
+        - like: "canary-10.l.error_ratio"
+
+    - name: "ramp-60"
+      description: "Расширение до 60%"
+      kind: "progressive"
+      traffic:
+        target: "service/{{ .svc }}"
+        strategy: "weighted"
+        weightPercent: 60
+      replicas:
+        min: 3
+      duration: "20m"
+      checks:
+        - like: "canary-10.m.http5xx"
+          override:
+            assert: { lte: 0.015 }
+        - like: "canary-10.m.latency_p95"
+          override:
+            assert: { lte: 280 }
+
+    - name: "full-100"
+      description: "Полный трафик, bake-time мониторинг"
+      kind: "progressive"
+      traffic:
+        target: "service/{{ .svc }}"
+        strategy: "weighted"
+        weightPercent: 100
+      bakeTime: "{{ defaults.rollout.bakeTimeFullMinutes }}m"
+      checks:
+        - like: "canary-10.m.http5xx"
+          override: { assert: { lte: 0.01 } }
+        - id: "post.regression-tests"
+          type: "external-hook"
+          params:
+            endpointRef: "http://rollout-runner.tools.svc/regression"
+            timeoutMs: 900000
+            retry: *retry_backoff
+
+    - name: "postchecks"
+      description: "Финальная фиксация, аудит, уведомления"
+      kind: "checks-only"
+      checks:
+        - uses: "post.audit"
+
+  # ---------- Автоматический откат/стратегии реакции ----------
+  reactions:
+    onFailure:
+      - if:
+          any:
+            - checkId: "m.http5xx"
+              comparator: "gt"
+              value: 0.05
+            - checkId: "slo.errorBudgetBurn"
+              state: "critical"
+        then:
+          action: "rollback"
+          params:
+            to: "previous-stable"
+            traffic: "step"
+            stepPercent: 20
+      - if:
+          any:
+            - checkId: "l.error_ratio"
+              comparator: "gt"
+              value: 0.05
+        then:
+          action: "pause"
+          params:
+            reason: "High error logs ratio"
+    onWarning:
+      - action: "pause"
+        params:
+          requireApproval: true
+          message: "Warning threshold exceeded, waiting for operator decision"
+
+  # ---------- Соответствие (mapping) ----------
+  compliance:
+    mappings:
+      "pregates.gate.artifact-signature":
+        - framework: "SLSA"
+          control: "Provenance/Signature"
+      "pregates.gate.sbom":
+        - framework: "ISO-27001"
+          control: "A.12.6.1"
+        - framework: "PCI-DSS"
+          control: "6.3.2"
+      "stages.canary-10":
+        - framework: "ITIL"
+          control: "Change Enablement"
+
+  # ---------- Профили окружений (патчи) ----------
+  profiles:
+    dev:
+      defaults:
+        approvals:
+          required: false
+        rollout:
+          bakeTimeFullMinutes: 5
+      stages:
+        - name: "canary-10"
+          duration: "5m"
+          checks:
+            - like: "canary-10.m.http5xx"
+              override: { assert: { lte: 0.05 } }
+    staging:
+      stages:
+        - name: "ramp-60"
+          duration: "10m"
+    prod:
+      defaults:
+        approvals:
+          required: true
+          minApprovers: 2
+      reactions:
+        onFailure:
+          - if:
+              any:
+                - checkId: "m.http5xx"
+                  comparator: "gt"
+                  value: 0.02
+            then:
+              action: "rollback"
+              params:
+                to: "previous-stable"
+                traffic: "immediate"
+
+  # ---------- Уведомления по событиям ----------
+  notifications:
+    events:
+      - on: ["stage.start"]
+        sink: "{{ defaults.notifications.defaultChannel }}"
+        template: "Stage {{ .stage }} started for {{ .svc }} release {{ .release }}"
+      - on: ["stage.fail"]
+        sink: "{{ defaults.notifications.defaultChannel }}"
+        template: ":warning: Stage {{ .stage }} failed: {{ .reason }}"
+      - on: ["rollback.complete"]
+        sink: "{{ defaults.notifications.defaultChannel }}"
+        template: ":rewind: Rollback to {{ .target }} completed for {{ .svc }}"
+      - on: ["approval.requested"]
+        sink: "email://platform-leads@security.local"
+        template: "Approval required for rollout {{ .release }} (stage {{ .stage }})"

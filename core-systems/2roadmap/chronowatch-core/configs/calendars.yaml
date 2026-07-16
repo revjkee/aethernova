@@ -1,0 +1,275 @@
+# chronowatch-core/configs/calendars.yaml
+# =====================================================================
+# Промышленная конфигурация календарей для ChronoWatch Core
+# - Глобальные настройки: таймзона, локаль, кэш, таймауты
+# - Провайдеры праздников (builtin) и ICS-подписки
+# - Базовые календари (24x7, бизнес-часы SE/RU)
+# - Окна обслуживания и блэкауты по RRULE/ISO
+# - Композитные календари и SLA-профили
+# - Привязка сервисов к календарям
+# =====================================================================
+
+apiVersion: chronowatch/v1
+kind: CalendarConfig
+
+metadata:
+  name: "chronowatch-calendars"
+  description: "Корпоративные календари работы, обслуживания и SLA"
+
+# -----------------------------
+# Глобальные параметры
+# -----------------------------
+global:
+  timezoneDefault: "Europe/Stockholm"   # Базовая таймзона
+  localeDefault: "se-SE"                 # Базовая локаль
+  weekStartsOn: "MON"                    # MON | SUN
+  # Поведение при пересечениях интервалов разных источников
+  collisionPolicy:
+    # merge | override-newer | override-priority
+    strategy: "override-priority"
+    priorityOrder: ["blackout", "maintenance", "holiday", "business", "runtime"]
+
+  # Настройки RRULE/времени
+  time:
+    rruleTzMode: "floating"              # floating | tz-aware
+    dstPolicy: "respect"                 # respect | ignore
+
+  # Кэш/ретраи для внешних источников (ICS и т.п.)
+  fetch:
+    userAgent: "ChronoWatch/1.0"
+    timeout: "10s"
+    retry:
+      attempts: 3
+      initialBackoff: "1s"
+      maxBackoff: "10s"
+      factor: 2.0
+    cache:
+      enabled: true
+      ttl: "3600s"                       # 1 час
+
+# -----------------------------
+# Провайдеры праздников
+# -----------------------------
+holidays:
+  providers:
+    - id: "se-gov"
+      type: "builtin"
+      country: "SE"
+      observed: true
+      cacheTtl: "24h"
+    - id: "ru-gov"
+      type: "builtin"
+      country: "RU"
+      observed: true
+      cacheTtl: "24h"
+
+# -----------------------------
+# YAML-якоря шаблонов рабочих недель
+# -----------------------------
+templates:
+  # Бизнес-часы: SE (Стокгольм)
+  workWeekSE: &workWeekSE
+    mon: ["09:00-12:00", "13:00-18:00"]
+    tue: ["09:00-12:00", "13:00-18:00"]
+    wed: ["09:00-12:00", "13:00-18:00"]
+    thu: ["09:00-12:00", "13:00-18:00"]
+    fri: ["09:00-12:00", "13:00-17:00"]
+    sat: []
+    sun: []
+  # Бизнес-часы: RU (Москва)
+  workWeekRU: &workWeekRU
+    mon: ["10:00-14:00", "15:00-19:00"]
+    tue: ["10:00-14:00", "15:00-19:00"]
+    wed: ["10:00-14:00", "15:00-19:00"]
+    thu: ["10:00-14:00", "15:00-19:00"]
+    fri: ["10:00-14:00", "15:00-18:00"]
+    sat: []
+    sun: []
+
+# -----------------------------
+# Базовые календари
+# -----------------------------
+calendars:
+  # 24/7 без ограничений
+  - id: "runtime-24x7"
+    kind: "runtime"
+    displayName: "24x7 Runtime"
+    timezone: "UTC"
+    includes:
+      - rrule: "FREQ=DAILY;INTERVAL=1"
+    excludes: []
+    tags: ["runtime", "core"]
+
+  # Бизнес-часы для SE (учитывает гос.праздники SE)
+  - id: "business-se"
+    kind: "business"
+    displayName: "Business Hours SE"
+    timezone: "Europe/Stockholm"
+    locale: "se-SE"
+    workWeek: *workWeekSE
+    excludes:
+      - rrule: "FREQ=WEEKLY;BYDAY=SA,SU"
+      - holidayProviderRef: "se-gov"
+    tags: ["business", "eu", "se"]
+
+  # Бизнес-часы для RU (учитывает гос.праздники RU)
+  - id: "business-ru"
+    kind: "business"
+    displayName: "Business Hours RU"
+    timezone: "Europe/Moscow"
+    locale: "ru-RU"
+    workWeek: *workWeekRU
+    excludes:
+      - rrule: "FREQ=WEEKLY;BYDAY=SA,SU"
+      - holidayProviderRef: "ru-gov"
+    tags: ["business", "ru"]
+
+  # Еженедельное окно обслуживания (например, вс 01:00-03:00 CET/CEST)
+  - id: "maintenance-weekly-se"
+    kind: "maintenance"
+    displayName: "Weekly Maintenance SE"
+    timezone: "Europe/Stockholm"
+    windows:
+      - rrule: "FREQ=WEEKLY;BYDAY=SU;BYHOUR=1;BYMINUTE=0;DURATION=PT2H"
+    tags: ["maintenance", "se"]
+
+  # Ежемесячный блэкаут в конце месяца (закрытие отчётности)
+  - id: "blackout-eom"
+    kind: "blackout"
+    displayName: "End-of-Month Blackout"
+    timezone: "Europe/Stockholm"
+    windows:
+      - rrule: "FREQ=MONTHLY;BYSETPOS=-1;BYDAY=MO,TU,WE,TH,FR;BYHOUR=23;BYMINUTE=0;DURATION=PT1H"
+    tags: ["blackout", "finance"]
+
+  # Внутренние дополнительные праздники/выходные (ручные даты, формат ISO)
+  - id: "internal-holidays"
+    kind: "holiday"
+    displayName: "Internal Non-working Days"
+    timezone: "Europe/Stockholm"
+    dates:
+      # Примеры (заполните своими датами):
+      # - "2025-01-02"
+      # - "2025-07-10"
+      []
+    tags: ["holiday", "internal"]
+
+# -----------------------------
+# Композитные календари (include/subtract/override)
+# -----------------------------
+composites:
+  # Runtime prod: 24x7 минус обслуживание и блэкауты
+  - id: "runtime-prod"
+    displayName: "Runtime PROD (24x7 minus maint/blackout)"
+    compose:
+      include:
+        - ref: "runtime-24x7"
+      subtract:
+        - ref: "maintenance-weekly-se"
+        - ref: "blackout-eom"
+    tags: ["runtime", "prod"]
+
+  # Support Tier1 для SE: бизнес-часы SE минус внутренние праздники
+  - id: "support-tier1-se"
+    displayName: "Support Tier1 SE"
+    compose:
+      include:
+        - ref: "business-se"
+      subtract:
+        - ref: "internal-holidays"
+    tags: ["support", "tier1", "se"]
+
+  # Finance операции SE: бизнес-часы SE минус EOM-блэкаут
+  - id: "finance-ops-se"
+    displayName: "Finance Ops SE"
+    compose:
+      include:
+        - ref: "business-se"
+      subtract:
+        - ref: "blackout-eom"
+    tags: ["finance", "se"]
+
+# -----------------------------
+# Подписки на внешние календари (ICS)
+# -----------------------------
+subscriptions:
+  ics:
+    - id: "team-holidays"
+      description: "Командные отпускные календари (агрегированные)"
+      # Храните URL в переменных окружения/секретах
+      url: "${CHRONO_ICS_TEAM}"        # пример: "https://example.com/team.ics"
+      timezone: "Europe/Stockholm"
+      refreshInterval: "6h"
+      trust:
+        signatureRequired: false
+        allowHttp: false
+      mapping:
+        toCalendar: "internal-holidays"
+        # merge | override
+        collision: "merge"
+
+    - id: "vendor-maintenance"
+      description: "Окна обслуживания внешних вендоров"
+      url: "${CHRONO_ICS_VENDOR_MAINT}"
+      timezone: "UTC"
+      refreshInterval: "12h"
+      mapping:
+        toCalendar: "maintenance-weekly-se"
+        collision: "merge"
+
+# -----------------------------
+# SLA-профили и привязка сервисов
+# -----------------------------
+slaProfiles:
+  - id: "tier1-se"
+    responseTime: "15m"
+    resolutionTime: "4h"
+    calendarRef: "support-tier1-se"
+  - id: "tier0-core"
+    responseTime: "5m"
+    resolutionTime: "1h"
+    calendarRef: "runtime-prod"
+
+serviceBindings:
+  - service: "api-gateway"
+    calendarRef: "runtime-prod"
+    slaProfileRef: "tier0-core"
+  - service: "scheduler"
+    calendarRef: "runtime-prod"
+    slaProfileRef: "tier0-core"
+  - service: "billing"
+    calendarRef: "finance-ops-se"
+    slaProfileRef: "tier1-se"
+  - service: "support-frontend"
+    calendarRef: "support-tier1-se"
+    slaProfileRef: "tier1-se"
+
+# -----------------------------
+# Правила валидации и санитарные ограничения
+# -----------------------------
+validation:
+  # Запрещаем пересечения в пределах одного календаря по типам
+  disallowOverlaps:
+    - withinKinds: ["maintenance", "blackout"]
+    - withinKinds: ["business", "holiday"]
+  # Ограничиваем максимальную длину окна обслуживания
+  maxWindowDuration:
+    maintenance: "8h"
+    blackout: "24h"
+  # Предупреждать, если бизнес-часы короче минимума
+  minBusinessSpanPerDay: "4h"
+
+# -----------------------------
+# Экспорт/интеграция
+# -----------------------------
+export:
+  enableIcs: true
+  ics:
+    # Контроль приватности при экспорте
+    redactDescriptions: true
+    includeTags: ["maintenance", "blackout", "business"]
+  api:
+    enabled: true
+    rateLimit:
+      rps: 50
+      burst: 100

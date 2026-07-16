@@ -1,0 +1,463 @@
+# zero-trust-core/configs/security.yaml
+apiVersion: zerotrust.aethernova/v1
+kind: SecurityConfig
+metadata:
+  name: zero-trust-core
+  environment: ${APP_ENV:-dev}   # dev | stage | prod
+  owner: platform-security
+  revision: 1
+
+# ---------- Anchors (defaults) ----------
+retryPolicy: &retry_defaults
+  attempts: 4
+  baseDelaySeconds: 0.2
+  maxDelaySeconds: 2.0
+  jitter: full
+
+tls: &tls_defaults
+  minVersion: TLS1_2
+  maxVersion: TLS1_3
+  # Only strong suites; 1.2 kept for legacy agents
+  cipherSuitesTLS12:
+    - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+    - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+  cipherSuitesTLS13:
+    - TLS_AES_256_GCM_SHA384
+    - TLS_AES_128_GCM_SHA256
+    - TLS_CHACHA20_POLY1305_SHA256
+  curves:
+    - X25519
+    - secp256r1
+    - secp384r1
+  sessionTickets:
+    enabled: false
+  hsts:
+    enabled: true
+    maxAgeSeconds: 31536000
+    includeSubdomains: true
+    preload: true
+  staplingOCSP: required
+  sniRequired: true
+
+mtls: &mtls_defaults
+  mode: required_internal_optional_edge   # internal services require, external edge optional+policy
+  clientCAs:
+    bundlePath: /etc/zero-trust/pki/trust-bundle.pem
+  verifyLeaf:
+    eku:
+      require:
+        - serverAuth
+        - clientAuth
+    nameConstraints:
+      permittedDNS: []
+      excludedDNS: []
+  crl:
+    enabled: true
+    distributionPoints:
+      - ${CRL_URL:-http://crl.example.com/root.crl}
+    refreshSeconds: 3600
+  ocsp:
+    enabled: true
+    responderURL: ${OCSP_URL:-http://ocsp.example.com}
+
+logging: &logging_defaults
+  level: ${LOG_LEVEL:-INFO}
+  json: true
+  redact:
+    enablePIIRedaction: true
+    patterns:
+      - type: email
+      - type: ipv4
+      - type: jwt
+  sinks:
+    - type: stdout
+    - type: otlp
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      retry: *retry_defaults
+
+audit: &audit_defaults
+  enabled: true
+  sink:
+    type: file
+    path: /var/log/zero-trust/audit.log
+  fields:
+    include:
+      - ts
+      - actor
+      - action
+      - resource
+      - decision
+      - reason
+      - ip
+      - mfa
+      - token.kid
+      - request.id
+
+metrics: &metrics_defaults
+  prometheus:
+    enabled: true
+    path: /metrics
+  statsd:
+    enabled: false
+
+tracing: &tracing_defaults
+  otlp:
+    enabled: true
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+    sampling:
+      ratio: ${OTEL_SAMPLING_RATIO:-0.1}
+
+rateLimit: &ratelimit_defaults
+  backend:
+    type: redis
+    url: ${REDIS_URL:-redis://redis:6379/0}
+  limits:
+    default:
+      requestsPerMinute: 600
+      burst: 200
+    authEndpoints:
+      requestsPerMinute: 120
+      burst: 60
+
+waf:
+  enabled: true
+  mode: block
+  ruleset: owasp-modsecurity-crs
+  exclusions:
+    - path: /openapi.json
+
+cors:
+  enabled: true
+  allowOrigins: ["https://*.example.com"]
+  allowMethods: ["GET","POST","PUT","DELETE","OPTIONS"]
+  allowHeaders: ["Authorization","Content-Type","X-Request-Id"]
+  allowCredentials: false
+  maxAgeSeconds: 600
+
+csrf:
+  enabled: true
+  cookieName: zt_csrf
+  headerName: X-CSRF-Token
+  sameSite: Lax
+
+# ---------- Identity / AuthN ----------
+identity:
+  oidc:
+    primary:
+      issuer: ${OIDC_ISSUER:-https://idp.example.com}
+      jwksURI: ${OIDC_JWKS_URI:-https://idp.example.com/.well-known/jwks.json}
+      clientId: ${OIDC_CLIENT_ID:-zero-trust-core}
+      audiences: ["zero-trust-core","api"]
+      allowedAlgs: ["RS256","PS256","ES256"]
+      leewaySeconds: 60
+      cacheTTLSeconds: 600
+      requireTLS: true
+  webauthn:
+    enabled: true
+    rpId: example.com
+    origins:
+      - https://example.com
+      - https://admin.example.com
+    attestation: none
+    userVerification: required
+    challengeTTLSeconds: 180
+    metadata:
+      trustAnchorsPath: /etc/zero-trust/webauthn/metadata-roots.json
+  sessions:
+    cookie:
+      name: zt_session
+      domain: .example.com
+      secure: true
+      httpOnly: true
+      sameSite: Lax
+      ttlSeconds: 3600
+      rotationSeconds: 900
+
+# ---------- IAM (RBAC/ABAC) ----------
+iam:
+  roles:
+    source: file
+    path: /etc/zero-trust/iam/roles.toml
+  attributes:
+    fromJWT:
+      - claim: "realm_access.roles"
+        mapTo: roles
+      - claim: "groups"
+        mapTo: groups
+      - claim: "acr"
+        mapTo: mfa.acr
+  enforcementOrder:
+    - tokenScopes
+    - denyOverrides
+    - roleStatements
+    - attributeConditions
+
+# ---------- ReBAC (Zanzibar-like) ----------
+authz:
+  model:
+    namespacesPath: /etc/zero-trust/authz/namespaces.json
+  relationships:
+    backend:
+      type: postgres
+      dsn: ${AUTHZ_PG_DSN:-postgresql://authz@db/authz}
+      retry: *retry_defaults
+    cache:
+      type: redis
+      url: ${REDIS_URL:-redis://redis:6379/1}
+      ttlSeconds:
+        tuples: 60
+        checks: 5
+  evaluator:
+    expandLimit: 10000
+    listObjectsPageSize: 500
+    caveats:
+      enabled: true
+
+# ---------- Tokens / OAuth2 ----------
+tokens:
+  signing:
+    defaultAlg: PS256
+    kms:
+      provider: azure_key_vault
+      vaultURL: ${AZURE_KV_VAULT_URL:-https://vault.vault.azure.net}
+      retry: *retry_defaults
+      cacheTTLSeconds:
+        keys: 300
+        cryptoClients: 1800
+      keys:
+        access:
+          kid: ${JWT_ACCESS_KID:-access-key}
+          keyId: ${AZURE_KV_ACCESS_KEY_ID:-my-access-key}
+          alg: PS256
+        refresh:
+          kid: ${JWT_REFRESH_KID:-refresh-key}
+          keyId: ${AZURE_KV_REFRESH_KEY_ID:-my-refresh-key}
+          alg: PS256
+    rotation:
+      overlapSeconds: 86400
+      schedule: "0 3 * * *"   # daily at 03:00 UTC
+  verification:
+    jwksCacheTTLSeconds: 600
+    allowedAlgs: ["RS256","PS256","ES256"]
+  revocation:
+    backend:
+      type: redis
+      url: ${REDIS_URL:-redis://redis:6379/2}
+    gracePeriodSeconds: 5
+  introspection:
+    enabled: true
+    endpointPath: /api/v1/token/introspect
+    responseSchemaPath: /app/schemas/jsonschema/v1/token_introspection.schema.json
+    cache:
+      inactiveSeconds: 30
+      activeSeconds: 5
+  revokeEndpoint:
+    enabled: true
+    path: /api/v1/revoke
+    contentType: application/x-www-form-urlencoded
+
+# ---------- PKI / mTLS issuing ----------
+pki:
+  ca:
+    trustBundlePath: /etc/zero-trust/pki/trust-bundle.pem
+    ocspURL: ${OCSP_URL:-http://ocsp.example.com}
+    crlURL: ${CRL_URL:-http://crl.example.com/root.crl}
+  issuing:
+    mode: local_ca          # local_ca | external_kms
+    rootPath: /etc/zero-trust/pki/root-ca.pem
+    intermediatePath: /etc/zero-trust/pki/intermediate-ca.pem
+    keyPath: /etc/zero-trust/pki/intermediate-ca.key
+    keyPasswordRef: secretref:azure-kv://${AZURE_KV_VAULT_NAME:-vault}/secrets/mtls-intermediate-key-pass
+    defaults:
+      leafTTLDays: 30
+      serverAuth: true
+      clientAuth: true
+      backdateSeconds: 60
+      nameConstraints:
+        permittedDNS: []
+  crl:
+    nextUpdateDays: 7
+    publishPath: /var/www/crl/intermediate.crl
+
+# ---------- KMS (Crypto operations) ----------
+kms:
+  azureKeyVault:
+    enabled: true
+    vaultURL: ${AZURE_KV_VAULT_URL:-https://vault.vault.azure.net}
+    credentials:
+      type: default_azure_credential
+    retry: *retry_defaults
+    cacheTTLSeconds:
+      keys: 300
+      jwk: 300
+      cryptoClients: 1800
+    algorithms:
+      signatures: ["PS256","PS384","ES256","ES384","EdDSA"]
+      encryption: ["RSA-OAEP-256","RSA-OAEP"]
+      wrap: ["RSA-OAEP-256","RSA-OAEP"]
+    keyUsage:
+      sign:
+        - ${AZURE_KV_ACCESS_KEY_ID:-my-access-key}
+        - ${AZURE_KV_REFRESH_KEY_ID:-my-refresh-key}
+      encrypt:
+        - ${AZURE_KV_ENC_KEY_ID:-my-enc-key}
+      wrap:
+        - ${AZURE_KV_WRAP_KEY_ID:-my-wrap-key}
+
+# ---------- Threat detection ----------
+threatDetection:
+  yara:
+    enabled: true
+    rules:
+      - namespace: core
+        paths:
+          - /etc/zero-trust/yara/rules/core
+        includePaths:
+          - /etc/zero-trust/yara/includes
+    cacheDir: /var/cache/zero-trust/yara
+    timeoutSeconds: 10
+    maxFileSizeBytes: 52428800
+    disableModules: []
+    externals:
+      env: ${APP_ENV:-dev}
+  fileScan:
+    onUpload:
+      enabled: true
+      maxSizeBytes: 104857600
+      blockOnDetection: true
+
+# ---------- Network policy ----------
+network:
+  ipAllowDeny:
+    allowCIDRs:
+      - 10.0.0.0/8
+      - 192.168.0.0/16
+    denyCIDRs:
+      - 0.0.0.0/0
+    precedence: deny_overrides
+  ddos:
+    enabled: true
+    connectionLimit:
+      perIP: 2000
+      perSubnet24: 20000
+
+# ---------- Privacy / DLP ----------
+privacy:
+  dlp:
+    redactInLogs: true
+    detectors:
+      - name: credit_card
+        action: redact
+      - name: national_id
+        action: redact
+  dataRetention:
+    accessLogsDays: 30
+    auditLogsDays: 365
+    pii:
+      minRetentionDays: 0
+      policy: delete_on_revoke
+
+# ---------- API Gateway / HTTP ----------
+http:
+  baseURL: ${PUBLIC_BASE_URL:-https://api.example.com}
+  listen:
+    address: 0.0.0.0
+    port: ${PORT:-8080}
+    proxyProtocol: false
+  headers:
+    security:
+      - name: X-Content-Type-Options
+        value: nosniff
+      - name: X-Frame-Options
+        value: DENY
+      - name: Referrer-Policy
+        value: no-referrer
+      - name: Permissions-Policy
+        value: accelerometer=(),camera=(),microphone=()
+  timeouts:
+    readSeconds: 30
+    writeSeconds: 30
+    idleSeconds: 90
+
+# ---------- Service dependencies ----------
+storage:
+  postgres:
+    dsn: ${APP_PG_DSN:-postgresql://app@db/app}
+    retry: *retry_defaults
+  redis:
+    url: ${REDIS_URL:-redis://redis:6379/0}
+    tls:
+      enabled: false
+
+# ---------- Secrets loading ----------
+secrets:
+  providers:
+    - type: azure_key_vault
+      vaultURL: ${AZURE_KV_VAULT_URL:-https://vault.vault.azure.net}
+      retry: *retry_defaults
+    - type: env
+      prefix: ZT_SECRET_
+  policy:
+    required:
+      - tokens.signing.kms
+      - pki.issuing.keyPasswordRef
+
+# ---------- Profiles (environment overlays) ----------
+profiles:
+  base: &base
+    tls: *tls_defaults
+    mtls: *mtls_defaults
+    logging: *logging_defaults
+    audit: *audit_defaults
+    metrics: *metrics_defaults
+    tracing: *tracing_defaults
+    rateLimit: *ratelimit_defaults
+
+  dev:
+    <<: *base
+    logging:
+      <<: *logging_defaults
+      level: DEBUG
+    waf:
+      mode: detect
+    identity:
+      webauthn:
+        userVerification: preferred
+    tokens:
+      signing:
+        rotation:
+          overlapSeconds: 3600
+          schedule: "@daily"
+    cors:
+      allowOrigins: ["*"]
+
+  stage:
+    <<: *base
+    rateLimit:
+      <<: *ratelimit_defaults
+      limits:
+        default:
+          requestsPerMinute: 300
+          burst: 120
+    tokens:
+      verification:
+        jwksCacheTTLSeconds: 120
+
+  prod:
+    <<: *base
+    waf:
+      mode: block
+    cors:
+      allowOrigins: ["https://*.example.com"]
+    tokens:
+      verification:
+        jwksCacheTTLSeconds: 600
+    logging:
+      <<: *logging_defaults
+      level: INFO
+    privacy:
+      dataRetention:
+        accessLogsDays: 90
+        auditLogsDays: 730

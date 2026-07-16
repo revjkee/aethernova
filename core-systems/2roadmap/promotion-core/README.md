@@ -1,0 +1,3 @@
+# promotion-core
+
+Project Documentation
