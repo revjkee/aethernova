@@ -1,1 +1,0 @@
-// CandidateStatusUpdater.tsx - автогенерировано

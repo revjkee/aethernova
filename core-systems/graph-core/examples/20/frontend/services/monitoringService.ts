@@ -1,1 +1,0 @@
-// monitoringService.ts - автогенерировано

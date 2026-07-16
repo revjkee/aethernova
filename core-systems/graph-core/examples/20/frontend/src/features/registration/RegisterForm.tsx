@@ -1,1 +1,0 @@
-// RegisterForm.tsx - автогенерировано

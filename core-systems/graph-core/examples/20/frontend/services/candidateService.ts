@@ -1,1 +1,0 @@
-// candidateService.ts - автогенерировано

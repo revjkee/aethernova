@@ -1,1 +1,0 @@
-# transparency_log_manager.py
