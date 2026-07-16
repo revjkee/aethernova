@@ -14,10 +14,10 @@ from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, PlainTextResponse
 
 # Опциональный OpenTelemetry (не обязателен)
-with contextlib.suppress(Exception):
+try:
     from opentelemetry import trace  # type: ignore
     _TRACER = trace.get_tracer("ledger-core.health")
-else:
+except Exception:
     _TRACER = None  # type: ignore
 
 router = APIRouter(prefix="/health", tags=["health"])

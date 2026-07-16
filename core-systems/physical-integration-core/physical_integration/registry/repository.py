@@ -1,7 +1,8 @@
+from __future__ import annotations
+
 import asyncio
 # physical_integration/registry/repository.py
 # Асинхронный промышленный репозиторий для реестра устройств (PostgreSQL + SQLAlchemy 2.x)
-from __future__ import annotations
 
 import re
 from contextlib import asynccontextmanager

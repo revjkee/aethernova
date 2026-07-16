@@ -373,8 +373,9 @@ class ConnectionManager:
                 conn.logger.info("Heartbeat timeout, closing %s", conn.conn_id)
                 try:
                     await conn.ws.close(code=1011, reason="heartbeat timeout")
-                finally:
-                    return
+                except Exception:
+                    conn.logger.debug("Heartbeat close failed", exc_info=True)
+                return
 
     async def _subscribe_checked(self, conn: Connection, patterns: List[str]):
         allowed: List[str] = []

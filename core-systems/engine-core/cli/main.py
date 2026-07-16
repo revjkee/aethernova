@@ -65,17 +65,17 @@ if not "profile_block" in globals():
     _HAS_PROF = False
 
 # Кэш
-with contextlib.suppress(Exception):
+try:
     from engine.adapters.cache_adapter import CacheAdapter, CacheConfig  # type: ignore
     _HAS_CACHE = True
-else:
+except Exception:
     _HAS_CACHE = False
 
 # DataFabric
-with contextlib.suppress(Exception):
+try:
     from engine.adapters.datafabric_adapter import DataFabricAdapter, DataFabricConfig  # type: ignore
     _HAS_DF = True
-else:
+except Exception:
     _HAS_DF = False
 
 # -----------------------------

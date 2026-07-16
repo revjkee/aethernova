@@ -322,7 +322,9 @@ class FileLedgerBackend:
 
     async def append(self, record: LedgerRecord) -> None:
         async with self._lock(record.tenant):
-            line = (json.dumps(record.dict(), ensure_ascii=False, separators=(",", ")) + "\n").encode("utf-8")
+            line = (
+                json.dumps(record.dict(), ensure_ascii=False, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
             await self._write_line_atomic(self._path(record.tenant), line)
             if record.hash:
                 await self._write_head(record.tenant, record.hash)
@@ -334,7 +336,16 @@ class FileLedgerBackend:
         async with self._lock(tenant):
             buf = bytearray()
             for r in records:
-                buf.extend((json.dumps(r.dict(), ensure_ascii=False, separators=(",", ")) + "\n").encode("utf-8"))
+                buf.extend(
+                    (
+                        json.dumps(
+                            r.dict(),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
             await self._write_line_atomic(self._path(tenant), bytes(buf))
             last = records[-1]
             if last.hash:
@@ -570,7 +581,9 @@ class LedgerCoreAdapter:
         """
         lines: List[str] = []
         async for rec in self.backend.iter_range(tenant):
-            lines.append(json.dumps(rec.dict(), ensure_ascii=False, separators=(",", ")) + "\n")
+            lines.append(
+                json.dumps(rec.dict(), ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
         return "".join(lines).encode("utf-8")
 
     async def import_ndjson(self, tenant: str, data: bytes, *, trust_hashes: bool = False) -> int:

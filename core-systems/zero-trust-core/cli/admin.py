@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # File: zero-trust-core/cli/admin.py
 # Industrial-grade Zero Trust Admin CLI (stdlib only).
 # Features:
@@ -18,7 +20,6 @@ Admin module
 """
 
 
-from __future__ import annotations
 
 import argparse
 import base64

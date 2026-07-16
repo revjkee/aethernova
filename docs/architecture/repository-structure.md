@@ -14,10 +14,15 @@ active, experimental, historical, or generated.
 components. Service directory names use kebab-case and normally end in
 `-core`. Python import packages inside a service use snake_case.
 
-`core-systems/2roadmap/` is an incubation area. Components may live there while
-their contracts and ownership are still evolving. A component should be moved
-to the top level of `core-systems/` when it becomes canonical; two active
-copies of the same component are not allowed.
+`core-systems/2roadmap/` is an incubation area for components that do not yet
+have a canonical counterpart. Components may live there while their contracts
+and ownership are still evolving. A component must be moved to the top level
+of `core-systems/` when it becomes canonical; name collisions between the two
+areas are forbidden.
+
+Recovered roadmap snapshots that collided with canonical components are kept
+under `archive/roadmap-overlays/`. They are historical comparison material,
+not an overlay mechanism and not an import source.
 
 ### Applications
 
@@ -43,6 +48,8 @@ copies of the same component are not allowed.
 - Superseded design drafts belong under `docs/legacy/`.
 - Emergency source snapshots belong under `archive/recovery-snapshots/` and
   are read-only. Production code must never import from `archive/`.
+- Colliding roadmap snapshots belong under `archive/roadmap-overlays/` until
+  their unique deltas are reviewed or removed.
 
 ## Repository hygiene
 

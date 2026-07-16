@@ -525,4 +525,12 @@ class SCIMConnector(IdentityConnector):
             "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
             "Operations": [{"op": "Add", "path": "members", "value": [{"value": uid}]}],
         }
-        r = await self.http.request("PATCH", f"{self.groups_url}/{gid
+        r = await self.http.request(
+            "PATCH",
+            f"{self.groups_url}/{gid}",
+            json_body=patch,
+        )
+        if r.status_code >= 400:
+            raise ConnectorError(
+                f"SCIM group member update failed: {r.status_code} {r.text[:200]}"
+            )

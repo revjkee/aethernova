@@ -236,7 +236,7 @@ _NUMBER_RE = re.compile(r"(?x)(?<!\w)(?:[\+\-]?\d{1,3}(?:[\s,\u00A0]\d{3})+|\d+)
 _WORD_RE = re.compile(r"(?u)\b\w+\b")
 
 def tokenize(text: str) -> List[Token]:
-    """
+    r"""
     Лёгкая, но промышленная токенизация с сохранением смещений:
       - URL, email, hashtag, mention выделяются первыми
       - числа (включая разделители тысяч и дробные части)

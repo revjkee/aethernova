@@ -15,7 +15,7 @@ from enum import Enum
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 # === Опциональные зависимости ===
-with contextlib.suppress(Exception):
+try:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils as asn1_utils
     from cryptography.hazmat.primitives.serialization import (
@@ -24,13 +24,13 @@ with contextlib.suppress(Exception):
     )
     from cryptography.exceptions import InvalidSignature
     _HAS_CRYPTO = True
-else:
+except Exception:
     _HAS_CRYPTO = False
 
-with contextlib.suppress(Exception):
+try:
     import boto3  # type: ignore
     _HAS_BOTO3 = True
-else:
+except Exception:
     _HAS_BOTO3 = False
 
 

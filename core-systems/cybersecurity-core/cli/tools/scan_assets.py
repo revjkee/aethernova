@@ -462,8 +462,7 @@ class Scanner:
                 raise
             except Exception as e:
                 res.error = repr(e)
-            finally:
-                return res
+            return res
 
     async def run(self, targets: Sequence[str], writer: "ResultsWriter") -> None:
         tgts = await self.build_targets(targets)

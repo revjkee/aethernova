@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 # neuroforge-core/cli/tools/quantize.py
 # Industrial-grade CLI tool for model quantization (PyTorch & ONNX).
 # - Dynamic/Static INT8, FP16 (Torch); Dynamic/Static INT8 (ONNX, if onnxruntime is available)
@@ -15,7 +17,6 @@ Quantize module
 """
 
 
-from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses

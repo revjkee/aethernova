@@ -333,7 +333,7 @@ def configure_logging(cfg: LoggingConfig) -> logging.Logger:
     if cfg.json_output:
         formatter = JSONFormatter(
             service=cfg.service,
-            env=cffg_env := cfg.env,
+            env=cfg.env,
             scrub_secrets=cfg.scrub_secrets,
             include_caller=cfg.include_caller,
             sampler=LogSampler(sample_rate=cfg.sample_rate, rate_limit_per_sec=cfg.rate_limit_per_sec),

@@ -442,8 +442,10 @@ def _build_exporter(config: TracingConfig) -> SpanExporter:
         # TLS / mTLS
         creds = None
         if config.ca_cert_path or config.client_cert_path or config.client_key_path:
-            with open(config.ca_cert_path, "rb") as f if config.ca_cert_path else contextlib.nullcontext() as f:
-                root_certs = f.read() if f else None
+            root_certs = None
+            if config.ca_cert_path:
+                with open(config.ca_cert_path, "rb") as cert_file:
+                    root_certs = cert_file.read()
             private_key = None
             certificate_chain = None
             if config.client_cert_path and config.client_key_path:

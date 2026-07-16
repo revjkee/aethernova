@@ -182,11 +182,11 @@ class SessionRecord:
     risk_flags: List[str] = field(default_factory=list)
     attributes: Dict[str, Any] = field(default_factory=dict)  # provider-specific data
 
-    def is_expired(self, now: Optional=datetime] = None) -> bool:  # type: ignore[syntax]
+    def is_expired(self, now: Optional[datetime] = None) -> bool:
         now = now or utc_now()
         return self.expires_at <= now
 
-    def is_idle(self, idle_timeout: Optional[timedelta], now: Optional=datetime] = None) -> bool:  # type: ignore[syntax]
+    def is_idle(self, idle_timeout: Optional[timedelta], now: Optional[datetime] = None) -> bool:
         if not idle_timeout:
             return False
         ref = self.last_seen_at or self.issued_at

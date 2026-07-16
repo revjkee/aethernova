@@ -191,16 +191,23 @@ def build_record_branch(cfg: PipelineConfig) -> Gst.Bin:
 
     mp4mux = _make_or_raise("mp4mux", "mp4_mux")
     if cfg.recording.fast_start:
-        _set_if(mp4mux, faststart=True, streamable=True, fragment-duration=cfg.recording.segment_seconds * 1000)
+        _set_if(
+            mp4mux,
+            faststart=True,
+            streamable=True,
+            **{"fragment-duration": cfg.recording.segment_seconds * 1000},
+        )
 
     split = _make_or_raise("splitmuxsink", "splitmux")
     _set_if(
         split,
         muxer=mp4mux,
         location=cfg.recording.location_pattern,
-        max-size-time=cfg.recording.segment_seconds * 1_000_000_000,
-        max-size-bytes=cfg.recording.max_size_mb * 1024 * 1024,
         async_=False,
+        **{
+            "max-size-time": cfg.recording.segment_seconds * 1_000_000_000,
+            "max-size-bytes": cfg.recording.max_size_mb * 1024 * 1024,
+        },
     )
 
     for el in (q, enc, split):

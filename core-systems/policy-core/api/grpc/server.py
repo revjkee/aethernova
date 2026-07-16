@@ -413,7 +413,6 @@ class ValidationInterceptor(aio.ServerInterceptor):
         async def _ss(request_it, context):
             async for r in request_it:
                 _validate(r.request if hasattr(r, "request") else r)
-                yield from ()
                 break
             async for resp in handler.stream_stream(request_it, context):
                 yield resp

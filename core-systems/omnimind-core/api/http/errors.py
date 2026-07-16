@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 # SPDX-License-Identifier: Apache-2.0
 """
@@ -27,7 +29,6 @@ Usage (Flask, optional):
     register_flask_error_handlers(app, debug=False)
 """
 
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 from http import HTTPStatus

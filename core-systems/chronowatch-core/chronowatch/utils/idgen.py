@@ -176,11 +176,11 @@ def uuid4_str() -> str:
 
 # Bitcoin Base58 (без 0, O, I, l)
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_B58_INDEX = {c: i for i, c in enumerate(_58 := _B58_ALPHABET)}
+_B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
 
 # Стандартное Base62
 _B62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-_B62_INDEX = {c: i for i, c in enumerate(_62 := _B62_ALPHABET)}
+_B62_INDEX = {c: i for i, c in enumerate(_B62_ALPHABET)}
 
 
 def random_id(size: int = 21, alphabet: str = _B62_ALPHABET) -> str:

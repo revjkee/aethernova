@@ -278,7 +278,7 @@ class StrictCORSMiddleware:
 
 # Optional: convenience factory for FastAPI/Starlette
 def make_default_cors_middleware(app):
-    """
+    r"""
     Example usage:
         app.add_middleware(
             StrictCORSMiddleware,

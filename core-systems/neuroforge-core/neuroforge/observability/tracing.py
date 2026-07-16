@@ -1,5 +1,5 @@
 # neuroforge/observability/tracing.py
-"""
+r"""
 Production-grade OpenTelemetry tracing bootstrap for NeuroForge.
 
 Features:

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 # security-core/api/http/routers/v1/introspect.py
 # Промышленный роутер introspection V1 для Aethernova Security Core (FastAPI)
@@ -6,7 +8,6 @@ import asyncio
 #   from routers.v1.introspect import get_router
 #   app.include_router(get_router())
 
-from __future__ import annotations
 
 import base64
 import json

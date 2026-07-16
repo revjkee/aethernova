@@ -733,7 +733,7 @@ def make_client(
     Упрощенный конструктор клиента.
     """
     kr = Keyring({1: psk}, current_key_id=1)
-    eps: List<MeshEndpoint] = []
+    eps: List[MeshEndpoint] = []
     proxy = None
     if via_socks5:
         proxy = SOCKS5Proxy(via_socks5[0], via_socks5[1], via_socks5[2], via_socks5[3])

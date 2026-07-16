@@ -764,4 +764,13 @@ def get_sso_config_from_env() -> SSOConfig:
         cookie_name=cookie_name,
         cookie_domain=cookie_domain,
         cookie_secure=cookie_secure,
-        cookie_samesite=cookie_sames
+        cookie_samesite=cookie_samesite,
+        session_ttl_sec=session_ttl,
+        state_ttl_sec=state_ttl,
+        jwks_cache_ttl_sec=jwks_ttl,
+        discovery_cache_ttl_sec=disc_ttl,
+        allowed_redirect_hosts=allowed_hosts,
+        allowed_redirect_paths=allowed_paths,
+        pkce_enabled=pkce_enabled,
+        http_timeout_sec=http_timeout,
+    )

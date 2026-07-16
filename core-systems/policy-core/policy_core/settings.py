@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import asyncio
 # policy_core/settings.py
-from __future__ import annotations
 
 import json
 import logging

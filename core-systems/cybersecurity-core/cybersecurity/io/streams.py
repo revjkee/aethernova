@@ -229,11 +229,6 @@ async def aiter_bytes(
         return
 
     if isinstance(source, (str, Path)):
-        return (_ for _ in [])  # тип-хинт трюк; ниже фактический yield
-    # fall through to real generator below
-
-
-    if isinstance(source, (str, Path)):
         path = Path(source)
         async for chunk in _aiter_from_path(path, chunk_size):
             yield chunk

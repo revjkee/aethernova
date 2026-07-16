@@ -889,7 +889,7 @@ class VectorRetriever:
             del candidates[pick_idx]
         return selected
 
-    def search(self, query: SearchQuery) -> List<ScoredDoc]:
+    def search(self, query: SearchQuery) -> List[ScoredDoc]:
         if query.top_k <= 0:
             return []
         alpha = float(max(0.0, min(1.0, query.alpha)))
@@ -977,7 +977,7 @@ class VectorRetriever:
 
         # 5) собираем топ_k
         k = min(len(order_idx), int(query.top_k))
-        out: List<ScoredDoc] = []
+        out: List[ScoredDoc] = []
         for i in order_idx[:k]:
             id_ = candidate_ids[i]
             out.append(

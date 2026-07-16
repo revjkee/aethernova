@@ -482,4 +482,36 @@ class InterestManager:
         for eid in visible_sorted:
             if sent_count >= max_updates or sent_bytes >= byte_budget:
                 if self.cfg.log_budget_drops and (sent_count >= max_updates or sent_bytes >= byte_budget):
-                    _LOGGER.debug("Budget ex_
+                    _LOGGER.debug(
+                        "Budget exhausted for subscriber %s: updates=%s bytes=%s",
+                        sub.sid,
+                        sent_count,
+                        sent_bytes,
+                    )
+                break
+
+            info = st.seen.get(eid)
+            tier_idx = self._tier_for(sub, eid)
+            version = self.version_fn(eid)
+            if info is not None and now < info.next_due_ts and version == info.last_version:
+                continue
+
+            estimated_size = max(0, int(self.estimate_size_fn(eid, tier_idx)))
+            if sent_bytes + estimated_size > byte_budget:
+                if self.cfg.log_budget_drops:
+                    _LOGGER.debug(
+                        "Byte budget exhausted for subscriber %s on entity %s",
+                        sub.sid,
+                        eid,
+                    )
+                break
+
+            batch["update"].append(self.encoder_fn(eid, tier_idx, version))
+            interval = self.cfg.lod_tiers[tier_idx].interval_s()
+            st.seen[eid] = _SeenInfo(
+                tier_idx=tier_idx,
+                next_due_ts=now + interval,
+                last_version=version,
+            )
+            sent_count += 1
+            sent_bytes += estimated_size

@@ -610,7 +610,7 @@ def _cfg_from_dict(data: Mapping[str, Any]) -> SanitizerConfig:
         redact=RedactPolicy(
             mask=str(_deep_get(data, ["redact_transform", "default_mask"], "[REDACTED]")),
             annotate=bool(_deep_get(data, ["redact_transform", "annotate_redactions"], True)),
-            annotation_prefix=str(_deep_get(data, ["redact_transform", "annotations", "prefix"], "[REDACTED:"])),
+            annotation_prefix=str(_deep_get(data, ["redact_transform", "annotations", "prefix"], "[REDACTED:")),
             annotation_suffix=str(_deep_get(data, ["redact_transform", "annotations", "suffix"], "]")),
             preserve_length_hint=bool(_deep_get(data, ["redact_transform", "preserve_length_hint"], False)),
         ),

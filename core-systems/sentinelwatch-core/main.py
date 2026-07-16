@@ -137,7 +137,7 @@ class SentinelwatchCoreCore:
         
         for system in required_systems:
             if not await self._check_system_availability(system):
-                logger.warning(f"⚠️ Система {{system}} недоступна - продолжаем в аварийном режиме")
+                logger.warning(f"⚠️ Система {system} недоступна - продолжаем в аварийном режиме")
                 
         return True  # Продолжаем работу даже при недоступности зависимостей
 
@@ -224,7 +224,7 @@ class SentinelwatchCoreCore:
         # Проверка критических компонентов
         for component_name, component in self.components.items():
             if isinstance(component, dict) and component.get("status") != "active":
-                logger.warning(f"⚠️ Компонент {{component_name}} не активен: {{component.get('status')}}")
+                logger.warning(f"⚠️ Компонент {component_name} не активен: {component.get('status')}")
     
     async def _backup_critical_data(self) -> None:
         """Резервное копирование критических данных"""
@@ -249,10 +249,10 @@ class SentinelwatchCoreCore:
             with open(backup_file, 'w') as f:
                 json.dump(backup_data, f, indent=2, default=str)
                 
-            logger.critical(f"💾 Экстренный бэкап сохранен: {{backup_file}}")
+            logger.critical(f"💾 Экстренный бэкап сохранен: {backup_file}")
             
         except Exception as e:
-            logger.error(f"❌ Ошибка экстренного бэкапа: {{e}}")
+            logger.error(f"❌ Ошибка экстренного бэкапа: {e}")
     
     async def _emergency_shutdown_components(self) -> None:
         """Экстренная остановка всех компонентов"""
@@ -263,9 +263,9 @@ class SentinelwatchCoreCore:
                 elif isinstance(component, dict):
                     component["status"] = "emergency_stopped"
                     
-                logger.info(f"🔒 Компонент {{component_name}} экстренно остановлен")
+                logger.info(f"🔒 Компонент {component_name} экстренно остановлен")
             except Exception as e:
-                logger.error(f"❌ Ошибка остановки {{component_name}}: {{e}}")
+                logger.error(f"❌ Ошибка остановки {component_name}: {e}")
     
     def get_status(self) -> Dict[str, Any]:
         """Получение статуса системы"""
@@ -280,17 +280,17 @@ class SentinelwatchCoreCore:
             "security_context": self.security_context,
             "uptime": self.metrics.get("uptime_seconds", 0),
             "config": self.config.dict()
-        }}
+        }
     
     async def emergency_health_check(self) -> Dict[str, Any]:
         """ЭКСТРЕННАЯ проверка работоспособности"""
-        checks = {{
+        checks = {
             "system_running": self.is_running,
             "emergency_mode_active": self.emergency_mode,
             "components_initialized": len(self.components) > 0,
             "security_context_valid": bool(self.security_context),
             "config_loaded": bool(self.config)
-        }}
+        }
         
         # Специализированные экстренные проверки
         if self.emergency_mode:
@@ -305,14 +305,14 @@ class SentinelwatchCoreCore:
         else:
             status = "critical_failure"
         
-        return {{
+        return {
             "status": status,
             "emergency_mode": self.emergency_mode,
             "timestamp": datetime.now().isoformat(),
             "checks": checks,
             "metrics": self.metrics,
             "uptime_seconds": self.metrics.get("uptime_seconds", 0)
-        }}
+        }
     
     async def _emergency_specific_health_checks(self) -> Dict[str, bool]:
         """Специализированные экстренные проверки здоровья"""

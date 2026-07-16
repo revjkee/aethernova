@@ -169,19 +169,19 @@ class AsyncEventLoop:
 
     # ---------------------------- Публичные API ---------------------------- #
 
-    def register_once(self, name: str, fn: JobCallable, *, retry: Optional[RetryPolicy] = None,
+    def register_once(self, name: str, fn: JobCallable, *args, retry: Optional[RetryPolicy] = None,
                       timeout_s: Optional[float] = None, concurrency_key: Optional[str] = None,
-                      max_concurrent_for_key: int = 1, *args, **kwargs) -> None:
+                      max_concurrent_for_key: int = 1, **kwargs) -> None:
         self._register(JobSpec(
             name=name, fn=fn, kind="once", retry=retry or self.cfg.default_retry, timeout_s=timeout_s,
             concurrency_key=concurrency_key, max_concurrent_for_key=max_concurrent_for_key,
             args=args, kwargs=kwargs
         ))
 
-    def register_delayed(self, name: str, fn: JobCallable, *, delay_s: float,
+    def register_delayed(self, name: str, fn: JobCallable, *args, delay_s: float,
                          retry: Optional[RetryPolicy] = None, timeout_s: Optional[float] = None,
                          concurrency_key: Optional[str] = None, max_concurrent_for_key: int = 1,
-                         *args, **kwargs) -> None:
+                         **kwargs) -> None:
         self._register(JobSpec(
             name=name, fn=fn, kind="delayed", delay_s=delay_s,
             retry=retry or self.cfg.default_retry, timeout_s=timeout_s,
@@ -189,10 +189,10 @@ class AsyncEventLoop:
             args=args, kwargs=kwargs
         ))
 
-    def register_periodic(self, name: str, fn: JobCallable, *, interval_s: float,
+    def register_periodic(self, name: str, fn: JobCallable, *args, interval_s: float,
                           run_immediately: bool = True, retry: Optional[RetryPolicy] = None,
                           timeout_s: Optional[float] = None, concurrency_key: Optional[str] = None,
-                          max_concurrent_for_key: int = 1, *args, **kwargs) -> None:
+                          max_concurrent_for_key: int = 1, **kwargs) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be > 0")
         self._register(JobSpec(

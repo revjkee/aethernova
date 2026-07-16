@@ -390,7 +390,7 @@ const Game3DView: FC<Game3DViewProps> = ({
                     {/* @ts-expect-error типы могут отсутствовать, безопасно по умолчанию */}
                     <PerfMod position="top-left" minimal deepAnalyze />
                   </React.Suspense>
-                ) : null>
+                ) : null}
               </R3F>
             </React.Suspense>
           )}

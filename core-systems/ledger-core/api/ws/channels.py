@@ -13,10 +13,10 @@ from fastapi import APIRouter, Depends, Header, HTTPException, WebSocket, WebSoc
 from pydantic import BaseModel, Field, ValidationError
 
 # Опциональные зависимости (без жёсткой привязки)
-with contextlib.suppress(Exception):
+try:
     from opentelemetry import trace  # type: ignore
     _TRACER = trace.get_tracer("ledger-core.ws")
-else:
+except Exception:
     _TRACER = None  # type: ignore
 
 try:

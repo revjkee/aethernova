@@ -1,7 +1,8 @@
+from __future__ import annotations
+
 import asyncio
 # mythos-core/api/http/routers/v1/moderation.py
 # Industrial-grade Moderation API router (FastAPI/ASGI), protobuf-compatible schemas, SSE streaming.
-from __future__ import annotations
 
 import hashlib
 import json

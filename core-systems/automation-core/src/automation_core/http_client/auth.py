@@ -79,7 +79,7 @@ class BaseAuth(Protocol):
     async def auth_headers(self, request: httpx.Request) -> Mapping[str, str]:
         ...
 
-    def __repr.sanitized__(self) -> str:
+    def __repr__(self) -> str:
         """Безопасное представление для логов."""
         return self.__class__.__name__
 
@@ -191,7 +191,7 @@ class OAuth2ClientCredentialsAuth:
         tok = await self._get_token()
         return {"Authorization": tok.header_value()}
 
-    def __repr.sanitized__(self) -> str:  # noqa: N802
+    def __repr__(self) -> str:
         return f"OAuth2ClientCredentialsAuth(client_id={_mask(self._client_id)})"
 
 
@@ -308,7 +308,7 @@ class OAuth2PKCEAuth:
         tok = await self._ensure_token()
         return {"Authorization": tok.header_value()}
 
-    def __repr.sanitized__(self) -> str:  # noqa: N802
+    def __repr__(self) -> str:
         return f"OAuth2PKCEAuth(client_id={_mask(self._client_id)})"
 
 
@@ -359,7 +359,7 @@ class ApiKeyAuth:
         params[self._name] = f"{self._prefix}{self._key}".strip()
         return url.copy_with(params=params)
 
-    def __repr.sanitized__(self) -> str:  # noqa: N802
+    def __repr__(self) -> str:
         return f"ApiKeyAuth(name={self._name}, location={self._location}, key={_mask(self._key)})"
 
 
@@ -410,7 +410,7 @@ class HmacAuth:
             self._h_signature: sig,
         }
 
-    def __repr.sanitized__(self) -> str:  # noqa: N802
+    def __repr__(self) -> str:
         return f"HmacAuth(access_key={_mask(self._ak)})"
 
 
@@ -437,7 +437,7 @@ class CompositeAuth:
     def strategies(self) -> Tuple[BaseAuth, ...]:
         return self._strategies
 
-    def __repr.sanitized__(self) -> str:  # noqa: N802
+    def __repr__(self) -> str:
         return "CompositeAuth(" + ", ".join(s.__repr.sanitized__() for s in self._strategies) + ")"
 
 

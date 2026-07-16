@@ -215,7 +215,8 @@ class JwtAuthInterceptor(ServerInterceptor):
 
         async def unary_stream(request, context):
             if not token:
-                return await abort_unauth(context, "missing bearer token")
+                await abort_unauth(context, "missing bearer token")
+                return
             try:
                 claims = self._decode_jwt(token)
                 context.set_trailing_metadata((("x-auth-sub", str(claims.get("sub", ""))),))

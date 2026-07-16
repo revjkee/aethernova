@@ -436,4 +436,31 @@ class Redactor:
             out.append(self._redact_value(value=item, key=str(idx), path=child_path, depth=depth + 1))
         return out
 
-    def _redact_string(self, value: str, key: str, path:
+    def _redact_string(self, value: str, key: str, path: str) -> str:
+        candidate = value[: self.policy.max_string_length]
+        if not self.policy.is_path_allowed(path) or not self.policy.is_key_allowed(key):
+            return self.policy.redacted_text
+        if self._should_redact_by_rules(key=key, path=path, value=candidate):
+            transformed = self._apply_rules(value=candidate, key=key, path=path)
+            return transformed if isinstance(transformed, str) else self.policy.redacted_text
+        if (
+            self.policy.redact_unknown_large_strings
+            and len(value) > self.policy.large_string_threshold
+        ):
+            return self.policy.redacted_text
+        return candidate
+
+    def _should_redact_by_rules(self, *, key: str, path: str, value: Any) -> bool:
+        return any(rule.applies(key, path, value) for rule in self.policy.rules)
+
+    def _apply_rules(self, *, value: Any, key: str, path: str) -> Any:
+        matches: List[RedactionMatch] = []
+        transformed = value
+        for rule in self.policy.rules:
+            if not rule.applies(key, path, transformed):
+                continue
+            matches.append(RedactionMatch(kind=rule.name, pattern=rule.name, detail=path))
+            if rule.transform is None:
+                return self.policy.redacted_text
+            transformed = rule.transform(transformed, key, path, matches)
+        return transformed

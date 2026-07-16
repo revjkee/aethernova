@@ -627,7 +627,7 @@ async def resolve_crl_latest(_, info, issuerDnDerSha256Hex, akiHex=None, delta=F
         raise ValueError("DB engine not configured")
     from sqlalchemy import text
     if delta:
-        q = text("""
+        q = text(r"""
             WITH latest_full AS (
               SELECT DISTINCT ON (issuer_dn_hash, COALESCE(authority_key_id, '\x'::bytea))
                      id, issuer_dn_hash, authority_key_id, crl_number, this_update
@@ -648,7 +648,7 @@ async def resolve_crl_latest(_, info, issuerDnDerSha256Hex, akiHex=None, delta=F
             LIMIT 1
         """)
     else:
-        q = text("""
+        q = text(r"""
             SELECT signed_der
             FROM security.crl
             WHERE is_delta = false
@@ -699,7 +699,7 @@ async def resolve_crls(_, info, filter=None, first: int = 20, after: Optional[st
             where.append("issuer_dn_hash = :issuer")
             params["issuer"] = filter["issuerDnHashHex"]
         if filter.get("authorityKeyIdHex") is not None:
-            where.append("COALESCE(authority_key_id, '\x'::bytea) = :aki")
+            where.append("COALESCE(authority_key_id, '\\x'::bytea) = :aki")
             params["aki"] = filter["authorityKeyIdHex"]
         if filter.get("isDelta") is not None:
             where.append("is_delta = :is_delta")

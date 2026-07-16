@@ -233,10 +233,10 @@ class IdentityAccessCoreCore:
             with open(backup_file, 'w') as f:
                 json.dump(backup_data, f, indent=2, default=str)
                 
-            logger.critical(f"💾 Экстренный бэкап сохранен: {{backup_file}}")
+            logger.critical(f"💾 Экстренный бэкап сохранен: {backup_file}")
             
         except Exception as e:
-            logger.error(f"❌ Ошибка экстренного бэкапа: {{e}}")
+            logger.error(f"❌ Ошибка экстренного бэкапа: {e}")
     
     async def _emergency_shutdown_components(self) -> None:
         """Экстренная остановка всех компонентов"""
@@ -247,9 +247,9 @@ class IdentityAccessCoreCore:
                 elif isinstance(component, dict):
                     component["status"] = "emergency_stopped"
                     
-                logger.info(f"🔒 Компонент {{component_name}} экстренно остановлен")
+                logger.info(f"🔒 Компонент {component_name} экстренно остановлен")
             except Exception as e:
-                logger.error(f"❌ Ошибка остановки {{component_name}}: {{e}}")
+                logger.error(f"❌ Ошибка остановки {component_name}: {e}")
     
     def get_status(self) -> Dict[str, Any]:
         """Получение статуса системы"""

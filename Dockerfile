@@ -1,66 +1,49 @@
-# syntax=docker/dockerfile:1.4
+# syntax=docker/dockerfile:1.7
 
-# 1. Stage: Build environment
-FROM python:3.11-bullseye-slim AS builder
+FROM python:3.12-slim AS builder
 
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential gcc libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get install -y tzdata && \
-    ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime && \
-    dpkg-reconfigure -f noninteractive tzdata
-RUN useradd -m appuser
-USER appuser
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    debian-archive-keyring ca-certificates \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends \
-    gcc \
-    libpq-dev \
-    build-essential \
-  && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
 
+COPY backend/requirements.txt ./requirements.txt
+RUN python -m pip wheel --wheel-dir /wheels -r requirements.txt
 
-# Обновляем и устанавливаем сборочные зависимости
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libpq-dev \
-    build-essential \
-  && rm -rf /var/lib/apt/lists/*
+FROM python:3.12-slim AS runtime
 
-WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    APP_MODULE=src.main:app \
+    HOST=0.0.0.0 \
+    PORT=8000 \
+    WORKERS=2
 
-# Копируем файлы с зависимостями
-COPY requirements.txt pyproject.toml ./
-
-# Обновляем pip и устанавливаем зависимости в изолированное окружение
-RUN python -m venv /opt/venv \
-  && . /opt/venv/bin/activate \
-  && pip install --upgrade pip setuptools wheel \
-  && pip install -r requirements.txt
-
-# Копируем исходный код
-COPY src/ ./src/
-
-# 2. Stage: Runtime environment
-FROM python:3.11-bullseye-slim
-
-
-# Копируем виртуальное окружение из build stage
-COPY --from=builder /opt/venv /opt/venv
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl libpq5 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system app \
+    && useradd --system --create-home --gid app --uid 10001 app
 
 WORKDIR /app
 
-# Копируем исходный код из build stage
-COPY --from=builder /app/src ./src
+COPY --from=builder /wheels /wheels
+COPY backend/requirements.txt ./requirements.txt
+RUN python -m pip install --no-index --find-links=/wheels -r requirements.txt \
+    && rm -rf /wheels
 
-ENV PATH="/opt/venv/bin:$PATH"
+COPY backend/src ./src
 
-# Минимизируем слои и очищаем кэш
-RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
-  && rm -rf /var/lib/apt/lists/*
+USER app
 
-# Устанавливаем переменную окружения для Python буферизации вывода
-ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
 
-# Стандартная команда запуска (можно адаптировать под конкретный entrypoint)
-CMD ["python", "-m", "src.main"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl --fail --silent http://127.0.0.1:8000/health || exit 1
+
+CMD ["sh", "-c", "exec gunicorn \"$APP_MODULE\" --worker-class uvicorn.workers.UvicornWorker --workers \"$WORKERS\" --bind \"$HOST:$PORT\" --access-logfile - --error-logfile -"]

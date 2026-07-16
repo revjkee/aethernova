@@ -1,5 +1,6 @@
-import asyncio
 from __future__ import annotations
+
+import asyncio
 
 import base64
 import hashlib
@@ -108,7 +109,7 @@ assets = Table(
     Column("tags", ARRAY(String), nullable=False, server_default=text("'{}'::text[]")),
     Column("labels", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     Column("props", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
-    Column("external_ids", JSONB, nullable=False, server_default(text("'{}'::jsonb"))),
+    Column("external_ids", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("deleted_at", DateTime(timezone=True), nullable=True),

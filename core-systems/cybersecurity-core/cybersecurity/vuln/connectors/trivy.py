@@ -612,4 +612,10 @@ class TrivyConnector:
         env = os.environ.copy()
         # Registry auth and tokens if needed by Trivy
         if self.cfg.username is not None:
-            env["TRIVY
+            env["TRIVY_USERNAME"] = self.cfg.username
+        if self.cfg.password is not None:
+            env["TRIVY_PASSWORD"] = self.cfg.password
+        if self.cfg.token is not None:
+            env["TRIVY_TOKEN"] = self.cfg.token
+        env.update(extra or {})
+        return env

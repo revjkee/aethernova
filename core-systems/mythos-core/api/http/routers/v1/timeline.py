@@ -452,7 +452,7 @@ class InMemoryTimelineService:
                     yield ev
                 except asyncio.TimeoutError:
                     # heartbeat represented as no-event; SSE layer will send comment
-                    yield from ()
+                    continue
         finally:
             await self._unsubscribe(req.tenant_id, req.stream, q)
 

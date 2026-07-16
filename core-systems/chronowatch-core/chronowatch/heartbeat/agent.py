@@ -78,7 +78,7 @@ class HeartbeatConfig:
     headers: Mapping[str, str] = field(default_factory=lambda: {"content-type": "application/json"})
     timeout_s: float = float(os.getenv("HEARTBEAT_TIMEOUT_S", "3.0"))
     verify_tls: bool = os.getenv("HEARTBEAT_VERIFY_TLS", "true").lower() in ("1", "true", "yes")
-    connect_via_app_http: bool = os.getenv("HEARTBEAT_USE_APP_HTTP", "true").lower() in ("1", "true", "yes"))
+    connect_via_app_http: bool = os.getenv("HEARTBEAT_USE_APP_HTTP", "true").lower() in ("1", "true", "yes")
 
     # Расписание
     interval_s: float = float(os.getenv("HEARTBEAT_INTERVAL_S", "15.0"))

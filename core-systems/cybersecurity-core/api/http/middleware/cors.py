@@ -107,7 +107,7 @@ class CORSConfig:
 
 
 class AdvancedCORSMiddleware:
-    """
+    r"""
     ASGI middleware implementing robust CORS with:
       - allow/deny (exact, wildcard, regex)
       - proper preflight handling

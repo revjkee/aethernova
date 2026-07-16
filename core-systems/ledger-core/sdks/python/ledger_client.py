@@ -64,15 +64,15 @@ except ImportError as e:  # pragma: no cover
     raise RuntimeError("Требуется зависимость httpx (pip install httpx)") from e
 
 # Опциональная валидация JSON Schema
-with contextlib.suppress(Exception):
+try:
     import jsonschema  # type: ignore
 
     _HAS_JSONSCHEMA = True
-else:
+except Exception:
     _HAS_JSONSCHEMA = False
 
 # Опциональный OpenTelemetry (необязателен)
-with contextlib.suppress(Exception):
+try:
     from opentelemetry import trace  # type: ignore
 
     _TRACER = trace.get_tracer("ledger-client")

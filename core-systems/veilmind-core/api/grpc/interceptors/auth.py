@@ -88,7 +88,7 @@ class Issuer:
 
 @dataclass(frozen=True)
 class MethodRule:
-    """
+    r"""
     Regex-based rule for method authorization.
     method_pattern: e.g. r"^/veilmind\.v1\.RiskService/(PublishEvents|ComputeRisk)$"
     require_any_role: authorize if principal.roles intersects these

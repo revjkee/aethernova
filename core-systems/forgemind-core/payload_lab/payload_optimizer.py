@@ -102,4 +102,8 @@ class PayloadOptimizer:
             logger.info(f"[Optimizer] Selected variant {v.id}: {v.metrics()}")
         return top_variants
 
-    def export_report_
+    def export_report(self, path: str) -> None:
+        """Export registered payload metrics as JSON."""
+        report = [variant.metrics() for variant in self.variants]
+        with open(path, "w", encoding="utf-8") as report_file:
+            json.dump(report, report_file, ensure_ascii=False, indent=2)

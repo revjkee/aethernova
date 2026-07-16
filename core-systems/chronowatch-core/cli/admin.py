@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # chronowatch-core/cli/admin.py
 # ChronoWatch Core — административный CLI.
 # Python 3.11+. Без обязательных внешних зависимостей. Опционально: grpcio, PyYAML, PyJWT.
@@ -10,7 +12,6 @@ Admin module
 """
 
 
-from __future__ import annotations
 
 import argparse
 import json

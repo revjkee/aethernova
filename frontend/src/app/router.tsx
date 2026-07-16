@@ -1,7 +1,6 @@
-import { BrowserRouter as Router, Route, Routes, Navigate } from 'react-router-dom'
+import { Route, Routes, Navigate } from 'react-router-dom'
 import { Suspense, lazy } from 'react'
 import { useAuth } from '@/shared/hooks/useAuth'
-import { Layout } from '@/shared/layout/Layout'
 import { LoadingScreen } from '@/shared/components/LoadingScreen'
 import { ErrorBoundary } from '@/shared/components/ErrorBoundary'
 import { routeGuard } from '@/shared/security/routeGuard'
@@ -31,33 +30,31 @@ export const AppRouter = () => {
   }
 
   return (
-    <Router>
-      <ErrorBoundary>
-        <Suspense fallback={<LoadingScreen />}>
-          <Layout>
-            <Routes>
-              <Route path="/" element={<HomePage />} />
-              <Route
-                path="/hr"
-                element={monitorRoute(<GuardedRoute element={<HRDashboard />} allowedRoles={['hr', 'admin']} />, 'HRDashboard')}
-              />
-              <Route
-                path="/agents"
-                element={monitorRoute(<GuardedRoute element={<AgentControl />} allowedRoles={['admin', 'agent-manager']} />, 'AgentControl')}
-              />
-              <Route
-                path="/governance"
-                element={monitorRoute(<GuardedRoute element={<GovernancePanel />} allowedRoles={['governor', 'admin']} />, 'GovernancePanel')}
-              />
-              <Route
-                path="/ethics"
-                element={monitorRoute(<GuardedRoute element={<EthicsAnalyzer />} allowedRoles={['ethics', 'admin']} />, 'EthicsAnalyzer')}
-              />
-              <Route path="*" element={<NotFound />} />
-            </Routes>
-          </Layout>
-        </Suspense>
-      </ErrorBoundary>
-    </Router>
+    <ErrorBoundary>
+      <Suspense fallback={<LoadingScreen />}>
+        <Routes>
+          <Route path="/" element={<HomePage />} />
+          <Route
+            path="/hr"
+            element={monitorRoute(<GuardedRoute element={<HRDashboard />} allowedRoles={['hr', 'admin']} />, 'HRDashboard')}
+          />
+          <Route
+            path="/agents"
+            element={monitorRoute(<GuardedRoute element={<AgentControl />} allowedRoles={['admin', 'agent-manager']} />, 'AgentControl')}
+          />
+          <Route
+            path="/governance"
+            element={monitorRoute(<GuardedRoute element={<GovernancePanel />} allowedRoles={['governor', 'admin']} />, 'GovernancePanel')}
+          />
+          <Route
+            path="/ethics"
+            element={monitorRoute(<GuardedRoute element={<EthicsAnalyzer />} allowedRoles={['ethics', 'admin']} />, 'EthicsAnalyzer')}
+          />
+          <Route path="*" element={<NotFound />} />
+        </Routes>
+      </Suspense>
+    </ErrorBoundary>
   )
 }
+
+export default AppRouter

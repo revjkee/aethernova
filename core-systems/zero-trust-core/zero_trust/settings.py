@@ -421,4 +421,82 @@ class Settings:
 # -----------------------------------------------------------------------------
 
 def _load_config_file(path: str) -> Dict[str, Any]:
-    if path.lower().endswith(
+    with open(path, "r", encoding="utf-8") as config_file:
+        text = config_file.read()
+    lower = path.lower()
+    if lower.endswith(".json"):
+        data = json.loads(text)
+    elif lower.endswith((".yaml", ".yml")):
+        if yaml is None:
+            raise RuntimeError("PyYAML is required to load YAML configuration")
+        data = yaml.safe_load(text) or {}
+    else:
+        raise ValueError(f"unsupported configuration format: {path}")
+    if not isinstance(data, Mapping):
+        raise ValueError("configuration root must be a mapping")
+    return dict(data)
+
+
+def _coerce_like(value: Any, current: Any) -> Any:
+    if isinstance(current, bool):
+        return _as_bool(value, current)
+    if isinstance(current, int) and not isinstance(current, bool):
+        return _as_int(value, current)
+    if isinstance(current, float):
+        return _as_float(value, current)
+    if isinstance(current, timedelta):
+        return _parse_duration(value, current)
+    if isinstance(current, list):
+        return _as_list(value)
+    if isinstance(current, dict):
+        return dict(value) if isinstance(value, Mapping) else _as_map(value)
+    return value
+
+
+def _overlay_dataclass(target: Any, values: Mapping[str, Any]) -> None:
+    for key, value in values.items():
+        if not hasattr(target, key):
+            continue
+        current = getattr(target, key)
+        if dataclasses.is_dataclass(current) and isinstance(value, Mapping):
+            _overlay_dataclass(current, value)
+        else:
+            setattr(target, key, _coerce_like(value, current))
+
+
+def _apply_env_overrides(settings: Settings, env: Mapping[str, str]) -> None:
+    for section_field in dataclasses.fields(settings):
+        section = getattr(settings, section_field.name)
+        if not dataclasses.is_dataclass(section):
+            continue
+        for item_field in dataclasses.fields(section):
+            env_name = f"ZT_{section_field.name}_{item_field.name}".upper()
+            if env_name in env:
+                current = getattr(section, item_field.name)
+                setattr(section, item_field.name, _coerce_like(env[env_name], current))
+
+
+def _resolve_secrets(target: Any, provider: SecretProvider) -> None:
+    if not dataclasses.is_dataclass(target):
+        return
+    for item_field in dataclasses.fields(target):
+        current = getattr(target, item_field.name)
+        if dataclasses.is_dataclass(current):
+            _resolve_secrets(current, provider)
+        elif isinstance(current, str) and current.startswith(("env://", "file://")):
+            resolved = provider.resolve(current)
+            if resolved is not None:
+                setattr(target, item_field.name, resolved)
+
+
+def _mask_inplace(value: Any, *, keys: Iterable[str]) -> None:
+    sensitive = {key.casefold() for key in keys}
+    if isinstance(value, MutableMapping):
+        for key, item in list(value.items()):
+            if str(key).casefold() in sensitive:
+                value[key] = _mask_secret(str(item)) if item is not None else None
+            else:
+                _mask_inplace(item, keys=sensitive)
+    elif isinstance(value, list):
+        for item in value:
+            _mask_inplace(item, keys=sensitive)

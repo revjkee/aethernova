@@ -73,7 +73,7 @@ class Principal:
 
 @dataclass
 class MethodPolicy:
-    """
+    r"""
     Authorization policy bound to one or more fully-qualified methods.
     method can be: '/pkg.Service/Method' exact, or glob '/pkg.Service/*', or regex 're:^/pkg\.Service/.*$'
     """

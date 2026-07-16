@@ -13,10 +13,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 # Опционально используем OpenTelemetry, если установлен
-with suppress(Exception):
+try:
     from opentelemetry import trace  # type: ignore
     tracer = trace.get_tracer(__name__)
-else:
+except Exception:
     tracer = None  # type: ignore
 
 router = APIRouter(prefix="/api/v1", tags=["health"])

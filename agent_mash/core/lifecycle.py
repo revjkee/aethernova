@@ -394,9 +394,6 @@ class LifecycleManager:
             await self._set_state(LifecycleState.FAILED, reason="run exception")
             # Request cancellation so upper orchestration can react.
             self.request_cancel()
-        finally:
-            # If run ends naturally and we are still RUNNING, move to STOPPED only after stop().
-            return
 
     async def stop(self) -> None:
         # Idempotent stop orchestration; serialize multiple concurrent stop callers.

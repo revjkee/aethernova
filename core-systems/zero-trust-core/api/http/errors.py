@@ -243,4 +243,11 @@ def ensure_correlation_id(request: Optional[Request] = None) -> str:
     # Extract or generate correlation id
     try:
         if request is not None:
-            headers = request.headers  # type: ignore[attr-d]()
+            headers = request.headers  # type: ignore[attr-defined]
+            for header_name in _CORR_HEADERS:
+                value = headers.get(header_name)
+                if value:
+                    return str(value)[:128]
+    except Exception:
+        logger.debug("Unable to read correlation headers", exc_info=True)
+    return uuid.uuid4().hex

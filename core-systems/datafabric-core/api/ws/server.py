@@ -368,8 +368,9 @@ async def _heartbeat_loop(c: Conn):
             # idle timeout
             try:
                 await c.ws.close(code=status.WS_1001_GOING_AWAY)
-            finally:
-                break
+            except Exception:
+                log.debug("idle_close_failed", extra={"conn": c.id}, exc_info=True)
+            break
         try:
             await c.ws.send_text(ServerEnvelope(type="pong", data={"ping": int(time.time())}, seq=hub._bump(c)).model_dump_json())  # type: ignore
             WS_MSG_OUT.labels("pong").inc()

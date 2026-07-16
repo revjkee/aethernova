@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 # chronowatch-core/api/http/errors.py
 # -*- coding: utf-8 -*-
@@ -21,7 +23,6 @@ import asyncio
 Гарантирует стабильный контракт для клиентов и удобство в SRE/обслуживании.
 """
 
-from __future__ import annotations
 
 import json
 import logging

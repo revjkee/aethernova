@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 # datafabric-core/examples/quickstart_local/seed.py
 # Industrial-grade local seeding script for DataFabric Quickstart
 # Features:
@@ -21,7 +23,6 @@ Seed module
 """
 
 
-from __future__ import annotations
 
 import argparse
 import concurrent.futures

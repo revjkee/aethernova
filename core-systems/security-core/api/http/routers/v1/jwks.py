@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import asyncio
 # security-core/api/http/routers/v1/jwks.py
-from __future__ import annotations
 
 import base64
 import hashlib

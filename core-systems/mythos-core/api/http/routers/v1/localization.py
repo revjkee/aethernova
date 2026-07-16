@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import asyncio
 # mythos-core/api/http/routers/v1/localization.py
-from __future__ import annotations
 
 import base64
 import hashlib
@@ -319,7 +320,10 @@ async def get_repo() -> LocalizationRepo:
 async def get_bundle(
     request: Request,
     response: Response,
-    namespace: constr(regex=r"^[a-zA-Z0-9_\-\.]{1,64}$) = Path(..., description="Пространство имён бандла"),
+    namespace: constr(regex=r"^[a-zA-Z0-9_\-\.]{1,64}$") = Path(
+        ...,
+        description="Пространство имён бандла",
+    ),
     locale: Optional[BCP47] = Query(None, description="Желаемая локаль для фильтрации"),
     keys: Optional[List[str]] = Query(None, description="Фильтр по ключам (повторяющийся параметр keys=...)"),
     since_revision_id: Optional[str] = Query(None, description="Вернуть только строки после данной ревизии (если поддерживается бэкендом)"),

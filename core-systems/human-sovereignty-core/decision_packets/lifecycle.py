@@ -447,4 +447,20 @@ class Lifecycle:
         packet_id: str,
         etype: PacketEventType,
         from_state: PacketState,
-        to_st_
+        to_state: PacketState,
+        actor: str,
+        reason: str,
+        data: Mapping[str, Any],
+        now_utc: _dt.datetime,
+    ) -> PacketEvent:
+        return PacketEvent(
+            event_id=str(uuid.uuid4()),
+            packet_id=packet_id,
+            type=etype,
+            from_state=from_state,
+            to_state=to_state,
+            at_utc=_iso_utc(now_utc),
+            actor=actor,
+            reason=reason,
+            data=_canonicalize(data),
+        )

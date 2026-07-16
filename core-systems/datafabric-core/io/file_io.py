@@ -364,7 +364,7 @@ class _RangeReader(io.RawIOBase):
         try:
             self._base.close()
         finally:
-            return super().close()
+            super().close()
 
 
 # Optional S3 backend
@@ -477,7 +477,7 @@ class _StreamingBodyReader(io.RawIOBase):
         try:
             self._body.close()
         finally:
-            return super().close()
+            super().close()
 
 
 class _S3BufferedWriter(io.BufferedWriter):

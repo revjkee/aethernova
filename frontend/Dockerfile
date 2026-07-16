@@ -6,8 +6,7 @@
 FROM node:22-alpine AS builder
 
 # Безопасные и воспроизводимые окружения
-ENV NODE_ENV=production \
-    CI=true \
+ENV CI=true \
     NPM_CONFIG_FUND=false \
     NPM_CONFIG_AUDIT=false \
     # Увеличиваем память для больших бандлов, если нужно
@@ -19,36 +18,12 @@ WORKDIR /app
 # Ставим их как виртуальный пакет и удалим в конце стадии
 RUN apk add --no-cache --virtual .build-deps python3 make g++ git
 
-# Оптимизация кэша: копируем только манифесты зависимостей
-# Поддержка npm / yarn / pnpm — определяется по lock-файлу
-COPY package.json ./
-COPY package-lock.json* ./
-COPY npm-shrinkwrap.json* ./
-COPY yarn.lock* ./
-COPY pnpm-lock.yaml* ./
+# Оптимизация кэша: проект использует npm и фиксированный package-lock.json.
+COPY package.json package-lock.json ./
 
-# Включаем corepack для yarn/pnpm при необходимости
-RUN corepack enable || true
-
-# Устанавливаем зависимости с использованием кэша менеджера пакетов
-# - npm: кэшируем /root/.npm
-# - yarn: кэшируем /usr/local/share/.cache/yarn
-# - pnpm: кэшируем /root/.local/share/pnpm/store
+# Dev-зависимости нужны на builder-стадии для Vite и TypeScript.
 RUN --mount=type=cache,target=/root/.npm \
-    --mount=type=cache,target=/usr/local/share/.cache/yarn \
-    --mount=type=cache,target=/root/.local/share/pnpm/store \
-    set -eux; \
-    if [ -f pnpm-lock.yaml ]; then \
-        corepack prepare pnpm@latest --activate; \
-        pnpm install --frozen-lockfile; \
-    elif [ -f yarn.lock ]; then \
-        corepack prepare yarn@stable --activate; \
-        yarn install --frozen-lockfile; \
-    elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then \
-        npm ci; \
-    else \
-        npm install; \
-    fi
+    npm ci --include=dev
 
 # Копируем остальной исходный код
 COPY . .
@@ -56,9 +31,6 @@ COPY . .
 # Сборка проекта
 # Используем npm run build (подходит и после yarn/pnpm install — скрипты читаются из package.json)
 RUN --mount=type=cache,target=/root/.npm \
-    --mount=type=cache,target=/usr/local/share/.cache/yarn \
-    --mount=type=cache,target=/root/.local/share/pnpm/store \
-    set -eux; \
     npm run build
 
 # Убираем сборочные зависимости (только для этой стадии)
@@ -67,14 +39,15 @@ RUN apk del .build-deps || true
 ############################################
 # 2) Runtime: лёгкий и безопасный Nginx
 ############################################
-FROM nginx:1.27-alpine AS runtime
+FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
+
+USER root
 
 # Метаданные образа (OCI)
 LABEL org.opencontainers.image.title="Frontend (SPA) - Production Image" \
       org.opencontainers.image.description="Optimized multi-stage build for Vite/React SPA with Nginx, gzip, caching and SPA fallback." \
-      org.opencontainers.image.vendor="Aethernova / NeuroCity" \
-      org.opencontainers.image.source="https://example.com/repo" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.vendor="Aethernova" \
+      org.opencontainers.image.source="https://github.com/revjkee/aethernova"
 
 # Рабочая директория nginx и права
 WORKDIR /usr/share/nginx/html
@@ -153,7 +126,7 @@ COPY --from=builder /app/dist/ /usr/share/nginx/html/
 
 # Права для небезопасного root не нужны: используем пользователя nginx и порт 8080
 RUN chown -R nginx:nginx /usr/share/nginx/html
-USER nginx
+USER 101
 
 EXPOSE 8080
 

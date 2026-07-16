@@ -533,4 +533,38 @@ def _make_cel() -> Evaluator:
         description = "Evaluates a CEL expression over evidence"
         default_weight = 1
 
-        async def evaluate(self, ctx: EvaluationConte
+        async def evaluate(
+            self,
+            ctx: EvaluationContext,
+            evidence: Dict[str, Any],
+            params: Dict[str, Any],
+        ) -> PostureCheck:
+            t0 = time.perf_counter()
+            expression = str(params.get("expression") or "").strip()
+            details: Dict[str, Any] = {"expression": expression}
+            if not expression:
+                result = PostureResult.UNKNOWN
+                details["reason"] = "expression_missing"
+            elif cel is None:
+                result = PostureResult.UNKNOWN
+                details["reason"] = "cel_engine_unavailable"
+            else:
+                # CEL Python packages expose incompatible APIs. Fail closed until
+                # a concrete adapter is configured for this deployment.
+                result = PostureResult.UNKNOWN
+                details["reason"] = "cel_adapter_not_configured"
+
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            check = PostureCheck(
+                key=self.key,
+                result=result,
+                score=0,
+                details=details,
+                evaluator_version=self.version,
+                duration_ms=duration_ms,
+            )
+            _inc_total(self.key, check.result)
+            _observe_time(self.key, duration_ms / 1000.0)
+            return check
+
+    return CelRule()

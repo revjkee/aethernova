@@ -524,10 +524,14 @@ class DataFabricAdapter:
                 self.metrics.breaker_opened += 1
                 if self.cfg.fail_open:
                     await self._audit("breaker_fail_open", {"fn": getattr(fn, "__name__", "fn")})
-                    return 0 if fn.__name__ == "write" else (async def _empty(): 
+                    if fn.__name__ == "write":
+                        return 0
+
+                    async def _empty():
                         if False:  # pragma: no cover
                             yield {}
-                    )
+
+                    return _empty()
                 raise RuntimeError("circuit breaker is open")
             attempt = 0
             while True:

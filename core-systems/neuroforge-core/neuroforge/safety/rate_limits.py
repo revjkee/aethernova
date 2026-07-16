@@ -493,11 +493,11 @@ class AsyncRateLimiter:
                     overall_allowed = overall_allowed and allowed
                 elif isinstance(rule, FixedWindowRule):
                     allowed, remaining, reset = await self._backend.fw_consume(key, rule.limit, rule.window, c, now, rule.jitter)
-                    per.append(RuleDecision(rule=rule.name, allowed=allowed, limit=rule.limit, remaining=remaining, reset_after_s=float(max(0.0, reset)), retry_after_s=None if allowed else float(max(0.0, reset)))))
+                    per.append(RuleDecision(rule=rule.name, allowed=allowed, limit=rule.limit, remaining=remaining, reset_after_s=float(max(0.0, reset)), retry_after_s=None if allowed else float(max(0.0, reset))))
                     overall_allowed = overall_allowed and allowed
                 elif isinstance(rule, SlidingWindowRule):
                     allowed, remaining, reset = await self._backend.sw_consume(key, rule.limit, rule.window, c, now, rule.collapse_hz)
-                    per.append(RuleDecision(rule=rule.name, allowed=allowed, limit=rule.limit, remaining=remaining, reset_after_s=float(max(0.0, reset)), retry_after_s=None if allowed else float(max(0.0, reset)))))
+                    per.append(RuleDecision(rule=rule.name, allowed=allowed, limit=rule.limit, remaining=remaining, reset_after_s=float(max(0.0, reset)), retry_after_s=None if allowed else float(max(0.0, reset))))
                     overall_allowed = overall_allowed and allowed
                 else:
                     raise ValueError(f"Unknown rule type: {type(rule)}")

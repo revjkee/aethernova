@@ -267,7 +267,7 @@ def _parse_plural_segment(seg: str) -> _PluralAST:
 def _compile_message(msg: str) -> _CompiledEntry:
     # Detect top-level plural patterns and compile a single plural AST.
     # If multiple plural sections exist, we process them left-to-right at runtime.
-    if "{", "plural" not in (msg, msg):  # tiny fast path
+    if "{" not in msg or "plural" not in msg:  # tiny fast path
         return _CompiledEntry(is_plural=False, ast=msg, compiled_at=time.time())
     # Walk string and replace the first plural with AST marker; leave others as text for recursive compile.
     i = 0
@@ -437,7 +437,7 @@ class I18n:
         loc = normalize_locale(locale or self.get_locale() or self.cfg.default_locale)
         # Prefer ICU plural at singular_key
         msg = self._lookup(loc, domain, singular_key, missing_silent=True)
-        if msg and "{", "plural," in (msg, msg):  # fast heuristic
+        if msg and "{" in msg and "plural," in msg:  # fast heuristic
             kwargs = {"count": count, **kwargs}
             entry = self._compile_if_needed(loc, domain, singular_key, msg)
             return _render_compiled(entry, kwargs, loc)

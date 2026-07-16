@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # datafabric-core/mocks/ingest_source_mock.py
 # Industrial-grade ingest source mock for DataFabric
 # Features:
@@ -60,7 +62,6 @@ Ingest Source Mock module
 """
 
 
-from __future__ import annotations
 
 import argparse
 import json

@@ -131,7 +131,7 @@ class Task:
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
 
-    def is_expired(self, now: Optional=datetime] = None) -> bool:  # type: ignore[valid-type]
+    def is_expired(self, now: Optional[datetime] = None) -> bool:
         now = ensure_utc(now or utcnow())
         return bool(self.deadline and now >= self.deadline)
 

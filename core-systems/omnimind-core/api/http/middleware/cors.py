@@ -1,5 +1,5 @@
 # path: ops/api/http/middleware/cors.py
-"""
+r"""
 Industrial-grade CORS middleware for ASGI apps.
 
 Features:
@@ -60,7 +60,7 @@ def _normalize_headers(headers: Union[Iterable[str], str, None]) -> Set[str]:
 
 
 def _add_header(headers: list[tuple[bytes, bytes]], name: str, value: str) -> None:
-    headers.append((name.encode("latin-1"), value.encode("latin-1"))
+    headers.append((name.encode("latin-1"), value.encode("latin-1")))
 
 
 def _has_header(headers: list[tuple[bytes, bytes]], name: str) -> bool:

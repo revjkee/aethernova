@@ -173,7 +173,7 @@ def _hmac_token(ctx: StrategyContext, value: Any, **kw) -> str:
     tag = hmac.new(key, msg, hashlib.sha256).digest()
     # shorten to requested length but keep collision resistance reasonable
     ln = int(kw.get("length", 22))
-    return base64.urlsafe_b64encode(tag).decode("ascii").rstrip("=").[:ln]
+    return base64.urlsafe_b64encode(tag).decode("ascii").rstrip("=")[:ln]
 
 # Reversible encryption (AES-GCM)
 def _encrypt(ctx: StrategyContext, value: Any, **kw) -> str:

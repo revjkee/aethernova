@@ -1,13 +1,25 @@
 import json
 import logging
 import uuid
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 from datetime import datetime
 
-from genius-core/genius-core-security/defense/policy_enforcer import apply_defense_policy
-from genius-core/meta-awareness/system_consistency_checker import check_defense_consistency
-from platform-security/enforcement/signature_base import get_attack_signatures
-from logging/ueba/anomaly_detector import analyze_behavior_pattern
+
+def apply_defense_policy(_rule: Dict[str, Any]) -> None:
+    """Fail closed until a concrete policy-enforcement adapter is configured."""
+    raise RuntimeError("Defense policy enforcement adapter is not configured")
+
+
+def check_defense_consistency(rules: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"valid": bool(rules), "rule_count": len(rules)}
+
+
+def get_attack_signatures() -> set[str]:
+    return set()
+
+
+def analyze_behavior_pattern(_event: Dict[str, Any]) -> Dict[str, Any]:
+    return {"behavior_type": "unknown", "conditions": {}, "risk": "medium"}
 
 # === TeslaAI Defense Engine v3.4 ===
 # Agents: RuleSynthesizer, PatternMatcher, CoverageAnalyzer, ThreatBinder,

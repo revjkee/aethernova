@@ -917,4 +917,9 @@ class StaticAttributeResolver(AttributeResolver):
         out: Dict[str, Dict[str, Any]] = {"subject": {}, "resource": {}, "action": {}, "environment": {}}
         for block in out.keys():
             avail = self._attrs.get(block, {})
-            req = set(required.get(block, [])) if
+            requested = set(required.get(block, ())) if required else set(avail)
+            current = getattr(ctx, block)
+            for key in requested:
+                if key not in current and key in avail:
+                    out[block][key] = avail[key]
+        return out

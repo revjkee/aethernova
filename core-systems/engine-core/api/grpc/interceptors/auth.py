@@ -392,9 +392,11 @@ class AuthInterceptor(ServerInterceptor):
                     principal = principal or await try_jwt()
                     principal = principal or await try_apikey()
                     if not principal and not AUTH_ALLOW_ANON:
-                        return await _unauth(StatusCode.UNAUTHENTICATED, ctx, "unauthenticated")
+                        await _unauth(StatusCode.UNAUTHENTICATED, ctx, "unauthenticated")
+                        return
                     if principal and not _match_rbac(method, principal.scopes, principal.roles):
-                        return await _unauth(StatusCode.PERMISSION_DENIED, ctx, "permission denied")
+                        await _unauth(StatusCode.PERMISSION_DENIED, ctx, "permission denied")
+                        return
                     token = principal_ctx.set(principal)
                     try:
                         async for resp in inner(request, ctx):
@@ -419,9 +421,11 @@ class AuthInterceptor(ServerInterceptor):
                     principal = principal or await try_jwt()
                     principal = principal or await try_apikey()
                     if not principal and not AUTH_ALLOW_ANON:
-                        return await _unauth(StatusCode.UNAUTHENTICATED, ctx, "unauthenticated")
+                        await _unauth(StatusCode.UNAUTHENTICATED, ctx, "unauthenticated")
+                        return
                     if principal and not _match_rbac(method, principal.scopes, principal.roles):
-                        return await _unauth(StatusCode.PERMISSION_DENIED, ctx, "permission denied")
+                        await _unauth(StatusCode.PERMISSION_DENIED, ctx, "permission denied")
+                        return
                     token = principal_ctx.set(principal)
                     try:
                         return await inner(request_iter, ctx)
@@ -445,9 +449,11 @@ class AuthInterceptor(ServerInterceptor):
                     principal = principal or await try_jwt()
                     principal = principal or await try_apikey()
                     if not principal and not AUTH_ALLOW_ANON:
-                        return await _unauth(StatusCode.UNAUTHENTICATED, ctx, "unauthenticated")
+                        await _unauth(StatusCode.UNAUTHENTICATED, ctx, "unauthenticated")
+                        return
                     if principal and not _match_rbac(method, principal.scopes, principal.roles):
-                        return await _unauth(StatusCode.PERMISSION_DENIED, ctx, "permission denied")
+                        await _unauth(StatusCode.PERMISSION_DENIED, ctx, "permission denied")
+                        return
                     token = principal_ctx.set(principal)
                     try:
                         async for resp in inner(request_iter, ctx):

@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 import asyncio
 # security-core/api/http/server.py
 # Промышленный HTTP-сервер авторизации и управления политиками (Zero-Trust RBAC+ABAC)
 # Зависимости: fastapi, uvicorn, pydantic, prometheus_client, (опционально) PyJWT
 # Запуск: UVICORN_WORKERS=4 uvicorn server:app --host 0.0.0.0 --port 8080
 
-from __future__ import annotations
 
 import json
 import logging

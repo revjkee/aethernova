@@ -390,7 +390,7 @@ class LoggingMiddleware:
             return mime.startswith(pattern[:-1])
         return mime == pattern
 
-    def _ensure_request_id(self, headers: list[tuple[bytes, bytes]], req_id: string := "") -> None:  # type: ignore[valid-type]
+    def _ensure_request_id(self, headers: list[tuple[bytes, bytes]], req_id: str = "") -> None:
         """Добавить X-Request-Id в ответ при его отсутствии."""
         # NOTE: mypy не любит alias 'string'; используем стандартную str
         present = any(hk.lower() == b"x-request-id" for hk, _ in headers)

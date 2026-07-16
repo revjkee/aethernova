@@ -369,7 +369,11 @@ def cmd_rotate(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     jwks = _load_jwks(args.jwks)
-    keys = sorted(jwks.get("keys", []), key=lambda k: (k.get("status") != "primary", -k.get("nbf", 0))), reverse=False)
+    keys = sorted(
+        jwks.get("keys", []),
+        key=lambda k: (k.get("status") != "primary", -k.get("nbf", 0)),
+        reverse=False,
+    )
     for k in keys:
         print(json.dumps({
             "kid": k.get("kid"),

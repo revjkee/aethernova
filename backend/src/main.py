@@ -20,7 +20,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Mount
 from pydantic import BaseModel, AnyHttpUrl, Field, ValidationError
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -35,7 +35,9 @@ from sqlalchemy import text
 # Settings
 # -----------------------------
 class Settings(BaseSettings):
-    APP_NAME: str = "NeuroCity Backend"
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    APP_NAME: str = "Aethernova Backend"
     APP_ENV: str = Field(default="development", pattern="^(development|staging|production)$")
     APP_VERSION: str = "1.0.0"
 
@@ -56,11 +58,6 @@ class Settings(BaseSettings):
     # Runtime
     REQUEST_ID_HEADER: str = "X-Request-ID"
     READINESS_STARTUP_GRACE_SEC: int = 2
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
 
 settings = Settings()
 

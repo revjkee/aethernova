@@ -183,9 +183,9 @@ class GraphCoreCore:
             try:
                 if hasattr(component, 'stop'):
                     await component.stop()
-                logger.info(f"Компонент {{component_name}} остановлен")
+                logger.info(f"Компонент {component_name} остановлен")
             except Exception as e:
-                logger.error(f"Ошибка остановки компонента {{component_name}}: {{e}}")
+                logger.error(f"Ошибка остановки компонента {component_name}: {e}")
     
     def get_status(self) -> Dict[str, Any]:
         """Получение статуса системы"""
@@ -198,28 +198,28 @@ class GraphCoreCore:
             "metrics": self.metrics,
             "uptime": asyncio.get_event_loop().time() - self.metrics.get("start_time", 0) if self.metrics else 0,
             "config": self.config.dict()
-        }}
+        }
     
     async def health_check(self) -> Dict[str, Any]:
         """Проверка работоспособности системы"""
-        checks = {{
+        checks = {
             "system_running": self.is_running,
             "components_healthy": len(self.components) > 0,
             "config_valid": bool(self.config),
             "dependencies_available": await self._check_dependencies()
-        }}
+        }
         
         # Специализированные проверки здоровья
         checks.update(await self._specialized_health_checks())
         
         status = "healthy" if all(checks.values()) else "unhealthy"
         
-        return {{
+        return {
             "status": status,
             "timestamp": asyncio.get_event_loop().time(),
             "checks": checks,
             "metrics": self.metrics
-        }}
+        }
     
     async def _specialized_health_checks(self) -> Dict[str, bool]:
         """Специализированные проверки здоровья для {category}"""

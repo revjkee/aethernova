@@ -487,9 +487,13 @@ async def _heartbeat_loop(conn: Connection) -> None:
             if now - conn.last_seen > IDLE_TIMEOUT:
                 try:
                     await _send_json(ws, ServerMessage(type=ServerMsgType.INFO, data={"reason": "idle timeout"}))
-                finally:
+                except Exception:
+                    pass
+                try:
                     await ws.close(code=1001, reason="idle")
-                    return
+                except Exception:
+                    pass
+                return
             conn.last_ping = now
             try:
                 await _send_json(ws, ServerMessage(type=ServerMsgType.PONG))
@@ -500,9 +504,13 @@ async def _heartbeat_loop(conn: Connection) -> None:
             if conn.last_pong < conn.last_ping:
                 try:
                     await _send_json(ws, ServerMessage(type=ServerMsgType.ERROR, data={"reason": "ping timeout"}))
-                finally:
+                except Exception:
+                    pass
+                try:
                     await ws.close(code=1001, reason="ping timeout")
-                    return
+                except Exception:
+                    pass
+                return
     except WebSocketDisconnect:
         return
     except Exception as e:  # pragma: no cover

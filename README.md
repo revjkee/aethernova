@@ -49,6 +49,13 @@ python -m pip install -r requirements-dev.txt
 npm --prefix frontend ci
 ```
 
+Run the fast repository and Compose checks:
+
+```bash
+python tools/repository_audit.py
+docker compose config --quiet
+```
+
 Useful commands:
 
 ```bash

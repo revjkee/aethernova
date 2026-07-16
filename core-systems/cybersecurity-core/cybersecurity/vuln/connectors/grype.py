@@ -583,4 +583,9 @@ class GrypeConnector:
                 except asyncio.TimeoutError:
                     with contextlib.suppress(ProcessLookupError):
                         proc.kill()
+                    with contextlib.suppress(ProcessLookupError):
+                        await proc.wait()
                     raise
+                return proc.returncode or 0, out, err
+            except Exception:
+                raise

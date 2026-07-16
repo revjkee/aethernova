@@ -454,7 +454,7 @@ UNITS["dl"] = UnitDef(1e-1 * 1e-3, dims_add(D0, L, 3))  # децилитр
 UNITS["cl"] = UnitDef(1e-2 * 1e-3, dims_add(D0, L, 3))
 
 # ---- Шорткаты API ----
-Quantity as Q  # type: ignore  # для удобства в докстринге
+Q = Quantity
 
 __all__ = [
     "convert", "parse_unit", "register_unit",

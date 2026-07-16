@@ -6,8 +6,20 @@ from typing import Any, Dict, Optional, List
 
 from llmops.tuning.model_api import call_llm
 from llmops.eval.code_validator import validate_code_syntax
-from genius-core/symbolic-reasoning/logical_binder import extract_code_goals
-from genius-core/meta-awareness/system_consistency_checker import check_architecture_consistency
+
+
+def extract_code_goals(code: str) -> List[str]:
+    """Extract explicit TODO/FIXME goals without an optional core dependency."""
+    return [
+        line.strip()
+        for line in code.splitlines()
+        if "TODO" in line.upper() or "FIXME" in line.upper()
+    ]
+
+
+def check_architecture_consistency(code: str) -> bool:
+    """Use syntax validity as a conservative local consistency baseline."""
+    return bool(validate_code_syntax(code))
 
 # === Copilot Agent v3.2 (TeslaAI) ===
 # Agents: CodeSuggester, Refactorer, Explainer, TestGenerator, PromptRewriter,

@@ -336,47 +336,45 @@ class AccessLogMiddleware:
             elif duration_ms >= self.cfg.slow_request_ms_warn:
                 level = "WARNING"
 
-            # sampling
-            if not _should_log(self.cfg.sample_rate) and level == "INFO":
-                return
+            # A return inside finally would suppress application exceptions.
+            if _should_log(self.cfg.sample_rate) or level != "INFO":
+                # заголовки (редактируем)
+                redacted_req_headers = _redact_headers(Headers(scope=scope), self.cfg.redact_headers)
+                redacted_resp_headers = _redact_headers(Headers(raw=resp_headers.raw), self.cfg.redact_headers)
 
-            # заголовки (редактируем)
-            redacted_req_headers = _redact_headers(Headers(scope=scope), self.cfg.redact_headers)
-            redacted_resp_headers = _redact_headers(Headers(raw=resp_headers.raw), self.cfg.redact_headers)
+                # тело запроса (попытка распарсить JSON для редактирования)
+                req_body_snippet = None
+                if self.cfg.include_request_body and body_chunks:
+                    req_body_bytes = b"".join(body_chunks)[: self.cfg.request_body_max_bytes]
+                    req_body_snippet = _best_effort_redacted_body(req_body_bytes, self.cfg.redact_json_fields)
 
-            # тело запроса (попытка распарсить JSON для редактирования)
-            req_body_snippet = None
-            if self.cfg.include_request_body and body_chunks:
-                req_body_bytes = b"".join(body_chunks)[: self.cfg.request_body_max_bytes]
-                req_body_snippet = _best_effort_redacted_body(req_body_bytes, self.cfg.redact_json_fields)
+                resp_body_snippet = None
+                if self.cfg.include_response_body and response_body_buf:
+                    resp_body_bytes = b"".join(response_body_buf)[: self.cfg.response_body_max_bytes]
+                    resp_body_snippet = _best_effort_redacted_body(resp_body_bytes, self.cfg.redact_json_fields)
 
-            resp_body_snippet = None
-            if self.cfg.include_response_body and response_body_buf:
-                resp_body_bytes = b"".join(response_body_buf)[: self.cfg.response_body_max_bytes]
-                resp_body_snippet = _best_effort_redacted_body(resp_body_bytes, self.cfg.redact_json_fields)
+                base = {
+                    "http.method": method,
+                    "http.path": path,
+                    "http.status": status_code,
+                    "http.request.headers": redacted_req_headers,
+                    "http.response.headers": redacted_resp_headers,
+                    "http.request.body": req_body_snippet,
+                    "http.response.body": resp_body_snippet,
+                    "net.peer_ip": client_ip,
+                    "http.user_agent": ua,
+                    "http.bytes_in": bytes_in,
+                    "http.bytes_out": bytes_out,
+                    "duration_ms": round(duration_ms, 3),
+                    "request_id": request_id,
+                    "trace_id": trace_id,
+                    "span_id": span_id,
+                }
 
-            base = {
-                "http.method": method,
-                "http.path": path,
-                "http.status": status_code,
-                "http.request.headers": redacted_req_headers,
-                "http.response.headers": redacted_resp_headers,
-                "http.request.body": req_body_snippet,
-                "http.response.body": resp_body_snippet,
-                "net.peer_ip": client_ip,
-                "http.user_agent": ua,
-                "http.bytes_in": bytes_in,
-                "http.bytes_out": bytes_out,
-                "duration_ms": round(duration_ms, 3),
-                "request_id": request_id,
-                "trace_id": trace_id,
-                "span_id": span_id,
-            }
-
-            if exc_info:
-                self._log(level="ERROR", msg="http_request_error", base=base, exc_info=exc_info)
-            else:
-                self._log(level=level, msg="http_request", base=base)
+                if exc_info:
+                    self._log(level="ERROR", msg="http_request_error", base=base, exc_info=exc_info)
+                else:
+                    self._log(level=level, msg="http_request", base=base)
 
     # -----------------------
     # Logging sink (structlog or stdlib)

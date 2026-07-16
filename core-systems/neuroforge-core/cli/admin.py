@@ -597,13 +597,19 @@ def handle_flags(ns: argparse.Namespace, rt: Runtime) -> int:
             flags[ns.name] = True
             store.set_flags(flags)
             audit_log(rt.audit_path, "flags.enable", True, name=ns.name)
-            if rt.json_out: print_json({"ok": True}); else: print("ENABLED")
+            if rt.json_out:
+                print_json({"ok": True})
+            else:
+                print("ENABLED")
             return EXIT_OK
         elif ns.op == "disable":
             flags[ns.name] = False
             store.set_flags(flags)
             audit_log(rt.audit_path, "flags.disable", True, name=ns.name)
-            if rt.json_out: print_json({"ok": True}); else: print("DISABLED")
+            if rt.json_out:
+                print_json({"ok": True})
+            else:
+                print("DISABLED")
             return EXIT_OK
         else:  # list
             audit_log(rt.audit_path, "flags.list", True, count=len(flags))
@@ -621,14 +627,20 @@ def handle_roles(ns: argparse.Namespace, rt: Runtime) -> int:
             roles.add(ns.role)
             store.set_roles(sorted(roles))
             audit_log(rt.audit_path, "roles.add", True, role=ns.role)
-            if rt.json_out: print_json({"ok": True}); else: print("OK")
+            if rt.json_out:
+                print_json({"ok": True})
+            else:
+                print("OK")
             return EXIT_OK
         elif ns.op == "remove":
             if ns.role in roles:
                 roles.remove(ns.role)
                 store.set_roles(sorted(roles))
                 audit_log(rt.audit_path, "roles.remove", True, role=ns.role)
-                if rt.json_out: print_json({"ok": True}); else: print("OK")
+                if rt.json_out:
+                    print_json({"ok": True})
+                else:
+                    print("OK")
                 return EXIT_OK
             audit_log(rt.audit_path, "roles.remove", False, role=ns.role)
             print("Role not found", file=sys.stderr)
@@ -665,7 +677,10 @@ def handle_users(ns: argparse.Namespace, rt: Runtime) -> int:
             users[ns.user_id] = dataclasses.asdict(rec)
             store.set_users(users)
             audit_log(rt.audit_path, "users.add", True, user_id=ns.user_id)
-            if rt.json_out: print_json({"ok": True}); else: print("OK")
+            if rt.json_out:
+                print_json({"ok": True})
+            else:
+                print("OK")
             return EXIT_OK
 
         elif ns.op == "list":
@@ -683,7 +698,10 @@ def handle_users(ns: argparse.Namespace, rt: Runtime) -> int:
             users[ns.user_id]["disabled"] = True
             store.set_users(users)
             audit_log(rt.audit_path, "users.disable", True, user_id=ns.user_id)
-            if rt.json_out: print_json({"ok": True}); else: print("OK")
+            if rt.json_out:
+                print_json({"ok": True})
+            else:
+                print("OK")
             return EXIT_OK
 
         elif ns.op == "enable":
@@ -692,7 +710,10 @@ def handle_users(ns: argparse.Namespace, rt: Runtime) -> int:
             users[ns.user_id]["disabled"] = False
             store.set_users(users)
             audit_log(rt.audit_path, "users.enable", True, user_id=ns.user_id)
-            if rt.json_out: print_json({"ok": True}); else: print("OK")
+            if rt.json_out:
+                print_json({"ok": True})
+            else:
+                print("OK")
             return EXIT_OK
 
         elif ns.op == "set-password":
@@ -705,7 +726,10 @@ def handle_users(ns: argparse.Namespace, rt: Runtime) -> int:
             users[ns.user_id]["password_scrypt"] = scrypt_hash(pwd1)
             store.set_users(users)
             audit_log(rt.audit_path, "users.set_password", True, user_id=ns.user_id)
-            if rt.json_out: print_json({"ok": True}); else: print("OK")
+            if rt.json_out:
+                print_json({"ok": True})
+            else:
+                print("OK")
             return EXIT_OK
 
         elif ns.op == "assign-role":
@@ -719,7 +743,10 @@ def handle_users(ns: argparse.Namespace, rt: Runtime) -> int:
             rec["roles"] = sorted(rs)
             store.set_users(users)
             audit_log(rt.audit_path, "users.assign_role", True, user_id=ns.user_id, role=ns.role)
-            if rt.json_out: print_json({"ok": True}); else: print("OK")
+            if rt.json_out:
+                print_json({"ok": True})
+            else:
+                print("OK")
             return EXIT_OK
 
     return EXIT_OK
@@ -770,7 +797,10 @@ def handle_secrets(ns: argparse.Namespace, rt: Runtime) -> int:
             audit_log(rt.audit_path, "secrets.rm", ok, name=ns.name)
         if not ok:
             print("Secret not found", file=sys.stderr); return EXIT_NOT_FOUND
-        if rt.json_out: print_json({"ok": True}); else: print("OK")
+        if rt.json_out:
+            print_json({"ok": True})
+        else:
+            print("OK")
         return EXIT_OK
 
     return EXIT_USAGE

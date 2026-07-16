@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""
+r"""
 veilmind.utils.text_ops
 Industrial-grade text utilities for Unicode-safe normalization, sanitization,
 redaction, URL/email extraction, slugification, safe truncation, and more.

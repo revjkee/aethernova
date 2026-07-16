@@ -297,7 +297,7 @@ class WindowsPrivEscAudit:
     # ---- UAC ----
 
     def check_uac_policy(self) -> CheckResult:
-        """
+        r"""
         Проверка ключей реестра UAC:
             HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
                 EnableLUA (1 = UAC включён)
@@ -363,7 +363,7 @@ class WindowsPrivEscAudit:
     # ---- AlwaysInstallElevated ----
 
     def check_always_install_elevated(self) -> CheckResult:
-        """
+        r"""
         Проверка AlwaysInstallElevated:
             HKLM\Software\Policies\Microsoft\Windows\Installer\AlwaysInstallElevated
             HKCU\Software\Policies\Microsoft\Windows\Installer\AlwaysInstallElevated
@@ -504,7 +504,7 @@ class WindowsPrivEscAudit:
     # ---- ACL sanity for common dirs ----
 
     def check_common_paths_acl(self) -> CheckResult:
-        """
+        r"""
         Базовая проверка прав доступа (icacls) для чувствительных каталогов.
         Ищем потенциально небезопасные ACL (Everyone:(F) или BUILTIN\Users:(F)/(M) и т.п.).
         Список директорий эвристический и консервативный.

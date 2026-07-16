@@ -550,7 +550,7 @@ class ESConnector:
 
     def ensure_ilm_policy(self, name: str, policy_body: Dict[str, Any]) -> None:
         def _put():
-            return self._es.ilm.put_lifecycle(policy=name, policy=policy_body)  # type: ignore
+            return self._es.ilm.put_lifecycle(name=name, policy=policy_body)  # type: ignore
         self._retrying("put_ilm_policy", _put)
 
     def ensure_index_with_alias(self, index_alias: str, settings: Optional[Dict[str, Any]] = None,

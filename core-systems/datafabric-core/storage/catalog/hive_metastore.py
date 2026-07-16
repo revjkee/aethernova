@@ -873,4 +873,8 @@ class HiveMetastoreClient:
                 partition_columns=partition_columns,
                 location=location,
                 serde_lib=serde_lib,
-                input_format=_
+                input_format=input_format,
+                output_format=output_format,
+                serde_params=serde_params,
+                table_params=table_params,
+            )

@@ -202,7 +202,7 @@ def _set_header(headers: list[HeaderKV], key: bytes, value: str) -> None:
         if k.lower() == lower:
             headers[i] = (k, value.encode("latin-1"))
             return
-    headers.append((key, value.encode("latin-1"))
+    headers.append((key, value.encode("latin-1")))
 
 
 def _append_vary(headers: list[HeaderKV], values: Sequence[str]) -> None:

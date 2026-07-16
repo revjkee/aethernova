@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import asyncio
 # chronowatch-core/api/http/routers/v1/sla.py
-from __future__ import annotations
 
 import os
 import math

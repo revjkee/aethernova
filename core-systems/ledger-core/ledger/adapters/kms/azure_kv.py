@@ -738,6 +738,7 @@ def _example():
     # ok = kms.verify(key_id, SigAlg.PS256, digest, sig)
     # versions = kms.list_key_versions("app-signing-key")
     # kms.rotate_key("app-signing-key")
+    """
     pass
 
 __all__ = [

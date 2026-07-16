@@ -234,8 +234,7 @@ class PostureDecision(BaseModel):
     risk_score: conint(ge=0, le=100)
     step_up_required: bool
     required_aal: str = "AAL1"
-    attestation:
-        dict | None = None
+    attestation: dict | None = None
     cache_ttl_sec: int = 60
     server_time_utc: int
 

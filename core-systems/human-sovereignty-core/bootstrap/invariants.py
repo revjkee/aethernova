@@ -505,4 +505,8 @@ def _canonicalize(obj: Any) -> Any:
         for k in sorted(obj.keys(), key=lambda x: str(x)):
             items[str(k)] = _canonicalize(obj[k])
         return items
-    if isinstance(obj, (list, tuple, set
+    if isinstance(obj, (list, tuple, set)):
+        return [_canonicalize(item) for item in obj]
+    if isinstance(obj, Enum):
+        return obj.value
+    return {"__type__": type(obj).__name__, "__repr__": repr(obj)}

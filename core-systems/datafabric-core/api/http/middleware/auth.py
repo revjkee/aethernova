@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import asyncio
 # datafabric-core/api/http/middleware/auth.py
-from __future__ import annotations
 
 import base64
 import json

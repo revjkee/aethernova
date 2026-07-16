@@ -17,38 +17,38 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tup
 
 # ====================== Мягкие импорты (всё опционально) ======================
 
-with contextlib.suppress(Exception):
+try:
     from dotenv import load_dotenv  # type: ignore
     _HAS_DOTENV = True
-else:
+except Exception:
     _HAS_DOTENV = False
 
-with contextlib.suppress(Exception):
+try:
     import uvloop  # type: ignore
     _HAS_UVLOOP = True
-else:
+except Exception:
     _HAS_UVLOOP = False
 
-with contextlib.suppress(Exception):
+try:
     from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine  # type: ignore
     from sqlalchemy import text as sa_text  # type: ignore
     _HAS_SA = True
-else:
+except Exception:
     _HAS_SA = False
 
-with contextlib.suppress(Exception):
+try:
     from ledger.adapters.db.repository import create_session_factory  # type: ignore
     _HAS_REPO = True
-else:
+except Exception:
     _HAS_REPO = False
 
-with contextlib.suppress(Exception):
+try:
     from ledger.crypto.signer import load_signer_from_pem, HashAlgorithm  # type: ignore
     _HAS_SIGNER = True
-else:
+except Exception:
     _HAS_SIGNER = False
 
-with contextlib.suppress(Exception):
+try:
     from ledger.security.self_inhibitor_integration import (
         InMemoryStore,
         SelfInhibitor,
@@ -56,10 +56,10 @@ with contextlib.suppress(Exception):
         env_policy_loader,
     )  # type: ignore
     _HAS_INHIBITOR = True
-else:
+except Exception:
     _HAS_INHIBITOR = False
 
-with contextlib.suppress(Exception):
+try:
     from adapters.legacy_migration_adapter import (  # type: ignore
         LegacyMigrationAdapter,
         LoadMode,
@@ -70,16 +70,16 @@ with contextlib.suppress(Exception):
         MigrationPolicy,
     )
     _HAS_MIGRATION = True
-else:
+except Exception:
     _HAS_MIGRATION = False
 
-with contextlib.suppress(Exception):
+try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.sdk.resources import Resource  # type: ignore
     from opentelemetry.sdk.trace import TracerProvider  # type: ignore
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter  # type: ignore
     _HAS_OTEL = True
-else:
+except Exception:
     _HAS_OTEL = False
 
 

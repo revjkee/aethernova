@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import asyncio
 # zero-trust-core/api/http/routers/v1/decisions.py
-from __future__ import annotations
 
 import fnmatch
 import json

@@ -40,18 +40,18 @@ try:
 except Exception:
     _HAS_PYDANTIC = False
 
-with contextlib.suppress(Exception):
+try:
     from jsonschema import validate as jsonschema_validate  # type: ignore
     _HAS_JSONSCHEMA = True
-else:
+except Exception:
     _HAS_JSONSCHEMA = False
 
 # Для БД при необходимости (источник/приёмник)
-with contextlib.suppress(Exception):
+try:
     import sqlalchemy as sa  # type: ignore
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine  # type: ignore
     _HAS_SA = True
-else:
+except Exception:
     _HAS_SA = False
 
 

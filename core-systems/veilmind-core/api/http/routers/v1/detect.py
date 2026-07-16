@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 VeilMind Core — v1 Detect Router
 Промышленный эндпоинт детекции PII/секретов в произвольном payload.
 

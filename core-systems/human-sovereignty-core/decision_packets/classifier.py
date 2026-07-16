@@ -486,4 +486,104 @@ class DecisionPacketClassifier:
                 reasons.append(
                     ClassificationReason(
                         code="risk.escalated_by_baseline",
-                        message="Baseline risk was higher than rule risk; using hig
+                        message="Baseline risk was higher than rule risk; using higher risk",
+                        evidence={
+                            "baseline_risk": str(baseline_risk),
+                            "rule_risk": str(rule.risk),
+                        },
+                    )
+                )
+            enforcement = rule.enforcement
+            violation = rule.violation or packet.declared_violation
+            audit_event = rule.audit_event
+
+        if packet.declared_risk is not None:
+            declared = self._max_risk(computed_risk, packet.declared_risk)
+            if declared != computed_risk:
+                reasons.append(
+                    ClassificationReason(
+                        code="risk.escalated_by_declaration",
+                        message="Declared risk raised the computed risk",
+                        evidence={"declared_risk": str(packet.declared_risk)},
+                    )
+                )
+                computed_risk = declared
+
+        return ClassificationResult(
+            classification_id=f"cls_{uuid.uuid4().hex}",
+            packet_id=packet.packet_id,
+            generated_at_utc=_utc_now_iso(),
+            risk=computed_risk,
+            enforcement=enforcement,
+            violation=violation,
+            audit_event=audit_event,
+            reasons=tuple(reasons),
+        )
+
+    def _baseline_risk(
+        self,
+        packet: DecisionPacket,
+        *,
+        reasons: List[ClassificationReason],
+    ) -> RiskLevel:
+        risk = packet.declared_risk or RiskLevel.NONE
+        if packet.consent in {HumanConsentState.DENIED, HumanConsentState.REVOKED}:
+            risk = self._max_risk(risk, RiskLevel.CRITICAL)
+            reasons.append(
+                ClassificationReason(
+                    code="consent.denied",
+                    message="Denied or revoked consent requires critical handling",
+                )
+            )
+        elif packet.consent in {HumanConsentState.UNKNOWN, HumanConsentState.EXPIRED}:
+            risk = self._max_risk(risk, RiskLevel.MEDIUM)
+            reasons.append(
+                ClassificationReason(
+                    code="consent.unconfirmed",
+                    message="Consent is not currently confirmed",
+                )
+            )
+        if packet.authority is DecisionAuthority.AI_AUTONOMOUS:
+            risk = self._max_risk(risk, RiskLevel.HIGH)
+            reasons.append(
+                ClassificationReason(
+                    code="authority.autonomous_ai",
+                    message="Autonomous AI decisions require elevated review",
+                )
+            )
+        return risk
+
+    def _default_enforcement(
+        self,
+        packet: DecisionPacket,
+        risk: RiskLevel,
+        *,
+        reasons: List[ClassificationReason],
+    ) -> EnforcementAction:
+        if risk in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
+            action = EnforcementAction.BLOCK
+        elif risk is RiskLevel.MEDIUM:
+            action = EnforcementAction.ESCALATE
+        elif packet.consent is HumanConsentState.GRANTED:
+            action = EnforcementAction.ALLOW
+        else:
+            action = EnforcementAction.WARN
+        reasons.append(
+            ClassificationReason(
+                code="policy.default_enforcement",
+                message="Default fail-closed enforcement selected",
+                evidence={"action": str(action), "risk": str(risk)},
+            )
+        )
+        return action
+
+    @staticmethod
+    def _max_risk(left: RiskLevel, right: RiskLevel) -> RiskLevel:
+        order = {
+            RiskLevel.NONE: 0,
+            RiskLevel.LOW: 1,
+            RiskLevel.MEDIUM: 2,
+            RiskLevel.HIGH: 3,
+            RiskLevel.CRITICAL: 4,
+        }
+        return left if order[left] >= order[right] else right
