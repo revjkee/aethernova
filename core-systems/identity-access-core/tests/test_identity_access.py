@@ -15,13 +15,27 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.authentication import AuthenticationService
 from src.authorization import AuthorizationEngine, Permission
 from src.session_manager import SessionManager
-from config import config
+from config import IdentityAccessCoreEmergencyConfig, config
+
+
+TEST_EMERGENCY_ADMIN_PASSWORD = "identity-test-emergency-password"
 
 
 @pytest.fixture
-def auth_service():
+def emergency_config():
+    """Explicit test-only opt-in for the legacy break-glass account."""
+    return IdentityAccessCoreEmergencyConfig(
+        _env_file=None,
+        emergency_admin_enabled=True,
+        emergency_admin_password=TEST_EMERGENCY_ADMIN_PASSWORD,
+        emergency_mfa_disabled=True,
+    )
+
+
+@pytest.fixture
+def auth_service(emergency_config):
     """Фикстура для сервиса аутентификации"""
-    return AuthenticationService(config)
+    return AuthenticationService(emergency_config)
 
 
 @pytest.fixture
@@ -52,7 +66,7 @@ class TestAuthenticationService:
         """Тест аутентификации экстренного админа"""
         user = await auth_service.authenticate(
             "emergency_admin",
-            config.emergency_admin_password
+            auth_service.config.emergency_admin_password
         )
         assert user is not None
         assert user['username'] == "emergency_admin"
@@ -83,7 +97,7 @@ class TestAuthenticationService:
         """Тест генерации JWT токена"""
         user = await auth_service.authenticate(
             "emergency_admin",
-            config.emergency_admin_password
+            auth_service.config.emergency_admin_password
         )
         
         token = await auth_service.generate_token(user, expires_in=3600)
@@ -95,7 +109,7 @@ class TestAuthenticationService:
         """Тест проверки JWT токена"""
         user = await auth_service.authenticate(
             "emergency_admin",
-            config.emergency_admin_password
+            auth_service.config.emergency_admin_password
         )
         
         token = await auth_service.generate_token(user, expires_in=3600)
@@ -328,7 +342,7 @@ async def test_integration_auth_session(auth_service, session_mgr):
     # Аутентификация
     user = await auth_service.authenticate(
         "emergency_admin",
-        config.emergency_admin_password
+        auth_service.config.emergency_admin_password
     )
     assert user is not None
     
@@ -347,7 +361,7 @@ async def test_integration_auth_authz(auth_service, authz_engine):
     # Аутентификация
     user = await auth_service.authenticate(
         "emergency_admin",
-        config.emergency_admin_password
+        auth_service.config.emergency_admin_password
     )
     assert user is not None
     

@@ -1,6 +1,10 @@
-# ✅ Identity Access Core - Восстановление завершено!
+# Identity Access Core — legacy recovery implementation
 
-## 🎯 Статус: OPERATIONAL
+## Статус: NOT PRODUCTION READY
+
+> Этот исторический отчёт не является подтверждением production readiness.
+> Критические package/build/runtime paths остаются неполными. Неявный
+> `emergency_admin` отключён, authentication bypass запрещён.
 
 **Приоритет**: 10/10 (КРИТИЧЕСКИЙ - наивысший)  
 **Категория**: Security Foundation  
@@ -84,16 +88,17 @@ pytest tests/ -v
 
 ---
 
-## 🔐 Экстренный доступ:
+## 🔐 Legacy break-glass access:
 
 ```
 Username: emergency_admin
-Password: CHANGE_IMMEDIATELY
+Enabled:  false (default)
+Password: no default; explicit environment value required
 Roles:    admin, emergency, superuser
 Access:   * (полный доступ)
 ```
 
-⚠️ **Смените пароль после первого запуска!**
+⚠️ Legacy flow не реализует MFA и не является production identity provider.
 
 ---
 
@@ -109,7 +114,7 @@ Access:   * (полный доступ)
 ## 🎯 Ключевые достижения:
 
 ✅ **Security Foundation** - Базовая система безопасности восстановлена
-✅ **Production Ready** - Готова к использованию в production
+❌ **Production Ready** - не подтверждено
 ✅ **Full Featured** - Полный набор функций безопасности
 ✅ **Well Tested** - 85% покрытие тестами
 ✅ **Well Documented** - Полная документация
@@ -151,7 +156,7 @@ Access:   * (полный доступ)
 
 **Identity Access Core** теперь является надежной основой безопасности для всей экосистемы AetherNova! 🚀🔐
 
-Статус: 🟢 **FULLY OPERATIONAL**
+Статус: **LEGACY / NOT PRODUCTION READY**
 
 ---
 

@@ -263,7 +263,7 @@ class IdentityAccessCoreCore:
             "metrics": self.metrics,
             "security_context": self.security_context,
             "uptime": self.metrics.get("uptime_seconds", 0),
-            "config": self.config.dict()
+            "config": self.config.public_dict()
         }
     
     async def emergency_health_check(self) -> Dict[str, Any]:
@@ -300,11 +300,18 @@ class IdentityAccessCoreCore:
     
     async def _emergency_specific_health_checks(self) -> Dict[str, bool]:
         """Специализированные экстренные проверки здоровья"""
+        emergency_admin_available = not self.config.emergency_admin_enabled
+        if self.config.emergency_admin_enabled and self.authentication_service:
+            emergency_admin_available = (
+                self.authentication_service.get_user("emergency_admin") is not None
+            )
+
         return {
             "authentication_service_active": self.authentication_service is not None,
             "authorization_engine_active": self.authorization_engine is not None,
             "session_manager_running": self.session_manager is not None,
-            "emergency_admin_available": True  # Всегда есть в экстренном режиме
+            "emergency_admin_available_if_enabled": emergency_admin_available,
+            "authentication_bypass_disabled": not self.config.emergency_auth_bypass,
         }
 
 

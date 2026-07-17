@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import configparser
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import tokenize
@@ -41,6 +43,10 @@ TOML_FILES = (
     "pyproject.toml",
     "core-systems/observability-core/pyproject.toml",
 )
+ALEMBIC_CONFIGS = ("backend/alembic.ini",)
+EXACT_REQUIREMENT = re.compile(
+    r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]+\])?\s*==\s*([^;\s]+)"
+)
 
 
 def tracked_files() -> list[str]:
@@ -63,6 +69,88 @@ def compile_python(path: pathlib.Path, relative: str) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error", SyntaxWarning)
         compile(source, relative, "exec")
+
+
+def exact_requirement_pins(path: pathlib.Path) -> dict[str, str]:
+    """Return normalized package names and exact versions declared by a file."""
+
+    pins: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        match = EXACT_REQUIREMENT.match(line)
+        if match is None:
+            continue
+        name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+        pins[name] = match.group(2)
+    return pins
+
+
+def conflicting_exact_pins(
+    first: pathlib.Path,
+    second: pathlib.Path,
+) -> list[tuple[str, str, str]]:
+    """Find packages pinned to different exact versions in two files."""
+
+    first_pins = exact_requirement_pins(first)
+    second_pins = exact_requirement_pins(second)
+    return [
+        (name, first_pins[name], second_pins[name])
+        for name in sorted(first_pins.keys() & second_pins.keys())
+        if first_pins[name] != second_pins[name]
+    ]
+
+
+def alembic_layout_errors(config_path: pathlib.Path) -> list[str]:
+    """Validate that an Alembic config resolves to an executable script tree."""
+
+    here = str(config_path.parent.resolve())
+    errors: list[str] = []
+    interpolating_parser = configparser.ConfigParser(defaults={"here": here})
+    try:
+        interpolating_parser.read(config_path, encoding="utf-8")
+        if interpolating_parser.has_section("post_write_hooks"):
+            dict(interpolating_parser.items("post_write_hooks"))
+    except configparser.Error as exc:
+        errors.append(f"{config_path}: invalid Alembic interpolation: {exc}")
+
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read(config_path, encoding="utf-8")
+    if not parser.has_section("alembic"):
+        errors.append(f"{config_path}: missing [alembic] section")
+        return errors
+
+    def resolve(raw_path: str) -> pathlib.Path:
+        expanded = raw_path.replace("%(here)s", here)
+        path = pathlib.Path(expanded)
+        return path if path.is_absolute() else config_path.parent / path
+
+    script_value = parser.get("alembic", "script_location", fallback="").strip()
+    if not script_value:
+        errors.append(f"{config_path}: script_location is not configured")
+        return errors
+
+    script_root = resolve(script_value)
+    env_path = script_root / "env.py"
+    if not env_path.is_file() or env_path.stat().st_size == 0:
+        errors.append(f"{config_path}: Alembic env.py is missing or empty: {env_path}")
+
+    versions_value = parser.get(
+        "alembic",
+        "version_locations",
+        fallback=str(script_root / "versions"),
+    ).strip()
+    version_roots = [
+        resolve(item.strip())
+        for item in re.split(r"[;\n]", versions_value)
+        if item.strip()
+    ]
+    if not version_roots:
+        errors.append(f"{config_path}: no Alembic version location is configured")
+    elif not any(root.is_dir() and any(root.glob("*.py")) for root in version_roots):
+        errors.append(
+            f"{config_path}: no Python revisions found in configured version locations"
+        )
+    return errors
 
 
 def main() -> int:
@@ -103,10 +191,24 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - report the original parser error
             errors.append(f"invalid TOML {relative}: {exc}")
 
+    requirements = ROOT / "requirements.txt"
+    requirements_dev = ROOT / "requirements-dev.txt"
+    for name, root_version, dev_version in conflicting_exact_pins(
+        requirements,
+        requirements_dev,
+    ):
+        errors.append(
+            "conflicting exact requirement pin: "
+            f"{name}=={root_version} in requirements.txt, "
+            f"{name}=={dev_version} in requirements-dev.txt"
+        )
+
+    for relative in ALEMBIC_CONFIGS:
+        errors.extend(alembic_layout_errors(ROOT / relative))
+
     for relative in files:
-        if (
-            not relative.endswith(".py")
-            or relative.startswith(PYTHON_EXCLUDED_PREFIXES)
+        if not relative.endswith(".py") or relative.startswith(
+            PYTHON_EXCLUDED_PREFIXES
         ):
             continue
         path = ROOT / relative

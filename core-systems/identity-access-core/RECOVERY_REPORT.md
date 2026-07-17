@@ -11,7 +11,12 @@
 **Система**: identity-access-core  
 **Категория**: Security Foundation  
 **Начальный статус**: CATASTROPHIC  
-**Конечный статус**: OPERATIONAL  
+**Исторический статус восстановления**: OPERATIONAL
+**Текущий статус**: legacy / NOT PRODUCTION READY
+
+> Этот recovery report не подтверждает production readiness. Неявный
+> `emergency_admin` отключён, authentication bypass запрещён, а package,
+> Docker и runtime paths требуют отдельной стабилизации.
 
 ### Критическая важность
 
@@ -388,7 +393,7 @@ pytest tests/ -v --cov=src
 - ✅ Добавлено управление сессиями
 - ✅ Написано 21 тест (покрытие 85%)
 - ✅ Создана полная документация
-- ✅ Система готова к production использованию
+- ❌ Production readiness не подтверждена
 
 **Время восстановления**: ~2 часа активной работы  
 **Строк кода создано**: ~2700+  
@@ -397,7 +402,7 @@ pytest tests/ -v --cov=src
 ### Статус системы:
 
 ```
-🟢 OPERATIONAL - ГОТОВА К РАБОТЕ
+LEGACY / NOT PRODUCTION READY
 
 Категория: Security Foundation
 Приоритет: КРИТИЧЕСКИЙ (10/10)

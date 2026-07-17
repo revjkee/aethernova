@@ -37,6 +37,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
-# Отладочный вывод
-print("Loaded settings:", settings.model_dump())

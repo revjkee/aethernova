@@ -25,15 +25,19 @@ class AuthenticationService:
         self.max_failed_attempts = 5
         self.lockout_duration = timedelta(minutes=15)
         
-        # Создание экстренного админа
-        self._create_emergency_admin()
+        if config.emergency_admin_enabled:
+            self._create_emergency_admin()
         
         logger.info("🔐 Authentication Service инициализирован")
     
     def _create_emergency_admin(self) -> None:
         """Создает экстренного администратора"""
+        password = self.config.emergency_admin_password
+        if password is None:
+            raise RuntimeError("Emergency admin password was not validated")
+
         password_hash = bcrypt.hashpw(
-            self.config.emergency_admin_password.encode('utf-8'),
+            password.encode('utf-8'),
             bcrypt.gensalt()
         )
         
