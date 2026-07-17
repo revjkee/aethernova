@@ -6,6 +6,8 @@ from tools.repository_audit import (
     ROOT,
     alembic_layout_errors,
     conflicting_exact_pins,
+    docker_copy_errors,
+    dockerignore_errors,
 )
 
 
@@ -76,3 +78,40 @@ def test_alembic_layout_rejects_invalid_post_write_interpolation(
 
 def test_backend_alembic_config_points_to_executable_tree() -> None:
     assert alembic_layout_errors(ROOT / "backend" / "alembic.ini") == []
+
+
+def test_docker_copy_rejects_env_and_missing_sources(tmp_path: Path) -> None:
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM python:3.12-slim\n"
+        "COPY .env /app/.env\n"
+        "COPY ./missing /app/missing\n",
+        encoding="utf-8",
+    )
+
+    errors = docker_copy_errors(dockerfile, tmp_path)
+
+    assert any("must not embed .env" in error for error in errors)
+    assert any("COPY source does not exist" in error for error in errors)
+
+
+def test_telegram_dockerfile_copy_sources_are_safe_and_present() -> None:
+    assert (
+        docker_copy_errors(
+            ROOT / "telegram_bot" / "Dockerfile",
+            ROOT / "telegram_bot",
+        )
+        == []
+    )
+
+
+def test_dockerignore_requires_env_exclusion(tmp_path: Path) -> None:
+    (tmp_path / ".dockerignore").write_text("__pycache__/\n", encoding="utf-8")
+
+    assert dockerignore_errors(tmp_path) == [
+        f"{tmp_path / '.dockerignore'}: .env is not excluded from the Docker context"
+    ]
+
+
+def test_telegram_docker_context_excludes_env_files() -> None:
+    assert dockerignore_errors(ROOT / "telegram_bot") == []

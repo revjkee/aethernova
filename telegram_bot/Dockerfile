@@ -12,10 +12,9 @@ COPY requirements.txt pyproject.toml ./
 # Установка Python-зависимостей
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Копируем backend и .env
+# Копируем runtime-код; конфигурация и секреты передаются только через env.
 COPY ./backend /app/backend
-COPY .env /app/.env
-COPY ./entrypoints /app/entrypoints
+COPY ./backend/entrypoints /app/entrypoints
 
 # Команда запуска — БОТ
 CMD ["python", "entrypoints/run_bot.py"]

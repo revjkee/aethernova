@@ -6,6 +6,7 @@ import configparser
 import json
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import tokenize
@@ -44,6 +45,8 @@ TOML_FILES = (
     "core-systems/observability-core/pyproject.toml",
 )
 ALEMBIC_CONFIGS = ("backend/alembic.ini",)
+DOCKER_COPY_CONTEXTS = (("telegram_bot/Dockerfile", "telegram_bot"),)
+DOCKER_CONTEXTS_REQUIRING_ENV_EXCLUDE = ("telegram_bot",)
 EXACT_REQUIREMENT = re.compile(
     r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]+\])?\s*==\s*([^;\s]+)"
 )
@@ -153,6 +156,63 @@ def alembic_layout_errors(config_path: pathlib.Path) -> list[str]:
     return errors
 
 
+def docker_copy_errors(
+    dockerfile: pathlib.Path,
+    context_root: pathlib.Path,
+) -> list[str]:
+    """Validate simple local COPY sources and reject direct .env copies."""
+
+    errors: list[str] = []
+    for line_number, raw_line in enumerate(
+        dockerfile.read_text(encoding="utf-8-sig").splitlines(),
+        start=1,
+    ):
+        stripped = raw_line.strip()
+        if not stripped.upper().startswith("COPY "):
+            continue
+        try:
+            tokens = shlex.split(stripped, posix=True)
+        except ValueError as exc:
+            errors.append(f"{dockerfile}:{line_number}: invalid COPY syntax: {exc}")
+            continue
+        if any(token.startswith("--from=") for token in tokens[1:]):
+            continue
+        arguments = [token for token in tokens[1:] if not token.startswith("--")]
+        if len(arguments) < 2:
+            errors.append(f"{dockerfile}:{line_number}: COPY has no source/destination")
+            continue
+        for source in arguments[:-1]:
+            normalized = source.removeprefix("./").replace("\\", "/")
+            if normalized == ".env":
+                errors.append(
+                    f"{dockerfile}:{line_number}: COPY must not embed .env in an image"
+                )
+                continue
+            source_path = context_root / normalized
+            if not source_path.exists():
+                errors.append(
+                    f"{dockerfile}:{line_number}: COPY source does not exist: {source}"
+                )
+    return errors
+
+
+def dockerignore_errors(context_root: pathlib.Path) -> list[str]:
+    """Require local environment files to stay outside a Docker build context."""
+
+    dockerignore = context_root / ".dockerignore"
+    if not dockerignore.is_file() or dockerignore.stat().st_size == 0:
+        return [f"{context_root}: .dockerignore is missing or empty"]
+
+    patterns = {
+        line.strip()
+        for line in dockerignore.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    if ".env" not in patterns:
+        return [f"{dockerignore}: .env is not excluded from the Docker context"]
+    return []
+
+
 def main() -> int:
     files = tracked_files()
     errors: list[str] = []
@@ -205,6 +265,12 @@ def main() -> int:
 
     for relative in ALEMBIC_CONFIGS:
         errors.extend(alembic_layout_errors(ROOT / relative))
+
+    for dockerfile, context_root in DOCKER_COPY_CONTEXTS:
+        errors.extend(docker_copy_errors(ROOT / dockerfile, ROOT / context_root))
+
+    for context_root in DOCKER_CONTEXTS_REQUIRING_ENV_EXCLUDE:
+        errors.extend(dockerignore_errors(ROOT / context_root))
 
     for relative in files:
         if not relative.endswith(".py") or relative.startswith(
