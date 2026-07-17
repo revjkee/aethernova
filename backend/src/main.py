@@ -9,18 +9,18 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Callable, Iterable, Optional
+from typing import AsyncGenerator, Callable, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel, Field, ValidationError
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Mount
-from pydantic import BaseModel, AnyHttpUrl, Field, ValidationError
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -38,7 +38,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     APP_NAME: str = "Aethernova Backend"
-    APP_ENV: str = Field(default="development", pattern="^(development|staging|production)$")
+    APP_ENV: str = Field(
+        default="development", pattern="^(development|staging|production)$"
+    )
     APP_VERSION: str = "1.0.0"
 
     # Security / Network
@@ -46,7 +48,10 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "http://localhost,http://127.0.0.1"
     CORS_ALLOW_CREDENTIALS: bool = True
     CORS_ALLOW_METHODS: str = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-    CORS_ALLOW_HEADERS: str = "Authorization,Content-Type,Accept,Accept-Language,Origin,User-Agent,X-Request-ID"
+    CORS_ALLOW_HEADERS: str = (
+        "Authorization,Content-Type,Accept,Accept-Language,"
+        "Origin,User-Agent,X-Request-ID"
+    )
 
     # Database (async only)
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/postgres"
@@ -58,6 +63,7 @@ class Settings(BaseSettings):
     # Runtime
     REQUEST_ID_HEADER: str = "X-Request-ID"
     READINESS_STARTUP_GRACE_SEC: int = 2
+
 
 settings = Settings()
 
@@ -149,7 +155,9 @@ async def init_engine() -> None:
         pool_pre_ping=True,
         future=True,
     )
-    session_factory = async_sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=engine, autoflush=False, expire_on_commit=False
+    )
 
     # Warm-up probe
     async with engine.begin() as conn:
@@ -179,7 +187,7 @@ async def lifespan(app: FastAPI):
     try:
         await init_engine()
         logger.info("Database engine initialized")
-    except Exception as exc:
+    except Exception:
         logger.exception("Failed to initialize database engine")
         # Fail fast in non-dev environments
         if settings.APP_ENV != "development":
@@ -205,6 +213,20 @@ def register_routes(app: FastAPI) -> None:
     # from .api.v1.users import router as users_router
     # app.include_router(users_router, prefix="/api/v1/users", tags=["users"])
     pass
+
+
+def configure_metrics(app: FastAPI) -> None:
+    """Expose bounded-cardinality Prometheus HTTP metrics."""
+
+    Instrumentator(
+        should_group_status_codes=True,
+        should_ignore_untemplated=True,
+        excluded_handlers=["/metrics"],
+    ).instrument(app).expose(
+        app,
+        endpoint="/metrics",
+        include_in_schema=False,
+    )
 
 
 # -----------------------------
@@ -233,7 +255,9 @@ def _problem_json(
 
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
         logger.warning(f"Validation error: {exc.errors()}")
         payload = _problem_json(
             title="Validation Error",
@@ -245,7 +269,9 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(payload, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     @app.exception_handler(ValidationError)
-    async def pydantic_exception_handler(request: Request, exc: ValidationError) -> JSONResponse:
+    async def pydantic_exception_handler(
+        request: Request, exc: ValidationError
+    ) -> JSONResponse:
         logger.warning(f"Pydantic validation error: {exc}")
         payload = _problem_json(
             title="Data Validation Error",
@@ -256,7 +282,9 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(payload, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     @app.exception_handler(HTTPException)
-    async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    async def http_exception_handler(
+        request: Request, exc: HTTPException
+    ) -> JSONResponse:
         payload = _problem_json(
             title="HTTP Error",
             detail=exc.detail,
@@ -266,7 +294,9 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(payload, status_code=exc.status_code)
 
     @app.exception_handler(Exception)
-    async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    async def general_exception_handler(
+        request: Request, exc: Exception
+    ) -> JSONResponse:
         logger.exception("Unhandled exception occurred")
         payload = _problem_json(
             title="Internal Server Error",
@@ -296,8 +326,12 @@ def create_app() -> FastAPI:
 
     # CORS
     cors_origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
-    cors_methods = [m.strip() for m in settings.CORS_ALLOW_METHODS.split(",") if m.strip()]
-    cors_headers = [h.strip() for h in settings.CORS_ALLOW_HEADERS.split(",") if h.strip()]
+    cors_methods = [
+        m.strip() for m in settings.CORS_ALLOW_METHODS.split(",") if m.strip()
+    ]
+    cors_headers = [
+        h.strip() for h in settings.CORS_ALLOW_HEADERS.split(",") if h.strip()
+    ]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
@@ -312,6 +346,9 @@ def create_app() -> FastAPI:
 
     # Request ID
     app.add_middleware(RequestIDMiddleware, header_name=settings.REQUEST_ID_HEADER)
+
+    # Prometheus metrics
+    configure_metrics(app)
 
     # Routes
     register_routes(app)
@@ -359,7 +396,9 @@ async def ready() -> str:
     # If engine is up and session_factory exists — we are ready
     if engine is None or session_factory is None:
         # In production, readiness should fail hard to avoid routing traffic
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="not ready")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="not ready"
+        )
     return "ready"
 
 
