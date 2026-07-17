@@ -55,11 +55,11 @@ export const useSystemMetrics = (refreshInterval: number = 30000) => {
 
 export const useAetherNovaMetrics = (refreshInterval: number = 30000) => {
   const [metrics, setMetrics] = useState<AetherNovaMetrics>({
-    activeAgents: 315,
+    activeAgents: 0,
     totalRequests: 0,
-    responseTime: 45,
+    responseTime: 0,
     errorRate: 0,
-    alertsCount: 3,
+    alertsCount: 0,
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);

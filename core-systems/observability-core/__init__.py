@@ -1,6 +1,1 @@
-"""
-__init__ module
-"""
-
-# TODO: Реализовать функциональность
-pass
+"""Compatibility marker for the standalone Observability Core project."""

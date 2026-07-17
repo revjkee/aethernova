@@ -25,14 +25,22 @@ REQUIRED_NONEMPTY = (
     "backend/requirements.txt",
     "frontend/package.json",
     "frontend/package-lock.json",
+    "core-systems/observability-core/pyproject.toml",
+    "core-systems/observability-core/observability-dashboard/package.json",
+    "core-systems/observability-core/observability-dashboard/package-lock.json",
 )
 JSON_FILES = (
     ".devcontainer/devcontainer.json",
     "frontend/package.json",
     "frontend/package-lock.json",
     "frontend/public/manifest.json",
+    "core-systems/observability-core/observability-dashboard/package.json",
+    "core-systems/observability-core/observability-dashboard/package-lock.json",
 )
-TOML_FILES = ("pyproject.toml",)
+TOML_FILES = (
+    "pyproject.toml",
+    "core-systems/observability-core/pyproject.toml",
+)
 
 
 def tracked_files() -> list[str]:

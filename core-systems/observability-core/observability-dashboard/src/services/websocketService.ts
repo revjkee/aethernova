@@ -37,11 +37,19 @@ class WebSocketService {
   private systemEventListeners: ((event: SystemEvent) => void)[] = [];
   private connectionListeners: ((connected: boolean) => void)[] = [];
 
-  constructor(private serverUrl: string = 'ws://localhost:8080') {}
+  constructor(
+    private serverUrl: string =
+      import.meta.env.VITE_OBSERVABILITY_SOCKET_URL ?? window.location.origin
+  ) {}
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
+        if (this.isConnected) {
+          resolve();
+          return;
+        }
+        this.socket?.disconnect();
         this.socket = io(this.serverUrl, {
           transports: ['websocket', 'polling'],
           timeout: 10000,
@@ -67,6 +75,7 @@ class WebSocketService {
         this.socket.on('connect_error', (error) => {
           console.error('WebSocket connection error:', error);
           this.isConnected = false;
+          this.reconnectAttempts += 1;
           this.notifyConnectionListeners(false);
           
           if (this.reconnectAttempts >= this.maxReconnectAttempts) {

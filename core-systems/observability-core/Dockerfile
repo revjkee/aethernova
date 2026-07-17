@@ -1,24 +1,26 @@
-# Dockerfile for observability-core
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN groupadd --system observability \
+    && useradd --system --create-home --gid observability --uid 10001 observability
 
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml README.md ./
+COPY src ./src
 
-# Copy source code
-COPY . .
+RUN python -m pip install --no-cache-dir .
 
-# Expose port (if needed)
+USER observability
+
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s \
-  CMD python -c "import asyncio; from main import ObservabilitycoreCore; \
-                 core = ObservabilitycoreCore(); \
-                 result = asyncio.run(core.health_check()); \
-                 exit(0 if result['status'] == 'healthy' else 1)"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
 
-# Run application
-CMD ["python", "main.py"]
+CMD ["uvicorn", "observability_core.api:app", "--host", "0.0.0.0", "--port", "8080"]

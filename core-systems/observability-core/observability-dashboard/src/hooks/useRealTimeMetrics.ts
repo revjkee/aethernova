@@ -26,8 +26,8 @@ export const useRealTimeObservability = () => {
       cpuUsage: 0,
       memoryUsage: 0,
       diskUsage: 0,
-      activeAgents: 315,
-      responseTime: 45,
+      activeAgents: 0,
+      responseTime: 0,
       errorRate: 0,
       lastUpdate: Date.now(),
     },
@@ -40,11 +40,22 @@ export const useRealTimeObservability = () => {
 
   // Handle metric updates
   const handleMetricUpdate = useCallback((update: MetricUpdate) => {
+    const metricKeys: Record<string, keyof RealTimeMetrics> = {
+      cpu_usage: 'cpuUsage',
+      memory_usage: 'memoryUsage',
+      disk_usage: 'diskUsage',
+      active_agents: 'activeAgents',
+      response_time: 'responseTime',
+      error_rate: 'errorRate',
+    };
+    const key = metricKeys[update.metric];
+    if (!key) return;
+
     setState(prev => ({
       ...prev,
       metrics: {
         ...prev.metrics,
-        [update.metric]: update.value,
+        [key]: update.value,
         lastUpdate: update.timestamp,
       }
     }));
@@ -105,8 +116,12 @@ export const useRealTimeObservability = () => {
           websocketService.subscribeToMetric(metric);
         });
 
-        // Start mock data for demo
-        websocketService.startMockDataStream();
+        if (
+          import.meta.env.DEV &&
+          import.meta.env.VITE_ENABLE_MOCK_STREAM === 'true'
+        ) {
+          websocketService.startMockDataStream();
+        }
 
         if (mounted) {
           setState(prev => ({ ...prev, loading: false, error: null }));
@@ -192,15 +207,24 @@ export const useMetricHistory = (metricName: string, timeRange: { from: Date; to
   const [data, setData] = useState<{ timestamp: number; value: number }[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const fromTimestamp = timeRange.from.getTime();
+  const toTimestamp = timeRange.to.getTime();
 
   useEffect(() => {
-    if (!metricName || !timeRange.from || !timeRange.to) return;
+    if (
+      !metricName ||
+      Number.isNaN(fromTimestamp) ||
+      Number.isNaN(toTimestamp)
+    ) return;
 
     setLoading(true);
     setError(null);
 
     // Request historical data
-    websocketService.requestMetricHistory(metricName, timeRange);
+    websocketService.requestMetricHistory(metricName, {
+      from: new Date(fromTimestamp),
+      to: new Date(toTimestamp),
+    });
 
     // Listen for historical data response
     const unsubscribe = websocketService.onMetricUpdate((update) => {
@@ -218,7 +242,7 @@ export const useMetricHistory = (metricName: string, timeRange: { from: Date; to
       unsubscribe();
       clearTimeout(timeout);
     };
-  }, [metricName, timeRange.from, timeRange.to]);
+  }, [metricName, fromTimestamp, toTimestamp]);
 
   return { data, loading, error };
 };

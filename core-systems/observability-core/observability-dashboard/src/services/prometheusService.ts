@@ -184,11 +184,11 @@ class PrometheusService {
     } catch (error) {
       console.error('Failed to fetch AetherNova metrics:', error);
       return {
-        activeAgents: 315, // Fallback to known value
+        activeAgents: 0,
         totalRequests: 0,
-        responseTime: 45,
+        responseTime: 0,
         errorRate: 0,
-        alertsCount: 3,
+        alertsCount: 0,
       };
     }
   }

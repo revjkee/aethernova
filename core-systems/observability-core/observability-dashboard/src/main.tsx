@@ -4,7 +4,12 @@ import App from './App.tsx'
 import './index.css'
 import './i18n'
 
-ReactDOM.createRoot(document.getElementById('root')!).render(
+const root = document.getElementById('root')
+if (!root) {
+  throw new Error('Dashboard root element was not found')
+}
+
+ReactDOM.createRoot(root).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>,
